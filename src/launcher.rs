@@ -1288,6 +1288,7 @@ pub fn launch_pty(
         run_here,
         terminal,
         inside_ai_tool,
+        Some(tool),
     )?;
 
     instance_binding::persist_terminal_launch_context(
@@ -1398,6 +1399,7 @@ fn launch_background_runner(
         false,
         terminal_mode,
         inside_ai_tool,
+        Some(tool),
     )?;
     match launch_result {
         terminal::LaunchResult::Background(log_file, pid) => Ok((log_file, pid, effective_preset)),
@@ -2015,6 +2017,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             false,
                             terminal_mode,
                             inside_ai_tool,
+                            Some("claude"),
                         )?;
                         match launch_result {
                             terminal::LaunchResult::Background(log_file, pid) => {
@@ -2054,6 +2057,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             effective_run_here,
                             terminal_mode,
                             inside_ai_tool,
+                            Some("claude"),
                         )?;
                         instance_binding::persist_terminal_launch_context(
                             db,

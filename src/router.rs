@@ -673,6 +673,7 @@ fn launch_new_terminal() -> i32 {
         false, // not run_here (open new window)
         None,  // default terminal
         inside_ai,
+        None, // not launching a specific tool (hcom TUI itself)
     ) {
         Ok((crate::terminal::LaunchResult::Success, _)) => 0,
         Ok((crate::terminal::LaunchResult::Failed(msg), _)) => {

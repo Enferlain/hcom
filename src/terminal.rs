@@ -928,27 +928,15 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Resolve a human-readable tool name for the launch script title/banner,
-/// detecting from the command when not explicitly provided.
-fn launch_display_name<'a>(command_str: &str, tool_name: Option<&'a str>) -> &'a str {
-    tool_name.unwrap_or_else(|| {
-        let cmd_lower = command_str.to_lowercase();
-        if cmd_lower.contains("opencode") {
-            "OpenCode"
-        } else if cmd_lower.contains("kilo") {
-            "Kilo Code"
-        } else if cmd_lower.contains("cursor-agent") {
-            "Cursor Agent"
-        } else if cmd_lower.contains("gemini") {
-            "Gemini"
-        } else if cmd_lower.contains("codex") {
-            "Codex"
-        } else if cmd_lower.contains("claude") {
-            "Claude Code"
-        } else {
-            "hcom"
-        }
-    })
+/// Resolve a human-readable tool name for the launch script title/banner
+/// from the internal tool id (e.g. "cursor", "kilo"). Falls back to "hcom"
+/// when there's no tool id (plain `hcom` TUI launches) or it doesn't
+/// resolve to a known tool.
+fn launch_display_name(tool_id: Option<&str>) -> &'static str {
+    tool_id
+        .and_then(|id| id.parse::<crate::tool::Tool>().ok())
+        .map(|t| t.spec().label)
+        .unwrap_or("hcom")
 }
 
 /// Create a bash script for terminal launch.
@@ -960,10 +948,10 @@ pub fn create_bash_script(
     cwd: Option<&str>,
     command_str: &str,
     background: bool,
-    tool_name: Option<&str>,
+    tool_id: Option<&str>,
     opens_new_window: bool,
 ) -> Result<()> {
-    let tool_name = launch_display_name(command_str, tool_name);
+    let tool_name = launch_display_name(tool_id);
 
     let mut f = fs::File::create(script_file).context("Failed to create script file")?;
 
@@ -1100,10 +1088,10 @@ pub fn create_powershell_script(
     cwd: Option<&str>,
     command_str: &str,
     background: bool,
-    tool_name: Option<&str>,
+    tool_id: Option<&str>,
     opens_new_window: bool,
 ) -> Result<()> {
-    let tool_name = launch_display_name(command_str, tool_name);
+    let tool_name = launch_display_name(tool_id);
 
     let mut f = fs::File::create(script_file).context("Failed to create script file")?;
     // Windows PowerShell 5.1 decodes BOM-less scripts using the active ANSI
@@ -1866,6 +1854,7 @@ fn parse_herdr_pane_id(captured: &str) -> Option<String> {
 /// - `background=true`: Launch as background process, returns Background(log_file, pid)
 /// - `run_here=true`: Run in current terminal (blocking via execve)
 /// - Otherwise: New terminal window/tab/split
+#[allow(clippy::too_many_arguments)]
 pub fn launch_terminal(
     command: &str,
     env: &HashMap<String, String>,
@@ -1874,6 +1863,7 @@ pub fn launch_terminal(
     run_here: bool,
     terminal: Option<&str>,
     inside_ai_tool: bool,
+    tool_id: Option<&str>,
 ) -> Result<(LaunchResult, String)> {
     let config_and_instance_env = env.clone();
 
@@ -1928,7 +1918,7 @@ pub fn launch_terminal(
             cwd,
             command,
             background,
-            None,
+            tool_id,
             opens_new_window,
         )?;
     } else {
@@ -1938,7 +1928,7 @@ pub fn launch_terminal(
             cwd,
             command,
             background,
-            None,
+            tool_id,
             opens_new_window,
         )?;
     }
@@ -2865,7 +2855,7 @@ mod tests {
             Some("/work/dir"),
             "claude --foo",
             false, // background
-            None,
+            Some("claude"),
             true, // opens_new_window
         )
         .unwrap();
@@ -2875,8 +2865,8 @@ mod tests {
                 .starts_with(&[0xEF, 0xBB, 0xBF])
         );
         let content = std::fs::read_to_string(&script).unwrap();
-        assert!(content.contains("$Host.UI.RawUI.WindowTitle = \"hcom: starting Claude Code...\""));
-        assert!(content.contains("Write-Host \"Starting Claude Code...\""));
+        assert!(content.contains("$Host.UI.RawUI.WindowTitle = \"hcom: starting Claude...\""));
+        assert!(content.contains("Write-Host \"Starting Claude...\""));
         assert!(content.contains("Remove-Item Env:"));
         assert!(content.contains("$env:HCOM_TOOL = 'claude'"));
         assert!(content.contains("Set-Location '/work/dir'"));
