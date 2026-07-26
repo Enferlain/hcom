@@ -36,19 +36,45 @@ typecheck:
 dist-check:
     dist generate --check
 
-ci: dist-check mock-tools typecheck
+# Each check's full output goes to a per-step log under {{ci-tmp}}/ci-logs/; stdout
+# only shows one ok/FAILED line per step so a pass is scannable and a failure
+# points straight at the relevant log instead of requiring re-runs or grepping.
+ci:
+    #!/usr/bin/env bash
+    set -uo pipefail
     mkdir -p "{{ci-tmp}}"
-    TMPDIR="{{ci-tmp}}" cargo fmt --all -- --check
-    TMPDIR="{{ci-tmp}}" cargo clippy --all-targets --locked -- -D warnings
-    TMPDIR="{{ci-tmp}}" cargo test --locked
+    log_dir="{{ci-tmp}}/ci-logs"
+    mkdir -p "$log_dir"
+    step() {
+        local name="$1"; shift
+        local log="$log_dir/$name.log"
+        printf '[ci] %-20s ' "$name"
+        if "$@" > "$log" 2>&1; then
+            echo "ok"
+        else
+            local rc=$?
+            echo "FAILED (exit $rc)"
+            echo "----- last 40 lines: $log -----"
+            tail -n 40 "$log"
+            exit "$rc"
+        fi
+    }
+    step dist-check  dist generate --check
+    step mock-tools  env HCOM_MOCK_TOOLS_PREFIX="{{mock-prefix}}" HCOM_MOCK_TOOLS_NPM_CACHE="{{mock-cache}}" bash ./scripts/install-mock-tools.sh
+    step typecheck   bash ./scripts/typecheck.sh
+    step fmt         env TMPDIR="{{ci-tmp}}" cargo fmt --all -- --check
+    step clippy      env TMPDIR="{{ci-tmp}}" cargo clippy --all-targets --locked -- -D warnings
+    step test        env TMPDIR="{{ci-tmp}}" cargo test --locked
     # Real-tool tests launch genuine claude/codex processes (each tens of threads,
     # with two alive at once during the fork phase). On a dev box already running
     # agents this can brush the soft nproc limit and make the tool's own hook
     # `posix_spawn` fail with EAGAIN. Raise the soft limit to the hard ceiling for
-    # these lines so the tests aren't flaky against a busy machine.
-    ulimit -Su "$(ulimit -Hu)" && TMPDIR="{{ci-tmp}}" PATH="{{mock-bin}}:$PATH" cargo test --locked --test real_tool_codex -- --ignored --nocapture --test-threads=1
-    ulimit -Su "$(ulimit -Hu)" && TMPDIR="{{ci-tmp}}" PATH="{{mock-bin}}:$PATH" cargo test --locked --test real_tool_claude -- --ignored --nocapture --test-threads=1
-    ulimit -Su "$(ulimit -Hu)" && TMPDIR="{{ci-tmp}}" PATH="{{mock-bin}}:$PATH" cargo test --locked --test test_relay_roundtrip -- --ignored --nocapture --test-threads=1
+    # these steps so the tests aren't flaky against a busy machine.
+    ulimit -Su "$(ulimit -Hu)"
+    step real_tool_codex        env TMPDIR="{{ci-tmp}}" PATH="{{mock-bin}}:$PATH" cargo test --locked --test real_tool_codex -- --ignored --nocapture --test-threads=1
+    step real_tool_claude       env TMPDIR="{{ci-tmp}}" PATH="{{mock-bin}}:$PATH" cargo test --locked --test real_tool_claude -- --ignored --nocapture --test-threads=1
+    step test_relay_roundtrip  env TMPDIR="{{ci-tmp}}" PATH="{{mock-bin}}:$PATH" cargo test --locked --test test_relay_roundtrip -- --ignored --nocapture --test-threads=1
+    echo "[ci] all checks passed"
 
 # Run every normal Windows CI check locally. The release-package smoke remains
 # available separately for release validation.
