@@ -263,6 +263,27 @@ fn no_transcript_error(db: &HcomDb, name: &str) -> String {
     }
 }
 
+/// Find a device-suffixed instance name ("dami:KEZE") matching a bare base
+/// name ("dami") that has no exact/tag/stopped match of its own. Relay pull
+/// always namespaces remote instances with a device suffix (see
+/// `relay::add_device_suffix`), so a bare name typed by the user never
+/// matches those rows directly — only this prefix lookup does. Without it,
+/// callers fall through to a plain-name DB lookup, which still succeeds via
+/// a looser `LIKE` prefix match and returns the remote device's transcript
+/// path as if it were a local file.
+fn resolve_remote_instance_name(db: &HcomDb, base_name: &str) -> Option<String> {
+    db.conn()
+        .query_row(
+            "SELECT name FROM instances WHERE name LIKE ?1 ESCAPE '\\' ORDER BY status_time DESC LIMIT 1",
+            rusqlite::params![format!(
+                "{}:____",
+                base_name.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            )],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+}
+
 /// Get exchanges from a transcript file using the shared transcript module.
 fn get_exchanges(
     path: &str,
@@ -975,6 +996,7 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
     if let Some(ref name) = args.name {
         let stripped = name.strip_prefix('@').unwrap_or(name);
         let resolved = crate::identity::resolve_display_name_or_stopped(db, stripped)
+            .or_else(|| resolve_remote_instance_name(db, stripped))
             .unwrap_or_else(|| stripped.to_string());
         if let Some((base_name, device)) = crate::relay::control::split_device_suffix(&resolved) {
             return crate::relay::control::dispatch_remote_and_print(
