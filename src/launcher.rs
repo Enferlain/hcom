@@ -1231,7 +1231,8 @@ pub fn create_runner_script(
 fn runner_invocation_command(script_file: &str) -> String {
     if cfg!(windows) {
         format!(
-            "powershell -ExecutionPolicy Bypass -File {}",
+            "powershell {} {}",
+            crate::terminal::POWERSHELL_SCRIPT_FLAGS.join(" "),
             crate::terminal::ps_quote(script_file)
         )
     } else {

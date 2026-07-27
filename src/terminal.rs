@@ -1052,6 +1052,18 @@ pub fn create_bash_script(
     Ok(())
 }
 
+/// Flags for every PowerShell process hcom starts to run a generated script.
+///
+/// `-NoProfile` is the Windows counterpart of running the Unix launcher with
+/// plain `bash script.sh` — a non-interactive, non-login shell that reads no
+/// `.bashrc`/`.profile`. Without it, a user's PowerShell profile runs inside
+/// each agent launch: its banner output lands in the PTY stream the screen
+/// scraper reads, its PATH/location edits override what the generated script
+/// just set, and anything in it that waits on input blocks forever, because
+/// background launches attach stdin to NUL. It also skips profile and module
+/// analysis work on every launch.
+pub const POWERSHELL_SCRIPT_FLAGS: &[&str] = &["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"];
+
 /// Quote a string as a PowerShell single-quoted literal (embedded `'` doubled).
 pub fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -1944,7 +1956,7 @@ pub fn launch_terminal(
 
         let mut cmd = if cfg!(windows) {
             let mut c = Command::new("powershell");
-            c.args(["-ExecutionPolicy", "Bypass", "-File"]);
+            c.args(POWERSHELL_SCRIPT_FLAGS);
             c
         } else {
             Command::new(resolve_bash_command())
@@ -1989,7 +2001,7 @@ pub fn launch_terminal(
         // Replace this process entirely with the script's shell.
         let mut cmd = if cfg!(windows) {
             let mut c = Command::new("powershell");
-            c.args(["-ExecutionPolicy", "Bypass", "-File"]);
+            c.args(POWERSHELL_SCRIPT_FLAGS);
             c
         } else {
             Command::new(resolve_bash_command())
