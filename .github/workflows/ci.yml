@@ -98,9 +98,11 @@ jobs:
   real-tool-tests:
     name: Real tool (${{ matrix.tool }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # One pass fits well inside 25 minutes; a `repeat` hunt needs room for each
-    # extra pass (~5 min on the slowest matrix entry) plus the shared setup.
-    timeout-minutes: ${{ inputs.repeat && fromJSON(inputs.repeat) * 6 + 20 || 25 }}
+    # One pass fits well inside 25 minutes. A `repeat` hunt takes as long as the
+    # count asks for, so it gets the platform maximum instead — the loop stops at
+    # the first failure anyway, and expressions have no arithmetic to scale this
+    # by the count.
+    timeout-minutes: ${{ inputs.repeat && 350 || 25 }}
     permissions:
       contents: read
     strategy:
