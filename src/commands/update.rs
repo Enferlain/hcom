@@ -1,10 +1,11 @@
 //! `hcom update` command — check and apply updates.
 //!
 //! Uses the shared `fetch_update_info()` function from update.rs to get current,
-//! latest, and availability in one call. Handles interactive prompts and applies updates.
+//! latest, and availability in one call. Applies immediately when an update is
+//! available; `--check` reports availability without applying.
 
 use crate::db::HcomDb;
-use crate::shared::{CommandContext, is_inside_ai_tool};
+use crate::shared::CommandContext;
 
 #[derive(clap::Parser, Debug)]
 #[command(name = "update", about = "Check for and apply updates")]
@@ -23,7 +24,7 @@ fn print_dev_root_notice(db: &HcomDb) {
     }
 }
 
-pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, ctx: Option<&CommandContext>) -> i32 {
+pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, _ctx: Option<&CommandContext>) -> i32 {
     println!("Checking for updates...");
     print_dev_root_notice(_db);
 
@@ -47,29 +48,6 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, ctx: Option<&CommandContext>)
     if args.check {
         println!("Run `hcom update` to apply.");
         return 0;
-    }
-
-    let go = ctx.map(|c| c.go).unwrap_or(false);
-    let inside_ai = is_inside_ai_tool();
-
-    // Inside AI tool without --go: suggest hcom update --go
-    if inside_ai && !go {
-        println!("Run `hcom update --go` to apply automatically.");
-        return 0;
-    }
-
-    // Interactive prompt when running in a terminal
-    if !go && !inside_ai {
-        print!("Apply update? [y/N] ");
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_err()
-            || !matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
-        {
-            println!("Cancelled.");
-            return 0;
-        }
     }
 
     let status = if cfg!(windows) {
