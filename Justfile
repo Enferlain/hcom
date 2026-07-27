@@ -88,12 +88,14 @@ real-tool-tests-windows: mock-tools-windows
     $env:PATH = "{{windows-mock-bin}};" + $env:PATH; cargo test --locked --test real_tool_claude -- --ignored --nocapture --test-threads=1
     $env:PATH = "{{windows-mock-bin}};" + $env:PATH; cargo test --locked --test test_relay_roundtrip -- --ignored --nocapture --test-threads=1
 
+# Mirrors `just ci`: each step's full output goes to a per-step log under
+# target/ci-logs/, stdout shows one ok/FAILED line per step. Without this a
+# failing pre-commit run buries the one relevant assertion under a full
+# --nocapture real-tool transcript. Optional args name the only steps to run,
+# e.g. `just ci-windows real_tool_claude`.
 [windows]
-ci-windows:
-    cargo fmt --all -- --check
-    cargo clippy --all-targets --locked -- -D warnings
-    cargo test --all-targets --locked
-    just real-tool-tests-windows
+ci-windows *steps:
+    & "{{justfile_directory()}}/scripts/ci-windows.ps1" {{ if steps == "" { "" } else { "-Only " + steps } }}
 
 [windows]
 package-smoke-windows:
