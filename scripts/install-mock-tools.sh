@@ -159,4 +159,27 @@ if [[ "$npm_platform" == "android" && -n "$codex_version" ]]; then
   chmod +x "$PREFIX/bin/codex"
 fi
 
+# Verify the pin here rather than letting a real-tool test discover it: this
+# script knows which version it asked for and can name the launcher that
+# answered, which a `found 2.1.185` panic 200 lines into a test cannot.
+verify_pin() {
+  local tool="$1" wanted="$2" launcher="$PREFIX/bin/$1" reported
+  [[ -n "$wanted" ]] || return 0
+  if [[ ! -x "$launcher" ]]; then
+    printf 'installed %s@%s but no executable at %s\n' "$tool" "$wanted" "$launcher" >&2
+    exit 1
+  fi
+  # `|| true`: under `set -e` a nonzero `--version` would abort the script here
+  # with no output, losing the very text that explains what went wrong.
+  reported="$("$launcher" --version 2>&1 || true)"
+  if [[ "$reported" != *"$wanted"* ]]; then
+    printf "pinned %s@%s, but '%s' reports '%s'\n" "$tool" "$wanted" "$launcher" "$reported" >&2
+    exit 1
+  fi
+  printf '%s %s verified at %s\n' "$tool" "$wanted" "$launcher" >&2
+}
+
+verify_pin claude "$claude_version"
+verify_pin codex "$codex_version"
+
 printf '%s\n' "$PREFIX/bin"
