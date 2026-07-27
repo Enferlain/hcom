@@ -182,20 +182,44 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: (Resolve-Path target/mock-tools).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      # Record exit code and elapsed time per attempt, and close the log group
+      # before failing. A cargo run that dies producing no output at all is
+      # otherwise indistinguishable from one that never started — a repeat hunt
+      # hit exactly that (instant exit 1, empty group, no annotation), and the
+      # per-attempt line is what separates "the test failed" from "something
+      # took the runner out from under it".
       - shell: bash
         if: runner.os != 'Windows'
         run: |
           for i in $(seq 1 "${{ inputs.repeat || 1 }}"); do
             echo "::group::${{ matrix.test }} attempt $i"
-            cargo test --locked --test '${{ matrix.test }}' -- --ignored --nocapture --test-threads=1
+            start=$SECONDS
+            if cargo test --locked --test '${{ matrix.test }}' -- --ignored --nocapture --test-threads=1; then
+              code=0
+            else
+              code=$?
+            fi
+            elapsed=$((SECONDS - start))
+            echo "attempt $i: exit=$code elapsed=${elapsed}s"
             echo "::endgroup::"
+            if [ "$code" -ne 0 ]; then
+              echo "::error::${{ matrix.test }} failed on attempt $i (exit $code after ${elapsed}s)"
+              exit "$code"
+            fi
           done
       - shell: pwsh
         if: runner.os == 'Windows'
         run: |
           foreach ($i in 1..${{ inputs.repeat || 1 }}) {
             Write-Host "::group::${{ matrix.test }} attempt $i"
+            $started = Get-Date
             cargo test --locked --test '${{ matrix.test }}' -- --ignored --nocapture --test-threads=1
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $code = $LASTEXITCODE
+            $elapsed = [int]((Get-Date) - $started).TotalSeconds
+            Write-Host "attempt ${i}: exit=$code elapsed=${elapsed}s"
             Write-Host "::endgroup::"
+            if ($code -ne 0) {
+              Write-Host "::error::${{ matrix.test }} failed on attempt $i (exit $code after ${elapsed}s)"
+              exit $code
+            }
           }
