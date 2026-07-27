@@ -33,6 +33,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// under a second; this only trips when one is genuinely wedged, converting an
 /// unbounded hang into a fast, labelled failure instead of a CI job timeout.
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Ceiling on the diagnostics process snapshot. Shorter than [`RUN_TIMEOUT`]:
+/// it is one OS query, and it runs from the panic hook where an unbounded wait
+/// would turn a failing test into a hung job.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Hcom {
     pub root: TempDir,
@@ -241,11 +245,40 @@ fn diagnostics_for(ctx: &DiagContext) -> String {
         ));
     }
 
+    // `list -v` adds what the JSON omits: the headless log path and the
+    // human-readable status detail. Do NOT read its `bindings:` line as
+    // evidence the PTY came up — "pty" there means `process_bound`, which the
+    // *launcher* writes before it spawns anything, so it is true for every
+    // launch. The `term <name>` exit code below and the process snapshot are
+    // the signals that actually distinguish a live PTY proxy from none.
+    let (code, stdout, stderr) = run_ctx(ctx, ["list", "-v"]);
+    out.push_str(&format!(
+        "\n--- list -v (exit {code}) ---\n{stdout}{stderr}"
+    ));
+
     let hcom_log = ctx.hcom_dir.join(".tmp/logs/hcom.log");
     out.push_str(&format!(
         "\n--- {} (tail) ---\n{}",
         hcom_log.display(),
         read_tail(&hcom_log, 120)
+    ));
+
+    // The generated launch scripts are the exact commands the launch chain was
+    // going to run. A launch that stalls before the tool prints anything leaves
+    // no other record of what it tried; background mode never deletes them, so
+    // they are still on disk at failure time.
+    out.push_str(&format!(
+        "\n--- launch scripts ---\n{}",
+        launch_scripts_dump(&ctx.hcom_dir.join(".tmp/launch"))
+    ));
+
+    // Which processes in the launch chain are actually alive. Without this the
+    // dump cannot distinguish "the tool hung" from "the wrapper shell never got
+    // as far as starting the tool" — the tracked pid is the background wrapper,
+    // not the tool.
+    out.push_str(&format!(
+        "\n--- launch-chain processes ---\n{}",
+        process_snapshot()
     ));
 
     // PTY screen per instance shows the exact upstream error text for
@@ -427,19 +460,40 @@ impl Hcom {
         command
     }
 
+    /// Resolve an external tool the same way hcom's own `which_bin` does, so a
+    /// version check and the launch it gates can never disagree about which file
+    /// they mean.
+    ///
+    /// Windows resolves extension-major *within* each PATH directory, so a stray
+    /// `claude.exe` sitting next to npm's `claude.cmd` shim wins — which is
+    /// exactly how a mock-tools prefix left over from an earlier pin silently
+    /// takes over. Returning the path lets callers name the offending file.
+    pub fn resolve_external<S: AsRef<OsStr>>(&self, program: S) -> Option<PathBuf> {
+        let program = program.as_ref();
+        #[cfg(windows)]
+        {
+            std::env::split_paths(&self.path_env)
+                .flat_map(|dir| {
+                    [".COM", ".EXE", ".BAT", ".CMD", ""]
+                        .map(move |ext| dir.join(format!("{}{ext}", program.to_string_lossy())))
+                })
+                .find(|candidate| candidate.is_file())
+        }
+        #[cfg(not(windows))]
+        {
+            std::env::split_paths(&self.path_env)
+                .map(|dir| dir.join(program))
+                .find(|candidate| candidate.is_file())
+        }
+    }
+
     /// Build a non-hcom command (for example `codex --version`) with the same
     /// credential-stripped, isolated environment.
     pub fn external_cmd<S: AsRef<OsStr>>(&self, program: S) -> Command {
         #[cfg(windows)]
         let mut command = {
             let program = program.as_ref();
-            let resolved = std::env::split_paths(&self.path_env)
-                .flat_map(|dir| {
-                    [".COM", ".EXE", ".BAT", ".CMD", ""]
-                        .map(move |ext| dir.join(format!("{}{ext}", program.to_string_lossy())))
-                })
-                .find(|candidate| candidate.is_file());
-            match resolved {
+            match self.resolve_external(program) {
                 Some(path)
                     if matches!(
                         path.extension().and_then(OsStr::to_str),
@@ -1085,4 +1139,185 @@ fn read_tail(path: &Path, max_lines: usize) -> String {
     let mut tail = lines[start..].join("\n");
     tail.push('\n');
     tail
+}
+
+/// Every generated launch/runner script still on disk, with its body.
+///
+/// A background launch that never produces tool output leaves these as the only
+/// record of what the wrapper shell was asked to run (background mode, unlike
+/// foreground, never deletes them).
+///
+/// Bodies are printed only for files positively identified as an hcom-generated
+/// wrapper/runner or an args sidecar. The launch dir ALSO holds the ambient-env
+/// sidecar, which carries the parent's non-HCOM environment — real credentials
+/// on a dev box — and the runner deletes it right after sourcing it. A launch
+/// that stalls before the runner runs is exactly when it is still there, i.e.
+/// exactly the case this dump exists for, so name-based exclusion is not enough
+/// (on Windows it is another `.ps1` with the same naming pattern). Identify by
+/// content instead and fail closed: hcom's scripts open with a comment or the
+/// window-title line, the env sidecar opens with an assignment.
+fn launch_scripts_dump(launch_dir: &Path) -> String {
+    let Ok(entries) = fs::read_dir(launch_dir) else {
+        return format!("<no launch dir at {}>\n", launch_dir.display());
+    };
+    let mut names: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    names.sort();
+    if names.is_empty() {
+        return "<launch dir is empty>\n".to_string();
+    }
+    let mut out = String::new();
+    for path in names {
+        out.push_str(&format!("\n-- {} --\n", path.display()));
+        let is_args = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".args.json"));
+        let body = fs::read_to_string(&path).unwrap_or_default();
+        let first = body
+            .trim_start_matches('\u{feff}')
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default();
+        let generated = first.starts_with('#') || first.starts_with("$Host.UI.RawUI.WindowTitle");
+        if is_args || generated {
+            out.push_str(&read_tail(&path, 60));
+        } else {
+            out.push_str("<not dumped: unrecognized file, may be the ambient-env sidecar>\n");
+        }
+    }
+    out
+}
+
+#[test]
+fn launch_scripts_dump_prints_generated_scripts_but_not_the_env_sidecar() {
+    let dir = tempfile::tempdir().expect("temp launch dir");
+    fs::write(
+        dir.path().join("claude_luna_1_2.ps1"),
+        "\u{feff}# Claude hcom native runner (luna)\n& 'hcom.exe' pty claude\n",
+    )
+    .expect("write runner");
+    fs::write(
+        dir.path().join("hcom_1_3.ps1"),
+        "\u{feff}$Host.UI.RawUI.WindowTitle = \"hcom: starting Claude...\"\nWrite-Host x\n",
+    )
+    .expect("write wrapper");
+    // Same extension and naming shape as the runner — only the body tells them
+    // apart, and this one holds the parent's ambient environment.
+    fs::write(
+        dir.path().join("claude_luna_1_4.ps1"),
+        "\u{feff}$env:AWS_SECRET_ACCESS_KEY = 'super-secret'\n",
+    )
+    .expect("write env sidecar");
+
+    let dump = launch_scripts_dump(dir.path());
+    assert!(dump.contains("pty claude"), "runner body missing:\n{dump}");
+    assert!(
+        dump.contains("Write-Host x"),
+        "wrapper body missing:\n{dump}"
+    );
+    assert!(
+        !dump.contains("super-secret"),
+        "ambient-env sidecar must never be dumped:\n{dump}"
+    );
+    assert!(
+        dump.contains("may be the ambient-env sidecar"),
+        "skipped file should say why:\n{dump}"
+    );
+}
+
+/// Processes in the launch chain that are still alive, with command lines.
+///
+/// The pid hcom tracks for a background launch is the *wrapper shell*, not the
+/// tool, so "process alive" in a launch-failure detail says nothing about
+/// whether the tool ever started. This snapshot is what separates the two:
+/// wrapper-only means the chain stalled before the tool; a live tool process
+/// means the tool itself is stuck.
+fn process_snapshot() -> String {
+    #[cfg(windows)]
+    let mut command = {
+        // CIM rather than `tasklist`: the command line is what distinguishes the
+        // outer wrapper, the runner shell, and `hcom pty` — all three are
+        // `powershell.exe`/`hcom.exe` by image name alone.
+        //
+        // Filter on the image name inside the query, not on the rendered line:
+        // matching `node` against whole command lines pulls in every Electron
+        // helper on a dev box (`--utility-sub-type=node.mojom.NodeService`) and
+        // buries the four processes this dump exists to show.
+        let mut command = Command::new("powershell");
+        command.args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process \
+             | Where-Object { $_.Name -match '^(hcom|claude|codex|node|powershell|pwsh|cmd|conhost|OpenConsole)\\.exe$' } \
+             | Select-Object ProcessId,ParentProcessId,Name,CommandLine \
+             | Format-Table -AutoSize | Out-String -Width 400",
+        ]);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("ps");
+        command.args(["-eo", "pid,ppid,etime,args"]);
+        command
+    };
+
+    // Bounded like every other diagnostics subprocess: this runs from the panic
+    // hook, where a `wait_with_output()` that never returns would hang the test
+    // binary instead of failing it, and WMI in particular can stall on a loaded
+    // machine — exactly when this dump matters most.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return format!("<process snapshot unavailable: {error}>\n"),
+    };
+    let stdout_buf = drain_stream(child.stdout.take());
+    let _stderr_buf = drain_stream(child.stderr.take());
+    let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return format!(
+                    "<process snapshot exceeded {}s and was killed>\n",
+                    SNAPSHOT_TIMEOUT.as_secs()
+                );
+            }
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(error) => return format!("<process snapshot wait failed: {error}>\n"),
+        }
+    }
+    let captured = stdout_buf
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let text = String::from_utf8_lossy(&captured);
+    let mut out = String::new();
+    for line in text.lines() {
+        // Windows already filtered in the query; `ps` output is narrow enough
+        // that a substring match over the whole line is fine here.
+        #[cfg(not(windows))]
+        {
+            const INTERESTING: &[&str] =
+                &["hcom", "claude", "codex", "node", "bash", "sh -", "script"];
+            let low = line.to_lowercase();
+            if !INTERESTING.iter().any(|needle| low.contains(needle)) {
+                continue;
+            }
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    if out.is_empty() {
+        out.push_str("<no launch-chain processes alive>\n");
+    }
+    out
 }
