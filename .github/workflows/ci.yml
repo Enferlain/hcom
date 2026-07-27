@@ -1,6 +1,20 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  # Hunting an intermittent real-tool failure needs repetition, not another
+  # single run: the Windows Claude launch has failed roughly once in ten CI
+  # runs, so a normal re-run is as likely to hide it as to reproduce it.
+  # `gh workflow run CI --ref <branch> -f repeat=10` reruns the real-tool test
+  # in-place that many times and stops at the first failure, with the failing
+  # iteration's diagnostics dump attached to it.
+  workflow_dispatch:
+    inputs:
+      repeat:
+        description: "Times to repeat each real-tool test (stops at first failure)"
+        required: false
+        default: "1"
 
 permissions:
   contents: read
@@ -84,7 +98,9 @@ jobs:
   real-tool-tests:
     name: Real tool (${{ matrix.tool }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    # One pass fits well inside 25 minutes; a `repeat` hunt needs room for each
+    # extra pass (~5 min on the slowest matrix entry) plus the shared setup.
+    timeout-minutes: ${{ inputs.repeat && fromJSON(inputs.repeat) * 6 + 20 || 25 }}
     permissions:
       contents: read
     strategy:
@@ -166,7 +182,18 @@ jobs:
         run: (Resolve-Path target/mock-tools).Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - shell: bash
         if: runner.os != 'Windows'
-        run: cargo test --locked --test '${{ matrix.test }}' -- --ignored --nocapture --test-threads=1
+        run: |
+          for i in $(seq 1 "${{ inputs.repeat || 1 }}"); do
+            echo "::group::${{ matrix.test }} attempt $i"
+            cargo test --locked --test '${{ matrix.test }}' -- --ignored --nocapture --test-threads=1
+            echo "::endgroup::"
+          done
       - shell: pwsh
         if: runner.os == 'Windows'
-        run: cargo test --locked --test '${{ matrix.test }}' -- --ignored --nocapture --test-threads=1
+        run: |
+          foreach ($i in 1..${{ inputs.repeat || 1 }}) {
+            Write-Host "::group::${{ matrix.test }} attempt $i"
+            cargo test --locked --test '${{ matrix.test }}' -- --ignored --nocapture --test-threads=1
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Write-Host "::endgroup::"
+          }
