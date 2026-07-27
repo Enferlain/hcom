@@ -72,11 +72,13 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, ctx: Option<&CommandContext>)
         }
     }
 
-    println!("Running: {}", info.cmd);
-
     let status = if cfg!(windows) {
         if crate::update::is_powershell_installer_command(info.cmd) {
-            std::process::Command::new("powershell")
+            let program = crate::update::windows_installer_program();
+            println!(
+                "Running: {program} -NoProfile -ExecutionPolicy Bypass -Command \"irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex\""
+            );
+            std::process::Command::new(program)
                 .args([
                     "-NoProfile",
                     "-ExecutionPolicy",
@@ -90,12 +92,14 @@ pub fn cmd_update(_db: &HcomDb, args: &UpdateArgs, ctx: Option<&CommandContext>)
                 "POSIX shell update command selected on Windows",
             ))
         } else {
+            println!("Running: {}", info.cmd);
             match crate::update::split_program_args(info.cmd) {
                 Some((program, args)) => std::process::Command::new(program).args(args).status(),
                 None => Err(std::io::Error::other("empty update command")),
             }
         }
     } else {
+        println!("Running: {}", info.cmd);
         std::process::Command::new("sh")
             .args(["-c", info.cmd])
             .status()
