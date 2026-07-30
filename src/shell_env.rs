@@ -426,15 +426,18 @@ mod tests {
     fn resolver_discards_stderr_without_breaking_env_resolution() {
         let shell = test_shell_path();
         let marker = "hcom-shell-env-stderr-test";
+        // ~256KB of stderr, several times the 64KB pipe buffer the resolver
+        // would deadlock on if stderr were piped instead of discarded. The
+        // chunk is doubled into a variable and emitted with the `echo`
+        // builtin so the volume costs no forks: an external command per line
+        // is ~23ms on syscall-heavy sandboxes (PRoot, Android), which turns a
+        // per-line loop into minutes of wall time.
         let cmd = format!(
-            "i=0; while [ \"$i\" -lt 8192 ]; do \
-             printf 'verbose resolver diagnostic\n' >&2; i=$((i + 1)); done; \
+            "chunk=x; i=0; while [ \"$i\" -lt 12 ]; do chunk=\"$chunk$chunk\"; i=$((i + 1)); done; \
+             i=0; while [ \"$i\" -lt 64 ]; do echo \"$chunk\" >&2; i=$((i + 1)); done; \
              printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\""
         );
 
-        // Generous timeout: this spawns a real shell to loop 8192 times, and
-        // syscall-heavy sandboxes (e.g. PRoot) can make that far slower than
-        // on a native kernel while still completing well short of a hang.
         let output =
             timed_shell_output_with_timeout(&shell, &cmd, marker, Duration::from_secs(30)).unwrap();
         let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
