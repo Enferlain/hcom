@@ -3712,9 +3712,7 @@ mod tests {
     #[test]
     fn test_resolve_termux_tool_launcher_codex_wrapper() {
         let resolved = resolve_termux_tool_launcher("codex", TERMUX_CODEX_WRAPPER_PATH);
-        if crate::shared::platform::is_termux()
-            && Path::new(TERMUX_CODEX_INNER_WRAPPER_PATH).exists()
-        {
+        if is_native_termux_runtime() && Path::new(TERMUX_CODEX_INNER_WRAPPER_PATH).exists() {
             let (command, args) = resolved.expect("expected termux codex wrapper override");
             assert!(command.ends_with("/sh") || command == "sh");
             assert_eq!(args, vec![TERMUX_CODEX_INNER_WRAPPER_PATH.to_string()]);
@@ -3730,7 +3728,7 @@ mod tests {
         std::fs::write(&path, "#!/usr/bin/env node\nconsole.log('ok');\n").unwrap();
 
         let resolved = resolve_termux_tool_launcher("tool", path.to_str().unwrap());
-        if crate::shared::platform::is_termux() {
+        if is_native_termux_runtime() {
             let (command, args) = resolved.expect("expected node wrapper on termux");
             assert!(command.ends_with("/node") || command == "node");
             assert_eq!(args, vec![path.to_string_lossy().to_string()]);

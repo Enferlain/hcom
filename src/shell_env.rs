@@ -392,8 +392,11 @@ mod tests {
              printf %s \"${MARKER_VAR}\"; env -0; printf %s \"${MARKER_VAR}\""
         );
 
+        // Generous timeout: this spawns a real shell to loop 8192 times, and
+        // syscall-heavy sandboxes (e.g. PRoot) can make that far slower than
+        // on a native kernel while still completing well short of a hang.
         let output =
-            timed_shell_output_with_timeout(&shell, &cmd, marker, Duration::from_secs(5)).unwrap();
+            timed_shell_output_with_timeout(&shell, &cmd, marker, Duration::from_secs(30)).unwrap();
         let env = parse_shell_env_output(&output.stdout, marker, MARKER_VAR).unwrap();
 
         assert!(env.contains_key("PATH"));
