@@ -885,8 +885,13 @@ fn events_wait(
             break 0;
         }
 
-        // Check for unread messages (interrupt wait) — use <hcom> XML tag format
-        if let Some(name) = instance_name {
+        // For an unfiltered wait, an older unread inbox message is still a useful
+        // interrupt even when its event predates the lookback window. Filtered
+        // waits must only complete on their declared event condition: otherwise
+        // an unrelated unread message can produce a false successful match.
+        if filter_query.is_empty()
+            && let Some(name) = instance_name
+        {
             let messages = db.get_unread_messages(name);
             if !messages.is_empty() {
                 // Format as <hcom> XML tag
@@ -1376,6 +1381,59 @@ mod tests {
         let args = EventsArgs::try_parse_from(["events", "--wait", "--full"]).unwrap();
         assert_eq!(args.wait, Some(60)); // default_missing_value
         assert!(args.full);
+    }
+
+    #[test]
+    fn filtered_wait_ignores_unrelated_unread_message() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("events-wait.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "message",
+            "nova",
+            &json!({"from": "nova", "scope": "broadcast", "text": "unrelated"}),
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE events SET timestamp = '2000-01-01T00:00:00Z' WHERE type = 'message'",
+                [],
+            )
+            .unwrap();
+        assert!(!db.get_unread_messages("luna").is_empty());
+
+        let filters = HashMap::from([("type".to_string(), vec!["status".to_string()])]);
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        let filter_query = format!(" AND ({filter_sql})");
+        assert_eq!(
+            events_wait(&db, &filter_query, 1, false, &filters, Some("luna"),),
+            1,
+            "an unrelated unread message must not satisfy a filtered wait"
+        );
+
+        assert_eq!(
+            events_wait(&db, "", 1, false, &HashMap::new(), Some("luna")),
+            0,
+            "an unfiltered wait should retain the older-unread inbox interrupt"
+        );
+
+        db.log_event(
+            "status",
+            "nova",
+            &json!({"status": "active", "context": "test"}),
+        )
+        .unwrap();
+        assert_eq!(
+            events_wait(&db, &filter_query, 1, false, &filters, Some("luna"),),
+            0,
+            "a matching event must still satisfy the filtered wait"
+        );
     }
 
     #[test]
