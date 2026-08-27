@@ -143,11 +143,13 @@ The important failure modes are concurrent and semantic, not just parser-level. 
 - acknowledgements followed by delayed final results;
 - results arriving shortly before or after waiter startup.
 
-### 33. Recipient ambiguity can silently broaden delivery
+### 33. Recipient ambiguity can silently broaden delivery — working
+
+Status: **Working as of 2026-08-27.** Recipient-free CLI sends now fail closed instead of becoming implicit broadcasts. A caller must provide an exact `@name`, reuse a seeded `--thread`, or explicitly acknowledge fan-out with `--broadcast`; large broadcasts from AI tools retain the additional `--go` preview gate. A live CLI smoke test reproduces `hcom send moto`, verifies that it creates no message, and confirms that `@moto` reaches only the intended worker.
 
 In the observed session, a short-name send intended for `records-common-moto` reported delivery to both that worker and an unrelated stale agent, `zero`. The preceding quoted-argument form failed with `No input received on stdin`, making the broad-delivery retry a plausible agent response to unclear syntax.
 
-This should fail closed. A send with no explicit, uniquely resolved recipient must not fan out implicitly. Return candidate identities and require the caller to select one, preferably using the stable workflow participant ID rather than a display name.
+The send path now fails closed. Exact names and deliberately suffixed tag groups remain available, while broadcast is an explicit operation rather than the fallback for ambiguous syntax.
 
 ### 34. An idle wait can be satisfied by the worker's own wait command
 
@@ -163,7 +165,9 @@ One observed worker was reported as `blocked: launch_blocked` after it had compl
 
 Make lifecycle transitions monotonic where appropriate and attach freshness, source, and attempt IDs to every state. A later verified ready/running/completed state must supersede an earlier launch blocker for the same attempt. Commands should return one reconciled state rather than forcing the caller to compare list, PTY, event, and resume interpretations.
 
-### 39. One worker's result can be attributed to another workflow
+### 39. One worker's result can be attributed to another workflow — working
+
+Status: **Working as of 2026-08-27.** `hcom events --cursor` captures an attempt boundary, and `hcom events --result-from <worker>` provides one fail-closed terminal-result wait from that boundary. The latter requires exactly one `--thread` workflow ID, binds the worker's exact registered generation (name plus immutable creation time), and owns the `message`/`inform` terminal condition so caller-supplied OR filters cannot widen it. If the worker reports and stops before the wait starts, correlation recovers the same generation from its post-cursor stopped snapshot. Regression and CLI coverage prove that a GLM report on Claude's thread, a Claude report on another thread, and a later worker reusing Claude's display name are rejected, while the exact worker/workflow/attempt tuple succeeds.
 
 In the mixed Claude/GLM incident, GLM's completion was accepted as Claude's result and the Claude worker was stopped. This is more severe than a spurious wake-up: it can terminate the wrong worker and cause the parent to reason from the wrong model's output.
 
@@ -173,7 +177,7 @@ A terminal result must match an immutable tuple such as:
 workflow_id + attempt_id + worker_session_id + result_kind
 ```
 
-Display names, recent messages, shared caller inboxes, or thread proximity are insufficient correlation keys. Cleanup must use the worker identity recorded on that same matched attempt. Add a concurrent mixed-provider regression test proving that GLM completion cannot satisfy or clean up a Claude workflow, and vice versa.
+Display names, recent messages, shared caller inboxes, or thread proximity remain insufficient correlation keys. Coordinators should capture the event cursor before launch, wait with `--result-from`, and clean up only the exact worker supplied to that correlated wait.
 
 ### 41. Filtered-listen timeout is indistinguishable from success
 

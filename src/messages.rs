@@ -93,6 +93,20 @@ pub struct ScopeResult {
     pub mentions: Vec<String>,
 }
 
+/// Stable identity for one registered instance generation.
+///
+/// Display names can be reclaimed after a worker stops. Pairing the name with
+/// its immutable creation timestamp lets result waits reject a later process
+/// that happens to reuse the same display name. Session IDs are intentionally
+/// excluded because providers may bind them after a wait has already armed.
+pub fn sender_instance_key(name: &str, instance_data: &Value) -> Option<String> {
+    let created_at = instance_data.get("created_at")?.as_f64()?;
+    if created_at <= 0.0 {
+        return None;
+    }
+    Some(format!("{name}@{created_at:.6}"))
+}
+
 /// Read receipt for a sent message.
 #[derive(Debug, Clone)]
 pub struct ReadReceipt {
@@ -1000,6 +1014,22 @@ mod tests {
     fn test_match_target_exact() {
         let instances = make_instances(&[("luna", None), ("nova", None)]);
         assert_eq!(match_target("luna", &instances).unwrap(), vec!["luna"]);
+    }
+
+    #[test]
+    fn sender_instance_key_distinguishes_reused_name_generations() {
+        let first = sender_instance_key(
+            "luna",
+            &serde_json::json!({"created_at": 1000.0, "session_id": "session-a"}),
+        )
+        .unwrap();
+        let reused = sender_instance_key(
+            "luna",
+            &serde_json::json!({"created_at": 2000.0, "session_id": "session-b"}),
+        )
+        .unwrap();
+        assert_eq!(first, "luna@1000.000000");
+        assert_ne!(first, reused);
     }
 
     #[test]

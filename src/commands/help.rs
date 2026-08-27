@@ -55,6 +55,11 @@ const EVENTS_HELP: &[HelpEntry] = &[
         "  --after-id ID",
         "Only match events after this durable cursor (requires --wait)",
     ),
+    ("  --cursor", "Print the current durable event cursor"),
+    (
+        "  --result-from NAME",
+        "Correlated terminal report; requires one --thread and pre-launch --after-id",
+    ),
     ("  --sql EXPR", "Raw SQL WHERE (ANDed with flags)"),
     (
         "  --remote-fetch --device ID",
@@ -236,7 +241,11 @@ const SEND_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "  broadcast + --thread reuses prior thread members; seed with @mentions first",
+        "  no-target send + --thread reuses prior members; seed with @mentions first",
+    ),
+    (
+        "  --broadcast",
+        "Explicitly send to every available agent (required for broadcasts)",
     ),
     ("", ""),
     ("Sender:", ""),
@@ -264,7 +273,10 @@ const SEND_HELP: &[HelpEntry] = &[
         "  hcom send @luna @nova --intent request -- Can you help?",
         "",
     ),
-    ("  hcom send -- Broadcast message to everyone", ""),
+    (
+        "  hcom send --broadcast -- Broadcast message to everyone",
+        "",
+    ),
     ("  echo 'Complex message' | hcom send @luna", ""),
     ("  hcom send @luna <<'EOF'", ""),
     ("  Multi-line message with special chars", ""),
@@ -1190,6 +1202,13 @@ mod tests {
     fn durable_cursor_is_documented_for_wait_commands() {
         assert!(get_command_help("events").contains("--after-id ID"));
         assert!(get_command_help("listen").contains("--after-id ID"));
+    }
+
+    #[test]
+    fn fail_closed_orchestration_options_are_documented() {
+        assert!(get_command_help("send").contains("--broadcast"));
+        assert!(get_command_help("events").contains("--cursor"));
+        assert!(get_command_help("events").contains("--result-from NAME"));
     }
 
     #[test]

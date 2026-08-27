@@ -7,8 +7,8 @@ use crate::db::subscriptions::create_request_watches;
 use crate::identity;
 use crate::instances;
 use crate::messages::{
-    InstanceInfo, MessageEnvelope, MessageScope, compute_scope, should_deliver_message,
-    validate_intent, validate_message,
+    InstanceInfo, MessageEnvelope, MessageScope, compute_scope, sender_instance_key,
+    should_deliver_message, validate_intent, validate_message,
 };
 use crate::shared::{
     CommandContext, SENDER, SenderIdentity, SenderKind, is_inside_ai_tool, status_icon,
@@ -34,7 +34,7 @@ Inline bundle (attach structured context):
 Examples:
     hcom send @luna -- Hello there!
     hcom send @luna @nova --intent request -- Can you help?
-    hcom send -- Broadcast message to everyone
+    hcom send --broadcast -- Broadcast message to everyone
     echo 'Complex message' | hcom send @luna
     hcom send @luna <<'EOF'
     Multi-line message with special chars
@@ -91,6 +91,10 @@ pub struct SendArgs {
     /// Threaded routing: seed recipients once, then reuse thread members
     #[arg(long)]
     pub thread: Option<String>,
+
+    /// Explicitly allow delivery to every available agent
+    #[arg(long)]
+    pub broadcast: bool,
 
     // ── Sender ──
     /// External sender identity
@@ -399,6 +403,11 @@ pub fn send_message(
         "text": message,
         "delivered_to": delivery.delivered_to.clone(),
     });
+    if let Some(instance_data) = identity.instance_data.as_ref()
+        && let Some(instance_key) = sender_instance_key(&identity.name, instance_data)
+    {
+        data["sender_instance_key"] = serde_json::json!(instance_key);
+    }
 
     // Add scope extra data (mentions)
     if !delivery.effective_mentions.is_empty() {
@@ -897,6 +906,27 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     };
 
+    // A recipient-free send used to become an implicit broadcast. That makes
+    // plausible mistakes such as `hcom send worker-name` fan out to every
+    // active agent. Require an explicit broadcast acknowledgement instead;
+    // thread-only sends remain safe because their durable membership resolves
+    // to a declared recipient set.
+    if preview_delivery.original_scope == MessageScope::Broadcast
+        && !preview_delivery.is_thread_resolved
+        && !args.broadcast
+    {
+        eprintln!("Error: Refusing implicit broadcast: no explicit recipient was resolved.");
+        eprintln!("Target an agent with @name, reuse a seeded --thread, or add --broadcast.");
+        return 1;
+    }
+    if args.broadcast
+        && (preview_delivery.original_scope != MessageScope::Broadcast
+            || preview_delivery.is_thread_resolved)
+    {
+        eprintln!("Error: --broadcast cannot be combined with agent targets or --thread");
+        return 1;
+    }
+
     if is_inside_ai_tool()
         && !ctx.map(|c| c.go).unwrap_or(false)
         && preview_delivery.original_scope == MessageScope::Broadcast
@@ -1217,9 +1247,11 @@ mod tests {
 
     #[test]
     fn parse_broadcast() {
-        let args = SendArgs::try_parse_from(["send", "--", "broadcast", "msg"]).unwrap();
+        let args =
+            SendArgs::try_parse_from(["send", "--broadcast", "--", "broadcast", "msg"]).unwrap();
         assert!(args.positionals.is_empty());
         assert_eq!(args.message, vec!["broadcast", "msg"]);
+        assert!(args.broadcast);
     }
 
     #[test]
@@ -1456,6 +1488,40 @@ mod tests {
         let shm = PathBuf::from(format!("{}-shm", path.display()));
         let _ = std::fs::remove_file(wal);
         let _ = std::fs::remove_file(shm);
+    }
+
+    #[test]
+    #[serial]
+    fn instance_messages_record_the_exact_sender_generation() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, created_at) VALUES
+                    ('luna', 'session-a', 1000.0),
+                    ('nova', 'session-b', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: db.get_instance("luna").unwrap(),
+            session_id: Some("session-a".into()),
+        };
+
+        send_message(&db, &sender, "result", None, Some(&["nova".to_string()])).unwrap();
+        let key: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.sender_instance_key')
+                 FROM events WHERE type = 'message' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, "luna@1000.000000");
+
+        cleanup_test_db(path);
     }
 
     #[test]

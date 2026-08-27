@@ -51,6 +51,16 @@ hcom events --wait 120 --sql "msg_thread='${thread}' AND msg_text LIKE '%DONE%'"
 
 **Why timestamps work:** `$(date +%s)` gives epoch seconds. Even if two workflows start in the same second, different thread prefixes (e.g., "review-" vs "ensemble-") prevent collision.
 
+For a terminal result from one worker, capture an event cursor before launch and use the correlated wait instead of matching prose:
+
+```bash
+cursor=$(hcom events --cursor)
+# launch worker and require its report to use --thread "$thread" --intent inform
+hcom events --wait 120 --after-id "$cursor" --thread "$thread" --result-from "$worker"
+```
+
+This tuple prevents a different worker, workflow, or earlier attempt from satisfying the result wait.
+
 ## SQL LIKE Matching Behavior
 
 `msg_text LIKE '%APPROVED%'` also matches `"approved": true` in JSON because SQLite LIKE is case-insensitive for ASCII characters. This is actually convenient for most use cases.
@@ -112,8 +122,10 @@ Without cleanup, orphan headless agents run indefinitely consuming resources. Al
 
 **Broadcast (no @mentions):**
 ```bash
-hcom send -- "everyone sees this"  # No @ prefix = broadcast
+hcom send --broadcast -- "everyone sees this"
 ```
+
+Broadcasts require `--broadcast`; a recipient-free send fails closed so a missing `@` cannot silently fan out.
 
 **Mention (targeted):**
 ```bash

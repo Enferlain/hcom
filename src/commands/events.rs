@@ -7,18 +7,21 @@
 //! - Unsubscribe: `hcom events unsub <id>`
 //! - Launch status: `hcom events launch [batch_id] [--timeout N]`
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::TcpListener;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::core::filters::{EventFilterArgs, build_sql_from_flags, resolve_filter_names};
+use crate::core::filters::{
+    EventFilterArgs, build_sql_from_flags, resolve_filter_names, validate_type_constraints,
+};
 use crate::core::launch_status::wait_for_launch;
 use crate::db::HcomDb;
 use crate::db::subscriptions::{
     SubCreateOutcome, build_and_insert_sql_subscription, create_filter_subscription,
 };
+use crate::messages::sender_instance_key;
 use crate::shared::CommandContext;
 
 /// Parsed arguments for `hcom events`.
@@ -43,6 +46,15 @@ pub struct EventsArgs {
     /// Only match events with an ID greater than this cursor (requires --wait)
     #[arg(long, requires = "wait")]
     pub after_id: Option<i64>,
+    /// Print the current durable event cursor for arming a later wait
+    #[arg(
+        long,
+        conflicts_with_all = ["wait", "last", "all", "full", "sql", "remote_fetch"]
+    )]
+    pub cursor: bool,
+    /// Wait for one exact worker's terminal report on one thread and attempt cursor
+    #[arg(long, requires = "wait", conflicts_with = "remote_fetch")]
+    pub result_from: Option<String>,
     /// Raw SQL WHERE clause
     #[arg(long)]
     pub sql: Option<String>,
@@ -116,6 +128,107 @@ pub struct EventsLaunchArgs {
     pub timeout: u64,
 }
 
+/// Apply the fail-closed result-correlation contract.
+///
+/// A result wait is deliberately stricter than composing independent filters:
+/// one immutable thread identifies the workflow, `after_id` identifies the
+/// attempt boundary, and the resolved sender identifies the worker. Owning the
+/// message type and intent here prevents an accidental OR filter from widening
+/// the terminal condition.
+fn apply_result_correlation(
+    db: &HcomDb,
+    args: &EventsArgs,
+    filters: &mut HashMap<String, Vec<String>>,
+) -> Result<(), String> {
+    let Some(worker) = args.result_from.as_deref() else {
+        return Ok(());
+    };
+
+    if args.after_id.is_none() {
+        return Err("--result-from requires --after-id captured before launch".to_string());
+    }
+    if args.filters.thread.len() != 1 {
+        return Err("--result-from requires exactly one --thread workflow ID".to_string());
+    }
+    if !args.filters.from.is_empty()
+        || !args.filters.event_type.is_empty()
+        || !args.filters.intent.is_empty()
+    {
+        return Err(
+            "--result-from owns --from, --type, and --intent; remove those filters".to_string(),
+        );
+    }
+
+    let after_id = args.after_id.expect("checked above");
+    let mut generations = BTreeSet::new();
+
+    if let Some(exact_worker) = crate::identity::resolve_display_name(db, worker)
+        && let Some(instance_data) = db
+            .get_instance(&exact_worker)
+            .map_err(|error| format!("failed to read --result-from worker: {error}"))?
+        && let Some(instance_key) = sender_instance_key(&exact_worker, &instance_data)
+    {
+        generations.insert((exact_worker, instance_key));
+    }
+
+    // A worker commonly reports and then stops before the coordinator arms
+    // its wait. Stopping deletes the live instance row, but the lifecycle event
+    // retains the immutable pre-delete snapshot. Only consider stops after the
+    // caller's pre-launch cursor so an earlier generation cannot be revived.
+    let mut statement = db
+        .conn()
+        .prepare(
+            "SELECT instance, data FROM events
+             WHERE id > ?1 AND type = 'life'
+               AND json_extract(data, '$.action') = 'stopped'
+               AND json_extract(data, '$.placeholder') IS NOT TRUE
+             ORDER BY id",
+        )
+        .map_err(|error| format!("failed to inspect stopped workers: {error}"))?;
+    let stopped = statement
+        .query_map(rusqlite::params![after_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("failed to inspect stopped workers: {error}"))?;
+    for row in stopped {
+        let (name, data) =
+            row.map_err(|error| format!("failed to inspect stopped worker row: {error}"))?;
+        let data: Value = serde_json::from_str(&data)
+            .map_err(|error| format!("invalid stopped worker snapshot: {error}"))?;
+        let Some(snapshot) = data.get("snapshot") else {
+            continue;
+        };
+        let tag = snapshot
+            .get("tag")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let display_name = tag.map_or_else(|| name.clone(), |tag| format!("{tag}-{name}"));
+        if !name.eq_ignore_ascii_case(worker) && !display_name.eq_ignore_ascii_case(worker) {
+            continue;
+        }
+        if let Some(instance_key) = sender_instance_key(&name, snapshot) {
+            generations.insert((name, instance_key));
+        }
+    }
+
+    let mut generations = generations.into_iter();
+    let Some((exact_worker, instance_key)) = generations.next() else {
+        return Err(format!(
+            "--result-from worker '{worker}' has no generation after the attempt cursor"
+        ));
+    };
+    if generations.next().is_some() {
+        return Err(format!(
+            "--result-from worker '{worker}' resolves to multiple generations after the attempt cursor"
+        ));
+    }
+    filters.insert("type".into(), vec!["message".into()]);
+    filters.insert("from".into(), vec![exact_worker]);
+    filters.insert("intent".into(), vec!["inform".into()]);
+    filters.insert("sender_instance_key".into(), vec![instance_key]);
+    validate_type_constraints(filters)
+}
+
 // ── Event Streamlining ──────────────────────────────────────────────────
 
 /// Remove bloat fields from event for ~35% token reduction.
@@ -138,6 +251,9 @@ pub fn streamline_event(event: &Value, filters: &HashMap<String, Vec<String>>) -
         match event_type {
             "message" => {
                 obj.remove("reply_to");
+                if !filters.contains_key("sender_instance_key") {
+                    obj.remove("sender_instance_key");
+                }
             }
             "status" => {
                 // Truncate detail unless --cmd or --file filter active
@@ -992,8 +1108,25 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
         .map(|id| id.name.clone());
     let caller_name = instance_name.clone();
 
+    if args.cursor {
+        if args.subcmd.is_some()
+            || !args.filters.to_filter_map().is_empty()
+            || args.device.is_some()
+            || args.result_from.is_some()
+        {
+            eprintln!("Error: --cursor cannot be combined with filters or other event modes");
+            return 1;
+        }
+        println!("{}", db.get_last_event_id());
+        return 0;
+    }
+
     // Handle subcommands
     if let Some(ref subcmd) = args.subcmd {
+        if args.result_from.is_some() {
+            eprintln!("Error: --result-from is only supported in query mode");
+            return 1;
+        }
         if args.remote_fetch {
             eprintln!("Error: --remote-fetch is only supported in query mode");
             return 1;
@@ -1020,6 +1153,10 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
 
     // Convert clap filter args to FilterMap
     let mut filters = args.filters.to_filter_map();
+    if let Err(error) = apply_result_correlation(db, args, &mut filters) {
+        eprintln!("Error: {error}");
+        return 1;
+    }
     resolve_filter_names(&mut filters, db);
 
     // Remote one-shot fetch
@@ -1374,6 +1511,289 @@ mod tests {
     }
 
     #[test]
+    fn test_events_cursor_is_a_standalone_mode() {
+        use clap::Parser;
+        let args = EventsArgs::try_parse_from(["events", "--cursor"]).unwrap();
+        assert!(args.cursor);
+        assert!(EventsArgs::try_parse_from(["events", "--cursor", "--wait", "1"]).is_err());
+    }
+
+    #[test]
+    fn result_wait_requires_exact_workflow_attempt_and_worker() {
+        use clap::Parser;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("result-correlation.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO instances (name, created_at) VALUES
+                    ('claude-worker', 1000.0),
+                    ('glm-worker', 1000.0);",
+            )
+            .unwrap();
+
+        let args = EventsArgs::try_parse_from([
+            "events",
+            "--wait",
+            "1",
+            "--after-id",
+            "0",
+            "--thread",
+            "claude-workflow",
+            "--result-from",
+            "claude-worker",
+        ])
+        .unwrap();
+        let mut filters = args.filters.to_filter_map();
+        apply_result_correlation(&db, &args, &mut filters).unwrap();
+        assert_eq!(filters.get("type").unwrap(), &["message"]);
+        assert_eq!(filters.get("from").unwrap(), &["claude-worker"]);
+        assert_eq!(filters.get("intent").unwrap(), &["inform"]);
+        let claude_instance_key = filters.get("sender_instance_key").unwrap()[0].clone();
+
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "message",
+            "glm-worker",
+            &json!({
+                "from": "glm-worker",
+                "scope": "mentions",
+                "mentions": ["caller"],
+                "intent": "inform",
+                "thread": "claude-workflow",
+                "sender_instance_key": "glm-worker@1000.000000",
+                "text": "wrong provider result"
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "message",
+            "claude-worker",
+            &json!({
+                "from": "claude-worker",
+                "scope": "mentions",
+                "mentions": ["caller"],
+                "intent": "inform",
+                "thread": "glm-workflow",
+                "sender_instance_key": claude_instance_key.clone(),
+                "text": "wrong workflow result"
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "message",
+            "claude-worker",
+            &json!({
+                "from": "claude-worker",
+                "scope": "mentions",
+                "mentions": ["caller"],
+                "intent": "inform",
+                "thread": "claude-workflow",
+                "sender_instance_key": "claude-worker@2000.000000",
+                "text": "reused display name result"
+            }),
+        )
+        .unwrap();
+
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        let filter_query = format!(" AND ({filter_sql})");
+        assert_eq!(
+            events_wait(&db, &filter_query, 1, Some(cursor), true, &filters, None),
+            1,
+            "another provider, workflow, or reused worker name must not satisfy the result wait"
+        );
+
+        db.log_event(
+            "message",
+            "claude-worker",
+            &json!({
+                "from": "claude-worker",
+                "scope": "mentions",
+                "mentions": ["caller"],
+                "intent": "inform",
+                "thread": "claude-workflow",
+                "sender_instance_key": claude_instance_key,
+                "text": "correlated result"
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            events_wait(&db, &filter_query, 1, Some(cursor), true, &filters, None),
+            0,
+            "only the exact worker/workflow/attempt tuple may complete the wait"
+        );
+
+        let missing_cursor = EventsArgs::try_parse_from([
+            "events",
+            "--wait",
+            "1",
+            "--thread",
+            "claude-workflow",
+            "--result-from",
+            "claude-worker",
+        ])
+        .unwrap();
+        let mut invalid_filters = missing_cursor.filters.to_filter_map();
+        assert!(
+            apply_result_correlation(&db, &missing_cursor, &mut invalid_filters)
+                .unwrap_err()
+                .contains("--after-id")
+        );
+        assert!(
+            EventsArgs::try_parse_from([
+                "events",
+                "--after-id",
+                "0",
+                "--thread",
+                "claude-workflow",
+                "--result-from",
+                "claude-worker",
+            ])
+            .is_err(),
+            "--result-from must require --wait"
+        );
+
+        let two_threads = EventsArgs::try_parse_from([
+            "events",
+            "--wait",
+            "1",
+            "--after-id",
+            "0",
+            "--thread",
+            "workflow-a",
+            "--thread",
+            "workflow-b",
+            "--result-from",
+            "claude-worker",
+        ])
+        .unwrap();
+        let mut invalid_filters = two_threads.filters.to_filter_map();
+        assert!(
+            apply_result_correlation(&db, &two_threads, &mut invalid_filters)
+                .unwrap_err()
+                .contains("exactly one --thread")
+        );
+
+        let conflicting = EventsArgs::try_parse_from([
+            "events",
+            "--wait",
+            "1",
+            "--after-id",
+            "0",
+            "--thread",
+            "claude-workflow",
+            "--from",
+            "glm-worker",
+            "--result-from",
+            "claude-worker",
+        ])
+        .unwrap();
+        let mut invalid_filters = conflicting.filters.to_filter_map();
+        assert!(
+            apply_result_correlation(&db, &conflicting, &mut invalid_filters)
+                .unwrap_err()
+                .contains("owns --from")
+        );
+    }
+
+    #[test]
+    fn result_wait_recovers_generation_after_worker_stops() {
+        use clap::Parser;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stopped-result.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tag, created_at)
+                 VALUES ('claude-worker', 'session-a', 'impl', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "message",
+            "claude-worker",
+            &json!({
+                "from": "claude-worker",
+                "scope": "mentions",
+                "mentions": ["caller"],
+                "intent": "inform",
+                "thread": "stopped-workflow",
+                "sender_instance_key": "claude-worker@1000.000000",
+                "text": "report before stop"
+            }),
+        )
+        .unwrap();
+        db.conn()
+            .execute("DELETE FROM instances WHERE name = 'claude-worker'", [])
+            .unwrap();
+        db.log_event(
+            "life",
+            "claude-worker",
+            &json!({
+                "action": "stopped",
+                "snapshot": {
+                    "name": "claude-worker",
+                    "tag": "impl",
+                    "created_at": 1000.0,
+                    "session_id": "session-a"
+                }
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "life",
+            "claude-worker",
+            &json!({
+                "action": "stopped",
+                "placeholder": true,
+                "snapshot": {
+                    "name": "claude-worker",
+                    "tag": "impl",
+                    "created_at": 1001.0,
+                    "session_id": "failed-launch"
+                }
+            }),
+        )
+        .unwrap();
+
+        let args = EventsArgs::try_parse_from([
+            "events",
+            "--wait",
+            "1",
+            "--after-id",
+            &cursor.to_string(),
+            "--thread",
+            "stopped-workflow",
+            "--result-from",
+            "impl-claude-worker",
+        ])
+        .unwrap();
+        let mut filters = args.filters.to_filter_map();
+        apply_result_correlation(&db, &args, &mut filters).unwrap();
+        assert_eq!(
+            filters.get("sender_instance_key").unwrap(),
+            &["claude-worker@1000.000000"]
+        );
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        assert_eq!(
+            events_wait(
+                &db,
+                &format!(" AND ({filter_sql})"),
+                1,
+                Some(cursor),
+                true,
+                &filters,
+                None,
+            ),
+            0,
+            "a report logged before stop must remain consumable"
+        );
+    }
+
+    #[test]
     fn test_events_args_wait_no_value() {
         use clap::Parser;
         let args = EventsArgs::try_parse_from(["events", "--wait", "--full"]).unwrap();
@@ -1455,6 +1875,31 @@ mod tests {
         let args = EventsArgs::try_parse_from(["events", "--full"]).unwrap();
         assert_eq!(args.wait, None);
         assert!(args.full);
+    }
+
+    #[test]
+    fn result_from_is_rejected_with_subcommands() {
+        use clap::Parser;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("result-subcommand.db")).unwrap();
+        db.ensure_schema().unwrap();
+        let args = EventsArgs::try_parse_from([
+            "events",
+            "--wait",
+            "1",
+            "--after-id",
+            "0",
+            "--thread",
+            "workflow",
+            "--result-from",
+            "worker",
+            "sub",
+            "--once",
+        ])
+        .unwrap();
+
+        assert_eq!(cmd_events(&db, &args, None), 1);
     }
 
     #[test]

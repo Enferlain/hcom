@@ -154,7 +154,7 @@ fn send_strips_redundant_trailing_name_from_auto_resolved_sender() {
 }
 
 #[test]
-fn ai_tool_broadcast_to_many_requires_go_preview() {
+fn broadcast_requires_explicit_scope_and_go_preview_in_ai_tools() {
     let h = Hcom::new();
     let sender = h.start();
     for _ in 0..4 {
@@ -162,27 +162,44 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
     }
 
     let mut cmd = h.cmd();
-    cmd.env("CODEX_SANDBOX", "1").args([
-        "send",
-        "--name",
-        &sender,
-        "--",
-        "probably meant one person",
-    ]);
+    cmd.env("CODEX_SANDBOX", "1")
+        .args(["send", "--name", &sender, "moto"]);
     let out = cmd.output().expect("spawn hcom send");
     let code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_ne!(
         code, 0,
-        "send should preview first: stdout={stdout} stderr={stderr}"
+        "implicit broadcast must fail closed: stdout={stdout} stderr={stderr}"
     );
     assert!(
-        stdout.contains("BROADCAST SEND PREVIEW")
-            && stdout.contains("broadcast to 4 agents")
-            && stdout.contains("Did you mean to send this to everyone?")
-            && stdout.contains("hcom send --go"),
-        "stdout={stdout}"
+        stderr.contains("Refusing implicit broadcast") && stderr.contains("--broadcast"),
+        "stdout={stdout} stderr={stderr}"
+    );
+
+    let mut preview_cmd = h.cmd();
+    preview_cmd.env("CODEX_SANDBOX", "1").args([
+        "send",
+        "--broadcast",
+        "--name",
+        &sender,
+        "--",
+        "explicit but not confirmed broadcast",
+    ]);
+    let preview_out = preview_cmd.output().expect("spawn explicit hcom broadcast");
+    let preview_code = preview_out.status.code().unwrap_or(-1);
+    let preview_stdout = String::from_utf8_lossy(&preview_out.stdout);
+    let preview_stderr = String::from_utf8_lossy(&preview_out.stderr);
+    assert_ne!(
+        preview_code, 0,
+        "AI-tool broadcast should preview first: stdout={preview_stdout} stderr={preview_stderr}"
+    );
+    assert!(
+        preview_stdout.contains("BROADCAST SEND PREVIEW")
+            && preview_stdout.contains("broadcast to 4 agents")
+            && preview_stdout.contains("Did you mean to send this to everyone?")
+            && preview_stdout.contains("hcom send --go"),
+        "stdout={preview_stdout}"
     );
 
     let (_, events_out, _) = h.run(["events", "--type", "message", "--last", "5"]);
@@ -195,6 +212,7 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
     go_cmd.env("CODEX_SANDBOX", "1").args([
         "--go",
         "send",
+        "--broadcast",
         "--name",
         &sender,
         "--",
@@ -208,6 +226,116 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
     assert!(
         go_stdout.contains("Sent to:") || go_stdout.contains("Sent to 4 agents"),
         "stdout={go_stdout}"
+    );
+}
+
+#[test]
+fn seeded_thread_allows_a_recipient_free_followup_without_broadcast() {
+    let h = Hcom::new();
+    let sender = h.start();
+    let recipient = h.start();
+    let target = format!("@{recipient}");
+
+    let (seed_code, _, seed_stderr) = h.run([
+        "send",
+        "--name",
+        &sender,
+        &target,
+        "--thread",
+        "seeded-thread",
+        "--",
+        "seed",
+    ]);
+    assert_eq!(seed_code, 0, "stderr={seed_stderr}");
+
+    let (follow_code, _, follow_stderr) = h.run([
+        "send",
+        "--name",
+        &sender,
+        "--thread",
+        "seeded-thread",
+        "--",
+        "followup",
+    ]);
+    assert_eq!(follow_code, 0, "stderr={follow_stderr}");
+    let (_, event, _) = h.run(["events", "--type", "message", "--last", "1", "--full"]);
+    assert!(event.contains(r#""text":"followup""#), "event={event}");
+    assert!(event.contains(&recipient), "event={event}");
+}
+
+#[test]
+fn cursor_and_result_from_reject_cross_worker_completion() {
+    let h = Hcom::new();
+    let caller = h.start();
+    let expected = h.start();
+    let other = h.start();
+    let caller_target = format!("@{caller}");
+    let (cursor_code, cursor, cursor_stderr) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_stderr}");
+    let cursor = cursor.trim().to_string();
+    assert!(cursor.parse::<i64>().is_ok(), "cursor={cursor}");
+
+    let (send_code, _, send_stderr) = h.run([
+        "send",
+        "--name",
+        &other,
+        &caller_target,
+        "--intent",
+        "inform",
+        "--thread",
+        "exact-result-thread",
+        "--",
+        "wrong worker",
+    ]);
+    assert_eq!(send_code, 0, "stderr={send_stderr}");
+
+    let (wrong_code, wrong_out, wrong_err) = h.run([
+        "events",
+        "--name",
+        &caller,
+        "--wait",
+        "1",
+        "--after-id",
+        &cursor,
+        "--thread",
+        "exact-result-thread",
+        "--result-from",
+        &expected,
+    ]);
+    assert_eq!(wrong_code, 1, "stdout={wrong_out} stderr={wrong_err}");
+    assert!(wrong_out.contains(r#""timed_out":true"#));
+
+    let (send_code, _, send_stderr) = h.run([
+        "send",
+        "--name",
+        &expected,
+        &caller_target,
+        "--intent",
+        "inform",
+        "--thread",
+        "exact-result-thread",
+        "--",
+        "exact result",
+    ]);
+    assert_eq!(send_code, 0, "stderr={send_stderr}");
+    let (match_code, matched, match_err) = h.run([
+        "events",
+        "--name",
+        &caller,
+        "--wait",
+        "1",
+        "--after-id",
+        &cursor,
+        "--thread",
+        "exact-result-thread",
+        "--result-from",
+        &expected,
+        "--full",
+    ]);
+    assert_eq!(match_code, 0, "stdout={matched} stderr={match_err}");
+    assert!(
+        matched.contains(r#""text":"exact result""#),
+        "matched={matched}"
     );
 }
 

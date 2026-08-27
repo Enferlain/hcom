@@ -33,7 +33,14 @@ const FLAG_MAP: &[(&str, &str)] = &[
 /// Flags that require type='status'.
 const STATUS_FLAGS: &[&str] = &["status", "context", "file", "cmd"];
 /// Flags that require type='message'.
-const MESSAGE_FLAGS: &[&str] = &["from", "mention", "intent", "thread", "reply_to"];
+const MESSAGE_FLAGS: &[&str] = &[
+    "from",
+    "mention",
+    "intent",
+    "thread",
+    "reply_to",
+    "sender_instance_key",
+];
 /// Flags that require type='life'.
 const LIFE_FLAGS: &[&str] = &["action"];
 
@@ -385,6 +392,15 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
 
     if let Some(values) = filters.get("reply_to") {
         clauses.push(eq_or_in("msg_reply_to", values));
+    }
+
+    // Internal exact-worker-generation filter used by --result-from. This is
+    // intentionally not exposed as a general composable CLI flag.
+    if let Some(values) = filters.get("sender_instance_key") {
+        clauses.push(eq_or_in(
+            "json_extract(data, '$.sender_instance_key')",
+            values,
+        ));
     }
 
     // Life filters
