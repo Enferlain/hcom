@@ -62,23 +62,25 @@ The observations above directly motivate issues 33–40 and provide concrete rep
 
 ### 1. Filtered waits can be satisfied by unrelated unread messages — working
 
-Status: **Working as of 2026-08-24.** Filtered waits now ignore unrelated unread inbox messages, while unfiltered waits retain the older-unread interrupt. Regression coverage verifies the negative filtered case, the preserved unfiltered behavior, and a positive matching-event case. The events test module and Clippy pass, the focused review approved the change, and the broader suite passes when excluding one pre-existing unrelated transcript PATH-error test.
+Status: **Working as of 2026-08-27.** Filtered event waits and filtered `listen` calls now ignore unrelated unread inbox messages, while unfiltered waits retain the older-unread interrupt. Filtered listen queries matching events directly and does not advance the normal inbox cursor, so ignored messages remain available to a later ordinary listen. Regression coverage verifies the negative filtered cases, preserved inbox delivery, the preserved unfiltered behavior, and positive matching-event cases. The focused event/listen suites and Clippy pass, focused review approved the changes, and the live CLI smoke test reproduced the original failure before the fix and passed afterward.
 
 Previously, the filtered event wait first checked for matching events but could also return success when the waiting identity merely had unread messages. An unrelated message could therefore wake a wait for a particular worker, thread, or event type.
 
-Evidence: [`events_wait`](../src/commands/events.rs#L854) and its unread-message fallback in [`events.rs`](../src/commands/events.rs#L888).
+Evidence: [`events_wait`](../src/commands/events.rs#L797) and its unread-message fallback in [`events.rs`](../src/commands/events.rs#L875).
 
-The implemented fix makes a filtered wait complete only on its declared condition. A future explicit inbox-interrupt option with a distinct return reason may still be useful.
+The implemented fix makes every filtered wait complete only on its declared condition. A future explicit inbox-interrupt option with a distinct return reason may still be useful.
+
+Remaining follow-up: internal `filter-wait:` status bookkeeping is excluded from filtered `listen`, but an `events --wait --type status` call or persistent status subscription can still observe that bookkeeping from another listener. The shared wait engine in issue 28 should suppress internal lifecycle noise consistently without hiding genuine agent status changes.
 
 ### 2. Waits use a time lookback instead of a durable cursor — working
 
-Status: **Working as of 2026-08-27.** `hcom events --wait` and filtered `hcom listen` now use an event-ID boundary instead of a ten-second wall-clock lookback. A wait without `--after-id` captures the current last event and observes only future events. A caller that captures a boundary before launching work can pass `--after-id <ID>` to safely consume a result that arrived just before the waiter started. Explicit-cursor waits are strict and do not fall back to older unread inbox messages.
+Status: **Working as of 2026-08-27.** `hcom events --wait` and filtered `hcom listen` now use an event-ID boundary instead of a ten-second wall-clock lookback. A wait without `--after-id` captures the current last event and observes only future events. A caller that captures a boundary before launching work can pass `--after-id <ID>` to safely consume a result that arrived just before the waiter started. Explicit-cursor waits are strict and do not fall back to older unread inbox messages. Both custom help pages now document the cursor option.
 
-Regression coverage verifies that a completed match is not replayed by a new wait, an event after an explicit cursor is consumed, filtered listen applies the same boundary, and `events --after-id` requires wait mode. The focused event and listen suites and Clippy pass, and focused review approved the cursor semantics. The full parallel run passed 2,178 tests; two unrelated environment-sensitive hook-install tests failed there and passed immediately when rerun alone. One pre-existing unrelated transcript PATH test remains excluded.
+Regression coverage verifies that a completed match is not replayed by a new wait, an event after an explicit cursor is consumed, filtered listen applies the same boundary without consuming inbox messages, both help pages expose the flag, and `events --after-id` requires wait mode. The live CLI smoke test confirms a match after the cursor, silence after advancing it, preserved ordinary inbox delivery, and visible help. The focused event, listen, and help suites pass; broader-gate details are recorded with the implementing commits.
 
 Previously, event waiting used a recent time window, which could replay old events or make repeated waits observe the same completion.
 
-Implementation: the cursor boundary in [`events.rs`](../src/commands/events.rs#L805) and the equivalent filtered-listen boundary in [`listen.rs`](../src/commands/listen.rs#L488).
+Implementation: the cursor boundary in [`events.rs`](../src/commands/events.rs#L812) and the equivalent filtered-listen boundary in [`listen.rs`](../src/commands/listen.rs#L520).
 
 The implemented CLI spelling is `--after-id`. Waiting and consumption no longer depend on wall-clock overlap.
 
@@ -388,6 +390,8 @@ Local scripts can contain important result extraction, retry, and readiness beha
 ### 31. Heartbeats can still pollute the parent context
 
 Compact heartbeats are cheaper than full polling but still cost tokens if repeatedly injected into the main conversation. Default delegated runs to final-result-only model delivery; send heartbeats to UI metadata or expose them on demand.
+
+Filtered listen currently caps its local polling interval at 500 ms so local status and lifecycle events are noticed promptly even when no socket wake arrives. Heartbeat persistence should be rate-limited independently (for example, every 5–10 seconds) so a long wait does not turn responsiveness into repeated SQLite writes.
 
 ### 32. Workflows lack an explicit communication policy
 

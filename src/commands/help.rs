@@ -51,6 +51,10 @@ const EVENTS_HELP: &[HelpEntry] = &[
     ("  --last N", "Limit count (default: 20)"),
     ("  --all", "Include archived sessions"),
     ("  --wait [SEC]", "Block until match (default: 60s)"),
+    (
+        "  --after-id ID",
+        "Only match events after this durable cursor (requires --wait)",
+    ),
     ("  --sql EXPR", "Raw SQL WHERE (ANDed with flags)"),
     (
         "  --remote-fetch --device ID",
@@ -421,6 +425,10 @@ const LISTEN_HELP: &[HelpEntry] = &[
     ("", ""),
     ("SQL filter mode:", ""),
     ("  --sql \"type='message'\"", "Custom SQL against events_v"),
+    (
+        "  --after-id ID",
+        "Only match events after this durable cursor (filter mode only)",
+    ),
     ("  --sql stopped:name", "Preset: wait for agent to stop"),
     ("  --idle NAME", "Shortcut: wait for agent to go idle"),
     ("", ""),
@@ -1176,6 +1184,12 @@ mod tests {
             );
             assert!(help.len() > 20, "help for '{}' should have content", cmd);
         }
+    }
+
+    #[test]
+    fn durable_cursor_is_documented_for_wait_commands() {
+        assert!(get_command_help("events").contains("--after-id ID"));
+        assert!(get_command_help("listen").contains("--after-id ID"));
     }
 
     #[test]

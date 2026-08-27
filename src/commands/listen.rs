@@ -5,7 +5,7 @@
 //! Uses TCP notify socket for instant wake on local messages.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::core::filters::{EventFilterArgs, build_sql_from_flags, resolve_filter_names};
@@ -451,24 +451,51 @@ fn listen_loop(
 }
 
 type FilterMatch = (i64, String, String, String);
+static FILTER_WAIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-fn first_filter_match_after(db: &HcomDb, sql_filter: &str, after_id: i64) -> Option<FilterMatch> {
+fn first_filter_match_after(
+    db: &HcomDb,
+    sql_filter: &str,
+    after_id: i64,
+) -> Result<Option<FilterMatch>, rusqlite::Error> {
     let cursor_query = format!(
-        "SELECT id, type, instance, data FROM events_v WHERE id > ? AND ({sql_filter}) ORDER BY id LIMIT 1"
+        "SELECT id, type, instance, data FROM events_v \
+         WHERE id > ?1 \
+           AND NOT (type = 'status' AND COALESCE(status_context, '') LIKE 'filter-wait:%') \
+           AND ({sql_filter}) ORDER BY id LIMIT 1"
     );
-    let mut stmt = db.conn().prepare(&cursor_query).ok()?;
-    stmt.query_row(rusqlite::params![after_id], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })
-    .ok()
+    let mut stmt = db.conn().prepare(&cursor_query)?;
+    let mut rows = stmt.query(rusqlite::params![after_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        row.get::<_, i64>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, String>(3)?,
+    )))
 }
 
-/// Listen with SQL filter — uses temp subscription.
+fn print_filter_match(row: &FilterMatch, json_output: bool) {
+    let notification = format!("[Match found] #{} {}:{}", row.0, row.1, row.2);
+    if json_output {
+        let data: serde_json::Value = serde_json::from_str(&row.3).unwrap_or_default();
+        let output = serde_json::json!({
+            "matched": true,
+            "notification": notification,
+            "event_id": row.0,
+            "type": row.1,
+            "instance": row.2,
+            "data": data,
+        });
+        println!("{}", serde_json::to_string(&output).unwrap_or_default());
+    } else {
+        println!("{notification}");
+    }
+}
+
+/// Listen directly for matching events without consuming the instance inbox.
 #[allow(clippy::too_many_arguments)]
 fn listen_with_filter(
     db: &HcomDb,
@@ -491,61 +518,51 @@ fn listen_with_filter(
     // back to consume a result that arrived just before listen started. With
     // no explicit boundary, this invocation only observes future events.
     let start_id = after_id.unwrap_or_else(|| db.get_last_event_id());
-    let now_ts = crate::shared::time::now_epoch_f64();
 
-    if let Some(row) = first_filter_match_after(db, sql_filter, start_id) {
-        if json_output {
-            let data: serde_json::Value = serde_json::from_str(&row.3).unwrap_or_default();
-            let j = serde_json::json!({
-                "event_id": row.0,
-                "type": row.1,
-                "instance": row.2,
-                "data": data,
-            });
-            println!("{}", serde_json::to_string(&j).unwrap_or_default());
-        } else {
-            println!("[Match found] #{} {}:{}", row.0, row.1, row.2);
+    match first_filter_match_after(db, sql_filter, start_id) {
+        Ok(Some(row)) => {
+            print_filter_match(&row, json_output);
+            set_status(
+                db,
+                instance_name,
+                ST_ACTIVE,
+                "filter matched",
+                Default::default(),
+            );
+            return 0;
         }
-        return 0;
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("Error querying filtered events: {e}");
+            return 1;
+        }
     }
 
-    // Create temp subscription — SHA256 over instance+filter+time to avoid collisions
-    let sub_id = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(format!("{instance_name}{sql_filter}{now_ts}").as_bytes());
-        let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        format!("listen-{}", &hex[..6])
-    };
-    let sub_key = format!("events_sub:{sub_id}");
-
-    // Mark as listening BEFORE capturing last_id
+    // Filter-wait status rows are operational bookkeeping, not events callers
+    // asked to match. Give this invocation a unique context; direct filtered
+    // queries exclude all contexts in this internal namespace.
+    let status_context = format!(
+        "filter-wait:{}:{}:{}",
+        std::process::id(),
+        crate::shared::time::now_epoch_i64(),
+        FILTER_WAIT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
     set_status(
         db,
         instance_name,
         ST_LISTENING,
-        &format!("filter:{sub_id}"),
+        &status_context,
         Default::default(),
     );
 
-    let sub_data = serde_json::json!({
-        "id": sub_id,
-        "sql": sql_filter,
-        "caller": instance_name,
-        "once": true,
-        "last_id": start_id,
-        "created": now_ts,
-    });
-    let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
-
-    // Setup notify
+    // The loop queries events_v directly, so unrelated inbox messages remain
+    // unread and no temporary subscription notification is generated.
     let notify_server = NotifyServer::new().ok();
     if let Some(ref server) = notify_server {
         let _ = db.upsert_notify_endpoint(instance_name, "listen_filter", server.port());
     }
 
     init_heartbeat(db, instance_name, timeout);
-
     let start_time = std::time::Instant::now();
 
     if !json_output {
@@ -554,8 +571,9 @@ fn listen_with_filter(
 
     let result = filter_listen_loop(
         db,
+        sql_filter,
+        start_id,
         instance_name,
-        &sub_id,
         timeout,
         json_output,
         instance_data,
@@ -564,18 +582,16 @@ fn listen_with_filter(
         shutdown,
     );
 
-    // Cleanup
-    let _ = db.kv_set(&sub_key, None);
     let _ = db.delete_notify_endpoint(instance_name, "listen_filter");
-
     result
 }
 
 #[allow(clippy::too_many_arguments)]
 fn filter_listen_loop(
     db: &HcomDb,
+    sql_filter: &str,
+    mut after_id: i64,
     instance_name: &str,
-    sub_id: &str,
     timeout: f64,
     json_output: bool,
     instance_data: &serde_json::Value,
@@ -617,69 +633,23 @@ fn filter_listen_loop(
             return 0;
         }
 
-        // Check for messages (subscription notification or regular)
-        let messages = db.get_unread_messages(instance_name);
-        if !messages.is_empty() {
-            // Advance cursor
-            if let Some(last) = messages.last()
-                && let Some(id) = last.event_id
-            {
-                let mut updates = serde_json::Map::new();
-                updates.insert("last_event_id".into(), serde_json::json!(id));
-                instances::update_instance_position(db, instance_name, &updates);
-            }
-
-            // Check for subscription notification
-            for msg in &messages {
-                if msg.from == "[hcom-events]" && msg.text.contains(&format!("[sub:{sub_id}]")) {
-                    if json_output {
-                        let j = serde_json::json!({
-                            "matched": true,
-                            "notification": msg.text,
-                        });
-                        println!("{}", serde_json::to_string(&j).unwrap_or_default());
-                    } else {
-                        println!("\n{}", msg.text);
-                    }
-                    set_status(
-                        db,
-                        instance_name,
-                        ST_ACTIVE,
-                        "filter matched",
-                        Default::default(),
-                    );
-                    return 0;
-                }
-            }
-
-            // Other non-system messages
-            let real_messages: Vec<&crate::db::Message> = messages
-                .iter()
-                .filter(|m| !m.from.starts_with('['))
-                .collect();
-            if !real_messages.is_empty() {
-                if json_output {
-                    for msg in &real_messages {
-                        let j = serde_json::json!({
-                            "from": msg.from,
-                            "text": msg.text,
-                        });
-                        println!("{}", serde_json::to_string(&j).unwrap_or_default());
-                    }
-                } else {
-                    let owned: Vec<crate::db::Message> =
-                        real_messages.iter().map(|m| (*m).clone()).collect();
-                    let formatted = format_messages_json(db, &owned, instance_name);
-                    println!("\n{formatted}");
-                }
+        let scan_through = db.get_last_event_id();
+        match first_filter_match_after(db, sql_filter, after_id) {
+            Ok(Some(row)) => {
+                print_filter_match(&row, json_output);
                 set_status(
                     db,
                     instance_name,
                     ST_ACTIVE,
-                    "message received",
+                    "filter matched",
                     Default::default(),
                 );
                 return 0;
+            }
+            Ok(None) => after_id = scan_through,
+            Err(e) => {
+                eprintln!("Error querying filtered events: {e}");
+                return 1;
             }
         }
 
@@ -690,11 +660,11 @@ fn filter_listen_loop(
             continue;
         }
 
-        // TCP select for local notifications. Relay imports (pull.rs) call
-        // `crate::notify::wake_all` after every batch, so the TCP wake fires
-        // as soon as remote events land — no separate relay polling needed.
+        // Relay imports call `wake_all`, while local events for another agent
+        // do not necessarily target this endpoint. Cap the socket wait so those
+        // cross-instance events are still detected promptly by direct polling.
         let wait_time = if notify_server.is_some() {
-            remaining.min(30.0)
+            remaining.min(0.5)
         } else {
             remaining.min(0.1)
         };
@@ -709,8 +679,11 @@ fn filter_listen_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{ListenArgs, expand_sql_preset, first_filter_match_after};
+    use super::{ListenArgs, expand_sql_preset, filter_listen_loop, first_filter_match_after};
     use crate::db::HcomDb;
+    use crate::instance_lifecycle::set_status;
+    use crate::shared::ST_LISTENING;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn listen_args_parse_durable_cursor() {
@@ -730,11 +703,158 @@ mod tests {
             .log_event("status", "nova", &serde_json::json!({"status": "active"}))
             .unwrap();
 
-        assert!(first_filter_match_after(&db, "type='status'", event_id).is_none());
+        assert!(
+            first_filter_match_after(&db, "type='status'", event_id)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
-            first_filter_match_after(&db, "type='status'", event_id - 1).map(|matched| matched.0),
+            first_filter_match_after(&db, "type='status'", event_id - 1)
+                .unwrap()
+                .map(|matched| matched.0),
             Some(event_id)
         );
+    }
+
+    #[test]
+    fn filtered_listen_excludes_its_own_listening_status_event() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("listen-status.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES ('alice', 'codex', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let start_id = db.get_last_event_id();
+        let context = "filter-wait:test:unique";
+
+        set_status(&db, "alice", ST_LISTENING, context, Default::default());
+        let status_id = db.get_last_event_id();
+        let stored_context: String = db
+            .conn()
+            .query_row(
+                "SELECT status_context FROM events_v WHERE id = ?1",
+                rusqlite::params![status_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_context, context);
+
+        assert!(
+            first_filter_match_after(&db, "type='status'", start_id)
+                .unwrap()
+                .is_none(),
+            "filtered waits must ignore operational filter-wait status rows"
+        );
+    }
+
+    #[test]
+    fn filtered_listen_does_not_consume_unrelated_inbox_messages() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("listen-inbox.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES ('alice', 'codex', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let unrelated_id = db
+            .log_event(
+                "message",
+                "bob",
+                &serde_json::json!({
+                    "from": "bob",
+                    "scope": "mentions",
+                    "delivered_to": ["alice"],
+                    "text": "unrelated"
+                }),
+            )
+            .unwrap();
+        let match_id = db
+            .log_event(
+                "message",
+                "bob",
+                &serde_json::json!({
+                    "from": "bob",
+                    "scope": "mentions",
+                    "delivered_to": ["alice"],
+                    "text": "wanted"
+                }),
+            )
+            .unwrap();
+        let shutdown = AtomicBool::new(false);
+        let instance_data = serde_json::json!({"tool": "codex"});
+        let sql = "type='message' AND msg_text='wanted'";
+
+        assert_eq!(
+            filter_listen_loop(
+                &db,
+                sql,
+                unrelated_id,
+                "alice",
+                1.0,
+                true,
+                &instance_data,
+                std::time::Instant::now(),
+                None,
+                &shutdown,
+            ),
+            0
+        );
+        let matched_context: String = db
+            .conn()
+            .query_row(
+                "SELECT status_context FROM instances WHERE name = 'alice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(matched_context, "filter matched");
+        set_status(
+            &db,
+            "alice",
+            ST_LISTENING,
+            "before-timeout",
+            Default::default(),
+        );
+        assert_eq!(
+            filter_listen_loop(
+                &db,
+                sql,
+                match_id,
+                "alice",
+                0.01,
+                true,
+                &instance_data,
+                std::time::Instant::now(),
+                None,
+                &shutdown,
+            ),
+            0
+        );
+        let timeout_context: String = db
+            .conn()
+            .query_row(
+                "SELECT status_context FROM instances WHERE name = 'alice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(timeout_context, "before-timeout");
+
+        let last_event_id: i64 = db
+            .conn()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = 'alice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last_event_id, 0, "filtered waits must leave inbox unread");
     }
 
     #[test]
