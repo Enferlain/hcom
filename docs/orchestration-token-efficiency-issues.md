@@ -19,10 +19,10 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 
 | Priority | Area | Issues | Intended outcome |
 | --- | --- | ---: | --- |
-| P0 | Correctness and state semantics | 11 | Waiting and completion become reliable |
+| P0 | Correctness and state semantics | 13 | Waiting and completion become reliable |
 | P1 | Orchestration abstractions | 14 | Routine supervision moves into deterministic software |
 | P1 | Communication policy | 9 | Useful communication remains available without constant interruption |
-| P2 | Efficiency and maintainability | 6 | Polling, duplicated logic, and context noise are reduced |
+| P2 | Efficiency and maintainability | 7 | Polling, duplicated logic, and context noise are reduced |
 
 ## Field evidence from Codex session `019fbf7b-705a-75d1-81bc-d935ab026c1c`
 
@@ -174,6 +174,18 @@ workflow_id + attempt_id + worker_session_id + result_kind
 ```
 
 Display names, recent messages, shared caller inboxes, or thread proximity are insufficient correlation keys. Cleanup must use the worker identity recorded on that same matched attempt. Add a concurrent mixed-provider regression test proving that GLM completion cannot satisfy or clean up a Claude workflow, and vice versa.
+
+### 41. Filtered-listen timeout is indistinguishable from success
+
+Filtered `hcom listen` currently exits with status `0` when its timeout expires without a match. A shell coordinator therefore cannot distinguish "condition matched" from "nothing happened" using the process result and may incorrectly advance a workflow.
+
+Use a distinct nonzero timeout exit code and a structured timeout result, aligned with `events --wait`. Preserve a documented compatibility path for interactive callers that intentionally treat an empty timeout as success.
+
+### 42. Filtered-listen JSON does not have a stable compatibility contract
+
+The direct event-scan implementation made filtered-listen JSON more consistent by returning `matched`, `notification`, `event_id`, `type`, `instance`, and `data`, but it also changed the previous notification text and output shape. Scripts that parse the old subscription-oriented payload can break even though the underlying match is correct.
+
+Define and test a stable machine-readable schema. Prefer typed fields over parsing `notification`, document additive versus breaking changes, and provide either a compatibility version or an explicit schema version when fields or meanings must change.
 
 ## P1: orchestration abstractions
 
@@ -411,6 +423,12 @@ automatic_receipts = true
 The observed parent tried plausible but unsupported forms including transcript `--tail`, events `--limit`, an SQL `from_agent` field, and a direct positional send. Each required another help, retry, or inspection call.
 
 Normalize common options across commands—for example `--last`, `--after-id`, `--from`, and `--json`—and validate ambiguous send syntax before doing anything. Structured orchestration APIs should avoid shell parsing entirely. When a command rejects an option, return the exact supported equivalent for that command rather than only generic usage.
+
+### 43. Internal filtered-wait context leaks into user-facing status
+
+Filtered listen uses a unique `filter-wait:<pid>:<epoch>:<sequence>` status context to prevent its own bookkeeping event from satisfying the filter. `hcom list` and the TUI can expose that raw implementation marker, adding noisy identifiers to the exact status surfaces agents inspect during supervision.
+
+Keep the unique internal marker for correctness, but hide or normalize it at presentation boundaries. Human- and model-facing status should say that the agent is waiting on an event filter without exposing coordination IDs unless diagnostic verbosity is explicitly requested.
 
 ## Capability-preserving design principles
 
