@@ -40,6 +40,9 @@ pub struct EventsArgs {
     /// Block until match (default: 60s when flag present without value)
     #[arg(long, num_args(0..=1), default_missing_value = "60")]
     pub wait: Option<u64>,
+    /// Only match events with an ID greater than this cursor (requires --wait)
+    #[arg(long, requires = "wait")]
+    pub after_id: Option<i64>,
     /// Raw SQL WHERE clause
     #[arg(long)]
     pub sql: Option<String>,
@@ -795,34 +798,19 @@ fn events_wait(
     db: &HcomDb,
     filter_query: &str,
     wait_timeout: u64,
+    after_id: Option<i64>,
     full_output: bool,
     filters: &HashMap<String, Vec<String>>,
     instance_name: Option<&str>,
 ) -> i32 {
     use std::time::Instant;
 
-    // Quick lookback: check last 10s for already-matching events
-    let now_ts = crate::shared::time::now_epoch_i64() - 10;
-    let lookback_ts = chrono::DateTime::from_timestamp(now_ts, 0)
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_default();
-
-    let lookback_query = format!(
-        "SELECT * FROM events_v WHERE timestamp > ?{filter_query} ORDER BY id DESC LIMIT 1"
-    );
-    if let Ok(mut stmt) = db.conn().prepare(&lookback_query)
-        && let Ok(mut rows) = stmt.query(rusqlite::params![lookback_ts])
-        && let Ok(Some(row)) = rows.next()
-        && let Ok(event) = parse_event_row(row)
-    {
-        let output = if full_output {
-            event.clone()
-        } else {
-            streamline_event(&event, filters)
-        };
-        println!("{}", serde_json::to_string(&output).unwrap_or_default());
-        return 0;
-    }
+    // Capture the boundary before setting up notification plumbing so events
+    // arriving during setup are still observed. An explicit cursor also lets a
+    // caller safely arm a wait before launching work and consume an event that
+    // arrived just before this process started.
+    let has_explicit_cursor = after_id.is_some();
+    let mut last_id = after_id.unwrap_or_else(|| db.get_last_event_id());
 
     // Setup TCP notify server for instant wake — only useful when we can
     // register an `events_wait` wake endpoint for `crate::notify::wake_all`
@@ -843,7 +831,6 @@ fn events_wait(
     }
 
     let start = Instant::now();
-    let mut last_id = db.get_last_event_id();
 
     let result = loop {
         if start.elapsed() >= Duration::from_secs(wait_timeout) {
@@ -885,11 +872,12 @@ fn events_wait(
             break 0;
         }
 
-        // For an unfiltered wait, an older unread inbox message is still a useful
-        // interrupt even when its event predates the lookback window. Filtered
-        // waits must only complete on their declared event condition: otherwise
-        // an unrelated unread message can produce a false successful match.
+        // For a legacy unfiltered wait, an older unread inbox message is still a
+        // useful interrupt. Filtered waits and explicit-cursor waits must only
+        // complete on their declared event boundary: otherwise unrelated or
+        // already-consumed messages can produce a false successful match.
         if filter_query.is_empty()
+            && !has_explicit_cursor
             && let Some(name) = instance_name
         {
             let messages = db.get_unread_messages(name);
@@ -1133,6 +1121,7 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
             db,
             &filter_query,
             timeout,
+            args.after_id,
             full_output,
             &filters,
             instance_name.as_deref(),
@@ -1376,6 +1365,15 @@ mod tests {
     }
 
     #[test]
+    fn test_events_args_after_id_requires_wait() {
+        use clap::Parser;
+        let args =
+            EventsArgs::try_parse_from(["events", "--wait", "30", "--after-id", "42"]).unwrap();
+        assert_eq!(args.after_id, Some(42));
+        assert!(EventsArgs::try_parse_from(["events", "--after-id", "42"]).is_err());
+    }
+
+    #[test]
     fn test_events_args_wait_no_value() {
         use clap::Parser;
         let args = EventsArgs::try_parse_from(["events", "--wait", "--full"]).unwrap();
@@ -1412,17 +1410,18 @@ mod tests {
         let filter_sql = build_sql_from_flags(&filters).unwrap();
         let filter_query = format!(" AND ({filter_sql})");
         assert_eq!(
-            events_wait(&db, &filter_query, 1, false, &filters, Some("luna"),),
+            events_wait(&db, &filter_query, 1, None, false, &filters, Some("luna"),),
             1,
             "an unrelated unread message must not satisfy a filtered wait"
         );
 
         assert_eq!(
-            events_wait(&db, "", 1, false, &HashMap::new(), Some("luna")),
+            events_wait(&db, "", 1, None, false, &HashMap::new(), Some("luna"),),
             0,
             "an unfiltered wait should retain the older-unread inbox interrupt"
         );
 
+        let cursor = db.get_last_event_id();
         db.log_event(
             "status",
             "nova",
@@ -1430,9 +1429,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            events_wait(&db, &filter_query, 1, false, &filters, Some("luna"),),
+            events_wait(
+                &db,
+                &filter_query,
+                1,
+                Some(cursor),
+                false,
+                &filters,
+                Some("luna"),
+            ),
             0,
-            "a matching event must still satisfy the filtered wait"
+            "a matching event after the durable cursor must satisfy the filtered wait"
+        );
+
+        assert_eq!(
+            events_wait(&db, &filter_query, 1, None, false, &filters, Some("luna"),),
+            1,
+            "a new wait must not replay the previously consumed match"
         );
     }
 

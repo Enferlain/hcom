@@ -32,6 +32,9 @@ pub struct ListenArgs {
     /// SQL WHERE filter
     #[arg(long)]
     pub sql: Option<String>,
+    /// Only match events with an ID greater than this cursor (filter mode only)
+    #[arg(long)]
+    pub after_id: Option<i64>,
     /// Composable event filters
     #[command(flatten)]
     pub filters: EventFilterArgs,
@@ -217,6 +220,11 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
         }
     };
 
+    if args.after_id.is_some() && combined_sql.is_none() {
+        eprintln!("Error: --after-id requires --sql or an event filter");
+        return 1;
+    }
+
     let instance_data = identity.instance_data.as_ref();
     if instance_data.is_none() {
         eprintln!("Error: hcom not started for '{instance_name}'.");
@@ -233,6 +241,7 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
             filter,
             &instance_name,
             timeout,
+            args.after_id,
             json_output,
             instance_data.unwrap(),
             &shutdown,
@@ -441,12 +450,32 @@ fn listen_loop(
     }
 }
 
+type FilterMatch = (i64, String, String, String);
+
+fn first_filter_match_after(db: &HcomDb, sql_filter: &str, after_id: i64) -> Option<FilterMatch> {
+    let cursor_query = format!(
+        "SELECT id, type, instance, data FROM events_v WHERE id > ? AND ({sql_filter}) ORDER BY id LIMIT 1"
+    );
+    let mut stmt = db.conn().prepare(&cursor_query).ok()?;
+    stmt.query_row(rusqlite::params![after_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })
+    .ok()
+}
+
 /// Listen with SQL filter — uses temp subscription.
+#[allow(clippy::too_many_arguments)]
 fn listen_with_filter(
     db: &HcomDb,
     sql_filter: &str,
     instance_name: &str,
     timeout: f64,
+    after_id: Option<i64>,
     json_output: bool,
     instance_data: &serde_json::Value,
     shutdown: &AtomicBool,
@@ -458,25 +487,13 @@ fn listen_with_filter(
         return 1;
     }
 
-    // Check for recent match (10s lookback)
+    // A caller can capture this boundary before launching work and pass it
+    // back to consume a result that arrived just before listen started. With
+    // no explicit boundary, this invocation only observes future events.
+    let start_id = after_id.unwrap_or_else(|| db.get_last_event_id());
     let now_ts = crate::shared::time::now_epoch_f64();
-    let lookback_ts = chrono::DateTime::from_timestamp((now_ts - 10.0) as i64, 0)
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
-        .unwrap_or_default();
 
-    let recent_query = format!(
-        "SELECT id, type, instance, data FROM events_v WHERE timestamp > ? AND ({sql_filter}) ORDER BY id DESC LIMIT 1"
-    );
-    if let Ok(mut stmt) = db.conn().prepare(&recent_query)
-        && let Ok(row) = stmt.query_row(rusqlite::params![lookback_ts], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-    {
+    if let Some(row) = first_filter_match_after(db, sql_filter, start_id) {
         if json_output {
             let data: serde_json::Value = serde_json::from_str(&row.3).unwrap_or_default();
             let j = serde_json::json!({
@@ -516,7 +533,7 @@ fn listen_with_filter(
         "sql": sql_filter,
         "caller": instance_name,
         "once": true,
-        "last_id": db.get_last_event_id(),
+        "last_id": start_id,
         "created": now_ts,
     });
     let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
@@ -692,7 +709,33 @@ fn filter_listen_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::expand_sql_preset;
+    use super::{ListenArgs, expand_sql_preset, first_filter_match_after};
+    use crate::db::HcomDb;
+
+    #[test]
+    fn listen_args_parse_durable_cursor() {
+        use clap::Parser;
+        let args =
+            ListenArgs::try_parse_from(["listen", "--sql", "type='status'", "--after-id", "42"])
+                .unwrap();
+        assert_eq!(args.after_id, Some(42));
+    }
+
+    #[test]
+    fn filtered_listen_uses_event_id_boundary() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("listen-cursor.db")).unwrap();
+        db.ensure_schema().unwrap();
+        let event_id = db
+            .log_event("status", "nova", &serde_json::json!({"status": "active"}))
+            .unwrap();
+
+        assert!(first_filter_match_after(&db, "type='status'", event_id).is_none());
+        assert_eq!(
+            first_filter_match_after(&db, "type='status'", event_id - 1).map(|matched| matched.0),
+            Some(event_id)
+        );
+    }
 
     #[test]
     fn stopped_sql_preset_expands_and_escapes_name() {

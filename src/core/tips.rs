@@ -26,7 +26,7 @@ pub fn get_tip(key: &str) -> Option<&'static str> {
         ),
         // Send-side
         "send:intent:request" => Some(
-            "[tip] intent=request: You signaled you expect a response. You'll be auto-notified if they end their turn or stop without responding. Safe to move on.",
+            "[tip] intent=request: You signaled you expect a result. You'll be auto-notified if they end their turn or stop without returning one. Safe to move on.",
         ),
         "send:intent:inform" => Some("[tip] intent=inform: You signaled no response needed."),
         "send:intent:ack" => {

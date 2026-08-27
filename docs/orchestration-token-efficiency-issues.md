@@ -70,27 +70,35 @@ Evidence: [`events_wait`](../src/commands/events.rs#L854) and its unread-message
 
 The implemented fix makes a filtered wait complete only on its declared condition. A future explicit inbox-interrupt option with a distinct return reason may still be useful.
 
-### 2. Waits use a time lookback instead of a durable cursor
+### 2. Waits use a time lookback instead of a durable cursor — working
 
-Event waiting uses a recent time window, which can replay old events or make repeated waits observe the same completion.
+Status: **Working as of 2026-08-27.** `hcom events --wait` and filtered `hcom listen` now use an event-ID boundary instead of a ten-second wall-clock lookback. A wait without `--after-id` captures the current last event and observes only future events. A caller that captures a boundary before launching work can pass `--after-id <ID>` to safely consume a result that arrived just before the waiter started. Explicit-cursor waits are strict and do not fall back to older unread inbox messages.
 
-Evidence: the lookback in [`events.rs`](../src/commands/events.rs#L804) and similar behavior in [`listen.rs`](../src/commands/listen.rs#L461).
+Regression coverage verifies that a completed match is not replayed by a new wait, an event after an explicit cursor is consumed, filtered listen applies the same boundary, and `events --after-id` requires wait mode. The focused event and listen suites and Clippy pass, and focused review approved the cursor semantics. The full parallel run passed 2,178 tests; two unrelated environment-sensitive hook-install tests failed there and passed immediately when rerun alone. One pre-existing unrelated transcript PATH test remains excluded.
 
-Add an event cursor such as `after_event_id`. Waiting and consumption should be idempotent and should not depend on wall-clock overlap.
+Previously, event waiting used a recent time window, which could replay old events or make repeated waits observe the same completion.
 
-### 3. An acknowledgement can satisfy a request watch
+Implementation: the cursor boundary in [`events.rs`](../src/commands/events.rs#L805) and the equivalent filtered-listen boundary in [`listen.rs`](../src/commands/listen.rs#L488).
 
-The bootstrap instructions say that an `ACK` confirms receipt but does not complete the task. Request-watch resolution, however, is based on the existence of a reply rather than the semantic kind of that reply.
+The implemented CLI spelling is `--after-id`. Waiting and consumption no longer depend on wall-clock overlap.
+
+### 3. An acknowledgement can satisfy a request watch — working
+
+Status: **Working as of 2026-08-27.** Request watches now treat `ack` and nested `request` messages as nonterminal. An `inform` reply, or a legacy reply with no intent, can complete the watch. The same intent rule is enforced in live flow/reply-ID cancellation, reply-existence checks, and the atomic delayed-grace sweep, so an ACK cannot resolve the watch through a secondary path.
+
+Regression coverage verifies end-to-end that ACK preserves a watch and a later result removes it, while the reply-existence path ignores both ACK and nested request intents. Request-watch notices now say that the worker did not return a result rather than incorrectly claiming it did not respond. The focused subscription suite and Clippy pass, and focused review approved the change. The broader-run caveats are the same as for issue 2 above.
+
+Previously, the bootstrap instructions said that an `ACK` confirms receipt but does not complete the task, while request-watch resolution was based on the existence of any reply.
 
 Evidence: the stated protocol in [`bootstrap.rs`](../src/bootstrap.rs#L117) and reply detection in [`subscriptions.rs`](../src/db/subscriptions.rs#L194).
 
-Represent at least these distinct states:
+The immediate protocol mismatch is fixed. A future durable workflow model should still represent at least these distinct states:
 
 ```text
 received -> accepted -> running -> succeeded | failed | blocked | cancelled
 ```
 
-Only a terminal task result should satisfy a completion watch.
+The current intent-based rule remains a compatibility bridge; explicit terminal task state is tracked separately by the lifecycle and workflow issues below.
 
 ### 4. Threaded requests can lose abandonment detection
 
