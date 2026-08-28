@@ -452,14 +452,38 @@ fn resolve_identity_with_expectation(
         }
     }
 
-    // 5. Transcript marker fallback (hook extension point)
+    // 5. Resolve wrapperless Codex hosts (for example the VS Code extension)
+    // from their thread/session binding. These processes cannot inherit an
+    // HCOM_PROCESS_ID, but Codex exports the same stable ID to tool commands.
+    if let Some(thread_id) = codex_thread_id.filter(|id| !id.is_empty())
+        && let Some(instance_name) = db
+            .get_session_binding(thread_id)
+            .map_err(|e| HcomError::DatabaseError(e.to_string()))?
+        && let Some(instance_data) = db
+            .get_instance(&instance_name)
+            .map_err(|e| HcomError::DatabaseError(e.to_string()))?
+    {
+        crate::log::log_info(
+            "identity",
+            "resolve",
+            &format!("method=codex_thread_id, name={instance_name}"),
+        );
+        return Ok(SenderIdentity {
+            kind: SenderKind::Instance,
+            name: instance_name,
+            session_id: Some(thread_id.to_string()),
+            instance_data: Some(instance_data),
+        });
+    }
+
+    // 6. Transcript marker fallback (hook extension point)
     if let Some(fallback) = transcript_fallback
         && let Some(identity) = fallback(db)
     {
         return Ok(identity);
     }
 
-    // 6. No identity
+    // 7. No identity
     if identity_expected {
         crate::log::log_warn(
             "identity",
@@ -736,6 +760,18 @@ mod tests {
             resolve_identity(&db, None, None, None, Some("pid-123"), None, None).unwrap();
         assert_eq!(identity.name, "luna");
         assert_eq!(identity.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn test_resolve_identity_codex_thread_without_process_binding() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "zero", Some("thread-vscode"), None);
+        insert_session_binding(&db, "thread-vscode", "zero");
+
+        let identity =
+            resolve_identity(&db, None, None, None, None, Some("thread-vscode"), None).unwrap();
+        assert_eq!(identity.name, "zero");
+        assert_eq!(identity.session_id.as_deref(), Some("thread-vscode"));
     }
 
     #[test]

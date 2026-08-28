@@ -31,7 +31,6 @@ use crate::shared::{ST_ACTIVE, ST_LISTENING};
 
 use super::common::SAFE_HCOM_COMMANDS;
 
-const HCOM_TRIGGER: &str = "<hcom>";
 const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     (
         "SessionStart",
@@ -96,6 +95,25 @@ const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
 const CODEX_APP_SERVER_STDERR_LIMIT: usize = 8192;
 type CodexHookHandler = fn(&HcomDb, &HcomContext, &HookPayload) -> HookResult;
+
+fn is_codex_vscode_host(ctx: &HcomContext) -> bool {
+    ctx.raw_env
+        .get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
+        .is_some_and(|originator| originator == "codex_vscode")
+}
+
+fn can_bootstrap_unmanaged_codex_session(
+    hook_name: &str,
+    ctx: &HcomContext,
+    payload: &HookPayload,
+) -> bool {
+    matches!(hook_name, "codex-sessionstart" | "codex-userpromptsubmit")
+        && is_codex_vscode_host(ctx)
+        && payload
+            .session_id
+            .as_deref()
+            .is_some_and(|session_id| !session_id.is_empty())
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CodexHookTrustEntry {
@@ -298,6 +316,167 @@ fn resolve_codex_instance(
     db.get_instance_full(&bound_name).ok().flatten()
 }
 
+/// Register a Codex session that was started outside `hcom` (for example by
+/// the VS Code extension). Native Codex hooks provide a stable session ID and
+/// transcript path even though no `HCOM_PROCESS_ID` can be inherited from a
+/// wrapper process.
+///
+/// This is intentionally called only from SessionStart and UserPromptSubmit:
+/// tool/stop hooks must never create a new identity as a side effect.
+fn adopt_unmanaged_codex_instance(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    payload: &HookPayload,
+) -> Option<InstanceRow> {
+    if !is_codex_vscode_host(ctx) {
+        return None;
+    }
+    let session_id = payload
+        .session_id
+        .as_deref()
+        .filter(|sid| !sid.is_empty())?;
+
+    // SessionStart and the first UserPromptSubmit can arrive in separate hook
+    // processes. Serialize the complete check/create/bind operation so they
+    // cannot mint two rows for the same extension session.
+    let lock_dir = db.path().parent()?.join(".tmp");
+    if let Err(error) = std::fs::create_dir_all(&lock_dir) {
+        log::log_warn(
+            "hooks",
+            "codex.adopt.lock_dir_failed",
+            &format!("session_id={session_id} err={error}"),
+        );
+        return None;
+    }
+    let lock_file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_dir.join("codex_adopt.lock"));
+    let lock_file = match lock_file {
+        Ok(file) => file,
+        Err(error) => {
+            log::log_warn(
+                "hooks",
+                "codex.adopt.lock_open_failed",
+                &format!("session_id={session_id} err={error}"),
+            );
+            return None;
+        }
+    };
+    if let Err(error) = crate::sys::fs::lock_exclusive(&lock_file) {
+        log::log_warn(
+            "hooks",
+            "codex.adopt.lock_failed",
+            &format!("session_id={session_id} err={error}"),
+        );
+        return None;
+    }
+
+    // A concurrent/repeated hook may have completed the binding after the
+    // caller's initial lookup. Recheck while holding the adoption lock.
+    if let Some(instance) = resolve_instance_codex(db, ctx, session_id) {
+        return Some(instance);
+    }
+
+    let transcript_path = payload
+        .transcript_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .map(normalize_codex_transcript_path)
+        .or_else(|| derive_codex_transcript_path(session_id));
+    let transcript_path = match transcript_path {
+        Some(path) => path,
+        None => {
+            log::log_warn(
+                "hooks",
+                "codex.adopt.transcript_missing",
+                &format!("session_id={session_id}"),
+            );
+            return None;
+        }
+    };
+    let cwd = payload
+        .raw
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .unwrap_or_else(|| ctx.cwd.to_str().unwrap_or(""));
+
+    let name = crate::instance_names::generate_unique_name(db).ok()?;
+    if let Err(error) = db.conn().execute_batch("BEGIN IMMEDIATE") {
+        log::log_error(
+            "hooks",
+            "codex.adopt.transaction_failed",
+            &format!("instance={name} session_id={session_id} err={error}"),
+        );
+        let _ = db.delete_instance(&name);
+        return None;
+    }
+
+    let adoption = (|| -> anyhow::Result<()> {
+        if !instance_binding::initialize_instance_in_position_file(
+            db,
+            &name,
+            Some(session_id),
+            None,
+            None,
+            None,
+            Some(&transcript_path),
+            Some("codex"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(cwd),
+        ) || db.get_instance_full(&name)?.is_none()
+        {
+            anyhow::bail!("instance initialization did not produce a row");
+        }
+        db.rebind_instance_session(&name, session_id)?;
+        if db.get_session_binding(session_id)?.as_deref() != Some(name.as_str()) {
+            anyhow::bail!("session binding verification failed");
+        }
+        Ok(())
+    })();
+
+    let adoption = adoption.and_then(|()| {
+        db.conn()
+            .execute_batch("COMMIT")
+            .map_err(anyhow::Error::from)
+    });
+    if let Err(error) = adoption {
+        let _ = db.conn().execute_batch("ROLLBACK");
+        let _ = db.delete_session_bindings_for_instance(&name);
+        let _ = db.delete_instance(&name);
+        log::log_error(
+            "hooks",
+            "codex.adopt.failed",
+            &format!("instance={name} session_id={session_id} err={error}"),
+        );
+        return None;
+    }
+    instance_binding::capture_and_store_launch_context(db, &name);
+    crate::relay::worker::ensure_worker(true);
+    common::notify_hook_instance_with_db(db, &name);
+    log::log_info(
+        "hooks",
+        "codex.adopt.success",
+        &format!("instance={name} session_id={session_id}"),
+    );
+    db.get_instance_full(&name).ok().flatten()
+}
+
+fn resolve_or_adopt_codex_instance(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    payload: &HookPayload,
+) -> Option<InstanceRow> {
+    resolve_codex_instance(db, ctx, payload)
+        .or_else(|| adopt_unmanaged_codex_instance(db, ctx, payload))
+}
+
 fn update_codex_position(
     db: &HcomDb,
     ctx: &HcomContext,
@@ -374,7 +553,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     };
 
     if instance_name.is_none() {
-        instance_name = resolve_codex_instance(db, ctx, payload).map(|i| i.name);
+        instance_name = resolve_or_adopt_codex_instance(db, ctx, payload).map(|i| i.name);
     }
 
     let instance_name = match instance_name {
@@ -392,7 +571,9 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         "start",
         Default::default(),
     );
-    crate::runtime_env::set_terminal_title(&instance_name);
+    if ctx.is_launched {
+        crate::runtime_env::set_terminal_title(&instance_name);
+    }
     crate::relay::worker::ensure_worker(true);
     common::notify_hook_instance_with_db(db, &instance_name);
 
@@ -402,28 +583,13 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
 }
 
 fn handle_userpromptsubmit(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let instance = match resolve_and_update_codex_instance(db, ctx, payload) {
+    let instance = match resolve_or_adopt_codex_instance(db, ctx, payload) {
         Some(instance) => instance,
         None => return hook_noop(),
     };
-
-    let prompt = payload
-        .raw
-        .get("prompt")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if prompt.trim() != HCOM_TRIGGER {
-        set_prompt_active(db, &instance.name);
-        return hook_noop();
-    }
-
-    if let Some(result) = prepare_codex_delivery(db, &instance.name) {
-        result
-    } else {
-        set_prompt_active(db, &instance.name);
-        hook_noop()
-    }
+    update_codex_position(db, ctx, payload, &instance.name);
+    set_prompt_active(db, &instance.name);
+    prepare_codex_delivery(db, &instance.name).unwrap_or_else(hook_noop)
 }
 
 fn handle_pretooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
@@ -553,11 +719,13 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
     };
 
     let ctx = HcomContext::from_os();
-    if !common::hook_gate_check(&ctx, &db) {
+    let payload = HookPayload::from_codex_native(codex_event_name(hook_name), raw);
+    let can_bootstrap_unmanaged_session =
+        can_bootstrap_unmanaged_codex_session(hook_name, &ctx, &payload);
+    if !common::hook_gate_check(&ctx, &db) && !can_bootstrap_unmanaged_session {
         return 0;
     }
 
-    let payload = HookPayload::from_codex_native(codex_event_name(hook_name), raw);
     let result = common::dispatch_with_panic_guard("codex", hook_name, hook_noop(), || {
         get_codex_handler(hook_name)
             .map(|handler| handler(&db, &ctx, &payload))
@@ -2665,6 +2833,35 @@ mod tests {
     use super::*;
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
+    use std::collections::HashMap;
+
+    fn unmanaged_codex_context(cwd: &Path) -> HcomContext {
+        HcomContext::from_env(
+            &HashMap::from([(
+                "CODEX_INTERNAL_ORIGINATOR_OVERRIDE".to_string(),
+                "codex_vscode".to_string(),
+            )]),
+            cwd.to_path_buf(),
+        )
+    }
+
+    fn unmanaged_codex_payload(
+        hook_name: &str,
+        session_id: &str,
+        transcript_path: &Path,
+        cwd: &Path,
+        prompt: Option<&str>,
+    ) -> HookPayload {
+        let mut raw = serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": transcript_path,
+            "cwd": cwd,
+        });
+        if let Some(prompt) = prompt {
+            raw["prompt"] = Value::String(prompt.to_string());
+        }
+        HookPayload::from_codex_native(hook_name, raw)
+    }
 
     #[test]
     fn test_hook_payload_factory_uses_native_fields() {
@@ -2677,6 +2874,133 @@ mod tests {
         );
         assert_eq!(payload.session_id.as_deref(), Some("sess-1"));
         assert_eq!(payload.hook_name, "UserPromptSubmit");
+    }
+
+    #[test]
+    fn test_only_start_and_prompt_hooks_can_bootstrap_unmanaged_session() {
+        let payload = HookPayload::from_codex_native(
+            "SessionStart",
+            serde_json::json!({ "session_id": "sess-vscode" }),
+        );
+        assert!(can_bootstrap_unmanaged_codex_session(
+            "codex-sessionstart",
+            &unmanaged_codex_context(Path::new("/workspace")),
+            &payload
+        ));
+        assert!(can_bootstrap_unmanaged_codex_session(
+            "codex-userpromptsubmit",
+            &unmanaged_codex_context(Path::new("/workspace")),
+            &payload
+        ));
+        assert!(!can_bootstrap_unmanaged_codex_session(
+            "codex-posttooluse",
+            &unmanaged_codex_context(Path::new("/workspace")),
+            &payload
+        ));
+
+        let terminal_ctx = HcomContext::from_env(&HashMap::new(), PathBuf::from("/workspace"));
+        assert!(!can_bootstrap_unmanaged_codex_session(
+            "codex-sessionstart",
+            &terminal_ctx,
+            &payload
+        ));
+
+        let missing_session = HookPayload::from_codex_native("SessionStart", serde_json::json!({}));
+        assert!(!can_bootstrap_unmanaged_codex_session(
+            "codex-sessionstart",
+            &unmanaged_codex_context(Path::new("/workspace")),
+            &missing_session
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn test_sessionstart_adopts_wrapperless_codex_session_once() {
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let transcript = home.join("rollout-sess-vscode.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let db = HcomDb::open().unwrap();
+        assert!(!common::hook_gate_check(
+            &unmanaged_codex_context(&workspace),
+            &db
+        ));
+
+        let payload =
+            unmanaged_codex_payload("SessionStart", "sess-vscode", &transcript, &workspace, None);
+        let ctx = unmanaged_codex_context(&workspace);
+        assert!(matches!(
+            handle_sessionstart(&db, &ctx, &payload),
+            HookResult::Allow { .. }
+        ));
+
+        let first = db.iter_instances_full().unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].session_id.as_deref(), Some("sess-vscode"));
+        assert_eq!(first[0].tool, "codex");
+        assert_eq!(first[0].directory, workspace.to_string_lossy());
+        assert_eq!(
+            first[0].transcript_path,
+            transcript.to_string_lossy().as_ref()
+        );
+
+        handle_sessionstart(&db, &ctx, &payload);
+        assert_eq!(db.iter_instances_full().unwrap().len(), 1);
+        assert_eq!(
+            db.get_session_binding("sess-vscode").unwrap().as_deref(),
+            Some(first[0].name.as_str())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_normal_prompt_adopts_session_and_delivers_pending_message() {
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let transcript = home.join("rollout-sess-prompt.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let db = HcomDb::open().unwrap();
+        let ctx = unmanaged_codex_context(&home);
+        let payload = unmanaged_codex_payload(
+            "UserPromptSubmit",
+            "sess-prompt",
+            &transcript,
+            &home,
+            Some("ordinary user prompt"),
+        );
+
+        // The first prompt creates the wrapperless identity.
+        assert!(matches!(
+            handle_userpromptsubmit(&db, &ctx, &payload),
+            HookResult::Allow { .. }
+        ));
+        let instance = db.iter_instances_full().unwrap().pop().unwrap();
+
+        let data = serde_json::json!({
+            "from": "peer",
+            "text": "hello from hcom",
+            "scope": "broadcast",
+        })
+        .to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-01-01T00:00:00Z', 'peer', ?1)",
+                rusqlite::params![data],
+            )
+            .unwrap();
+
+        let result = handle_userpromptsubmit(&db, &ctx, &payload);
+        match result {
+            HookResult::Allow {
+                additional_context: Some(context),
+                delivery_ack: Some(_),
+                ..
+            } => assert!(context.contains("hello from hcom")),
+            other => panic!("expected pending-message delivery, got {other:?}"),
+        }
+        assert_eq!(db.iter_instances_full().unwrap().len(), 1);
+        assert_eq!(instance.session_id.as_deref(), Some("sess-prompt"));
     }
 
     #[test]
