@@ -20,6 +20,8 @@ Rules:
 
 ### Fixed
 
+- Thread-routed requests now retain abandonment detection by creating durable
+  request watches for their delivered recipients.
 - Filtered `hcom listen` now returns a nonzero timeout result with structured
   JSON; `--timeout-ok` preserves the legacy exit code when explicitly needed.
 - Filtered waits perform a final event scan before timing out, so events in the

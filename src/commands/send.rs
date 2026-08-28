@@ -470,7 +470,6 @@ pub fn send_message(
         if env.intent.as_ref().map(|i| i.as_str()) == Some("request")
             && matches!(identity.kind, SenderKind::Instance)
             && delivery.effective_scope == MessageScope::Mentions
-            && !delivery.is_thread_resolved
         {
             create_request_watches(db, &identity.name, _event_id, &delivery.delivered_to);
         }
@@ -1614,6 +1613,7 @@ mod tests {
             session_id: None,
         };
         let envelope = MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Request),
             thread: Some("ops".into()),
             ..Default::default()
         };
@@ -1628,17 +1628,27 @@ mod tests {
         .unwrap();
         assert_eq!(delivered, vec!["nova".to_string()]);
         assert_eq!(db.get_thread_members("ops"), vec!["nova".to_string()]);
+        let reqwatch_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reqwatch_count, 0);
 
         cleanup_test_db(path);
     }
 
     #[test]
     #[serial]
-    fn send_message_thread_request_does_not_create_request_watch_rows() {
+    fn send_message_thread_request_creates_and_cancels_request_watch_rows() {
         let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
-                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                "INSERT INTO instances (name, created_at)
+                 VALUES ('luna', 1000.0), ('nova', 1000.0), ('miso', 1000.0)",
                 [],
             )
             .unwrap();
@@ -1658,7 +1668,7 @@ mod tests {
             &sender,
             "seed",
             Some(&seed_envelope),
-            Some(&["nova".to_string()]),
+            Some(&["nova".to_string(), "miso".to_string()]),
         )
         .unwrap();
 
@@ -1669,7 +1679,7 @@ mod tests {
         };
         let delivered =
             send_message(&db, &sender, "status?", Some(&request_envelope), None).unwrap();
-        assert_eq!(delivered, vec!["nova".to_string()]);
+        assert_eq!(delivered, vec!["nova".to_string(), "miso".to_string()]);
 
         let reqwatch_count: i64 = db
             .conn()
@@ -1679,7 +1689,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(reqwatch_count, 0);
+        assert_eq!(reqwatch_count, 2);
 
         let (scope, mentions_json): (String, String) = db
             .conn()
@@ -1695,6 +1705,49 @@ mod tests {
             .unwrap();
         assert_eq!(scope, "mentions");
         assert!(mentions_json.contains("nova"));
+
+        let responder = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "nova".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let reply_envelope = MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Inform),
+            thread: Some("ops".into()),
+            ..Default::default()
+        };
+        let delivered = send_message(&db, &responder, "done", Some(&reply_envelope), None).unwrap();
+        assert_eq!(delivered, vec!["luna".to_string(), "miso".to_string()]);
+
+        let reqwatch_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reqwatch_count, 1);
+
+        let responder = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "miso".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let delivered = send_message(&db, &responder, "done", Some(&reply_envelope), None).unwrap();
+        assert_eq!(delivered, vec!["luna".to_string(), "nova".to_string()]);
+
+        let reqwatch_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reqwatch_count, 0);
 
         cleanup_test_db(path);
     }

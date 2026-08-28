@@ -102,13 +102,29 @@ received -> accepted -> running -> succeeded | failed | blocked | cancelled
 
 The current intent-based rule remains a compatibility bridge; explicit terminal task state is tracked separately by the lifecycle and workflow issues below.
 
-### 4. Threaded requests can lose abandonment detection
+### 4. Threaded requests can lose abandonment detection — working
 
-Request watches are not created for some thread-routed requests. A request can therefore have a thread but no durable mechanism that detects abandonment or terminal completion.
+Status: **Working as of 2026-08-29.** Thread-routed requests now create the same
+per-recipient durable request watches as explicitly targeted requests. Routing
+through an existing thread no longer disables abandonment detection, while the
+existing sender-kind, request-intent, mentions-scope, and delivered-recipient
+guards remain intact.
 
-Evidence: request-watch creation in [`send.rs`](../src/commands/send.rs#L451) and the corresponding behavior documented by its test in [`send.rs`](../src/commands/send.rs#L1571).
+Regression coverage verifies that a threaded request creates its watch and that
+an `inform` reply on the thread cancels it. A hermetic live CLI run also showed
+the `reqwatch-*` subscription after the request and its removal after the reply.
 
-Track task completion by a stable task or workflow ID independently of the message-routing thread.
+Previously, request watches were not created for thread-routed requests. A
+request could therefore have a thread but no durable mechanism that detected
+abandonment or terminal completion.
+
+Implementation: request-watch creation in [`send.rs`](../src/commands/send.rs#L470)
+and its threaded request/reply regression test in
+[`send.rs`](../src/commands/send.rs#L1646).
+
+The immediate routing/watch coupling is fixed. Tracking task completion by a
+stable task or workflow ID independently of message routing remains the broader
+follow-up described by issue 10.
 
 ### 5. Agent activity is conflated with task state
 
