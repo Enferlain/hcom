@@ -151,7 +151,9 @@ In the observed session, a short-name send intended for `records-common-moto` re
 
 The send path now fails closed. Exact names and deliberately suffixed tag groups remain available, while broadcast is an explicit operation rather than the fallback for ambiguous syntax.
 
-### 34. An idle wait can be satisfied by the worker's own wait command
+### 34. An idle wait can be satisfied by the worker's own wait command — working
+
+Status: **Working as of 2026-08-29.** `--idle` is now a task-idle predicate rather than a textual alias for `status=listening`. It excludes `cmd:listen`, internal `filter-wait:*` bookkeeping, provider startup status, and orphan-recovery transport state, while genuine provider idle transitions continue to match. Ordinary and filtered waits invoked by an integrated AI tool no longer overwrite its provider-owned task status merely because the command is waiting on transport; ad-hoc participants retain their operational listening marker. Ambiguous combinations with `--agent`, `--status`, or `--blocked` fail clearly instead of creating an unsatisfiable wait. Unit and CLI regressions cover the negative transport-wait case and a positive provider-idle transition.
 
 Workers repeatedly called `hcom listen 5` or `hcom listen 10`. Those commands changed their status to `listening`, which caused the parent's `hcom listen --idle <worker>` to return even though the task was still active.
 
@@ -179,7 +181,9 @@ workflow_id + attempt_id + worker_session_id + result_kind
 
 Display names, recent messages, shared caller inboxes, or thread proximity remain insufficient correlation keys. Coordinators should capture the event cursor before launch, wait with `--result-from`, and clean up only the exact worker supplied to that correlated wait.
 
-### 41. Filtered-listen timeout is indistinguishable from success
+### 41. Filtered-listen timeout is indistinguishable from success — working
+
+Status: **Working as of 2026-08-29.** A filtered `hcom listen` now returns exit code `1` when no event matches before the timeout, while a match remains `0` and interruption remains `130`. JSON mode emits a structured `matched: false`, `reason: timeout`, notification, and requested/effective timeout durations instead of producing no result. A final event scan runs before the timeout decision so a match arriving during the last polling interval wins. Callers that intentionally rely on the legacy zero-on-timeout behavior can opt into it explicitly with `--timeout-ok`; the structured timeout payload is still emitted. Unit and hermetic CLI regressions cover the strict, compatibility, and final-interval paths.
 
 Filtered `hcom listen` currently exits with status `0` when its timeout expires without a match. A shell coordinator therefore cannot distinguish "condition matched" from "nothing happened" using the process result and may incorrectly advance a workflow.
 

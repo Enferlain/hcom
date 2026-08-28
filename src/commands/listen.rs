@@ -35,6 +35,9 @@ pub struct ListenArgs {
     /// Only match events with an ID greater than this cursor (filter mode only)
     #[arg(long)]
     pub after_id: Option<i64>,
+    /// Preserve the legacy zero exit code when a filtered wait times out
+    #[arg(long)]
+    pub timeout_ok: bool,
     /// Composable event filters
     #[command(flatten)]
     pub filters: EventFilterArgs,
@@ -126,7 +129,7 @@ fn expand_sql_preset(sql: &str) -> Result<String, &'static str> {
 
 /// Main entry point for `hcom listen` command.
 ///
-/// Returns exit code (0 = success, 1 = error, 130 = interrupted).
+/// Returns exit code (0 = success, 1 = timeout/error, 130 = interrupted).
 pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) -> i32 {
     let explicit_name = ctx.and_then(|c| c.explicit_name.as_deref());
 
@@ -174,6 +177,8 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
     } else {
         86400.0
     };
+
+    let requested_timeout = timeout;
 
     // Quick check mode
     if timeout <= 1.0 {
@@ -224,6 +229,10 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
         eprintln!("Error: --after-id requires --sql or an event filter");
         return 1;
     }
+    if args.timeout_ok && combined_sql.is_none() {
+        eprintln!("Error: --timeout-ok requires --sql or an event filter");
+        return 1;
+    }
 
     let instance_data = identity.instance_data.as_ref();
     if instance_data.is_none() {
@@ -241,25 +250,30 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
             filter,
             &instance_name,
             timeout,
+            requested_timeout,
             args.after_id,
+            args.timeout_ok,
             json_output,
             instance_data.unwrap(),
             &shutdown,
         );
     }
 
-    // Standard message-wait mode
-    // Mark as listening
-    set_status(
-        db,
-        &instance_name,
-        ST_LISTENING,
-        "ready",
-        StatusUpdate {
-            detail: "cmd:listen",
-            ..Default::default()
-        },
-    );
+    // An AI-tool command wait is transport state, not task-idle state. Ad-hoc
+    // participants have no provider hook to own their status, so retain the
+    // operational listening marker for them only.
+    if instance_data.unwrap().get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
+        set_status(
+            db,
+            &instance_name,
+            ST_LISTENING,
+            "ready",
+            StatusUpdate {
+                detail: "cmd:listen",
+                ..Default::default()
+            },
+        );
+    }
 
     let start_time = std::time::Instant::now();
 
@@ -305,19 +319,6 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
         &shutdown,
     );
 
-    // Cleanup: clear cmd:listen detail if still set
-    if let Ok(Some(current)) = db.get_instance_full(&instance_name)
-        && current.status_detail == "cmd:listen"
-    {
-        set_status(
-            db,
-            &instance_name,
-            ST_LISTENING,
-            "ready",
-            Default::default(),
-        );
-    }
-
     // Cleanup notify endpoint
     let _ = db.delete_notify_endpoint(&instance_name, "listen");
 
@@ -340,6 +341,15 @@ fn listen_loop(
         if shutdown.load(Ordering::Relaxed) {
             if !json_output {
                 eprintln!("\n[SIGTERM received, shutting down]");
+            }
+            if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
+                set_status(
+                    db,
+                    instance_name,
+                    ST_INACTIVE,
+                    "exit:interrupted",
+                    Default::default(),
+                );
             }
             return 130;
         }
@@ -495,6 +505,25 @@ fn print_filter_match(row: &FilterMatch, json_output: bool) {
     }
 }
 
+fn complete_filter_match(
+    db: &HcomDb,
+    row: &FilterMatch,
+    json_output: bool,
+    instance_name: &str,
+    instance_data: &serde_json::Value,
+) {
+    print_filter_match(row, json_output);
+    if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
+        set_status(
+            db,
+            instance_name,
+            ST_ACTIVE,
+            "filter matched",
+            Default::default(),
+        );
+    }
+}
+
 /// Listen directly for matching events without consuming the instance inbox.
 #[allow(clippy::too_many_arguments)]
 fn listen_with_filter(
@@ -502,7 +531,9 @@ fn listen_with_filter(
     sql_filter: &str,
     instance_name: &str,
     timeout: f64,
+    requested_timeout: f64,
     after_id: Option<i64>,
+    timeout_ok: bool,
     json_output: bool,
     instance_data: &serde_json::Value,
     shutdown: &AtomicBool,
@@ -521,14 +552,7 @@ fn listen_with_filter(
 
     match first_filter_match_after(db, sql_filter, start_id) {
         Ok(Some(row)) => {
-            print_filter_match(&row, json_output);
-            set_status(
-                db,
-                instance_name,
-                ST_ACTIVE,
-                "filter matched",
-                Default::default(),
-            );
+            complete_filter_match(db, &row, json_output, instance_name, instance_data);
             return 0;
         }
         Ok(None) => {}
@@ -547,13 +571,15 @@ fn listen_with_filter(
         crate::shared::time::now_epoch_i64(),
         FILTER_WAIT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
-    set_status(
-        db,
-        instance_name,
-        ST_LISTENING,
-        &status_context,
-        Default::default(),
-    );
+    if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
+        set_status(
+            db,
+            instance_name,
+            ST_LISTENING,
+            &status_context,
+            Default::default(),
+        );
+    }
 
     // The loop queries events_v directly, so unrelated inbox messages remain
     // unread and no temporary subscription notification is generated.
@@ -575,6 +601,8 @@ fn listen_with_filter(
         start_id,
         instance_name,
         timeout,
+        requested_timeout,
+        timeout_ok,
         json_output,
         instance_data,
         start_time,
@@ -593,6 +621,8 @@ fn filter_listen_loop(
     mut after_id: i64,
     instance_name: &str,
     timeout: f64,
+    requested_timeout: f64,
+    timeout_ok: bool,
     json_output: bool,
     instance_data: &serde_json::Value,
     start_time: std::time::Instant,
@@ -605,24 +635,16 @@ fn filter_listen_loop(
             if !json_output {
                 eprintln!("\n[SIGTERM received, shutting down]");
             }
-            return 130;
-        }
-
-        let elapsed = start_time.elapsed().as_secs_f64();
-        if elapsed >= timeout {
-            if !json_output {
-                eprintln!("\n[Timeout: no match after {timeout}s]");
-            }
             if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
                 set_status(
                     db,
                     instance_name,
                     ST_INACTIVE,
-                    "exit:timeout",
+                    "exit:interrupted",
                     Default::default(),
                 );
             }
-            return 0;
+            return 130;
         }
 
         // Check if stopped
@@ -636,14 +658,7 @@ fn filter_listen_loop(
         let scan_through = db.get_last_event_id();
         match first_filter_match_after(db, sql_filter, after_id) {
             Ok(Some(row)) => {
-                print_filter_match(&row, json_output);
-                set_status(
-                    db,
-                    instance_name,
-                    ST_ACTIVE,
-                    "filter matched",
-                    Default::default(),
-                );
+                complete_filter_match(db, &row, json_output, instance_name, instance_data);
                 return 0;
             }
             Ok(None) => after_id = scan_through,
@@ -651,6 +666,36 @@ fn filter_listen_loop(
                 eprintln!("Error querying filtered events: {e}");
                 return 1;
             }
+        }
+
+        // Scan before honoring the deadline so a cross-instance event that
+        // arrived during the final socket/poll interval cannot become a false
+        // timeout.
+        let elapsed = start_time.elapsed().as_secs_f64();
+        if elapsed >= timeout {
+            let notification = format!("[Timeout: no match after {timeout}s]");
+            if json_output {
+                let output = serde_json::json!({
+                    "matched": false,
+                    "reason": "timeout",
+                    "notification": notification,
+                    "timeout_seconds": requested_timeout,
+                    "effective_timeout_seconds": timeout,
+                });
+                println!("{}", serde_json::to_string(&output).unwrap_or_default());
+            } else {
+                eprintln!("\n{notification}");
+            }
+            if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
+                set_status(
+                    db,
+                    instance_name,
+                    ST_INACTIVE,
+                    "exit:timeout",
+                    Default::default(),
+                );
+            }
+            return i32::from(!timeout_ok);
         }
 
         update_heartbeat(db, instance_name);
@@ -679,7 +724,10 @@ fn filter_listen_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{ListenArgs, expand_sql_preset, filter_listen_loop, first_filter_match_after};
+    use super::{
+        ListenArgs, expand_sql_preset, filter_listen_loop, first_filter_match_after,
+        listen_with_filter,
+    };
     use crate::db::HcomDb;
     use crate::instance_lifecycle::set_status;
     use crate::shared::ST_LISTENING;
@@ -751,13 +799,146 @@ mod tests {
     }
 
     #[test]
+    fn integrated_filtered_wait_does_not_overwrite_provider_status() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("listen-provider-status.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances \
+                 (name, tool, status, status_context, status_detail, created_at) \
+                 VALUES ('alice', 'codex', 'active', 'tool:shell', 'working', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+
+        assert_eq!(
+            listen_with_filter(
+                &db,
+                "type='life'",
+                "alice",
+                0.01,
+                1.0,
+                Some(cursor),
+                false,
+                true,
+                &serde_json::json!({"tool": "codex"}),
+                &AtomicBool::new(false),
+            ),
+            1
+        );
+
+        let current = db.get_instance_full("alice").unwrap().unwrap();
+        assert_eq!(current.status, "active");
+        assert_eq!(current.status_context, "tool:shell");
+        assert_eq!(current.status_detail, "working");
+        assert_eq!(
+            db.get_last_event_id(),
+            cursor,
+            "an integrated transport wait must not emit task-status events"
+        );
+    }
+
+    #[test]
+    fn integrated_filtered_match_does_not_overwrite_provider_status() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("listen-provider-match.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances \
+                 (name, tool, status, status_context, status_detail, created_at) \
+                 VALUES ('alice', 'codex', 'active', 'tool:shell', 'working', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let match_id = db
+            .log_event("life", "nova", &serde_json::json!({"action": "stopped"}))
+            .unwrap();
+
+        assert_eq!(
+            listen_with_filter(
+                &db,
+                "type='life' AND instance='nova'",
+                "alice",
+                1.0,
+                1.0,
+                Some(cursor),
+                false,
+                true,
+                &serde_json::json!({"tool": "codex"}),
+                &AtomicBool::new(false),
+            ),
+            0
+        );
+
+        let current = db.get_instance_full("alice").unwrap().unwrap();
+        assert_eq!(current.status, "active");
+        assert_eq!(current.status_context, "tool:shell");
+        assert_eq!(current.status_detail, "working");
+        assert_eq!(db.get_last_event_id(), match_id);
+    }
+
+    #[test]
+    fn filtered_wait_scans_once_more_at_the_deadline() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("listen-final-scan.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES ('alice', 'codex', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            let mut writer_db = HcomDb::open_raw(&db_path).unwrap();
+            writer_db.ensure_schema().unwrap();
+            writer_db
+                .log_event(
+                    "status",
+                    "nova",
+                    &serde_json::json!({"status": "listening", "context": "turn:end"}),
+                )
+                .unwrap();
+        });
+
+        assert_eq!(
+            filter_listen_loop(
+                &db,
+                "type='status' AND instance='nova'",
+                cursor,
+                "alice",
+                0.1,
+                0.1,
+                false,
+                true,
+                &serde_json::json!({"tool": "codex"}),
+                std::time::Instant::now(),
+                None,
+                &AtomicBool::new(false),
+            ),
+            0,
+            "an event inside the final poll interval must beat timeout"
+        );
+        writer.join().unwrap();
+    }
+
+    #[test]
     fn filtered_listen_does_not_consume_unrelated_inbox_messages() {
         let temp = tempfile::TempDir::new().unwrap();
         let mut db = HcomDb::open_raw(&temp.path().join("listen-inbox.db")).unwrap();
         db.ensure_schema().unwrap();
         db.conn()
             .execute(
-                "INSERT INTO instances (name, tool, created_at) VALUES ('alice', 'codex', 1000.0)",
+                "INSERT INTO instances \
+                 (name, tool, status, status_context, status_detail, created_at) \
+                 VALUES ('alice', 'codex', 'active', 'before-match', 'working', 1000.0)",
                 [],
             )
             .unwrap();
@@ -797,6 +978,8 @@ mod tests {
                 unrelated_id,
                 "alice",
                 1.0,
+                1.0,
+                false,
                 true,
                 &instance_data,
                 std::time::Instant::now(),
@@ -813,7 +996,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(matched_context, "filter matched");
+        assert_eq!(matched_context, "before-match");
         set_status(
             &db,
             "alice",
@@ -828,13 +1011,15 @@ mod tests {
                 match_id,
                 "alice",
                 0.01,
+                0.01,
+                false,
                 true,
                 &instance_data,
                 std::time::Instant::now(),
                 None,
                 &shutdown,
             ),
-            0
+            1
         );
         let timeout_context: String = db
             .conn()
@@ -855,6 +1040,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last_event_id, 0, "filtered waits must leave inbox unread");
+    }
+
+    #[test]
+    fn filtered_listen_timeout_ok_preserves_legacy_success() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("listen-timeout-ok.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES ('alice', 'codex', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            filter_listen_loop(
+                &db,
+                "type='life'",
+                db.get_last_event_id(),
+                "alice",
+                0.01,
+                0.01,
+                true,
+                true,
+                &serde_json::json!({"tool": "codex"}),
+                std::time::Instant::now(),
+                None,
+                &AtomicBool::new(false),
+            ),
+            0
+        );
     }
 
     #[test]

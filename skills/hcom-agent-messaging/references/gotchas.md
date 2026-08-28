@@ -89,6 +89,11 @@ esac
 
 In scripts where you only care about success vs failure, `&& echo PASS || echo FAIL` is fine — exit codes 1 and 2 are both failures.
 
+Filtered `hcom listen` follows the same match/timeout distinction: **0** on
+match and **1** on timeout. With `--json`, a timeout returns a structured
+`{"matched":false,"reason":"timeout",...}` result. Add `--timeout-ok` only
+when preserving the legacy zero-on-timeout behavior is intentional.
+
 ## Agent Name Capture
 
 Names are random 4-letter CVCV words (luna, nemo, bali, kiwi, cora, etc.). Never hardcode them. Always parse from launch output:

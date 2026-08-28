@@ -11,6 +11,20 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
+## [2026-08-29]
+
+### Changed
+
+- `--idle` now ignores transport, startup, and orphan-recovery wait states and
+  matches genuine task-idle transitions.
+
+### Fixed
+
+- Filtered `hcom listen` now returns a nonzero timeout result with structured
+  JSON; `--timeout-ok` preserves the legacy exit code when explicitly needed.
+- Filtered waits perform a final event scan before timing out, so events in the
+  last polling interval are not reported as false timeouts.
+
 ## [2026-08-28]
 
 ### Added

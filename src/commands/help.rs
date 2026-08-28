@@ -71,7 +71,7 @@ const EVENTS_HELP: &[HelpEntry] = &[
 const EVENTS_HELP_2: &[HelpEntry] = &[
     ("", ""),
     ("Shortcuts:", ""),
-    ("  --idle NAME", "--agent NAME --status listening"),
+    ("  --idle NAME", "Wait for a task-idle transition"),
     ("  --blocked NAME", "--agent NAME --status blocked"),
     ("", ""),
     ("Wait for a launch batch:", ""),
@@ -424,6 +424,10 @@ const LISTEN_HELP: &[HelpEntry] = &[
     ("listen [timeout]", "Block until message arrives"),
     ("  [timeout]", "Timeout in seconds (alias for --timeout)"),
     ("  --timeout N", "Timeout in seconds (default: 86400)"),
+    (
+        "  --timeout-ok",
+        "Return 0 on filtered timeout (legacy compatibility)",
+    ),
     ("  --json", "Output messages as JSON"),
     ("", ""),
     ("Filter flags:", ""),
@@ -442,7 +446,7 @@ const LISTEN_HELP: &[HelpEntry] = &[
         "Only match events after this durable cursor (filter mode only)",
     ),
     ("  --sql stopped:name", "Preset: wait for agent to stop"),
-    ("  --idle NAME", "Shortcut: wait for agent to go idle"),
+    ("  --idle NAME", "Wait for a genuine task-idle transition"),
     ("", ""),
     ("Exit codes:", ""),
     ("  0", "Message received / event matched"),

@@ -91,6 +91,122 @@ fn events_empty_in_fresh_dir() {
 }
 
 #[test]
+fn filtered_listen_timeout_is_structured_and_nonzero() {
+    let h = Hcom::new();
+    let me = h.start();
+
+    let (code, stdout, stderr) = h.run([
+        "listen",
+        "--name",
+        &me,
+        "--timeout",
+        "1",
+        "--json",
+        "--type",
+        "life",
+    ]);
+    assert_eq!(code, 1, "stderr={stderr}; stdout={stdout}");
+    let timeout: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("timeout JSON: {error}; stdout={stdout}"));
+    assert_eq!(timeout["matched"].as_bool(), Some(false));
+    assert_eq!(timeout["reason"].as_str(), Some("timeout"));
+    assert_eq!(timeout["timeout_seconds"].as_f64(), Some(1.0));
+    assert_eq!(timeout["effective_timeout_seconds"].as_f64(), Some(0.1));
+
+    let (invalid_code, _, invalid_stderr) = h.run(["listen", "--name", &me, "--timeout-ok", "1"]);
+    assert_eq!(invalid_code, 1);
+    assert!(invalid_stderr.contains("--timeout-ok requires"));
+
+    let (compat_code, compat_stdout, compat_stderr) = h.run([
+        "listen",
+        "--name",
+        &me,
+        "--timeout",
+        "1",
+        "--timeout-ok",
+        "--json",
+        "--type",
+        "life",
+    ]);
+    assert_eq!(
+        compat_code, 0,
+        "stderr={compat_stderr}; stdout={compat_stdout}"
+    );
+    let compat: serde_json::Value = serde_json::from_str(compat_stdout.trim())
+        .unwrap_or_else(|error| panic!("compat timeout JSON: {error}; stdout={compat_stdout}"));
+    assert_eq!(compat["matched"].as_bool(), Some(false));
+    assert_eq!(compat["reason"].as_str(), Some("timeout"));
+}
+
+#[test]
+fn idle_wait_ignores_transport_listen_but_accepts_provider_idle() {
+    let h = Hcom::new();
+    let worker = h.start();
+
+    let (active_code, _, active_stderr) = h.run([
+        "pi-status",
+        "--name",
+        &worker,
+        "--status",
+        "active",
+        "--context",
+        "prompt",
+        "--detail",
+        "working",
+    ]);
+    assert_eq!(active_code, 0, "stderr={active_stderr}");
+
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+
+    let (listen_code, _, listen_err) = h.run(["listen", "--name", &worker, "1"]);
+    assert_eq!(listen_code, 0, "stderr={listen_err}");
+
+    let (transport_code, transport_out, transport_err) = h.run([
+        "events",
+        "--wait",
+        "1",
+        "--after-id",
+        &cursor,
+        "--idle",
+        &worker,
+    ]);
+    assert_eq!(
+        transport_code, 1,
+        "transport wait must not look task-idle: stderr={transport_err}; stdout={transport_out}"
+    );
+
+    let (idle_cursor_code, idle_cursor_out, idle_cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(idle_cursor_code, 0, "stderr={idle_cursor_err}");
+    let idle_cursor = idle_cursor_out.trim().to_string();
+    let (idle_code, _, idle_stderr) = h.run([
+        "pi-status",
+        "--name",
+        &worker,
+        "--status",
+        "listening",
+        "--context",
+        "turn:end",
+    ]);
+    assert_eq!(idle_code, 0, "stderr={idle_stderr}");
+
+    let (matched_code, matched_out, matched_err) = h.run([
+        "events",
+        "--wait",
+        "1",
+        "--after-id",
+        &idle_cursor,
+        "--idle",
+        &worker,
+    ]);
+    assert_eq!(
+        matched_code, 0,
+        "genuine provider idle must match: stderr={matched_err}; stdout={matched_out}"
+    );
+}
+
+#[test]
 fn send_without_identity_errors_with_hint() {
     let h = Hcom::new();
     let (code, _stdout, stderr) = h.run(["send", "@nobody", "--", "hi"]);
