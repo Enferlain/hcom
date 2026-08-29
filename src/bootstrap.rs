@@ -602,11 +602,9 @@ mod tests {
         let result = get_scripts(tmp.path());
         // Should list all bundled scripts
         assert!(result.starts_with("Scripts: "));
-        assert!(result.contains("agy"));
         assert!(result.contains("confess"));
         assert!(result.contains("debate"));
         assert!(result.contains("fatcow"));
-        assert!(result.contains("glm"));
     }
 
     #[test]

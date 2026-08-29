@@ -17,11 +17,8 @@ Rules:
 
 - `--idle` now ignores transport, startup, and orphan-recovery wait states and
   matches genuine task-idle transitions.
-- The deterministic single-worker `agy` and `glm` workflows are now bundled in
-  the hcom binary; user scripts with the same names remain supported overrides.
 - Direct Antigravity callers can compose a pre-launch cursor, raw launch, and
-  one generation-aware blocking result wait without repeated status polling;
-  the bundled workflow additionally owns parsing, recovery, and cleanup.
+  one generation-aware blocking result wait without repeated status polling.
 
 ### Fixed
 
@@ -36,20 +33,18 @@ Rules:
   authoritative without overwriting active task state, preventing workers that
   have begun execution from later being reported as launch-blocked. Later
   approval prompts remain task-level blockers rather than launch failures.
-- The bundled `hcom run agy` and `hcom run glm` workflows capture
-  their result cursors before launch and correlate completion by exact worker
-  generation and thread, preventing fast reports sent during readiness handling
-  from being missed.
-- The bundled Antigravity workflow now instructs completion reports and its
-  idle retry to use the coordinator's `hcom` command, reducing mixed-version
-  reports that lack generation metadata; its heartbeat also counts current
-  Antigravity transcript tool calls correctly.
 - Thread-routed requests now retain abandonment detection by creating durable
   request watches for their delivered recipients.
 - Filtered `hcom listen` now returns a nonzero timeout result with structured
   JSON; `--timeout-ok` preserves the legacy exit code when explicitly needed.
 - Filtered waits perform a final event scan before timing out, so events in the
   last polling interval are not reported as false timeouts.
+
+### Removed
+
+- `agy` and `glm` are no longer shipped as built-in workflows. Existing
+  `~/.hcom/scripts/agy.sh` and `glm.sh` files continue to run as user-created
+  workflows.
 
 ## [2026-08-28]
 

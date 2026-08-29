@@ -27,7 +27,7 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 ### Status overview
 
 - **Working:** 1, 2, 3, 4, 33, 34, 35, 39, 40, and 41.
-- **Substantially addressed:** 30, with the remaining native-workflow follow-up
+- **Partially addressed:** 30, with the remaining native-workflow follow-up
   tracked by issues 8 and 28.
 - **Partially mitigated:** 15; provider-native workspace trust is not an hcom
   policy decision.
@@ -384,10 +384,10 @@ placeholder stops, and reused display names cannot complete the wait.
 Recovered output uses the normal message-shaped result with explicit
 `transcript_recovery` provenance, provider, evidence kind, session, transcript,
 and attempt cursor. A supported stopped worker with no authoritative result
-fails explicitly instead of becoming a heartbeat or timeout loop. The bundled
-`agy` and `glm` workflows both capture the cursor before launch and use the same
-`--result-from` contract; the obsolete Antigravity-only shell parser was
-removed. Same-named scripts in `~/.hcom/scripts` remain explicit user overrides.
+fails explicitly instead of becoming a heartbeat or timeout loop. The tested
+user-created `agy` and `glm` workflows both capture the cursor before launch
+and use the same `--result-from` contract; the obsolete Antigravity-only shell
+parser was removed.
 Provider-adapter, correlation, stopped-worker recovery, syntax, and focused
 event tests pass. The workflow also instructs workers to use the coordinator's
 `hcom` command rather than a separately resolved `uvx hcom`, preventing an
@@ -399,7 +399,7 @@ The equivalent direct workflow—pre-launch cursor, raw `hcom 1 agy`, and one
 blocking `hcom events --result-from` wait—returned the exact generation-tagged
 report in 9.5 seconds without polling, terminal inspection, or manual input,
 then cleaned up successfully. This verifies the underlying primitives as well
-as the bundled coordinator; raw callers still own launch parsing and cleanup.
+as the user-workflow coordinator; raw callers still own launch parsing and cleanup.
 The Claude-hosted GLM end-to-end path remains gated by the separate native
 workspace-trust issue, but its transcript format and wrapper contract are
 covered hermetically.
@@ -512,12 +512,12 @@ Wake only intended recipients and any explicitly registered coordinator.
 
 Local scripts can contain important result extraction, retry, and readiness behavior that is neither portable nor tested with hcom. Move the generic state machine into the Rust application and keep provider-specific recognition in small adapters.
 
-Status: **Substantially addressed by issue 40.** Result correlation and
-provider-specific stopped-transcript recovery live in versioned Rust code, and
-the deterministic Antigravity and GLM launch/wait/heartbeat/cleanup workflows
-are repository-bundled scripts. The remaining step is to move the generic
-single-worker state machine from shell into a native workflow command while
-retaining provider-specific policy and launch arguments in small adapters.
+Status: **Partially addressed by issue 40.** Result correlation and
+provider-specific stopped-transcript recovery live in versioned Rust code. The
+deterministic Antigravity and GLM launch/wait/heartbeat/cleanup workflows remain
+user-created scripts under `~/.hcom/scripts/`. The remaining step is to move the
+generic single-worker state machine from shell into a native workflow command
+while retaining provider-specific policy and launch arguments in small adapters.
 
 ### 31. Heartbeats can still pollute the parent context
 

@@ -75,11 +75,9 @@ pub struct RunArgs {
 /// Bundled script agent descriptions.
 fn bundled_agent_desc(name: &str) -> &'static str {
     match name {
-        "agy" => "1 agent",
         "confess" => "3 agents",
         "debate" => "2+ agents",
         "fatcow" => "1 agent",
-        "glm" => "1 agent",
         _ => "",
     }
 }
@@ -487,7 +485,7 @@ const SCRIPT_GUIDE: &str = r#"# Creating Custom Scripts
   User scripts:    ~/.hcom/scripts/
   File types:      *.sh (bash), *.py (Python 3)
 
-*.sh scripts (including the bundled agy/confess/debate/fatcow/glm workflows) run via
+*.sh scripts (including the bundled confess/debate/fatcow workflows) run via
 `bash`. On Windows, install Git Bash (already a common dependency for
 Windows dev setups, including npm-installed AI CLIs) so `bash` is on PATH.
 Python scripts use `PYTHON` when set; otherwise Windows tries `python`, then
@@ -668,21 +666,17 @@ mod tests {
 
     #[test]
     fn test_bundled_agent_desc() {
-        assert_eq!(bundled_agent_desc("agy"), "1 agent");
         assert_eq!(bundled_agent_desc("confess"), "3 agents");
-        assert_eq!(bundled_agent_desc("glm"), "1 agent");
         assert_eq!(bundled_agent_desc("unknown"), "");
     }
 
     #[test]
     fn test_embedded_scripts_available() {
-        assert_eq!(scripts::SCRIPTS.len(), 5);
+        assert_eq!(scripts::SCRIPTS.len(), 3);
         let names: Vec<&str> = scripts::SCRIPTS.iter().map(|(n, _)| *n).collect();
-        assert!(names.contains(&"agy"));
         assert!(names.contains(&"confess"));
         assert!(names.contains(&"debate"));
         assert!(names.contains(&"fatcow"));
-        assert!(names.contains(&"glm"));
     }
 
     #[test]
@@ -693,28 +687,6 @@ mod tests {
             assert!(
                 !desc.is_empty(),
                 "Bundled script '{name}' should have a description comment"
-            );
-        }
-    }
-
-    #[test]
-    fn bundled_provider_workflows_use_the_exact_result_contract() {
-        for name in ["agy", "glm"] {
-            let content = scripts::SCRIPTS
-                .iter()
-                .find_map(|(script_name, content)| (*script_name == name).then_some(*content))
-                .unwrap();
-            assert!(content.contains("hcom events --cursor"));
-            assert!(content.contains("--result-from \"$worker\""));
-            assert!(content.contains("trap cleanup ERR"));
-            assert!(content.contains("cleanup; exit 130"));
-            assert!(content.contains("cleanup; exit 143"));
-            assert!(content.contains("hcom kill \"$name\""));
-            assert!(content.contains("(not participating)"));
-            assert!(!content.contains("realpath"));
-            assert!(
-                !content.contains("/home/imi"),
-                "bundled workflow '{name}' must not contain a developer-specific path"
             );
         }
     }
