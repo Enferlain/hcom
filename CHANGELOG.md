@@ -20,6 +20,13 @@ Rules:
 
 ### Fixed
 
+- Launch readiness now treats provider-owned turn and tool activity as
+  authoritative without overwriting active task state, preventing workers that
+  have begun execution from later being reported as launch-blocked. Later
+  approval prompts remain task-level blockers rather than launch failures.
+- The local standalone `hcom run agy` workflow now captures its result cursor
+  before launch and correlates completion by exact worker generation and thread,
+  preventing fast reports sent during readiness handling from being missed.
 - Thread-routed requests now retain abandonment detection by creating durable
   request watches for their delivered recipients.
 - Filtered `hcom listen` now returns a nonzero timeout result with structured

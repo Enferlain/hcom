@@ -931,6 +931,68 @@ impl LaunchOutcome {
     }
 }
 
+#[derive(Clone, Copy)]
+struct LaunchActivityScope<'a> {
+    after_event_id: i64,
+    status_owner: &'a str,
+}
+
+impl<'a> LaunchActivityScope<'a> {
+    fn new(after_event_id: i64, status_owner: &'a str) -> Self {
+        Self {
+            after_event_id,
+            status_owner,
+        }
+    }
+}
+
+/// Return true when provider lifecycle state proves this launch executed.
+fn provider_activity_observed(
+    db: &HcomDb,
+    current_name: &str,
+    current_status: &str,
+    scope: &LaunchActivityScope<'_>,
+) -> bool {
+    // The loop reset this exact row to listening at startup, so a later active
+    // value is fresh. After a mid-loop canonical rebind, require the bounded
+    // event path below instead of trusting a possibly stale row value.
+    if current_status == ST_ACTIVE && current_name == scope.status_owner {
+        return true;
+    }
+    if current_status != ST_ACTIVE && current_status != ST_LISTENING && current_status != ST_BLOCKED
+    {
+        return false;
+    }
+
+    // A fast turn can enter and leave active between delivery-loop reads. Status
+    // events retain that evidence. Scope it to both the bound provider session
+    // and this delivery-loop attempt so neither display-name reuse nor a
+    // same-session resume can inherit an earlier generation's activity.
+    let Some(session_id) = db
+        .get_instance_full(current_name)
+        .ok()
+        .flatten()
+        .and_then(|instance| instance.session_id)
+    else {
+        return false;
+    };
+    db.conn()
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM events
+                WHERE type = 'status'
+                  AND instance = ?1
+                  AND json_extract(data, '$.session') = ?2
+                  AND json_extract(data, '$.new_status') = 'active'
+                  AND id > ?3
+            )",
+            rusqlite::params![current_name, session_id, scope.after_event_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|found| found != 0)
+        .unwrap_or(false)
+}
+
 /// Drive the launch-outcome state machine for one tick.
 ///
 /// - Pending: emit Ready if screen is good, else maybe emit Blocked.
@@ -942,13 +1004,27 @@ fn drive_launch_outcome(
     state: &DeliveryState,
     current_name: &str,
     current_status: &str,
+    activity_scope: &LaunchActivityScope<'_>,
     config: &ToolConfig,
     launch_outcome: &mut LaunchOutcome,
 ) {
+    // Provider hooks set the instance active only after a turn or tool has
+    // actually begun. That is stronger launch evidence than a lagging or stale
+    // screen scrape, and prevents a fast completed turn from being classified
+    // as launch_blocked when the terminal later settles on provider chrome.
     match *launch_outcome {
         LaunchOutcome::Pending => {
-            if launch_ready_observed(db, current_name, config, state) {
-                emit_launch_ready_once(db, state, current_name, launch_outcome);
+            let provider_activity =
+                provider_activity_observed(db, current_name, current_status, activity_scope);
+            if provider_activity || launch_ready_observed(db, current_name, config, state) {
+                emit_launch_ready_once(
+                    db,
+                    state,
+                    current_name,
+                    current_status,
+                    launch_outcome,
+                    provider_activity,
+                );
             } else {
                 maybe_emit_launch_blocked(
                     db,
@@ -961,8 +1037,17 @@ fn drive_launch_outcome(
             }
         }
         LaunchOutcome::Blocked => {
-            if launch_ready_observed(db, current_name, config, state) {
-                emit_launch_ready_once(db, state, current_name, launch_outcome);
+            let provider_activity =
+                provider_activity_observed(db, current_name, current_status, activity_scope);
+            if provider_activity || launch_ready_observed(db, current_name, config, state) {
+                emit_launch_ready_once(
+                    db,
+                    state,
+                    current_name,
+                    current_status,
+                    launch_outcome,
+                    provider_activity,
+                );
             }
         }
         LaunchOutcome::Ready | LaunchOutcome::Failed => {}
@@ -1250,7 +1335,9 @@ fn emit_launch_ready_once(
     db: &HcomDb,
     state: &DeliveryState,
     current_name: &str,
+    current_status: &str,
     outcome: &mut LaunchOutcome,
+    provider_activity: bool,
 ) {
     // Allow Pending → Ready (first readiness) and Blocked → Ready (recovery,
     // e.g. user accepted agy's trust-folder prompt after launch_blocked fired).
@@ -1259,20 +1346,35 @@ fn emit_launch_ready_once(
     if !outcome.is_pending() && !was_blocked {
         return;
     }
-    let context = if was_blocked {
-        "launch_blocked_cleared"
-    } else {
-        "ready_observed"
+    let context = match (was_blocked, provider_activity) {
+        (true, true) => "launch_blocked_cleared_by_provider_activity",
+        (true, false) => "launch_blocked_cleared",
+        (false, true) => "provider_activity",
+        (false, false) => "ready_observed",
     };
-    if let Err(e) = db.set_status(current_name, ST_LISTENING, context) {
-        log_warn(
-            "native",
-            "delivery.launch_ready_status_fail",
-            &format!("Failed to mark launch ready for {}: {}", current_name, e),
-        );
-        return;
-    }
-    if let Err(e) = db.emit_ready_event(current_name, ST_LISTENING, context) {
+    let current_block_is_launch_blocked = current_status == ST_BLOCKED
+        && db
+            .get_instance_full(current_name)
+            .ok()
+            .flatten()
+            .is_some_and(|instance| instance.status_context == "launch_blocked");
+    let ready_status = if provider_activity && !current_block_is_launch_blocked {
+        // Do not overwrite the provider-owned task state merely to record
+        // launch readiness. A durable activity event may now be followed by
+        // listening, so preserve whichever provider state the loop observed.
+        current_status
+    } else {
+        if let Err(e) = db.set_status(current_name, ST_LISTENING, context) {
+            log_warn(
+                "native",
+                "delivery.launch_ready_status_fail",
+                &format!("Failed to mark launch ready for {}: {}", current_name, e),
+            );
+            return;
+        }
+        ST_LISTENING
+    };
+    if let Err(e) = db.emit_ready_event(current_name, ready_status, context) {
         log_warn(
             "native",
             "delivery.launch_ready_event_fail",
@@ -1565,6 +1667,10 @@ pub fn run_delivery_loop(
     shared_status: Option<Arc<std::sync::RwLock<String>>>,
     title_wake: Option<TitleWake>,
 ) {
+    // Bound durable provider-activity evidence to this delivery attempt. The
+    // delivery thread starts before provider hooks, so subsequent active events
+    // belong to this launch even when a resume reuses the same name and session.
+    let launch_activity_after_id = db.get_last_event_id();
     // Resolve authoritative instance name from process binding.
     // The instance_name parameter is a fallback - the binding is the source of truth
     // because it can change (e.g., Claude session resume switches to canonical instance).
@@ -1610,6 +1716,9 @@ pub fn run_delivery_loop(
             &format!("Failed to set initial status: {}", e),
         );
     }
+    let launch_status_owner = current_name.clone();
+    let launch_activity_scope =
+        LaunchActivityScope::new(launch_activity_after_id, &launch_status_owner);
 
     // Set tcp_mode flag to indicate native PTY is handling delivery.
     // Also re-asserted on every heartbeat (self-heals after DB reset/instance recreation).
@@ -1678,6 +1787,7 @@ pub fn run_delivery_loop(
                 state,
                 &current_name,
                 &current_status,
+                &launch_activity_scope,
                 config,
                 &mut launch_outcome,
             );
@@ -1774,6 +1884,7 @@ pub fn run_delivery_loop(
                 state,
                 &current_name,
                 &current_status,
+                &launch_activity_scope,
                 config,
                 &mut launch_outcome,
             );
@@ -3134,6 +3245,362 @@ mod tests {
             &ToolConfig::for_tool(crate::tool::Tool::Copilot),
             &state
         ));
+    }
+
+    #[test]
+    fn provider_activity_finalizes_launch_without_overwriting_task_state() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                    (name, tool, status, status_context, status_detail, created_at)
+                 VALUES
+                    ('naga', 'antigravity', 'active', 'tool:run_command',
+                     'cargo metadata --no-deps', 1)",
+                [],
+            )
+            .unwrap();
+
+        // Recreate the observed contradiction: provider hooks prove execution,
+        // while the terminal scraper still sees neither a ready/empty prompt
+        // nor an approval-free screen.
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.prompt_empty = false;
+        screen.approval = true;
+        let state = make_state(screen, 500);
+        let mut outcome = LaunchOutcome::Pending;
+
+        drive_launch_outcome(
+            &db,
+            &state,
+            "naga",
+            ST_ACTIVE,
+            &LaunchActivityScope::new(0, "naga"),
+            &ToolConfig::for_tool(crate::tool::Tool::Antigravity),
+            &mut outcome,
+        );
+
+        assert_eq!(outcome, LaunchOutcome::Ready);
+        let instance = db.get_instance_full("naga").unwrap().unwrap();
+        assert_eq!(instance.status, ST_ACTIVE);
+        assert_eq!(instance.status_context, "tool:run_command");
+        assert_eq!(instance.status_detail, "cargo metadata --no-deps");
+
+        let ready: (String, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT
+                    json_extract(data, '$.action'),
+                    json_extract(data, '$.status'),
+                    json_extract(data, '$.context')
+                 FROM events
+                 WHERE type = 'life' AND instance = 'naga'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            ready,
+            ("ready".into(), ST_ACTIVE.into(), "provider_activity".into())
+        );
+    }
+
+    #[test]
+    fn provider_activity_recovers_a_previously_blocked_launch() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                    (name, tool, session_id, status, status_context, created_at)
+                 VALUES
+                    ('hira', 'antigravity', 'session-recovered', 'blocked',
+                     'launch_blocked', 1)",
+                [],
+            )
+            .unwrap();
+        let activity_after_id = db.get_last_event_id();
+        let active = serde_json::json!({
+            "status": "active",
+            "new_status": "active",
+            "context": "tool:view_file",
+            "session": "session-recovered",
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('status', '2026-08-29T00:00:00Z', 'hira', ?1)",
+                rusqlite::params![active.to_string()],
+            )
+            .unwrap();
+
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.prompt_empty = false;
+        let state = make_state(screen, 500);
+        let mut outcome = LaunchOutcome::Blocked;
+
+        drive_launch_outcome(
+            &db,
+            &state,
+            "hira",
+            ST_BLOCKED,
+            &LaunchActivityScope::new(activity_after_id, "hira"),
+            &ToolConfig::for_tool(crate::tool::Tool::Antigravity),
+            &mut outcome,
+        );
+
+        assert_eq!(outcome, LaunchOutcome::Ready);
+        let instance = db.get_instance_full("hira").unwrap().unwrap();
+        assert_eq!(instance.status, ST_LISTENING);
+        assert_eq!(
+            instance.status_context,
+            "launch_blocked_cleared_by_provider_activity"
+        );
+        let context: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.context')
+                 FROM events
+                 WHERE type = 'life' AND instance = 'hira'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(context, "launch_blocked_cleared_by_provider_activity");
+    }
+
+    #[test]
+    fn durable_session_activity_closes_the_fast_turn_observation_race() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                    (name, tool, session_id, status, status_context, created_at)
+                 VALUES
+                    ('zeno', 'antigravity', 'session-fast', 'listening', '', 1)",
+                [],
+            )
+            .unwrap();
+        let active = serde_json::json!({
+            "status": "active",
+            "new_status": "active",
+            "context": "tool:view_file",
+            "session": "session-fast",
+        });
+        let activity_after_id = db.get_last_event_id();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('status', '2026-08-29T00:00:00Z', 'zeno', ?1)",
+                rusqlite::params![active.to_string()],
+            )
+            .unwrap();
+
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.prompt_empty = false;
+        let state = make_state(screen, 500);
+        let mut outcome = LaunchOutcome::Pending;
+
+        drive_launch_outcome(
+            &db,
+            &state,
+            "zeno",
+            ST_LISTENING,
+            &LaunchActivityScope::new(activity_after_id, "zeno"),
+            &ToolConfig::for_tool(crate::tool::Tool::Antigravity),
+            &mut outcome,
+        );
+
+        assert_eq!(outcome, LaunchOutcome::Ready);
+        let instance = db.get_instance_full("zeno").unwrap().unwrap();
+        assert_eq!(instance.status, ST_LISTENING);
+        assert_eq!(instance.status_context, "");
+    }
+
+    #[test]
+    fn durable_activity_does_not_cross_attempt_or_session_boundaries() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                    (name, tool, session_id, status, status_context, created_at)
+                 VALUES
+                    ('miso', 'antigravity', 'session-current', 'listening', '', 2)",
+                [],
+            )
+            .unwrap();
+        let old = serde_json::json!({
+            "status": "active",
+            "new_status": "active",
+            "context": "tool:view_file",
+            "session": "session-current",
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('status', '2026-08-28T00:00:00Z', 'miso', ?1)",
+                rusqlite::params![old.to_string()],
+            )
+            .unwrap();
+        let activity_after_id = db.get_last_event_id();
+        let other_session = serde_json::json!({
+            "status": "active",
+            "new_status": "active",
+            "context": "tool:run_command",
+            "session": "session-other",
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('status', '2026-08-29T00:00:00Z', 'miso', ?1)",
+                rusqlite::params![other_session.to_string()],
+            )
+            .unwrap();
+
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.prompt_empty = false;
+        let state = make_state(screen, 500);
+        let mut outcome = LaunchOutcome::Pending;
+        drive_launch_outcome(
+            &db,
+            &state,
+            "miso",
+            ST_LISTENING,
+            &LaunchActivityScope::new(activity_after_id, "miso"),
+            &ToolConfig::for_tool(crate::tool::Tool::Antigravity),
+            &mut outcome,
+        );
+
+        assert_eq!(outcome, LaunchOutcome::Pending);
+    }
+
+    #[test]
+    fn rebound_name_does_not_trust_an_unbounded_active_row() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                    (name, tool, status, status_context, created_at)
+                 VALUES ('canonical', 'antigravity', 'active', 'tool:old', 1)",
+                [],
+            )
+            .unwrap();
+
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.prompt_empty = false;
+        let state = make_state(screen, 500);
+        let mut outcome = LaunchOutcome::Pending;
+        drive_launch_outcome(
+            &db,
+            &state,
+            "canonical",
+            ST_ACTIVE,
+            &LaunchActivityScope::new(db.get_last_event_id(), "placeholder"),
+            &ToolConfig::for_tool(crate::tool::Tool::Antigravity),
+            &mut outcome,
+        );
+
+        assert_eq!(outcome, LaunchOutcome::Pending);
+    }
+
+    #[test]
+    fn provider_approval_block_survives_launch_recovery() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                    (name, tool, session_id, status, status_context, created_at)
+                 VALUES
+                    ('sora', 'antigravity', 'session-approval', 'blocked',
+                     'pty:approval', 1)",
+                [],
+            )
+            .unwrap();
+        let activity_after_id = db.get_last_event_id();
+        let active = serde_json::json!({
+            "status": "active",
+            "new_status": "active",
+            "context": "tool:run_command",
+            "session": "session-approval",
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('status', '2026-08-29T00:00:00Z', 'sora', ?1)",
+                rusqlite::params![active.to_string()],
+            )
+            .unwrap();
+
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.approval = true;
+        let state = make_state(screen, 500);
+        let mut outcome = LaunchOutcome::Blocked;
+        drive_launch_outcome(
+            &db,
+            &state,
+            "sora",
+            ST_BLOCKED,
+            &LaunchActivityScope::new(activity_after_id, "sora"),
+            &ToolConfig::for_tool(crate::tool::Tool::Antigravity),
+            &mut outcome,
+        );
+
+        assert_eq!(outcome, LaunchOutcome::Ready);
+        let instance = db.get_instance_full("sora").unwrap().unwrap();
+        assert_eq!(instance.status, ST_BLOCKED);
+        assert_eq!(instance.status_context, "pty:approval");
+        let ready_status: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.status')
+                 FROM events
+                 WHERE type = 'life' AND instance = 'sora'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ready_status, ST_BLOCKED);
+    }
+
+    #[test]
+    fn provider_activity_is_generic_launch_evidence() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                    (name, tool, status, status_context, created_at)
+                 VALUES ('luna', 'claude', 'active', 'prompt', 1)",
+                [],
+            )
+            .unwrap();
+
+        let mut screen = safe_screen();
+        screen.prompt_empty = false;
+        let state = make_state(screen, 500);
+        let mut outcome = LaunchOutcome::Pending;
+        drive_launch_outcome(
+            &db,
+            &state,
+            "luna",
+            ST_ACTIVE,
+            &LaunchActivityScope::new(0, "luna"),
+            &ToolConfig::claude(),
+            &mut outcome,
+        );
+
+        assert_eq!(outcome, LaunchOutcome::Ready);
+        assert_eq!(
+            db.get_instance_full("luna").unwrap().unwrap().status,
+            ST_ACTIVE
+        );
     }
 
     #[test]

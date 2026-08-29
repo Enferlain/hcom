@@ -20,7 +20,7 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 | Priority | Area | Issues | Intended outcome |
 | --- | --- | ---: | --- |
 | P0 | Correctness and state semantics | 13 | Waiting and completion become reliable |
-| P1 | Orchestration abstractions | 14 | Routine supervision moves into deterministic software |
+| P1 | Orchestration abstractions | 15 | Routine supervision moves into deterministic software |
 | P1 | Communication policy | 9 | Useful communication remains available without constant interruption |
 | P2 | Efficiency and maintainability | 7 | Polling, duplicated logic, and context noise are reduced |
 
@@ -177,9 +177,27 @@ Evidence: listen explicitly writes listening status in [`listen.rs`](../src/comm
 
 Do not implement task-idle waiting in terms of the status side effect of the wait command itself. At minimum, distinguish `transport_waiting` from `task_idle`; preferably wait on the workflow's terminal task state.
 
-### 35. Lifecycle views can remain stale and mutually contradictory
+### 35. Lifecycle views can remain stale and mutually contradictory — working
 
 One observed worker was reported as `blocked: launch_blocked` after it had completed and sent a result. Terminal inspection simultaneously showed `ready=true`, while resume refused because the process was still active.
+
+Status: **Working as of 2026-08-29.** Provider-owned `active` status from a real
+turn or tool hook is now authoritative launch evidence. Session-scoped status
+events retain that evidence if a fast first turn returns to `listening` between
+delivery-loop reads. It finalizes both pending launches and recovery from an
+earlier launch blocker without overwriting the provider's active or listening
+task state. Screen readiness remains the pre-execution signal. An approval shown
+after provider execution began remains a task-level blocker, but cannot
+retroactively redefine that launch as a failure.
+
+Regression coverage recreates an unready, non-empty, approval-looking terminal
+alongside active Antigravity tool status and verifies pending-to-ready,
+blocked-to-ready, fast-turn durable-event, and generic-provider transitions,
+attempt/session and rebound-name isolation, preserved approval blockers and
+provider state, and typed ready lifecycle events. Delivery tests and Clippy
+pass. Live `hcom run agy` regressions changed the previously repeated `0/1
+ready` result to `1/1 ready` in 8.0–8.5 seconds, then returned the exact
+completion report and cleaned up the worker automatically.
 
 Make lifecycle transitions monotonic where appropriate and attach freshness, source, and attempt IDs to every state. A later verified ready/running/completed state must supersede an earlier launch blocker for the same attempt. Commands should return one reconciled state rather than forcing the caller to compare list, PTY, event, and resume interpretations.
 
@@ -280,7 +298,16 @@ The launcher has targeted readiness handling for some providers, but Antigravity
 
 Evidence: provider-specific readiness handling in [`launcher.rs`](../src/launcher.rs#L1520).
 
-Add exact prompt recognition and an explicit policy controlling whether trust may be accepted automatically. Do not use broad keystroke injection based on fuzzy terminal text.
+Status: **Partially mitigated locally as of 2026-08-29, not fixed in hcom.**
+Antigravity now has native trusted-workspace state and explicit per-workspace file
+grants for the current development workspaces. A fresh live launch entered the
+workspace and completed its read-only task without external input. Earlier
+launches nevertheless stopped at the trust screen twice, so persisted provider
+state has not yet established a reliable launcher contract.
+
+Recognize the prompt only to return a typed `workspace_trust` blocker. hcom must
+not synthesize approval, inject confirmation keys, or mutate Antigravity trust
+state. Trust remains under the provider's native policy and the user's control.
 
 ### 16. Timeout recovery is not a resumable workflow
 
@@ -332,6 +359,45 @@ extract_final_result(worker_session_id, attempt_id)
 ```
 
 Each adapter should identify authoritative final-response records, reject partial or cross-attempt content, and return provenance describing whether the result came from the protocol event or transcript recovery. Recovery belongs in repository code with fixtures and tests, not only in personal `~/.hcom/scripts`.
+
+Status: **Immediate Antigravity delivery race working locally as of 2026-08-29;
+provider-adapter parity remains unresolved.** The failure reproduced when an
+Antigravity worker sent its correct completion report during launch-readiness
+handling. The standalone wrapper started its filtered wait afterward, captured
+a newer implicit event boundary, and kept its outer wait loop running despite
+the report already existing on the expected thread.
+
+The active local wrapper now captures `hcom events --cursor` before launch and
+waits with `--after-id`, the exact thread, and `--result-from` for the launched
+worker generation. A repeat of the same fast read-only smoke task returned the
+correlated report and cleaned up the worker in 16.5 seconds even though launch
+readiness still reported `0/1`; existing CLI regression coverage separately
+rejects cross-worker results. The wrapper also distinguishes a real timeout
+payload from correlation/setup errors instead of turning a failed wait into a
+heartbeat loop. `bash -n` and the live regression both passed. This is an
+unversioned local change in `~/.hcom/scripts/agy.sh`; the broader issue remains
+open until this behavior and equivalent provider-specific transcript recovery
+live in versioned repository adapters. The GLM wrapper still lacks equivalent
+recovery and could not be exercised in this pass because its Claude-hosted
+launch stopped at native workspace trust.
+
+### 44. Provider-native sandboxes do not provide one reliable worker boundary
+
+Status: **Planned.** Adopt Bubblewrap as an optional hcom-owned outer sandbox
+for interacting workers on Linux. This is a downstream architecture item, not
+part of the immediate Antigravity lifecycle fixes.
+
+The outer policy should mount only the declared workspace read/write, expose
+provider credentials and configuration with the minimum required access, hide
+secret and system paths, make `.git` read-only by default, and control network
+access explicitly. hcom communication should use a project-local `HCOM_DIR` or
+a narrow broker interface rather than mounting the complete user-level hcom
+state into every worker.
+
+Provider permission systems remain useful for approval UX, but they should not
+be the sole containment boundary. Sandbox startup must be fail-closed: a worker
+must never silently fall back to unrestricted host execution when Bubblewrap is
+unavailable or its policy cannot be installed.
 
 ## P1: communication policy and context control
 
