@@ -79,6 +79,23 @@ fn get_unread_counts_batch(db: &HcomDb, instances: &[InstanceRow]) -> HashMap<St
     counts
 }
 
+/// Seconds since the stored provider state last changed. Unlike computed
+/// status age, this remains meaningful while a listening heartbeat is fresh.
+fn stored_status_age_seconds(data: &InstanceRow) -> i64 {
+    let since = if data.status_time > 0 {
+        data.status_time
+    } else {
+        data.created_at as i64
+    };
+    if since > 0 {
+        crate::shared::time::now_epoch_i64()
+            .saturating_sub(since)
+            .max(0)
+    } else {
+        0
+    }
+}
+
 /// Main entry point for `hcom list` command.
 ///
 /// Returns exit code (0 = success, 1 = error).
@@ -148,10 +165,15 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
 
         match db.get_instance_full(&lookup_name) {
             Ok(Some(data)) => {
+                let computed_status = get_instance_status(&data, db);
                 let mut payload = serde_json::json!({
                     "name": lookup_name,
                     "session_id": data.session_id,
-                    "status": data.status,
+                    "status": computed_status.status,
+                    "status_context": data.status_context,
+                    "status_detail": data.status_detail,
+                    "status_age_seconds": computed_status.age_seconds,
+                    "stored_status_age_seconds": stored_status_age_seconds(&data),
                     "directory": data.directory,
                     "transcript_path": data.transcript_path,
                     "parent_name": data.parent_name,
@@ -246,6 +268,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 "status_context": data.status_context,
                 "status_detail": data.status_detail,
                 "status_age_seconds": age_seconds,
+                "stored_status_age_seconds": stored_status_age_seconds(data),
                 "description": description,
                 "unread_count": unread_counts.get(&data.name).copied().unwrap_or(0),
                 "headless": data.background != 0,

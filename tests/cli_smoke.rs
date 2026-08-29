@@ -83,6 +83,60 @@ fn list_json_empty() {
 }
 
 #[test]
+fn named_list_json_includes_computed_status_metadata() {
+    let h = Hcom::new();
+    let name = h.start();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let db = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    db.execute(
+        "UPDATE instances
+         SET status = 'listening', status_time = ?1, last_stop = ?2
+         WHERE name = ?3",
+        rusqlite::params![now - 300, now, name],
+    )
+    .unwrap();
+    drop(db);
+
+    let (code, stdout, stderr) = h.run(["list", &name, "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("named list json");
+    assert!(value.get("status_context").is_some(), "stdout={stdout}");
+    assert!(value.get("status_detail").is_some(), "stdout={stdout}");
+    assert!(value["status_age_seconds"].is_number(), "stdout={stdout}");
+    assert!(
+        value["stored_status_age_seconds"].is_number(),
+        "stdout={stdout}"
+    );
+    assert_eq!(value["status"], "listening", "stdout={stdout}");
+    assert_eq!(value["status_age_seconds"], 0, "stdout={stdout}");
+    assert!(
+        value["stored_status_age_seconds"].as_i64().unwrap() >= 300,
+        "stdout={stdout}"
+    );
+
+    let (code, full_stdout, stderr) = h.run(["list", "--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let full: serde_json::Value = serde_json::from_str(&full_stdout).expect("full list json");
+    let same_worker = full
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .expect("worker in full list");
+    assert_eq!(value["status"], same_worker["status"]);
+    let targeted_age = value["stored_status_age_seconds"].as_i64().unwrap();
+    let full_age = same_worker["stored_status_age_seconds"].as_i64().unwrap();
+    assert!(
+        (targeted_age - full_age).abs() <= 1,
+        "targeted={targeted_age} full={full_age}"
+    );
+    assert!(full_age >= 300, "stdout={full_stdout}");
+}
+
+#[test]
 fn events_empty_in_fresh_dir() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["events", "--last", "5"]);
@@ -339,10 +393,7 @@ fn broadcast_requires_explicit_scope_and_go_preview_in_ai_tools() {
     let go_stdout = String::from_utf8_lossy(&go_out.stdout);
     let go_stderr = String::from_utf8_lossy(&go_out.stderr);
     assert_eq!(go_code, 0, "stdout={go_stdout} stderr={go_stderr}");
-    assert!(
-        go_stdout.contains("Sent to:") || go_stdout.contains("Sent to 4 agents"),
-        "stdout={go_stdout}"
-    );
+    assert!(go_stdout.contains("Sent to:"), "stdout={go_stdout}");
 }
 
 #[test]

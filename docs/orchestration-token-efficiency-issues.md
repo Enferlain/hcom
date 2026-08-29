@@ -24,6 +24,16 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 | P1 | Communication policy | 9 | Useful communication remains available without constant interruption |
 | P2 | Efficiency and maintainability | 7 | Polling, duplicated logic, and context noise are reduced |
 
+### Status overview
+
+- **Working:** 1, 2, 3, 4, 33, 34, 35, 39, 40, and 41.
+- **Substantially addressed:** 30, with the remaining native-workflow follow-up
+  tracked by issues 8 and 28.
+- **Partially mitigated:** 15; provider-native workspace trust is not an hcom
+  policy decision.
+- **Planned:** 44, the optional Bubblewrap boundary.
+- All other entries remain open unless their section says otherwise.
+
 ## Field evidence from Codex session `019fbf7b-705a-75d1-81bc-d935ab026c1c`
 
 The session contains two sustained hcom-supervised Antigravity runs on 2026-08-15 and 2026-08-16. Task-specific source and prompt content is intentionally omitted here; the orchestration behavior is the relevant evidence.
@@ -197,7 +207,9 @@ attempt/session and rebound-name isolation, preserved approval blockers and
 provider state, and typed ready lifecycle events. Delivery tests and Clippy
 pass. Live `hcom run agy` regressions changed the previously repeated `0/1
 ready` result to `1/1 ready` in 8.0–8.5 seconds, then returned the exact
-completion report and cleaned up the worker automatically.
+completion report and cleaned up the worker automatically. A direct
+`hcom 1 agy` launch also reached `1/1 ready` in 7.0 seconds without a trust or
+approval prompt.
 
 Make lifecycle transitions monotonic where appropriate and attach freshness, source, and attempt IDs to every state. A later verified ready/running/completed state must supersede an earlier launch blocker for the same attempt. Commands should return one reconciled state rather than forcing the caller to compare list, PTY, event, and resume interpretations.
 
@@ -348,7 +360,7 @@ output_digest: ...
 
 These records do not remove the need for parent verification, but they make stale, fabricated, or mismatched claims detectable without transcript archaeology.
 
-### 40. Final-result recovery differs by provider wrapper
+### 40. Final-result recovery differs by provider wrapper — working
 
 The current standalone Antigravity wrapper can recover the last completed `PLANNER_RESPONSE` from a stopped worker's transcript when its hcom report is missing. The GLM wrapper waits for an hcom completion report but does not provide equivalent transcript recovery. This asymmetry recreates the original “worker completed but result did not appear” failure depending on which provider ran the task.
 
@@ -360,26 +372,37 @@ extract_final_result(worker_session_id, attempt_id)
 
 Each adapter should identify authoritative final-response records, reject partial or cross-attempt content, and return provenance describing whether the result came from the protocol event or transcript recovery. Recovery belongs in repository code with fixtures and tests, not only in personal `~/.hcom/scripts`.
 
-Status: **Immediate Antigravity delivery race working locally as of 2026-08-29;
-provider-adapter parity remains unresolved.** The failure reproduced when an
-Antigravity worker sent its correct completion report during launch-readiness
-handling. The standalone wrapper started its filtered wait afterward, captured
-a newer implicit event boundary, and kept its outer wait loop running despite
-the report already existing on the expected thread.
+Status: **Working as of 2026-08-29.** Exact `--result-from` waits now watch the
+correlated worker generation for both its hcom completion message and a stopped
+lifecycle snapshot. If an Antigravity or Claude-format worker, including GLM,
+stops without a matching message, a versioned provider adapter recovers only a
+result bound to the expected workflow thread and session. Successful completion
+sends are preferred; a terminal Claude response is accepted only from the
+matching turn. Failed sends, wrong threads, wrong sessions, partial responses,
+placeholder stops, and reused display names cannot complete the wait.
 
-The active local wrapper now captures `hcom events --cursor` before launch and
-waits with `--after-id`, the exact thread, and `--result-from` for the launched
-worker generation. A repeat of the same fast read-only smoke task returned the
-correlated report and cleaned up the worker in 16.5 seconds even though launch
-readiness still reported `0/1`; existing CLI regression coverage separately
-rejects cross-worker results. The wrapper also distinguishes a real timeout
-payload from correlation/setup errors instead of turning a failed wait into a
-heartbeat loop. `bash -n` and the live regression both passed. This is an
-unversioned local change in `~/.hcom/scripts/agy.sh`; the broader issue remains
-open until this behavior and equivalent provider-specific transcript recovery
-live in versioned repository adapters. The GLM wrapper still lacks equivalent
-recovery and could not be exercised in this pass because its Claude-hosted
-launch stopped at native workspace trust.
+Recovered output uses the normal message-shaped result with explicit
+`transcript_recovery` provenance, provider, evidence kind, session, transcript,
+and attempt cursor. A supported stopped worker with no authoritative result
+fails explicitly instead of becoming a heartbeat or timeout loop. The bundled
+`agy` and `glm` workflows both capture the cursor before launch and use the same
+`--result-from` contract; the obsolete Antigravity-only shell parser was
+removed. Same-named scripts in `~/.hcom/scripts` remain explicit user overrides.
+Provider-adapter, correlation, stopped-worker recovery, syntax, and focused
+event tests pass. The workflow also instructs workers to use the coordinator's
+`hcom` command rather than a separately resolved `uvx hcom`, preventing an
+older package version from being selected during the tested workflow. This is
+a compatibility mitigation rather than protocol enforcement. A live
+Antigravity run returned its exact generation-tagged report in 12.9 seconds,
+cleaned up automatically, and required one wrapper invocation.
+The equivalent direct workflow—pre-launch cursor, raw `hcom 1 agy`, and one
+blocking `hcom events --result-from` wait—returned the exact generation-tagged
+report in 9.5 seconds without polling, terminal inspection, or manual input,
+then cleaned up successfully. This verifies the underlying primitives as well
+as the bundled coordinator; raw callers still own launch parsing and cleanup.
+The Claude-hosted GLM end-to-end path remains gated by the separate native
+workspace-trust issue, but its transcript format and wrapper contract are
+covered hermetically.
 
 ### 44. Provider-native sandboxes do not provide one reliable worker boundary
 
@@ -488,6 +511,13 @@ Wake only intended recipients and any explicitly registered coordinator.
 ### 30. Useful provider coordinators live outside the repository
 
 Local scripts can contain important result extraction, retry, and readiness behavior that is neither portable nor tested with hcom. Move the generic state machine into the Rust application and keep provider-specific recognition in small adapters.
+
+Status: **Substantially addressed by issue 40.** Result correlation and
+provider-specific stopped-transcript recovery live in versioned Rust code, and
+the deterministic Antigravity and GLM launch/wait/heartbeat/cleanup workflows
+are repository-bundled scripts. The remaining step is to move the generic
+single-worker state machine from shell into a native workflow command while
+retaining provider-specific policy and launch arguments in small adapters.
 
 ### 31. Heartbeats can still pollute the parent context
 

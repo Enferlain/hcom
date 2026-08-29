@@ -295,6 +295,8 @@ hcom send -b @luna -- hey           # one-off message to an agent
 hcom list                           # show all active agents
 hcom term [name]                    # view/inject into an agent's PTY screen
 hcom events --wait <filters>         # Block until match for scripting
+hcom events --wait 1800 --after-id N --thread ID --result-from NAME
+                                     # Exact result; recovers supported stopped workers
 hcom update                         # update hcom version
 ```
 
@@ -371,11 +373,20 @@ hcom run docs              # tell agent to run this to create any new workflow
 
 Tell agent to run them:
 
+**`hcom run agy`** — launches one Antigravity worker, waits for an exact
+thread-isolated completion result, emits compact heartbeats, and cleans up after
+success. Requires the `agy` CLI; user permissions remain provider-controlled.
+
 **`hcom run confess`** — An agent (or background clone) writes an honesty self-eval. A spawned calibrator reads the target's transcript independently. A judge compares both reports and sends back a verdict via hcom message.
 
 **`hcom run debate`** — A judge spawns and sets up a debate with existing agents. It coordinates rounds in a shared thread where all agents see each other's arguments, with shared context of workspace files and transcripts.
 
 **`hcom run fatcow`** — headless agent reads every file in a path, subscribes to file edit events to stay current, and answers other agents on demand.
+
+**`hcom run glm`** — launches one Z.ai GLM coding worker through Claude Code,
+waits for an exact thread-isolated completion result, and cleans up after
+success. Requires `AI_API_KEY` and Claude Code on `PATH`; `HCOM_GLM_*`
+environment variables customize the compatibility endpoint and runtime.
 
 Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovered, override bundled scripts of the same name. Ask an agent to author one; `hcom run docs --scripts` is the authoring guide.
 

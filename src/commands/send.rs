@@ -14,6 +14,8 @@ use crate::shared::{
     CommandContext, SENDER, SenderIdentity, SenderKind, is_inside_ai_tool, status_icon,
 };
 
+pub(crate) const RECIPIENT_FEEDBACK_PREFIX: &str = "Sent to:";
+
 const SEND_AFTER_HELP: &str = "\
 Target matching:
     @luna                          exact base name
@@ -221,10 +223,10 @@ impl SendArgs {
 /// Get formatted recipient feedback showing who received the message.
 fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
     if delivered_to.is_empty() {
-        return format!("Sent to: {SENDER}");
+        return format!("{RECIPIENT_FEEDBACK_PREFIX} {SENDER}");
     }
     if delivered_to.len() > 10 {
-        return format!("Sent to {} agents", delivered_to.len());
+        return format!("{RECIPIENT_FEEDBACK_PREFIX} {} agents", delivered_to.len());
     }
 
     let mut parts = Vec::new();
@@ -237,7 +239,7 @@ fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
             parts.push(format!("◌ {name}"));
         }
     }
-    format!("Sent to: {}", parts.join(", "))
+    format!("{RECIPIENT_FEEDBACK_PREFIX} {}", parts.join(", "))
 }
 
 struct ResolvedDelivery {
