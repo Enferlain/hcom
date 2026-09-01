@@ -11,6 +11,23 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
+## [2026-08-31]
+
+### Added
+
+- Launch-blocked results now expose structured blocker records with typed
+  `workspace_trust`, `authentication`, `quota`, `confirmation`, `crashed`, or
+  `unknown` kinds and separate matched evidence while preserving the existing
+  human-readable blocker list.
+
+### Fixed
+
+- Structured approval signals now take precedence over incidental command text,
+  successful exit code 0 is not classified as a crash, and only distinctive
+  workspace-trust prompts bypass launch-screen settling.
+- Antigravity approval responses now suppress the stale prompt for one redraw,
+  preventing a cleared approval from briefly returning as blocked.
+
 ## [2026-08-29]
 
 ### Changed

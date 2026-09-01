@@ -19,8 +19,8 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::db::HcomDb;
 use crate::delivery::{
-    APPROVAL_SCRAPE_CLEAR_MS, DeliveryState, ScreenState, ToolConfig, latch_scraped_approval,
-    run_delivery_loop,
+    APPROVAL_RESPONSE_GRACE_MS, APPROVAL_SCRAPE_CLEAR_MS, DeliveryState, ScreenState, ToolConfig,
+    latch_scraped_approval, run_delivery_loop,
 };
 use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
@@ -33,6 +33,12 @@ use super::screen::ScreenTracker;
 /// User-activity cooldown applied uniformly across tools (0.5s). Dim detection
 /// enables this for Claude.
 pub(super) const USER_ACTIVITY_COOLDOWN_MS: u64 = 500;
+
+fn approval_response_grace_active(answered_at: Option<Instant>) -> bool {
+    answered_at.is_some_and(|answered_at| {
+        answered_at.elapsed() < Duration::from_millis(APPROVAL_RESPONSE_GRACE_MS)
+    })
+}
 
 /// Update shared delivery state from screen tracker.
 ///
@@ -63,8 +69,12 @@ pub(super) fn update_delivery_state(
             scraped_approval,
             screen.is_output_stable(APPROVAL_SCRAPE_CLEAR_MS),
         );
+        let antigravity_response_grace = target.name() == "antigravity"
+            && approval_response_grace_active(state.approval_response_at);
         let approval = (scrape_latched_tool && state.approval_scrape_latched)
-            || (target.name() == "antigravity" && screen.is_antigravity_approval_visible());
+            || (target.name() == "antigravity"
+                && !antigravity_response_grace
+                && screen.is_antigravity_approval_visible());
         if approval != state.approval {
             approval_changed = Some(approval);
         }
@@ -126,6 +136,7 @@ pub(super) fn clear_injected_approval_state(
     let approval_cleared = match screen_state.write() {
         Ok(mut state) if state.approval => {
             state.approval = false;
+            state.approval_response_at = Some(Instant::now());
             true
         }
         _ => false,
@@ -161,6 +172,9 @@ pub(super) fn note_user_keystroke(
         if !cursor_scrape {
             approval_cleared = state.approval;
             state.approval = false;
+            if approval_cleared {
+                state.approval_response_at = Some(Instant::now());
+            }
         }
     }
     if approval_cleared {
@@ -1326,6 +1340,7 @@ mod tests {
         let cleared = note_user_keystroke(&target, &state, &publish);
         assert!(cleared, "a standing approval was cleared");
         assert!(!state.read().unwrap().approval, "approval cleared");
+        assert!(state.read().unwrap().approval_response_at.is_some());
         assert_eq!(calls.get(), 1, "cleared edge published once");
     }
 
@@ -1371,6 +1386,7 @@ mod tests {
         };
         assert!(clear_injected_approval_state(&target, &state, &publish));
         assert!(!state.read().unwrap().approval);
+        assert!(state.read().unwrap().approval_response_at.is_some());
         assert_eq!(calls.get(), 1);
     }
 
@@ -1380,6 +1396,15 @@ mod tests {
         let state = Arc::new(RwLock::new(ScreenState::default()));
         let publish = |_a: bool| panic!("must not publish when nothing to clear");
         assert!(!clear_injected_approval_state(&target, &state, &publish));
+    }
+
+    #[test]
+    fn approval_response_grace_expires_after_one_redraw_window() {
+        assert!(!approval_response_grace_active(None));
+        assert!(approval_response_grace_active(Some(Instant::now())));
+        assert!(!approval_response_grace_active(Some(
+            Instant::now() - Duration::from_millis(APPROVAL_RESPONSE_GRACE_MS + 1)
+        )));
     }
 
     // build_early_launch_context is portable (env::var/fs::read_to_string/thread::sleep

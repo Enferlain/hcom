@@ -26,7 +26,7 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 
 ### Status overview
 
-- **Working:** 1, 2, 3, 4, 33, 34, 35, 39, 40, and 41.
+- **Working:** 1, 2, 3, 4, 14, 33, 34, 35, 39, 40, and 41.
 - **Partially addressed:** 30, with the remaining native-workflow follow-up
   tracked by issues 8 and 28.
 - **Partially mitigated:** 15; provider-native workspace trust is not an hcom
@@ -191,7 +191,7 @@ Do not implement task-idle waiting in terms of the status side effect of the wai
 
 One observed worker was reported as `blocked: launch_blocked` after it had completed and sent a result. Terminal inspection simultaneously showed `ready=true`, while resume refused because the process was still active.
 
-Status: **Working as of 2026-08-29.** Provider-owned `active` status from a real
+Status: **Working as of 2026-09-01.** Provider-owned `active` status from a real
 turn or tool hook is now authoritative launch evidence. Session-scoped status
 events retain that evidence if a fast first turn returns to `listening` between
 delivery-loop reads. It finalizes both pending launches and recovery from an
@@ -199,6 +199,11 @@ earlier launch blocker without overwriting the provider's active or listening
 task state. Screen readiness remains the pre-execution signal. An approval shown
 after provider execution began remains a task-level blocker, but cannot
 retroactively redefine that launch as a failure.
+
+Antigravity approval responses also suppress the already-answered screen scrape
+for one redraw window. This prevents the observed same-second
+`approval_cleared -> approval -> approval_cleared` bounce from leaking a stale
+blocked state into a wrapper heartbeat without approving any command itself.
 
 Regression coverage recreates an unready, non-empty, approval-looking terminal
 alongside active Antigravity tool status and verifies pending-to-ready,
@@ -295,6 +300,15 @@ Classify known failure modes and handle safe, deterministic recovery internally.
 Launch-blocked events can include a terminal tail, but the caller still has to infer whether it saw workspace trust, authentication, quota exhaustion, a crash, or another prompt.
 
 Evidence: blocked launch reporting in [`delivery.rs`](../src/delivery.rs#L1351).
+
+Status: **Working as of 2026-08-31.** Launch-blocked events and wait results now
+carry a stable `blocked_kind`, the actual matched evidence line, the raw detail,
+and the legacy human-readable blocker string. Provider approval signals outrank
+incidental auth, quota, or crash words in proposed commands; successful exit
+code 0 is not treated as a crash; and only a distinctive workspace-trust prompt
+can bypass screen settling. Producer-to-consumer regression coverage verifies
+that the event emitted by the delivery loop is returned by `wait_for_launch`
+without losing the structured fields.
 
 Add a `blocked_kind`, for example:
 
@@ -577,7 +591,9 @@ delegate_many([
 -> final structured results returned together
 ```
 
-Commands such as `hcom list -v`, `hcom term`, `hcom transcript`, and `hcom inject` should appear in the main agent's trace only when it deliberately enters diagnostic mode.
+Commands such as `hcom list -v`, `hcom term`, `hcom transcript`, and
+`hcom term inject` should appear in the main agent's trace only when it
+deliberately enters diagnostic mode.
 
 ## Recommended implementation order
 

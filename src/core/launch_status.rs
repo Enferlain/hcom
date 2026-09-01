@@ -11,6 +11,70 @@ use crate::instance_lifecycle;
 use rusqlite::params;
 use std::collections::HashSet;
 
+/// Typed classification of a launch blocker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedKind {
+    WorkspaceTrust,
+    Authentication,
+    Quota,
+    Confirmation,
+    Crashed,
+    Unknown,
+}
+
+impl BlockedKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BlockedKind::WorkspaceTrust => "workspace_trust",
+            BlockedKind::Authentication => "authentication",
+            BlockedKind::Quota => "quota",
+            BlockedKind::Confirmation => "confirmation",
+            BlockedKind::Crashed => "crashed",
+            BlockedKind::Unknown => "unknown",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "workspace_trust" => BlockedKind::WorkspaceTrust,
+            "authentication" => BlockedKind::Authentication,
+            "quota" => BlockedKind::Quota,
+            "confirmation" => BlockedKind::Confirmation,
+            "crashed" => BlockedKind::Crashed,
+            _ => BlockedKind::Unknown,
+        }
+    }
+}
+
+impl std::str::FromStr for BlockedKind {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(BlockedKind::from_str(s))
+    }
+}
+
+impl std::fmt::Display for BlockedKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Structured blocker record for an instance.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockerRecord {
+    pub instance: String,
+    pub kind: BlockedKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Result of a launch wait operation.
 #[derive(Debug, Clone)]
 pub struct LaunchResult {
@@ -22,6 +86,7 @@ pub struct LaunchResult {
     pub instances: Vec<String>,
     pub failures: Vec<String>,
     pub blockers: Vec<String>,
+    pub blocked_records: Vec<BlockerRecord>,
     pub launcher: Option<String>,
     pub timestamp: Option<String>,
     pub batch_id: Option<String>,
@@ -60,6 +125,7 @@ struct LaunchData {
     instances: Vec<String>,
     failures: Vec<String>,
     blockers: Vec<String>,
+    blocked_records: Vec<BlockerRecord>,
     launcher: String,
     timestamp: String,
     batch_id: Option<String>,
@@ -149,31 +215,71 @@ fn emit_row_finalized_event(db: &HcomDb, name: &str, launcher: &str, batch_id: &
     let _ = db.log_event("life", name, &event_data);
 }
 
-fn get_blocked_for_batch(db: &HcomDb, batch_id: &str) -> (i64, Vec<String>) {
+struct RawBlockerRow {
+    instance: String,
+    detail: Option<String>,
+    kind: Option<String>,
+    evidence: Option<String>,
+    reason: Option<String>,
+}
+
+fn get_blocked_for_batch(db: &HcomDb, batch_id: &str) -> (i64, Vec<String>, Vec<BlockerRecord>) {
     let conn = db.conn();
     let mut stmt = match conn.prepare(
-        "SELECT instance, json_extract(data, '$.detail') FROM events \
+        "SELECT instance, \
+                json_extract(data, '$.detail'), \
+                json_extract(data, '$.blocked_kind'), \
+                json_extract(data, '$.evidence'), \
+                json_extract(data, '$.reason') \
+         FROM events \
          WHERE type = 'life' \
          AND json_extract(data, '$.action') = 'launch_blocked' \
-         AND json_extract(data, '$.batch_id') = ?",
+         AND json_extract(data, '$.batch_id') = ? \
+         ORDER BY id ASC",
     ) {
         Ok(s) => s,
-        Err(_) => return (0, vec![]),
+        Err(_) => return (0, vec![], vec![]),
     };
-    let blockers: Vec<String> = match stmt.query_map(params![batch_id], |row| {
-        let name: String = row.get(0)?;
-        let detail: Option<String> = row.get(1).ok();
-        Ok(format!(
-            "{}: {}",
-            name,
-            detail.unwrap_or_else(|| "launch blocked".to_string())
-        ))
+    let rows: Vec<RawBlockerRow> = match stmt.query_map(params![batch_id], |row| {
+        Ok(RawBlockerRow {
+            instance: row.get(0)?,
+            detail: row.get(1).ok(),
+            kind: row.get(2).ok(),
+            evidence: row.get(3).ok(),
+            reason: row.get(4).ok(),
+        })
     }) {
         Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
         Err(_) => vec![],
     };
+
+    let mut blockers = Vec::new();
+    let mut blocked_records = Vec::new();
+
+    for row in rows {
+        let display_detail = row
+            .detail
+            .clone()
+            .unwrap_or_else(|| "launch blocked".to_string());
+        blockers.push(format!("{}: {}", row.instance, display_detail));
+
+        let kind = row
+            .kind
+            .as_deref()
+            .map(BlockedKind::from_str)
+            .unwrap_or(BlockedKind::Unknown);
+
+        blocked_records.push(BlockerRecord {
+            instance: row.instance,
+            kind,
+            evidence: row.evidence.filter(|s| !s.is_empty()),
+            detail: row.detail.filter(|s| !s.is_empty()),
+            reason: row.reason.filter(|s| !s.is_empty()),
+        });
+    }
+
     let count = blockers.len() as i64;
-    (count, blockers)
+    (count, blockers, blocked_records)
 }
 
 fn launch_failed_events_for_batch(
@@ -311,10 +417,12 @@ fn aggregate_batches(batches: &[BatchInfo], launcher: &str) -> LaunchData {
     let mut all_instances = Vec::new();
     let mut all_failures = Vec::new();
     let mut all_blockers = Vec::new();
+    let mut all_blocked_records = Vec::new();
     for b in batches {
         all_instances.extend(b.instances.clone());
         all_failures.extend(b.failures.clone());
         all_blockers.extend(b.blockers.clone());
+        all_blocked_records.extend(b.blocked_records.clone());
     }
     let batch_ids: Vec<String> = batches.iter().map(|b| b.batch_id.clone()).collect();
     LaunchData {
@@ -325,6 +433,7 @@ fn aggregate_batches(batches: &[BatchInfo], launcher: &str) -> LaunchData {
         instances: all_instances,
         failures: all_failures,
         blockers: all_blockers,
+        blocked_records: all_blocked_records,
         launcher: launcher.to_string(),
         timestamp: batches
             .first()
@@ -346,6 +455,7 @@ struct BatchInfo {
     instances: Vec<String>,
     failures: Vec<String>,
     blockers: Vec<String>,
+    blocked_records: Vec<BlockerRecord>,
     timestamp: String,
 }
 
@@ -425,7 +535,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
         let (ready_count, ready_instances) = get_ready_for_batch(db, batch_id);
         let (failed_count, failures) =
             get_failed_for_batch(db, batch_id, lnchr, *batch_event_id, &ready_instances);
-        let (blocked_count, blockers) = get_blocked_for_batch(db, batch_id);
+        let (blocked_count, blockers, blocked_records) = get_blocked_for_batch(db, batch_id);
         batches.push(BatchInfo {
             batch_id: batch_id.clone(),
             launcher: lnchr.clone(),
@@ -436,6 +546,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
             instances: ready_instances,
             failures,
             blockers,
+            blocked_records,
             timestamp: ts.clone(),
         });
     }
@@ -474,6 +585,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
                 instances: b.instances.clone(),
                 failures: b.failures.clone(),
                 blockers: b.blockers.clone(),
+                blocked_records: b.blocked_records.clone(),
                 timestamp: b.timestamp.clone(),
             })
             .collect();
@@ -498,6 +610,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
                 instances: b.instances.clone(),
                 failures: b.failures.clone(),
                 blockers: b.blockers.clone(),
+                blocked_records: b.blocked_records.clone(),
                 timestamp: b.timestamp.clone(),
             })
             .collect();
@@ -514,6 +627,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
         instances: first.instances.clone(),
         failures: first.failures.clone(),
         blockers: first.blockers.clone(),
+        blocked_records: first.blocked_records.clone(),
         launcher: effective_launcher,
         timestamp: first.timestamp.clone(),
         batch_id: Some(first.batch_id.clone()),
@@ -567,7 +681,7 @@ fn get_launch_batch(db: &HcomDb, batch_id: &str) -> Option<LaunchData> {
         batch_event_id,
         &ready_instances,
     );
-    let (blocked_count, blockers) = get_blocked_for_batch(db, &resolved_batch_id);
+    let (blocked_count, blockers, blocked_records) = get_blocked_for_batch(db, &resolved_batch_id);
 
     Some(LaunchData {
         expected,
@@ -577,6 +691,7 @@ fn get_launch_batch(db: &HcomDb, batch_id: &str) -> Option<LaunchData> {
         instances: ready_instances,
         failures,
         blockers,
+        blocked_records,
         launcher,
         timestamp,
         batch_id: Some(resolved_batch_id),
@@ -628,6 +743,7 @@ pub fn wait_for_launch(
                 instances: vec![],
                 failures: vec![],
                 blockers: vec![],
+                blocked_records: vec![],
                 launcher: None,
                 timestamp: None,
                 batch_id: None,
@@ -661,6 +777,7 @@ pub fn wait_for_launch(
                     instances: vec![],
                     failures: vec![],
                     blockers: vec![],
+                    blocked_records: vec![],
                     launcher: None,
                     timestamp: None,
                     batch_id: None,
@@ -744,6 +861,7 @@ pub fn wait_for_launch(
         instances: status_data.instances,
         failures: status_data.failures,
         blockers: status_data.blockers,
+        blocked_records: status_data.blocked_records,
         launcher: Some(status_data.launcher),
         timestamp: Some(status_data.timestamp),
         batch_id: status_data.batch_id,
@@ -783,6 +901,12 @@ impl LaunchResult {
         if !self.blockers.is_empty() {
             obj.insert("blockers".into(), serde_json::json!(self.blockers));
         }
+        if !self.blocked_records.is_empty() {
+            obj.insert(
+                "blocked_records".into(),
+                serde_json::json!(self.blocked_records),
+            );
+        }
         if let Some(ref launcher) = self.launcher {
             obj.insert("launcher".into(), serde_json::json!(launcher));
         }
@@ -812,7 +936,40 @@ impl LaunchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::tempdir;
+
+    struct EnvVarGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvVarGuard {
+        fn set(values: &[(&'static str, &str)]) -> Self {
+            let saved = values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, value) in values {
+                // SAFETY: callers serialize tests that mutate process env.
+                unsafe { std::env::set_var(key, value) };
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                // SAFETY: callers serialize tests that mutate process env.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
 
     fn make_test_db() -> (HcomDb, tempfile::TempDir) {
         let dir = tempdir().unwrap();
@@ -841,6 +998,7 @@ mod tests {
             instances: vec![],
             failures: vec![],
             blockers: vec![],
+            blocked_records: vec![],
             launcher: None,
             timestamp: None,
             batch_id: None,
@@ -864,6 +1022,7 @@ mod tests {
             instances: vec!["luna".into(), "nova".into(), "peso".into()],
             failures: vec![],
             blockers: vec![],
+            blocked_records: vec![],
             launcher: Some("bigboss".into()),
             timestamp: Some("2024-01-01T00:00:00Z".into()),
             batch_id: Some("batch-123".into()),
@@ -889,6 +1048,7 @@ mod tests {
             instances: vec!["luna".into()],
             failures: vec![],
             blockers: vec![],
+            blocked_records: vec![],
             launcher: Some("bigboss".into()),
             timestamp: Some("2024-01-01T00:00:00Z".into()),
             batch_id: Some("batch-123".into()),
@@ -1019,6 +1179,53 @@ mod tests {
         let json = result.to_json();
         assert_eq!(json["status"], "blocked");
         assert_eq!(json["blocked"], 1);
+    }
+
+    #[test]
+    #[serial]
+    fn test_blocked_event_producer_consumer_round_trip() {
+        let (db, _dir) = make_test_db();
+        let _env = EnvVarGuard::set(&[
+            ("HCOM_LAUNCHED_BY", "leku"),
+            ("HCOM_LAUNCH_BATCH_ID", "batch-blocked-roundtrip"),
+        ]);
+
+        db.log_event(
+            "life",
+            "leku",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-blocked-roundtrip",
+                "launched": 1,
+                "instances": ["mari"]
+            }),
+        )
+        .unwrap();
+        db.emit_launch_blocked_event(
+            "mari",
+            "screen_settled_not_ready",
+            "launch blocked: workspace approval required",
+            "workspace_trust",
+            Some("Do you trust the files in this folder?"),
+        )
+        .unwrap();
+
+        let result = wait_for_launch(&db, None, Some("batch-blocked-roundtrip"), 1);
+        assert_eq!(result.status, LaunchStatus::Blocked);
+        assert_eq!(
+            result.blockers,
+            vec!["mari: launch blocked: workspace approval required"]
+        );
+        assert_eq!(
+            result.blocked_records,
+            vec![BlockerRecord {
+                instance: "mari".to_string(),
+                kind: BlockedKind::WorkspaceTrust,
+                evidence: Some("Do you trust the files in this folder?".to_string()),
+                detail: Some("launch blocked: workspace approval required".to_string()),
+                reason: Some("screen_settled_not_ready".to_string()),
+            }]
+        );
     }
 
     #[test]
@@ -1223,5 +1430,267 @@ mod tests {
             stored.status_detail,
             details[0].strip_prefix("mari: ").unwrap()
         );
+    }
+
+    #[test]
+    fn test_blocked_kind_contract_exact_values() {
+        let cases = [
+            (BlockedKind::WorkspaceTrust, "workspace_trust"),
+            (BlockedKind::Authentication, "authentication"),
+            (BlockedKind::Quota, "quota"),
+            (BlockedKind::Confirmation, "confirmation"),
+            (BlockedKind::Crashed, "crashed"),
+            (BlockedKind::Unknown, "unknown"),
+        ];
+
+        for (kind, expected_str) in cases {
+            assert_eq!(kind.as_str(), expected_str);
+            assert_eq!(BlockedKind::from_str(expected_str), kind);
+            assert_eq!(format!("{}", kind), expected_str);
+            let json = serde_json::to_value(kind).unwrap();
+            assert_eq!(json, serde_json::json!(expected_str));
+            let deserialized: BlockedKind = serde_json::from_value(json).unwrap();
+            assert_eq!(deserialized, kind);
+        }
+    }
+
+    #[test]
+    fn test_blocked_kind_unknown_fallback() {
+        assert_eq!(BlockedKind::from_str(""), BlockedKind::Unknown);
+        assert_eq!(BlockedKind::from_str("other"), BlockedKind::Unknown);
+        assert_eq!(
+            BlockedKind::from_str("some_custom_prompt"),
+            BlockedKind::Unknown
+        );
+    }
+
+    #[test]
+    fn test_wait_for_launch_legacy_compatibility() {
+        let (db, _dir) = make_test_db();
+
+        db.log_event(
+            "life",
+            "leku",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-legacy",
+                "launched": 1,
+                "instances": ["mari"]
+            }),
+        )
+        .unwrap();
+        // Legacy event without blocked_kind or evidence
+        db.log_event(
+            "life",
+            "mari",
+            &serde_json::json!({
+                "action": "launch_blocked",
+                "batch_id": "batch-legacy",
+                "detail": "launch blocked: run hcom term mari"
+            }),
+        )
+        .unwrap();
+
+        let result = wait_for_launch(&db, None, Some("batch-legacy"), 1);
+        assert_eq!(result.status, LaunchStatus::Blocked);
+        assert_eq!(result.blocked, Some(1));
+        assert_eq!(
+            result.blockers,
+            vec!["mari: launch blocked: run hcom term mari".to_string()]
+        );
+        assert_eq!(result.blocked_records.len(), 1);
+        assert_eq!(result.blocked_records[0].instance, "mari");
+        assert_eq!(result.blocked_records[0].kind, BlockedKind::Unknown);
+        assert_eq!(result.blocked_records[0].evidence, None);
+        assert_eq!(
+            result.blocked_records[0].detail,
+            Some("launch blocked: run hcom term mari".to_string())
+        );
+
+        let json = result.to_json();
+        assert_eq!(json["status"], "blocked");
+        assert_eq!(
+            json["blockers"],
+            serde_json::json!(["mari: launch blocked: run hcom term mari"])
+        );
+        assert_eq!(
+            json["blocked_records"],
+            serde_json::json!([{
+                "instance": "mari",
+                "kind": "unknown",
+                "detail": "launch blocked: run hcom term mari"
+            }])
+        );
+    }
+
+    #[test]
+    fn test_wait_for_launch_all_blocked_kinds_and_fields() {
+        let (db, _dir) = make_test_db();
+
+        let kinds_and_evidence = [
+            (
+                "inst_trust",
+                "workspace_trust",
+                Some("Do you trust the files in this folder?"),
+                BlockedKind::WorkspaceTrust,
+            ),
+            (
+                "inst_auth",
+                "authentication",
+                Some("Please login with anthropic login"),
+                BlockedKind::Authentication,
+            ),
+            (
+                "inst_quota",
+                "quota",
+                Some("429 Too Many Requests (quota exceeded)"),
+                BlockedKind::Quota,
+            ),
+            (
+                "inst_conf",
+                "confirmation",
+                Some("approval_prompt"),
+                BlockedKind::Confirmation,
+            ),
+            (
+                "inst_crash",
+                "crashed",
+                Some("Segmentation fault (core dumped)"),
+                BlockedKind::Crashed,
+            ),
+            ("inst_unk", "unknown", None, BlockedKind::Unknown),
+        ];
+
+        let instances: Vec<String> = kinds_and_evidence
+            .iter()
+            .map(|(name, _, _, _)| name.to_string())
+            .collect();
+
+        db.log_event(
+            "life",
+            "leku",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-all-kinds",
+                "launched": kinds_and_evidence.len(),
+                "instances": instances,
+            }),
+        )
+        .unwrap();
+
+        for (name, kind_str, evidence, _) in &kinds_and_evidence {
+            let mut event_data = serde_json::json!({
+                "action": "launch_blocked",
+                "batch_id": "batch-all-kinds",
+                "blocked_kind": kind_str,
+                "reason": "screen_settled_not_ready",
+                "detail": format!("diagnostic tail for {name}"),
+            });
+            if let Some(ev) = evidence {
+                event_data["evidence"] = serde_json::json!(ev);
+            }
+            db.log_event("life", name, &event_data).unwrap();
+        }
+
+        let result = wait_for_launch(&db, None, Some("batch-all-kinds"), 1);
+        assert_eq!(result.status, LaunchStatus::Blocked);
+        assert_eq!(result.blocked, Some(kinds_and_evidence.len() as i64));
+        assert_eq!(result.blocked_records.len(), kinds_and_evidence.len());
+
+        for (idx, (name, _, evidence, expected_kind)) in kinds_and_evidence.iter().enumerate() {
+            let record = &result.blocked_records[idx];
+            assert_eq!(record.instance, *name);
+            assert_eq!(record.kind, *expected_kind);
+            assert_eq!(record.evidence.as_deref(), *evidence);
+            assert_eq!(
+                record.detail.as_deref(),
+                Some(format!("diagnostic tail for {name}").as_str())
+            );
+            assert_eq!(record.reason.as_deref(), Some("screen_settled_not_ready"));
+        }
+
+        let json = result.to_json();
+        assert_eq!(json["status"], "blocked");
+        assert!(json.get("blockers").is_some());
+        let records = json["blocked_records"].as_array().unwrap();
+        assert_eq!(records.len(), kinds_and_evidence.len());
+        assert_eq!(records[0]["kind"], "workspace_trust");
+        assert_eq!(
+            records[0]["evidence"],
+            "Do you trust the files in this folder?"
+        );
+    }
+
+    #[test]
+    fn test_wait_for_launch_aggregation_with_blocked_records() {
+        let (db, _dir) = make_test_db();
+
+        let batches = [
+            ("b1", "inst1", "workspace_trust", "trust prompt"),
+            ("b2", "inst2", "quota", "out of credits"),
+        ];
+
+        for (bid, inst, kind, ev) in &batches {
+            db.log_event(
+                "life",
+                "leku",
+                &serde_json::json!({
+                    "action": "batch_launched",
+                    "batch_id": bid,
+                    "launched": 1,
+                    "instances": [inst]
+                }),
+            )
+            .unwrap();
+            db.log_event(
+                "life",
+                inst,
+                &serde_json::json!({
+                    "action": "launch_blocked",
+                    "batch_id": bid,
+                    "blocked_kind": kind,
+                    "evidence": ev,
+                    "detail": format!("{inst} detail"),
+                    "reason": "screen_settled_not_ready"
+                }),
+            )
+            .unwrap();
+        }
+
+        // Fetch launch status for launcher "leku" (aggregates recent batches in DESC order)
+        let status = get_launch_status(&db, Some("leku")).expect("expected aggregated launch data");
+        assert_eq!(status.blocked, 2);
+        assert_eq!(status.blocked_records.len(), 2);
+        assert!(
+            status
+                .blocked_records
+                .iter()
+                .any(|r| r.instance == "inst1" && r.kind == BlockedKind::WorkspaceTrust)
+        );
+        assert!(
+            status
+                .blocked_records
+                .iter()
+                .any(|r| r.instance == "inst2" && r.kind == BlockedKind::Quota)
+        );
+
+        let result = wait_for_launch(&db, Some("leku"), None, 1);
+        assert_eq!(result.status, LaunchStatus::Blocked);
+        assert_eq!(result.blocked_records.len(), 2);
+        assert!(
+            result
+                .blocked_records
+                .iter()
+                .any(|r| r.instance == "inst1" && r.kind == BlockedKind::WorkspaceTrust)
+        );
+        assert!(
+            result
+                .blocked_records
+                .iter()
+                .any(|r| r.instance == "inst2" && r.kind == BlockedKind::Quota)
+        );
+
+        let json = result.to_json();
+        assert_eq!(json["blocked_records"].as_array().unwrap().len(), 2);
     }
 }

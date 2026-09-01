@@ -5,6 +5,16 @@ use rusqlite::params;
 
 use super::{HcomDb, chrono_now_iso, subscriptions};
 
+struct LaunchLifecycleEvent<'a> {
+    action: &'a str,
+    status: &'a str,
+    context: &'a str,
+    reason: Option<&'a str>,
+    detail: Option<&'a str>,
+    blocked_kind: Option<&'a str>,
+    evidence: Option<&'a str>,
+}
+
 /// Message from the events table
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -214,26 +224,28 @@ impl HcomDb {
     fn emit_launch_lifecycle_event(
         &self,
         name: &str,
-        action: &str,
-        status: &str,
-        context: &str,
-        reason: Option<&str>,
-        detail: Option<&str>,
+        event: LaunchLifecycleEvent<'_>,
     ) -> Result<(String, Option<String>)> {
         let launcher = std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
         let batch_id = std::env::var("HCOM_LAUNCH_BATCH_ID").ok();
 
         let mut event_data = serde_json::json!({
-            "action": action,
+            "action": event.action,
             "by": &launcher,
-            "status": status,
-            "context": context,
+            "status": event.status,
+            "context": event.context,
         });
-        if let Some(reason) = reason.filter(|s| !s.is_empty()) {
+        if let Some(reason) = event.reason.filter(|s| !s.is_empty()) {
             event_data["reason"] = serde_json::Value::String(reason.to_string());
         }
-        if let Some(detail) = detail.filter(|s| !s.is_empty()) {
+        if let Some(detail) = event.detail.filter(|s| !s.is_empty()) {
             event_data["detail"] = serde_json::Value::String(detail.to_string());
+        }
+        if let Some(kind) = event.blocked_kind.filter(|s| !s.is_empty()) {
+            event_data["blocked_kind"] = serde_json::Value::String(kind.to_string());
+        }
+        if let Some(evidence) = event.evidence.filter(|s| !s.is_empty()) {
+            event_data["evidence"] = serde_json::Value::String(evidence.to_string());
         }
         if let Some(ref bid) = batch_id {
             event_data["batch_id"] = serde_json::Value::String(bid.clone());
@@ -247,8 +259,18 @@ impl HcomDb {
     ///
     /// Called on first status update (when status_context was "new").
     pub(crate) fn emit_ready_event(&self, name: &str, status: &str, context: &str) -> Result<()> {
-        let (launcher, batch_id) =
-            self.emit_launch_lifecycle_event(name, "ready", status, context, None, None)?;
+        let (launcher, batch_id) = self.emit_launch_lifecycle_event(
+            name,
+            LaunchLifecycleEvent {
+                action: "ready",
+                status,
+                context,
+                reason: None,
+                detail: None,
+                blocked_kind: None,
+                evidence: None,
+            },
+        )?;
         if launcher != "unknown"
             && let Some(ref bid) = batch_id
         {
@@ -267,11 +289,15 @@ impl HcomDb {
     ) -> Result<()> {
         let (launcher, batch_id) = self.emit_launch_lifecycle_event(
             name,
-            "launch_failed",
-            status,
-            context,
-            Some(reason),
-            Some(detail),
+            LaunchLifecycleEvent {
+                action: "launch_failed",
+                status,
+                context,
+                reason: Some(reason),
+                detail: Some(detail),
+                blocked_kind: None,
+                evidence: None,
+            },
         )?;
         if launcher != "unknown"
             && let Some(ref bid) = batch_id
@@ -285,18 +311,22 @@ impl HcomDb {
     pub(crate) fn emit_launch_blocked_event(
         &self,
         name: &str,
-        status: &str,
-        context: &str,
         reason: &str,
         detail: &str,
+        blocked_kind: &str,
+        evidence: Option<&str>,
     ) -> Result<()> {
         self.emit_launch_lifecycle_event(
             name,
-            "launch_blocked",
-            status,
-            context,
-            Some(reason),
-            Some(detail),
+            LaunchLifecycleEvent {
+                action: "launch_blocked",
+                status: "blocked",
+                context: "launch_blocked",
+                reason: Some(reason),
+                detail: Some(detail),
+                blocked_kind: Some(blocked_kind),
+                evidence,
+            },
         )?;
         Ok(())
     }
