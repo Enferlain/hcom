@@ -26,7 +26,7 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 
 ### Status overview
 
-- **Working:** 1, 2, 3, 4, 14, 33, 34, 35, 39, 40, and 41.
+- **Working:** 1, 2, 3, 4, 6, 14, 33, 34, 35, 36, 39, 40, and 41.
 - **Partially addressed:** 30, with the remaining native-workflow follow-up
   tracked by issues 8 and 28.
 - **Partially mitigated:** 15; provider-native workspace trust is not an hcom
@@ -154,7 +154,17 @@ The coordinator should wait on `task_state`, not terminal activity.
 
 The PTY monitor transitions an active agent to listening after stable output for a short interval, with a source comment already noting possible false positives. Silent reasoning or a long tool call can therefore look idle.
 
-Evidence: the stable-output heuristic in [`delivery.rs`](../src/delivery.rs#L1975).
+Evidence: the delivery-gate status ownership and quiet-screen diagnostic in
+[`delivery.rs`](../src/delivery.rs#L2293).
+
+Status: **Working as of 2026-09-01.** The delivery loop no longer changes a
+provider-owned `active` row to `listening`/`pty:recovered` after ten seconds of
+quiet terminal output. Provider hooks now exclusively own the task-active to
+task-idle transition. Screen quietness remains available as `quiet_ms` in gate
+diagnostics but cannot unblock delivery or make a worker eligible for message
+injection. Regression coverage keeps an eleven-second-quiet active worker
+active, non-idle, and blocked at the delivery gate, and verifies that the
+surviving TUI context annotation never changes status or emits a status event.
 
 Use screen stability only as a UI hint. It should not establish task completion, abandonment, or readiness for reassignment.
 
@@ -351,11 +361,37 @@ See [Codex VS Code native-agent gap](codex-vscode-native-agent-gap.md#recommende
 
 The observed session also shows why the interface must own the entire wait: long CLI listens repeatedly yielded at the surrounding tool's shorter execution boundary, causing the model to issue another listen or inspect command even though the underlying workflow had not changed.
 
-### 36. A successful send does not mean a blocked worker can act on it
+### 36. A successful send does not mean a blocked worker can act on it — working
 
 An observed follow-up returned `Sent to: blocked-worker`, but the worker did not visibly resume. Resume then failed because the same process was considered active, and the parent resorted to terminal injection.
 
+A live `hcom run glm` session reproduced this on 2026-09-01. After a proposed
+command was denied, Claude stopped at `What should Claude do instead?`. An
+`hcom send` instruction was persisted successfully but did not schedule a new
+turn; the same instruction had to be submitted with `hcom term inject` before
+the worker continued.
+
+Status: **Working as of 2026-09-03 for the reproduced Claude denial path.** A
+Claude `PermissionDenied` hook now changes the worker to listening only when
+the current lifecycle row is the matching hook-owned `blocked: approval`
+state. The transition preserves denial diagnostics and wakes delivery, making
+an already queued targeted message actionable at the resulting prompt. Rule
+or policy denials without a current interactive approval, and late denials
+after a newer provider transition, leave the current state unchanged.
+
+Regression coverage inserts a real targeted message, verifies that it remains
+pending while approval is blocked, and proves that it becomes preparable and
+passes the delivery gate after denial. Separate tests cover subagent approval
+rows and the guard that preserves an active state. The complete Claude-hook
+and delivery test suites, formatting, and `cargo check` pass; focused review
+approved the guarded implementation.
+
 Return separate delivery states such as `persisted`, `delivered_to_process`, `turn_scheduled`, and `actionable`. When a managed worker is blocked or between turns, the coordinator should either schedule a turn through a supported mechanism or report one typed blocker. A successful queue write must not imply that task execution resumed.
+
+Remaining follow-up: the CLI still reports a successful persistence/routing
+operation without distinguishing `delivered_to_process`, `turn_scheduled`, and
+`actionable`. The concrete stuck-worker failure is fixed, but those explicit
+delivery receipts remain desirable protocol work.
 
 ### 37. Completion reports do not carry verifiable gate provenance
 

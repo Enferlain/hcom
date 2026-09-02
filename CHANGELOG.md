@@ -11,6 +11,25 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
+## [2026-09-03]
+
+### Fixed
+
+- Claude permission denials now release only the matching hook-owned approval
+  blocker, allowing an already queued targeted message to reach the resulting
+  `What should Claude do instead?` prompt without external terminal input.
+  Policy denials and newer provider lifecycle states remain non-idle.
+
+## [2026-09-01]
+
+### Fixed
+
+- Quiet terminal output no longer rewrites a provider-owned active worker as
+  listening; screen stability is now diagnostic only, so silent reasoning and
+  long-running tools remain non-idle and ineligible for message injection.
+- Delivery gate diagnostics reuse their existing screen lock instead of
+  recursively acquiring it while a writer may be queued.
+
 ## [2026-08-31]
 
 ### Added

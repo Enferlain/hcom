@@ -1251,6 +1251,51 @@ pub(crate) fn evaluate_gate(
     }
 }
 
+/// Refresh the TUI gate context while a pending message waits on a busy
+/// (`not_idle`) worker.
+///
+/// This intentionally never touches instance *status*. Terminal output
+/// stability is a UI/diagnostic hint only: silent reasoning and long tool
+/// calls present exactly like a finished turn, so a provider-owned `active`
+/// row must survive a quiet screen, and the delivery gate stays blocked until
+/// the provider's own hooks flip the row back to `listening`.
+fn refresh_not_idle_gate_context(
+    db: &HcomDb,
+    name: &str,
+    block_since: Option<Instant>,
+    last_block_context: &mut String,
+) {
+    let Some(since) = block_since else {
+        return;
+    };
+    if since.elapsed().as_secs_f64() < 2.0 {
+        return;
+    }
+    // Display context only: `set_gate_status` never rewrites `status`, and the
+    // `listening` match arm leaves provider-owned `active`/`blocked` rows alone.
+    match db.get_status(name) {
+        Ok(Some((status, _))) if status == ST_LISTENING => {
+            const CONTEXT: &str = "tui:not-idle";
+            if CONTEXT != last_block_context.as_str() {
+                if let Err(e) = db.set_gate_status(name, CONTEXT, "waiting for idle status") {
+                    log_warn("native", "delivery.gate_status_fail", &format!("{}", e));
+                }
+                *last_block_context = CONTEXT.to_string();
+            }
+        }
+        Ok(Some(_)) | Ok(None) => {
+            // Status not "listening" or not found - nothing to annotate
+        }
+        Err(e) => {
+            log_error(
+                "native",
+                "delivery.tui_status_update",
+                &format!("DB error checking status: {}", e),
+            );
+        }
+    }
+}
+
 /// Build a diagnostic string for a `delivery.gate_pass` log line.
 fn gate_pass_diagnostics(db: &HcomDb, name: &str, state: &DeliveryState, is_idle: bool) -> String {
     let now = crate::shared::time::now_epoch_i64();
@@ -2245,16 +2290,19 @@ pub fn run_delivery_loop(
                         // Log gate failure
                         if attempt == 0 || attempt.is_multiple_of(5) {
                             let screen = state.screen.read().unwrap();
+                            // `quiet_ms` (time since last output) is diagnostic
+                            // only — see refresh_not_idle_gate_context.
                             log_info(
                                 "native",
                                 "delivery.gate_blocked",
                                 &format!(
-                                    "Gate blocked: {} (attempt={}, ready={}, approval={}, user_active={})",
+                                    "Gate blocked: {} (attempt={}, ready={}, approval={}, user_active={}, quiet_ms={})",
                                     gate.reason,
                                     attempt,
                                     screen.ready,
                                     screen.approval,
-                                    state.is_user_active()
+                                    state.is_user_active_with_guard(&screen),
+                                    screen.last_output.elapsed().as_millis()
                                 ),
                             );
                         }
@@ -2269,86 +2317,19 @@ pub fn run_delivery_loop(
                             screen.approval
                         };
                         if !approval_showing && gate.reason == "not_idle" {
-                            // Stability-based recovery: if status stuck "active" but output stable 10s,
-                            // or stale PTY approval was left behind after the PTY cleared,
-                            // flip back to listening.
-                            // NOTE: stability tracking has false positives from escape sequences,
-                            // but still useful for true idle detection when no data arrives at all.
-                            match db.get_status(&current_name) {
-                                Ok(Some((status, _))) if status == ST_ACTIVE => {
-                                    let screen = state.screen.read().unwrap();
-                                    let stable_10s =
-                                        screen.last_output.elapsed().as_millis() > 10000;
-                                    drop(screen);
-                                    if stable_10s {
-                                        if let Err(e) = db.set_status(
-                                            &current_name,
-                                            "listening",
-                                            "pty:recovered",
-                                        ) {
-                                            log_warn(
-                                                "native",
-                                                "delivery.set_status_fail",
-                                                &format!("Failed to set recovered status: {}", e),
-                                            );
-                                        }
-                                        log_info(
-                                            "native",
-                                            "delivery.recovered",
-                                            &format!(
-                                                "Status recovered: output stable 10s, {} -> listening",
-                                                status
-                                            ),
-                                        );
-                                        attempt = 0;
-                                        continue;
-                                    }
-                                }
-                                Ok(Some(_)) | Ok(None) => {
-                                    // Status not "active" or not found - skip recovery
-                                }
-                                Err(e) => {
-                                    log_error(
-                                        "native",
-                                        "delivery.recovery_check",
-                                        &format!("DB error checking status: {}", e),
-                                    );
-                                }
-                            }
-                            // Fall through to TUI status update
-                            if let Some(since) = block_since
-                                && since.elapsed().as_secs_f64() >= 2.0
-                            {
-                                match db.get_status(&current_name) {
-                                    Ok(Some((status, _))) if status == ST_LISTENING => {
-                                        let context = "tui:not-idle".to_string();
-                                        if context != last_block_context {
-                                            if let Err(e) = db.set_gate_status(
-                                                &current_name,
-                                                &context,
-                                                "waiting for idle status",
-                                            ) {
-                                                log_warn(
-                                                    "native",
-                                                    "delivery.gate_status_fail",
-                                                    &format!("{}", e),
-                                                );
-                                            }
-                                            last_block_context = context;
-                                        }
-                                    }
-                                    Ok(Some(_)) | Ok(None) => {
-                                        // Status not "listening" or not found - skip
-                                    }
-                                    Err(e) => {
-                                        log_error(
-                                            "native",
-                                            "delivery.tui_status_update",
-                                            &format!("DB error checking status: {}", e),
-                                        );
-                                    }
-                                }
-                            }
+                            // A busy worker owns its `active` row: the provider's
+                            // hooks flip it back to `listening` when the turn ends.
+                            // Quiet output must not do that job for them — silent
+                            // reasoning and long tool calls present exactly like a
+                            // finished turn, so screen stability stays a log
+                            // diagnostic (`quiet_ms` above) and never recovers
+                            // status or unblocks the gate.
+                            refresh_not_idle_gate_context(
+                                db,
+                                &current_name,
+                                block_since,
+                                &mut last_block_context,
+                            );
                         } else if let Some(since) = block_since {
                             // After 2 seconds of blocking, update TUI status context
                             if since.elapsed().as_secs_f64() >= 2.0 {
@@ -3193,6 +3174,97 @@ mod tests {
         let result = evaluate_gate(&config, &state, false);
         assert!(!result.safe);
         assert_eq!(result.reason, "not_idle");
+    }
+
+    #[test]
+    fn quiet_active_worker_stays_active_and_gate_stays_blocked() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, created_at)
+                 VALUES ('tori', 'claude', 'active', 'tool:Bash', 1)",
+                [],
+            )
+            .unwrap();
+
+        // Screen quiet for 11s — past the 10s mark the removed stability
+        // heuristic treated as recovered idleness. Silent reasoning or a long
+        // tool call looks exactly like this, so nothing may act on it.
+        let state = make_state(safe_screen(), 500);
+        state.screen.write().unwrap().last_output = Instant::now() - Duration::from_secs(11);
+
+        // Everything a blocked delivery iteration does to the row: heartbeat
+        // refresh plus the not-idle gate-context refresh. Repeated to prove the
+        // quiet interval never accumulates into a status flip.
+        let mut last_block_context = String::new();
+        for _ in 0..3 {
+            db.update_heartbeat("tori").unwrap();
+            refresh_not_idle_gate_context(
+                &db,
+                "tori",
+                Some(Instant::now() - Duration::from_secs(3)),
+                &mut last_block_context,
+            );
+        }
+
+        let instance = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(instance.status, ST_ACTIVE);
+        assert_eq!(instance.status_context, "tool:Bash");
+
+        // The provider-owned active row keeps the worker non-injectable.
+        let is_idle = db.is_idle("tori");
+        assert!(!is_idle);
+        let gate = evaluate_gate(&ToolConfig::claude(), &state, is_idle);
+        assert!(!gate.safe);
+        assert_eq!(gate.reason, "not_idle");
+    }
+
+    #[test]
+    fn not_idle_gate_context_annotates_listening_rows_only() {
+        let (_dir, db) = open_ready_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, created_at)
+                 VALUES ('mila', 'claude', 'listening', 'start', 1)",
+                [],
+            )
+            .unwrap();
+
+        let mut last_block_context = String::new();
+
+        // Under the 2s settle window nothing is written yet.
+        refresh_not_idle_gate_context(&db, "mila", Some(Instant::now()), &mut last_block_context);
+        assert_eq!(last_block_context, "");
+        assert_eq!(
+            db.get_instance_full("mila")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            "start"
+        );
+
+        // Once blocking has persisted, the TUI context updates display-only:
+        // no status change and no status event.
+        refresh_not_idle_gate_context(
+            &db,
+            "mila",
+            Some(Instant::now() - Duration::from_secs(3)),
+            &mut last_block_context,
+        );
+        assert_eq!(last_block_context, "tui:not-idle");
+        let instance = db.get_instance_full("mila").unwrap().unwrap();
+        assert_eq!(instance.status, ST_LISTENING);
+        assert_eq!(instance.status_context, "tui:not-idle");
+
+        let status_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance = 'mila' AND type = 'status'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_events, 0);
     }
 
     #[test]

@@ -1658,6 +1658,18 @@ fn handle_permission_denied(
     agent_id: Option<&str>,
 ) -> (i32, String) {
     revoke_shell_actor_for_hook(db, session_id, payload, agent_id);
+    let approval_is_current = db
+        .get_instance_full(instance_name)
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.status == ST_BLOCKED && row.status_context == "approval");
+    if !approval_is_current {
+        // Rule/policy denials can be reported while Claude is still reasoning.
+        // Only an interactive approval that we previously marked blocked is an
+        // idle "What should Claude do instead?" prompt. This guard also keeps a
+        // late denial from overwriting a newer provider-owned lifecycle state.
+        return (0, String::new());
+    }
     let reason = payload
         .raw
         .get("reason")
@@ -1666,7 +1678,7 @@ fn handle_permission_denied(
     lifecycle::set_status(
         db,
         instance_name,
-        ST_BLOCKED,
+        ST_LISTENING,
         &format!("denied:{}", payload.tool_name),
         lifecycle::StatusUpdate {
             detail: reason,
@@ -1675,6 +1687,9 @@ fn handle_permission_denied(
             ..Default::default()
         },
     );
+    // Keep headless Stop-hook polling consistent with Claude's idle-prompt
+    // notification. set_status itself wakes the PTY delivery loop.
+    common::notify_hook_instance_with_db(db, instance_name);
     (0, String::new())
 }
 
@@ -6857,5 +6872,197 @@ mod tests {
             Some("1".to_string()),
             "a different session's stop-claim keys must survive"
         );
+    }
+
+    /// Issue #36 regression test:
+    /// After a Claude permission command is denied, Claude displays 'What should Claude do instead?'
+    /// and waits at the interactive prompt. PermissionDenied hook must transition the instance
+    /// from ST_BLOCKED to ST_LISTENING so db.is_idle() becomes true and pending delivery can proceed.
+    #[test]
+    #[serial]
+    fn test_permission_denied_transitions_instance_to_listening_and_unblocks_gate() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('miso', 'sess-1', 'claude', 'blocked', 'approval', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-1", "miso");
+        let ctx = make_ctx();
+
+        let message = serde_json::json!({
+            "from": "kuma",
+            "text": "continue without that command",
+            "scope": "mentions",
+            "mentions": ["miso"],
+            "delivered_to": ["miso"],
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data) VALUES ('message', '2026-09-03T00:00:00Z', 'kuma', ?1)",
+                [message.to_string()],
+            )
+            .unwrap();
+
+        // The targeted message is durable, but the approval-owned lifecycle
+        // state keeps the worker ineligible for injection.
+        assert!(db.has_pending("miso"));
+        assert!(!db.is_idle("miso"));
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_use_id": "call-bash-1",
+            "reason": "User denied command execution",
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let (exit_code, stdout, ack, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_PERMISSION_DENIED, &mut payload);
+
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(ack.is_none());
+
+        let instance = db.get_instance_full("miso").unwrap().unwrap();
+        assert_eq!(instance.status, ST_LISTENING);
+        assert_eq!(instance.status_context, "denied:Bash");
+        assert_eq!(instance.status_detail, "User denied command execution");
+        assert!(
+            db.is_idle("miso"),
+            "db.is_idle must be true once permission is denied"
+        );
+        assert!(
+            db.has_pending("miso"),
+            "denial must not consume the message"
+        );
+        let prepared = common::prepare_pending_messages(&db, "miso")
+            .expect("the queued instruction must now be available to delivery");
+        assert!(prepared.formatted.contains("continue without that command"));
+
+        // Verify status event logged the transition from blocked to listening
+        let events: Vec<(String, String)> = db
+            .conn()
+            .prepare("SELECT type, data FROM events WHERE instance = 'miso' AND type = 'status' ORDER BY id DESC")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+
+        assert!(!events.is_empty());
+        let event_data: Value = serde_json::from_str(&events[0].1).unwrap();
+        assert_eq!(event_data["status"], ST_LISTENING);
+        assert_eq!(event_data["old_status"], ST_BLOCKED);
+        assert_eq!(event_data["detail"], "User denied command execution");
+
+        // Verify gate evaluation unblocks for Claude
+        let screen = crate::delivery::ScreenState {
+            ready: true,
+            prompt_empty: true,
+            approval: false,
+            last_user_input: Instant::now() - std::time::Duration::from_secs(10),
+            last_output: Instant::now() - std::time::Duration::from_secs(10),
+            ..Default::default()
+        };
+        let state = crate::delivery::DeliveryState {
+            screen: std::sync::Arc::new(std::sync::RwLock::new(screen)),
+            launch_phase_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            inject_port: 0,
+            user_activity_cooldown_ms: 500,
+        };
+        let config = crate::delivery::ToolConfig::claude();
+        let gate = crate::delivery::evaluate_gate(&config, &state, db.is_idle("miso"));
+        assert!(
+            gate.safe,
+            "evaluate_gate must be safe after permission denial"
+        );
+        assert_eq!(gate.reason, "ok");
+    }
+
+    /// Issue #36 regression test:
+    /// PermissionDenied on a subagent transitions the subagent row to ST_LISTENING.
+    #[test]
+    #[serial]
+    fn test_permission_denied_on_subagent_transitions_subagent_to_listening() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 'prompt', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
+
+        // Create subagent instance row
+        let sub_name =
+            ensure_subagent_row(&db, "nova", "sess-1", "child-agent-1", "general").unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'blocked', status_context = 'approval' WHERE name = ?1",
+                [&sub_name],
+            )
+            .unwrap();
+
+        assert!(!db.is_idle(&sub_name));
+
+        let ctx = make_ctx();
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "child-agent-1",
+            "tool_name": "Bash",
+            "tool_use_id": "call-sub-bash",
+            "reason": "permission denied by policy",
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let (exit_code, stdout, ack, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_PERMISSION_DENIED, &mut payload);
+
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        assert!(ack.is_none());
+
+        let sub_row = db.get_instance_full(&sub_name).unwrap().unwrap();
+        assert_eq!(sub_row.status, ST_LISTENING);
+        assert!(db.is_idle(&sub_name));
+    }
+
+    /// A rule/policy denial can arrive without an interactive approval prompt.
+    /// It must not manufacture an idle state or overwrite newer provider state.
+    #[test]
+    #[serial]
+    fn test_permission_denied_without_current_approval_preserves_active_state() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('tori', 'sess-1', 'claude', 'active', 'prompt', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-1", "tori");
+        let ctx = make_ctx();
+
+        let denied_raw = serde_json::json!({
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_use_id": "call-1",
+            "reason": "Command rejected by user",
+        });
+        let mut denied_payload = HookPayload::from_claude(denied_raw);
+        let (exit_code, stdout, _ack, _timing) =
+            route_claude_hook(&db, &ctx, HOOK_PERMISSION_DENIED, &mut denied_payload);
+
+        assert_eq!(exit_code, 0);
+        assert!(stdout.is_empty());
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "prompt");
+        assert!(!db.is_idle("tori"));
     }
 }
