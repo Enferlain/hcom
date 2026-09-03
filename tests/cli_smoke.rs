@@ -162,10 +162,22 @@ fn filtered_listen_timeout_is_structured_and_nonzero() {
     assert_eq!(code, 1, "stderr={stderr}; stdout={stdout}");
     let timeout: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|error| panic!("timeout JSON: {error}; stdout={stdout}"));
+    // Contract version 1: see src/commands/listen_result.rs.
+    assert_eq!(timeout["schema_version"].as_i64(), Some(1));
     assert_eq!(timeout["matched"].as_bool(), Some(false));
     assert_eq!(timeout["reason"].as_str(), Some("timeout"));
     assert_eq!(timeout["timeout_seconds"].as_f64(), Some(1.0));
     assert_eq!(timeout["effective_timeout_seconds"].as_f64(), Some(0.1));
+    assert_eq!(
+        timeout["notification"].as_str(),
+        Some("[Timeout: no match after 0.1s]")
+    );
+    for absent in ["event_id", "type", "instance", "data"] {
+        assert!(
+            timeout.get(absent).is_none(),
+            "timeout JSON must not carry matched key '{absent}': {stdout}"
+        );
+    }
 
     let (invalid_code, _, invalid_stderr) = h.run(["listen", "--name", &me, "--timeout-ok", "1"]);
     assert_eq!(invalid_code, 1);
@@ -188,8 +200,74 @@ fn filtered_listen_timeout_is_structured_and_nonzero() {
     );
     let compat: serde_json::Value = serde_json::from_str(compat_stdout.trim())
         .unwrap_or_else(|error| panic!("compat timeout JSON: {error}; stdout={compat_stdout}"));
+    assert_eq!(compat["schema_version"].as_i64(), Some(1));
     assert_eq!(compat["matched"].as_bool(), Some(false));
     assert_eq!(compat["reason"].as_str(), Some("timeout"));
+}
+
+#[test]
+fn filtered_listen_match_result_follows_versioned_schema() {
+    let h = Hcom::new();
+    let me = h.start();
+
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+
+    // Emit a real post-cursor status event for a second identity.
+    let worker = h.start();
+    let (status_code, _, status_err) = h.run([
+        "pi-status",
+        "--name",
+        &worker,
+        "--status",
+        "listening",
+        "--context",
+        "turn:end",
+    ]);
+    assert_eq!(status_code, 0, "stderr={status_err}");
+
+    let (code, stdout, stderr) = h.run([
+        "listen",
+        "--name",
+        &me,
+        "--timeout",
+        "3",
+        "--json",
+        "--after-id",
+        &cursor,
+        "--type",
+        "status",
+        "--agent",
+        &worker,
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}; stdout={stdout}");
+    let matched: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("match JSON: {error}; stdout={stdout}"));
+
+    // Contract version 1: see src/commands/listen_result.rs.
+    assert_eq!(matched["schema_version"].as_i64(), Some(1));
+    assert_eq!(matched["matched"].as_bool(), Some(true));
+    assert_eq!(matched["type"].as_str(), Some("status"));
+    assert_eq!(matched["instance"].as_str(), Some(worker.as_str()));
+    let event_id = matched["event_id"].as_i64().expect("event_id integer");
+    assert!(event_id > cursor.parse::<i64>().unwrap_or(0));
+    assert!(
+        matched["data"].is_object(),
+        "matched data must be the event payload: {stdout}"
+    );
+    // Legacy prose is preserved verbatim for older parsers.
+    let expected_notification = format!("[Match found] #{event_id} status:{worker}");
+    assert_eq!(
+        matched["notification"].as_str(),
+        Some(expected_notification.as_str())
+    );
+    for absent in ["reason", "timeout_seconds", "effective_timeout_seconds"] {
+        assert!(
+            matched.get(absent).is_none(),
+            "match JSON must not carry timeout key '{absent}': {stdout}"
+        );
+    }
 }
 
 #[test]

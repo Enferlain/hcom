@@ -2047,7 +2047,7 @@ fn handle_notify(
                 db,
                 instance_name,
                 ST_BLOCKED,
-                "approval",
+                "elicitation",
                 Default::default(),
             );
             return (0, String::new());
@@ -3489,6 +3489,22 @@ mod tests {
             )
             .unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn elicitation_notification_uses_distinct_block_context() {
+        let (_dir, db) = make_delivery_test_db();
+        let payload = HookPayload::from_claude(serde_json::json!({
+            "notification_type": "elicitation_dialog"
+        }));
+
+        let (code, stdout) = handle_notify(&db, &payload, "nova", &serde_json::Map::new());
+
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
+        let row = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "elicitation");
     }
 
     fn delivery_cursor(db: &HcomDb) -> i64 {

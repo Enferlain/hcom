@@ -26,7 +26,7 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 
 ### Status overview
 
-- **Working:** 1, 2, 3, 4, 6, 14, 33, 34, 35, 36, 39, 40, and 41.
+- **Working:** 1, 2, 3, 4, 6, 14, 33, 34, 35, 36, 39, 40, 41, and 42.
 - **Partially addressed:** 30, with the remaining native-workflow follow-up
   tracked by issues 8 and 28.
 - **Partially mitigated:** 15; provider-native workspace trust is not an hcom
@@ -250,9 +250,11 @@ Filtered `hcom listen` currently exits with status `0` when its timeout expires 
 
 Use a distinct nonzero timeout exit code and a structured timeout result, aligned with `events --wait`. Preserve a documented compatibility path for interactive callers that intentionally treat an empty timeout as success.
 
-### 42. Filtered-listen JSON does not have a stable compatibility contract
+### 42. Filtered-listen JSON does not have a stable compatibility contract — working
 
 The direct event-scan implementation made filtered-listen JSON more consistent by returning `matched`, `notification`, `event_id`, `type`, `instance`, and `data`, but it also changed the previous notification text and output shape. Scripts that parse the old subscription-oriented payload can break even though the underlying match is correct.
+
+Status: **Working as of 2026-09-03.** Filtered `hcom listen --json` output is now an explicitly versioned contract built by one module, [`listen_result.rs`](../src/commands/listen_result.rs), so the match and timeout shapes cannot drift apart. Both outcomes carry `schema_version` (currently `1`), `matched`, and the legacy `notification` prose with its wording preserved; a match adds the typed `event_id`, `type`, `instance`, and `data` fields, a timeout adds `reason`, `timeout_seconds`, and `effective_timeout_seconds`, and no key appears on the wrong outcome. The module documents the compatibility policy: additive keys may land within a version and consumers must ignore unknown keys, while removing, renaming, or retyping a key, moving one between outcomes, or changing `matched` semantics requires a version bump together with the contract tests. `hcom listen --help` documents the schema, unit tests pin the exact key sets and types for both outcomes, and hermetic CLI regressions verify the versioned match and timeout objects end to end. Unfiltered message-mode `--json` lines remain a separate legacy shape outside the contract.
 
 Define and test a stable machine-readable schema. Prefer typed fields over parsing `notification`, document additive versus breaking changes, and provide either a compatibility version or an explicit schema version when fields or meanings must change.
 
@@ -372,12 +374,15 @@ turn; the same instruction had to be submitted with `hcom term inject` before
 the worker continued.
 
 Status: **Working as of 2026-09-03 for the reproduced Claude denial path.** A
-Claude `PermissionDenied` hook now changes the worker to listening only when
-the current lifecycle row is the matching hook-owned `blocked: approval`
-state. The transition preserves denial diagnostics and wakes delivery, making
-an already queued targeted message actionable at the resulting prompt. Rule
-or policy denials without a current interactive approval, and late denials
-after a newer provider transition, leave the current state unchanged.
+Claude `PermissionDenied` hook changes the worker to listening only when the
+current lifecycle row is the matching hook-owned `blocked: approval` state.
+Claude Code 2.1.252 does not emit that hook for every interactive `No`, so the
+PTY also recognizes its settled, empty `Interrupted · What should Claude do
+instead?` prompt as the same falling edge. The screen fallback is constrained
+to the current input-box context and refuses to fire while a newer approval
+menu is visible. Both paths preserve denial diagnostics and wake delivery;
+rule or policy denials without a current interactive approval, and late
+denials after a newer provider transition, leave the current state unchanged.
 
 Regression coverage inserts a real targeted message, verifies that it remains
 pending while approval is blocked, and proves that it becomes preparable and
@@ -385,6 +390,12 @@ passes the delivery gate after denial. Separate tests cover subagent approval
 rows and the guard that preserves an active state. The complete Claude-hook
 and delivery test suites, formatting, and `cargo check` pass; focused review
 approved the guarded implementation.
+
+A live `hcom run glm` regression then entered `blocked: approval`, selected
+`No` through `hcom term inject`, and queued a targeted follow-up. Without any
+external terminal input or prompt injection, the worker returned to listening,
+received the queued message, confirmed it, sent its completion report, and was
+cleaned up by the wrapper.
 
 Return separate delivery states such as `persisted`, `delivered_to_process`, `turn_scheduled`, and `actionable`. When a managed worker is blocked or between turns, the coordinator should either schedule a turn through a supported mechanism or report one typed blocker. A successful queue write must not imply that task execution resumed.
 
@@ -471,6 +482,20 @@ Provider permission systems remain useful for approval UX, but they should not
 be the sole containment boundary. Sandbox startup must be fail-closed: a worker
 must never silently fall back to unrestricted host execution when Bubblewrap is
 unavailable or its policy cannot be installed.
+
+### 45. Provider-run cleanup can turn a successful result into wrapper failure
+
+A live `hcom run glm` probe on 2026-09-03 received the worker's valid,
+correlated completion report and stopped the worker, but the wrapper then
+exited nonzero because removal of its temporary `provider-runs` directory raced
+with another writer and returned `Directory not empty`. This makes a successful
+task look failed and encourages callers to inspect state or rerun work that has
+already completed.
+
+Make provider-run cleanup atomic or retry boundedly after child processes have
+closed their files. Cleanup failure should remain a structured warning when the
+authoritative result was already recovered, while genuine leaked processes or
+credentials should still fail loudly and report their exact path and owner.
 
 ## P1: communication policy and context control
 

@@ -494,6 +494,50 @@ impl ScreenTracker {
         has_agent_row && has_nav_hint
     }
 
+    /// Claude Code's settled prompt after the user explicitly denies a tool.
+    ///
+    /// Some Claude Code releases do not emit the configured PermissionDenied
+    /// hook for the interactive "No" choice. The TUI does reliably return to
+    /// an empty input box under an "Interrupted · What should Claude do
+    /// instead?" banner. Restrict this fallback to the rows immediately above
+    /// the live empty input box, and reject a currently-visible approval menu
+    /// so stale scrollback cannot release a newer approval.
+    pub fn is_claude_denial_followup_visible(&self) -> bool {
+        let lines = self.get_screen_lines();
+        let Some((prompt_row, _)) = self.claude_input_box_row(&lines) else {
+            return false;
+        };
+        const CONTEXT_ROWS: usize = 8;
+        let context = &lines[prompt_row.saturating_sub(CONTEXT_ROWS)..prompt_row];
+        let has_denial_banner = context.iter().any(|line| {
+            line.contains("Interrupted") && line.contains("What should Claude do instead?")
+        });
+        let has_approval_menu = context.iter().any(|line| {
+            // These strings are load-bearing: they veto releasing a new
+            // approval while an older denial banner remains on screen.
+            line.contains("This command requires approval")
+                || line.contains("Do you want to proceed?")
+                || line.contains("Do you want to make this edit")
+                || line.contains("Yes, and don’t ask again")
+                || line.contains("Yes, and don't ask again")
+                || line.contains("tell Claude what to do differently")
+        });
+
+        let prompt_line = &lines[prompt_row];
+        let prompt_char = prompt_line
+            .trim_start()
+            .chars()
+            .next()
+            .expect("claude_input_box_row found a prompt glyph");
+        let prompt_pos = prompt_line
+            .find(prompt_char)
+            .expect("prompt glyph must occur in its source line");
+        let prompt_empty =
+            trim_with_nbsp(&prompt_line[prompt_pos + prompt_char.len_utf8()..]).is_empty();
+
+        has_denial_banner && !has_approval_menu && prompt_empty
+    }
+
     /// Check if output has been stable for N milliseconds
     /// Note: ms=0 returns true (always stable), which is valid for tools that skip stability check
     pub fn is_output_stable(&self, ms: u64) -> bool {
@@ -652,54 +696,41 @@ impl ScreenTracker {
     /// previous 3s workaround needed when using text heuristics.
     fn get_claude_input_box(&self) -> Option<(String, bool)> {
         let lines = self.get_screen_lines();
-        let num_lines = lines.len();
+        let (row_idx, prompt_char) = self.claude_input_box_row(&lines)?;
+        let line = &lines[row_idx];
+        let prompt_pos = line.find(prompt_char)?;
+        let after_prompt = &line[prompt_pos + prompt_char.len_utf8()..];
+        let text = trim_with_nbsp(after_prompt).to_string();
+        if text.is_empty() {
+            return Some((text, false));
+        }
 
-        // Search bottom-to-top to find the actual current input box,
-        // not stale output lines that happen to match the ❯ + ─ border pattern.
-        // `bypassPermissions` mode (require_ready_prompt=false) renders the
-        // same bordered box with a plain `>` instead of the styled `❯` — try
-        // the styled glyph first since it's the common case and less prone to
-        // matching unrelated output.
-        for row_idx in (1..num_lines).rev() {
-            let line = &lines[row_idx];
-            let trimmed = line.trim_start();
+        let is_placeholder = self
+            .is_dim_after_prompt(row_idx as u16, &prompt_char.to_string())
+            .unwrap_or(true);
+        Some((text, is_placeholder))
+    }
+
+    /// Locate Claude's current bordered input row and prompt glyph.
+    fn claude_input_box_row(&self, lines: &[String]) -> Option<(usize, char)> {
+        // Search bottom-to-top to find the actual current input box, not stale
+        // output that happens to contain the same border and prompt glyph.
+        for row_idx in (1..lines.len()).rev() {
+            let trimmed = lines[row_idx].trim_start();
             let Some(prompt_char) = ['❯', '>'].into_iter().find(|c| trimmed.starts_with(*c))
             else {
                 continue;
             };
-
-            let line_above = &lines[row_idx - 1];
-            if !line_above.contains('─') {
+            if !lines[row_idx - 1].contains('─') {
                 continue;
             }
-
-            let mut has_border_below = false;
-            for offset in 1..=3 {
-                if row_idx + offset >= num_lines {
-                    break;
-                }
-                if lines[row_idx + offset].contains('─') {
-                    has_border_below = true;
-                    break;
-                }
+            let has_border_below = (1..=3).any(|offset| {
+                row_idx + offset < lines.len() && lines[row_idx + offset].contains('─')
+            });
+            if has_border_below {
+                return Some((row_idx, prompt_char));
             }
-            if !has_border_below {
-                continue;
-            }
-
-            let prompt_pos = line.find(prompt_char)?;
-            let after_prompt = &line[prompt_pos + prompt_char.len_utf8()..];
-            let text = trim_with_nbsp(after_prompt).to_string();
-            if text.is_empty() {
-                return Some((text, false));
-            }
-
-            let is_placeholder = self
-                .is_dim_after_prompt(row_idx as u16, &prompt_char.to_string())
-                .unwrap_or(true);
-            return Some((text, is_placeholder));
         }
-
         None
     }
 
@@ -1501,6 +1532,85 @@ mod tests {
         lines.push("│ ❯                                              │");
         render_rows(&mut t, &lines);
         assert!(!t.is_claude_subagent_nav_visible());
+    }
+
+    #[test]
+    fn claude_denial_followup_is_detected_at_empty_prompt() {
+        let mut t = make_tracker(24, 80, "");
+        let mut lines = vec![""; 19];
+        lines.extend_from_slice(&[
+            "  Interrupted · What should Claude do instead?",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "❯",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "  ? for shortcuts",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(t.is_claude_denial_followup_visible());
+    }
+
+    #[test]
+    fn claude_old_denial_does_not_clear_current_approval() {
+        let mut t = make_tracker(24, 80, "");
+        let mut lines = vec![""; 17];
+        lines.extend_from_slice(&[
+            "  Interrupted · What should Claude do instead?",
+            "  This command requires approval",
+            "  Do you want to proceed?",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "❯",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "  ? for shortcuts",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_claude_denial_followup_visible());
+    }
+
+    #[test]
+    fn claude_old_denial_does_not_clear_edit_approval_variant() {
+        let mut t = make_tracker(24, 80, "");
+        let mut lines = vec![""; 17];
+        lines.extend_from_slice(&[
+            "  Interrupted · What should Claude do instead?",
+            "  Do you want to make this edit to src/main.rs?",
+            "  1. Yes",
+            "  2. Yes, and don't ask again",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "❯",
+            "────────────────────────────────────────────────────────────────────────────────",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_claude_denial_followup_visible());
+    }
+
+    #[test]
+    fn claude_denial_followup_requires_empty_prompt() {
+        let mut t = make_tracker(24, 80, "");
+        let mut lines = vec![""; 19];
+        lines.extend_from_slice(&[
+            "  Interrupted · What should Claude do instead?",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "❯ please continue",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "  ? for shortcuts",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_claude_denial_followup_visible());
+    }
+
+    #[test]
+    fn claude_denial_in_scrollback_is_ignored() {
+        let mut t = make_tracker(30, 80, "");
+        let mut lines = vec!["  Interrupted · What should Claude do instead?"];
+        lines.extend(std::iter::repeat_n("", 25));
+        lines.extend_from_slice(&[
+            "────────────────────────────────────────────────────────────────────────────────",
+            "❯",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "  ? for shortcuts",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_claude_denial_followup_visible());
     }
 
     #[test]

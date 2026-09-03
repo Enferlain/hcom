@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::commands::listen_result::{self, FilterMatchEvent};
 use crate::core::filters::{EventFilterArgs, build_sql_from_flags, resolve_filter_names};
 use crate::db::HcomDb;
 use crate::identity;
@@ -488,20 +489,13 @@ fn first_filter_match_after(
 }
 
 fn print_filter_match(row: &FilterMatch, json_output: bool) {
-    let notification = format!("[Match found] #{} {}:{}", row.0, row.1, row.2);
+    let event = FilterMatchEvent::from_row(row.0, &row.1, &row.2, &row.3);
     if json_output {
-        let data: serde_json::Value = serde_json::from_str(&row.3).unwrap_or_default();
-        let output = serde_json::json!({
-            "matched": true,
-            "notification": notification,
-            "event_id": row.0,
-            "type": row.1,
-            "instance": row.2,
-            "data": data,
-        });
+        // Versioned contract: see commands/listen_result.rs.
+        let output = listen_result::matched_result(&event);
         println!("{}", serde_json::to_string(&output).unwrap_or_default());
     } else {
-        println!("{notification}");
+        println!("{}", listen_result::match_notification(&event));
     }
 }
 
@@ -673,18 +667,12 @@ fn filter_listen_loop(
         // timeout.
         let elapsed = start_time.elapsed().as_secs_f64();
         if elapsed >= timeout {
-            let notification = format!("[Timeout: no match after {timeout}s]");
             if json_output {
-                let output = serde_json::json!({
-                    "matched": false,
-                    "reason": "timeout",
-                    "notification": notification,
-                    "timeout_seconds": requested_timeout,
-                    "effective_timeout_seconds": timeout,
-                });
+                // Versioned contract: see commands/listen_result.rs.
+                let output = listen_result::timeout_result(requested_timeout, timeout);
                 println!("{}", serde_json::to_string(&output).unwrap_or_default());
             } else {
-                eprintln!("\n{notification}");
+                eprintln!("\n{}", listen_result::timeout_notification(timeout));
             }
             if instance_data.get("tool").and_then(|v| v.as_str()) == Some("adhoc") {
                 set_status(

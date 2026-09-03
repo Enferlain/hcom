@@ -13,12 +13,21 @@ Rules:
 
 ## [2026-09-03]
 
+### Changed
+
+- Filtered `hcom listen --json` results are now an explicitly versioned
+  contract: both match and timeout outcomes carry `schema_version` with the
+  typed fields documented in `hcom listen --help`, keeping the legacy
+  notification prose as a non-parsing surface.
+
 ### Fixed
 
 - Claude permission denials now release only the matching hook-owned approval
   blocker, allowing an already queued targeted message to reach the resulting
   `What should Claude do instead?` prompt without external terminal input.
-  Policy denials and newer provider lifecycle states remain non-idle.
+  Releases that omit the `PermissionDenied` hook are covered by a guarded PTY
+  check for that settled empty prompt; policy denials and newer provider
+  lifecycle states remain non-idle.
 
 ## [2026-09-01]
 

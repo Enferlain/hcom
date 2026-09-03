@@ -53,6 +53,7 @@ pub(super) fn update_delivery_state(
     publish: &dyn Fn(bool),
 ) {
     let mut approval_changed = None;
+    let mut claude_denial_followup = false;
     if let Ok(mut state) = screen_state.write() {
         state.ready = screen.is_ready();
         // Cursor and Codex can briefly erase their approval surfaces during
@@ -98,6 +99,12 @@ pub(super) fn update_delivery_state(
         state.nav_overlay = matches!(target.known_tool(), Some(Tool::Claude))
             && (screen.is_claude_subagent_nav_visible()
                 || screen.is_claude_session_switcher_visible());
+        // Claude Code v2.1.252 can omit PermissionDenied for the interactive
+        // "No" choice. Its settled denial follow-up is a narrow, observable
+        // falling edge for the hook-owned approval block.
+        claude_denial_followup = matches!(target.known_tool(), Some(Tool::Claude))
+            && screen.is_claude_denial_followup_visible()
+            && screen.is_output_stable(APPROVAL_SCRAPE_CLEAR_MS);
         // visible_tail is only consumed by the launch-blocked heuristic;
         // skip the screen walk + allocation once launch phase is over.
         state.visible_tail = if launch_phase_active.load(Ordering::Acquire) {
@@ -111,6 +118,9 @@ pub(super) fn update_delivery_state(
 
     if let Some(approval) = approval_changed {
         publish(approval);
+    }
+    if claude_denial_followup {
+        publish(false);
     }
 }
 
@@ -227,16 +237,22 @@ pub(super) fn publish_approval_status(
             return;
         }
     };
-    let already_blocked = current
+    let pty_blocked = current
         .as_ref()
         .is_some_and(|row| row.status == ST_BLOCKED && row.status_context == "pty:approval");
+    let hook_blocked = current
+        .as_ref()
+        .is_some_and(|row| row.status == ST_BLOCKED && row.status_context == "approval");
+    let already_blocked = pty_blocked || hook_blocked;
 
     // Resolve the approval edge to publish: block on the rising edge, release
     // on the falling edge, and stay silent when the row already matches.
     let edge = if approval {
         (!already_blocked).then_some((ST_BLOCKED, "pty:approval"))
     } else {
-        already_blocked.then_some((ST_LISTENING, "pty:approval_cleared"))
+        pty_blocked
+            .then_some((ST_LISTENING, "pty:approval_cleared"))
+            .or_else(|| hook_blocked.then_some((ST_LISTENING, "denied:screen")))
     };
     let Some((status, context)) = edge else {
         // No transition to publish. Still reflect a standing block in the
@@ -1396,6 +1412,55 @@ mod tests {
         let state = Arc::new(RwLock::new(ScreenState::default()));
         let publish = |_a: bool| panic!("must not publish when nothing to clear");
         assert!(!clear_injected_approval_state(&target, &state, &publish));
+    }
+
+    #[test]
+    #[serial]
+    fn publish_screen_denial_releases_only_hook_owned_approval() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, status_time, created_at)
+                 VALUES ('nova', 'claude', 'blocked', 'approval', 'cargo fmt', 0, 0)",
+                [],
+            )
+            .unwrap();
+        let shared_status = Arc::new(RwLock::new(ST_BLOCKED.to_string()));
+
+        publish_approval_status(false, Some("nova"), &shared_status);
+
+        let released = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(released.status, ST_LISTENING);
+        assert_eq!(released.status_context, "denied:screen");
+        assert_eq!(released.status_detail, "cargo fmt");
+        assert_eq!(*shared_status.read().unwrap(), ST_LISTENING);
+        let event_data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'status' AND instance = 'nova'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_data).unwrap();
+        assert_eq!(event["status"], ST_LISTENING);
+        assert_eq!(event["context"], "denied:screen");
+
+        for (status, context) in [("active", "tool:Bash"), (ST_BLOCKED, "elicitation")] {
+            db.conn()
+                .execute(
+                    "UPDATE instances SET status = ?1, status_context = ?2 WHERE name = 'nova'",
+                    rusqlite::params![status, context],
+                )
+                .unwrap();
+            publish_approval_status(false, Some("nova"), &shared_status);
+            let unchanged = db.get_instance_full("nova").unwrap().unwrap();
+            assert_eq!(unchanged.status, status);
+            assert_eq!(unchanged.status_context, context);
+        }
     }
 
     #[test]

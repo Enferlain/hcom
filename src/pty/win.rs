@@ -577,7 +577,9 @@ impl Proxy {
                         // gate sees leftover non-dim text on the prompt row — then
                         // latches forever instead of self-correcting within one poll,
                         // stalling delivery indefinitely until new output arrives.
-                        if ready_signaled.load(Ordering::Acquire) {
+                        if ready_signaled.load(Ordering::Acquire)
+                            || matches!(target.known_tool(), Some(Tool::Claude))
+                        {
                             shared::update_delivery_state(
                                 &screen_state,
                                 &screen,

@@ -428,7 +428,10 @@ const LISTEN_HELP: &[HelpEntry] = &[
         "  --timeout-ok",
         "Return 0 on filtered timeout (legacy compatibility)",
     ),
-    ("  --json", "Output messages as JSON"),
+    (
+        "  --json",
+        "Output messages as JSON (filtered schema: see below)",
+    ),
     ("", ""),
     ("Filter flags:", ""),
     ("", "Supports all filter flags from 'events' command"),
@@ -447,6 +450,23 @@ const LISTEN_HELP: &[HelpEntry] = &[
     ),
     ("  --sql stopped:name", "Preset: wait for agent to stop"),
     ("  --idle NAME", "Wait for a genuine task-idle transition"),
+    ("", ""),
+    ("Filtered --json schema (version 1):", ""),
+    (
+        "",
+        "One object; always: schema_version, matched, notification",
+    ),
+    (
+        "",
+        "notification is legacy prose - parse the typed fields instead",
+    ),
+    ("", "Match adds: event_id, type, instance, data"),
+    ("", "Timeout adds: reason, timeout_seconds,"),
+    ("", "  effective_timeout_seconds"),
+    (
+        "",
+        "New keys may appear within a version; ignore unknown keys",
+    ),
     ("", ""),
     ("Exit codes:", ""),
     ("  0", "Message received / event matched"),
@@ -1206,6 +1226,18 @@ mod tests {
     fn durable_cursor_is_documented_for_wait_commands() {
         assert!(get_command_help("events").contains("--after-id ID"));
         assert!(get_command_help("listen").contains("--after-id ID"));
+    }
+
+    #[test]
+    fn filtered_listen_json_contract_is_documented() {
+        let help = get_command_help("listen");
+        assert!(
+            help.contains("Filtered --json schema (version 1)"),
+            "listen help must document the versioned filtered JSON contract"
+        );
+        assert!(help.contains("schema_version"));
+        assert!(help.contains("Match adds: event_id, type, instance, data"));
+        assert!(help.contains("effective_timeout_seconds"));
     }
 
     #[test]

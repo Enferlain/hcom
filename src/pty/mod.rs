@@ -57,7 +57,7 @@ use screen::ScreenTracker;
 use terminal::TerminalGuard;
 
 #[cfg(unix)]
-use crate::delivery::ScreenState;
+use crate::delivery::{APPROVAL_SCRAPE_CLEAR_MS, ScreenState};
 use crate::tool::Tool;
 
 /// Identity of the process wrapped by the PTY.
@@ -906,10 +906,24 @@ impl Proxy {
             if !include_listener {
                 poll_timeout = poll_timeout.min(100u16);
             }
+            // A candidate Claude denial needs one quiet re-check after the
+            // partial-frame stability window. Cap this one poll rather than
+            // making every Claude session wake at a higher steady cadence.
+            if matches!(self.config.target.known_tool(), Some(Tool::Claude))
+                && self.screen.is_claude_denial_followup_visible()
+            {
+                poll_timeout = poll_timeout.min(APPROVAL_SCRAPE_CLEAR_MS as u16);
+            }
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout)) {
                 Ok(0) => {
                     // Timeout - still update delivery state for time-based checks
-                    if ready_signaled {
+                    // Claude's delivery gate intentionally skips the visual
+                    // ready check, so lifecycle fallbacks must also be
+                    // re-evaluated after output settles even when its screen
+                    // never matched the generic ready pattern.
+                    if ready_signaled
+                        || matches!(self.config.target.known_tool(), Some(Tool::Claude))
+                    {
                         shared::update_delivery_state(
                             &self.delivery_state,
                             &self.screen,
@@ -964,7 +978,9 @@ impl Proxy {
                 Ok(_) => {}
                 Err(Errno::EINTR) => {
                     // Interrupted - still update delivery state
-                    if ready_signaled {
+                    if ready_signaled
+                        || matches!(self.config.target.known_tool(), Some(Tool::Claude))
+                    {
                         shared::update_delivery_state(
                             &self.delivery_state,
                             &self.screen,
