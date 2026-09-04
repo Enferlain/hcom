@@ -11,6 +11,13 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
+## [2026-09-04]
+
+### Added
+
+- Added `github-pr-review` built-in workflow script to facilitate automated GitHub PR reviews.
+- Added GitHub workflow `.github/workflows/hcom-review.yml` for testing the PR review integration.
+
 ## [2026-09-03]
 
 ### Changed
@@ -113,3 +120,10 @@ Rules:
   instead of being silently ignored.
 
 ### Removed
+
+## [2026-09-04]
+
+### Added
+
+- Added `github-pr-review` built-in workflow script to facilitate automated GitHub PR reviews.
+- Added GitHub workflow `.github/workflows/hcom-review.yml` for testing the PR review integration.

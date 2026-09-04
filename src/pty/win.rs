@@ -9,6 +9,7 @@
 //! an **idle** agent be woken on Windows (the M1 limitation): the delivery loop
 //! injects `<hcom>` text into the ConPTY input when a message arrives.
 
+
 use anyhow::{Context, Result};
 use std::io::{IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -578,7 +579,7 @@ impl Proxy {
                         // latches forever instead of self-correcting within one poll,
                         // stalling delivery indefinitely until new output arrives.
                         if ready_signaled.load(Ordering::Acquire)
-                            || matches!(target.known_tool(), Some(Tool::Claude))
+                            || matches!(target.known_tool(), Some(crate::tool::Tool::Claude))
                         {
                             shared::update_delivery_state(
                                 &screen_state,
