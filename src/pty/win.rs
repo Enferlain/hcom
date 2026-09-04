@@ -9,7 +9,7 @@
 //! an **idle** agent be woken on Windows (the M1 limitation): the delivery loop
 //! injects `<hcom>` text into the ConPTY input when a message arrives.
 
-use crate::tool::Tool;
+
 use anyhow::{Context, Result};
 use std::io::{IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
