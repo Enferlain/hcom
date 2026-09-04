@@ -172,7 +172,7 @@ pub fn do_resume(
             hcom_config: &hcom_config,
             inline_readiness_wait_secs: None,
         };
-        print_launch_feedback(&db, &launch_result, &output)?;
+        print_launch_feedback(&db, &launch_result, &output, None)?;
         return Ok(0);
     }
 
@@ -576,6 +576,13 @@ fn execute_prepared_resume(
     let result = execute_prepared_resume_result(db, name, fork, plan)?;
 
     if print_feedback_now {
+        // Resume/fork share launch's inline readiness wait + exit-code mapping:
+        // when invoked from inside an AI tool we block briefly so the caller
+        // sees ready/blocked/failed instead of a bare "spawned" line.
+        let readiness_state = inline_readiness_wait_secs
+            .filter(|_| result.launched == 1)
+            .map(|secs| crate::commands::launch::print_inline_launch_readiness(db, &result, secs));
+
         let output = LaunchOutputContext {
             action: &plan.output.action,
             tool: &plan.output.tool,
@@ -588,13 +595,7 @@ fn execute_prepared_resume(
             hcom_config,
             inline_readiness_wait_secs,
         };
-        print_launch_feedback(db, &result, &output)?;
-        // Resume/fork share launch's inline readiness wait + exit-code mapping:
-        // when invoked from inside an AI tool we block briefly so the caller
-        // sees ready/blocked/failed instead of a bare "spawned" line.
-        let readiness_state = inline_readiness_wait_secs
-            .filter(|_| result.launched == 1)
-            .map(|secs| crate::commands::launch::print_inline_launch_readiness(db, &result, secs));
+        print_launch_feedback(db, &result, &output, readiness_state.clone())?;
         log_info(
             if fork { "fork" } else { "resume" },
             &format!("cmd.{}", if fork { "fork" } else { "resume" }),

@@ -11,10 +11,6 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
-## [Unreleased]
-
-- **Changed:** Agent-facing launch tips now prioritize high-level workflow commands (like `hcom events --wait`) on success, relegating low-level diagnostic commands (like `list`, `term`, `kill`) to blocked or failed runs.
-
 ## [2026-09-03]
 
 ### Changed

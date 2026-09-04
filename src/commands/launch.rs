@@ -124,7 +124,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
                     hcom_config: &hcom_config,
                     inline_readiness_wait_secs: None,
                 };
-                print_launch_feedback(&db, &launch_result, &output)?;
+                print_launch_feedback(&db, &launch_result, &output, None)?;
                 return Ok(0);
             }
             Err(e) => bail!("Remote launch failed for device {device}: {e}"),
@@ -202,41 +202,12 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         },
     )?;
 
-    print_launch_feedback(&db, &result, &output)?;
     let readiness_state = output
         .inline_readiness_wait_secs
         .filter(|_| result.launched == 1)
         .map(|secs| print_inline_launch_readiness(&db, &result, secs));
 
-    let diagnostic_mode = match readiness_state {
-        Some(InlineLaunchReadiness::Failed) | Some(InlineLaunchReadiness::Blocked) => true,
-        _ => false,
-    };
-
-    let launcher_participating = db
-        .get_instance_full(launcher_name_ref)
-        .ok()
-        .flatten()
-        .is_some();
-    let (terminal_mode, terminal_auto_detected) = crate::terminal::resolve_terminal_mode_for_tips(
-        terminal_for_output.as_deref(),
-        &hcom_config.terminal,
-        background,
-        hcom_flags.run_here.unwrap_or(false),
-    );
-    tips::print_launch_tips(
-        &db,
-        LaunchTipsContext {
-            launched: result.launched,
-            tag: tag_for_output.as_deref(),
-            launcher_name: Some(launcher_name_ref),
-            launcher_participating,
-            background,
-            terminal_mode: &terminal_mode,
-            terminal_auto_detected,
-            diagnostic_mode,
-        },
-    );
+    print_launch_feedback(&db, &result, &output, readiness_state.clone())?;
 
     // Log summary
     log_info(
@@ -704,25 +675,20 @@ pub(crate) struct LaunchOutputContext<'a> {
     pub action: &'a str,
     pub tool: &'a str,
     pub requested_count: usize,
-    #[allow(dead_code)]
     pub tag: Option<&'a str>,
-    #[allow(dead_code)]
     pub launcher_name: &'a str,
-    #[allow(dead_code)]
     pub terminal: Option<&'a str>,
-    #[allow(dead_code)]
     pub background: bool,
-    #[allow(dead_code)]
     pub run_here: Option<bool>,
-    #[allow(dead_code)]
     pub hcom_config: &'a HcomConfig,
     pub inline_readiness_wait_secs: Option<u64>,
 }
 
 pub(crate) fn print_launch_feedback(
-    _db: &HcomDb,
+    db: &HcomDb,
     result: &LaunchResult,
     ctx: &LaunchOutputContext<'_>,
+    readiness_state: Option<InlineLaunchReadiness>,
 ) -> Result<()> {
     if result.failed > 0 {
         for err in &result.errors {
@@ -764,6 +730,36 @@ pub(crate) fn print_launch_feedback(
         println!("To block until ready or fail (30s timeout), run: hcom events launch");
     }
 
+    let launcher_participating = db
+        .get_instance_full(ctx.launcher_name)
+        .ok()
+        .flatten()
+        .is_some();
+    let (terminal_mode, terminal_auto_detected) = crate::terminal::resolve_terminal_mode_for_tips(
+        ctx.terminal,
+        &ctx.hcom_config.terminal,
+        ctx.background,
+        ctx.run_here.unwrap_or(false),
+    );
+    let diagnostic_mode = match readiness_state {
+        Some(InlineLaunchReadiness::Failed) |
+        Some(InlineLaunchReadiness::Blocked) => true,
+        _ => false,
+    };
+
+    tips::print_launch_tips(
+        db,
+        LaunchTipsContext {
+            launched: result.launched,
+            tag: ctx.tag,
+            launcher_name: Some(ctx.launcher_name),
+            launcher_participating,
+            background: ctx.background,
+            terminal_mode: &terminal_mode,
+            terminal_auto_detected,
+            diagnostic_mode,
+        },
+    );
     Ok(())
 }
 

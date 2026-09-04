@@ -160,35 +160,46 @@ pub fn print_launch_tips(db: &HcomDb, ctx: LaunchTipsContext<'_>) {
     // --- One-time (kv-tracked) ---
 
     if inside_tool {
-        if !ctx.launcher_participating {
+        if has_close {
+            // High-level managed workflow
             once(
                 db,
                 &mut tips,
                 ctx.launcher_name,
-                "launch:start",
-                "[tip] Run 'hcom start' to receive notifications/messages from instances",
+                "launch:managed-wait",
+                "[tip] Wait for workflow completion: hcom run <workflow>",
             );
         }
 
-        if has_close {
-            if !ctx.diagnostic_mode {
+        if ctx.diagnostic_mode {
+            if !ctx.launcher_participating {
                 once(
                     db,
                     &mut tips,
                     ctx.launcher_name,
-                    "launch:workflow",
-                    "[tip] Wait for result: hcom events --wait --sql stopped:<name>",
+                    "launch:start",
+                    "[tip] Run 'hcom start' to receive notifications/messages from instances",
                 );
             }
-        }
 
-        if ctx.diagnostic_mode {
             if has_close {
-                once(db, &mut tips, ctx.launcher_name, "launch:kill", "[tip] Kill agents and close their panes: hcom kill <name1> <name2> ...");
+                once(
+                    db,
+                    &mut tips,
+                    ctx.launcher_name,
+                    "launch:kill",
+                    "[tip] Kill agents and close their panes: hcom kill <name1> <name2> ...",
+                );
             }
 
             if !ctx.background {
-                once(db, &mut tips, ctx.launcher_name, "launch:term", "[tip] View an agent's screen: hcom term <name> | Inject keystrokes: hcom term inject <name> [text] --enter");
+                once(
+                    db,
+                    &mut tips,
+                    ctx.launcher_name,
+                    "launch:term",
+                    "[tip] View an agent's screen: hcom term <name> | Inject keystrokes: hcom term inject <name> [text] --enter",
+                );
             }
 
             if is_tmux || ctx.background {
