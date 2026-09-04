@@ -1,0 +1,50 @@
+name: hcom PR review
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  hcom-review:
+    if: >
+      github.event.issue.pull_request &&
+      github.event.issue.state == 'open' &&
+      startsWith(github.event.comment.body, '/hcom review')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Validate actor
+        # Initially accept commands only from an explicit maintainer allowlist.
+        run: |
+          ALLOWLIST="Enferlain"
+          if [[ ! " $ALLOWLIST " =~ " ${{ github.actor }} " ]]; then
+            echo "::error::Actor ${{ github.actor }} is not allowed to run hcom review."
+            sh -c "exit 1"
+          fi
+
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup hcom
+        run: |
+          mkdir -p ~/.cargo/bin
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          cargo build --release
+          cp target/release/hcom ~/.cargo/bin/
+
+      - name: Run hcom review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          hcom run github-pr-review \
+            --pr-url "${{ github.event.issue.pull_request.url }}" \
+            --github-token "${{ secrets.GITHUB_TOKEN }}" \
+            --allowlist "Enferlain" \
+            --actor "${{ github.actor }}"
