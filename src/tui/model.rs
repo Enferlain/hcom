@@ -287,6 +287,9 @@ fn strip_context_prefix(ctx: &str) -> &str {
             other => other,
         };
     }
+    if ctx.starts_with("filter-wait:") {
+        return "event filter";
+    }
     const PREFIXES: &[&str] = &[
         "tool:",
         "deliver:",
