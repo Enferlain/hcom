@@ -448,6 +448,14 @@ impl HcomDb {
                 params![name],
             )?;
             tx.execute(
+                "DELETE FROM kv
+                 WHERE key LIKE 'events_sub:%'
+                   AND json_extract(value, '$.caller') = ?
+                   AND json_extract(value, '$.auto_thread_member') = 1
+                   AND COALESCE(json_extract(value, '$.delivery_only'), 0) = 1",
+                params![name],
+            )?;
+            tx.execute(
                 "INSERT INTO events (timestamp, type, instance, data)
                  VALUES (?, 'life', ?, ?)",
                 params![timestamp, name, data],
@@ -1157,6 +1165,63 @@ mod tests {
         // Should be ordered by created_at DESC
         assert_eq!(instances[0]["name"], "luna");
         assert_eq!(instances[1]["name"], "nova");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_finalize_instance_stop_removes_thread_memberships() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, session_id) VALUES ('luna', 1000.0, 'sess1')",
+                [],
+            )
+            .unwrap();
+
+        // Add a normal subscription
+        let normal = serde_json::json!({
+            "id": "sub-normal",
+            "caller": "luna",
+            "sql": "type = 'message'",
+            "last_id": 0
+        });
+        db.kv_set("events_sub:sub-normal", Some(&normal.to_string()))
+            .unwrap();
+
+        // Add an auto thread membership
+        let thread_member = serde_json::json!({
+            "id": "sub-thread",
+            "caller": "luna",
+            "thread_name": "debate-1",
+            "auto_thread_member": true,
+            "delivery_only": true,
+            "created": 1000.0,
+            "last_id": 0
+        });
+        db.kv_set("events_sub:sub-thread", Some(&thread_member.to_string()))
+            .unwrap();
+
+        // Add an explicitly retained (persistent) thread membership
+        let persistent_member = serde_json::json!({
+            "id": "sub-persist",
+            "caller": "luna",
+            "thread_name": "debate-1",
+            "delivery_only": true,
+            "created": 1000.0,
+            "last_id": 0
+        });
+        db.kv_set("events_sub:sub-persist", Some(&persistent_member.to_string()))
+            .unwrap();
+
+        let event_data = serde_json::json!({"action": "stopped"});
+        let won = db.finalize_instance_stop("luna", 1000.0, Some("sess1"), None, &event_data).unwrap();
+        assert!(won);
+
+        assert!(db.kv_get("events_sub:sub-normal").unwrap().is_none(), "Normal subscriptions should be removed");
+        assert!(db.kv_get("events_sub:sub-thread").unwrap().is_none(), "Auto thread memberships should be removed");
+        assert!(db.kv_get("events_sub:sub-persist").unwrap().is_some(), "Explicitly persistent thread memberships should remain");
 
         cleanup_test_db(db_path);
     }

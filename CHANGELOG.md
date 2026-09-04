@@ -22,6 +22,7 @@ Rules:
 
 ### Fixed
 
+- Fixed an issue where auto-thread memberships would outlive workflows, causing cross-workflow noise. They now properly expire on workflow close.
 - Claude permission denials now release only the matching hook-owned approval
   blocker, allowing an already queued targeted message to reach the resulting
   `What should Claude do instead?` prompt without external terminal input.
