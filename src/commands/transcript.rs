@@ -62,6 +62,8 @@ pub struct TranscriptArgs {
     /// Last N exchanges
     #[arg(long)]
     pub last: Option<usize>,
+    #[arg(long, hide = true)]
+    pub tail: Option<usize>,
     /// Exchange range (flag form)
     #[arg(long = "range")]
     pub range_flag: Option<String>,
@@ -94,7 +96,11 @@ pub struct TranscriptSearchArgs {
     pub exclude_self: bool,
     /// Max results (default: 20)
     #[arg(long, default_value = "20")]
-    pub limit: usize,
+    pub last: usize,
+    #[arg(long, hide = true)]
+    pub limit: Option<usize>,
+    #[arg(long, hide = true)]
+    pub tail: Option<usize>,
     /// Filter by exact agent type (canonical name or declared alias)
     #[arg(long)]
     pub agent: Option<String>,
@@ -115,6 +121,8 @@ pub struct TranscriptTimelineArgs {
     /// Last N exchanges per agent
     #[arg(long)]
     pub last: Option<usize>,
+    #[arg(long, hide = true)]
+    pub tail: Option<usize>,
 }
 
 /// Truncate a string to at most `max` bytes at a valid UTF-8 char boundary.
@@ -371,10 +379,19 @@ fn cmd_transcript_search(
     args: &TranscriptSearchArgs,
     ctx: Option<&CommandContext>,
 ) -> i32 {
+    if args.tail.is_some() {
+        eprintln!("Error: Unsupported flag '--tail'. Use '--last' instead.");
+        return 1;
+    }
+    if args.limit.is_some() {
+        eprintln!("Error: Unsupported flag '--limit'. Use '--last' instead.");
+        return 1;
+    }
+
     let live_mode = args.live;
     let all_mode = args.all;
     let json_mode = args.json;
-    let limit = args.limit;
+    let limit = args.last;
     let agent_filter = match args.agent.as_deref() {
         Some(value) => match transcript::parse_tool_filter(value) {
             Ok(tool) => Some(tool),
@@ -812,6 +829,11 @@ fn cmd_transcript_search(
 
 /// Timeline: `hcom transcript timeline [--last N] [--full] [--json]`
 fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
+    if args.tail.is_some() {
+        eprintln!("Error: Unsupported flag '--tail'. Use '--last' instead.");
+        return 1;
+    }
+
     let json_mode = args.json;
     let full_mode = args.full;
     let detailed = args.detailed;
@@ -977,6 +999,11 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
 
 /// Main entry point for `hcom transcript` command.
 pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandContext>) -> i32 {
+    if args.tail.is_some() {
+        eprintln!("Error: Unsupported flag '--tail'. Use '--last' instead.");
+        return 1;
+    }
+
     // Handle subcommands
     match &args.subcmd {
         Some(TranscriptSubcmd::Search(search_args)) => {
@@ -1979,7 +2006,7 @@ mod tests {
             Some(TranscriptSubcmd::Search(ref s)) => {
                 assert_eq!(s.pattern, "error");
                 assert!(s.live);
-                assert_eq!(s.limit, 50);
+                assert_eq!(s.limit, Some(50));
             }
             _ => panic!("expected Search subcommand"),
         }

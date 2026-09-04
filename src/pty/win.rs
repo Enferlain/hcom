@@ -23,6 +23,7 @@ use super::ProxyConfig;
 use super::inject::{InjectResult, InjectServer, QueryCommand};
 use super::screen::ScreenTracker;
 use super::shared;
+use crate::tool::Tool;
 
 use crate::db::HcomDb;
 use crate::delivery::{EXIT_WAS_KILLED, ScreenState};

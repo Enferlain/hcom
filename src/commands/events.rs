@@ -46,6 +46,8 @@ pub struct EventsArgs {
     /// Limit count (default: 20)
     #[arg(long)]
     pub last: Option<usize>,
+    #[arg(long, hide = true)]
+    pub limit: Option<usize>,
     /// Include archived sessions
     #[arg(long)]
     pub all: bool,
@@ -1308,6 +1310,18 @@ fn build_message_preview(db: &HcomDb, instance_name: &str) -> String {
 
 /// Main entry point for `hcom events` command.
 pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) -> i32 {
+    if args.limit.is_some() {
+        eprintln!("Error: Unsupported flag '--limit'. Use '--last' instead.");
+        return 1;
+    }
+
+    if let Some(sql) = &args.sql {
+        if sql.contains("from_agent") {
+            eprintln!("Error: Unknown SQL field 'from_agent'. Use 'from' (or 'msg_from' in raw SQL).");
+            return 1;
+        }
+    }
+
     // Resolve identity context
     let instance_name = ctx
         .and_then(|c| c.identity.as_ref())

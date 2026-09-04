@@ -1097,7 +1097,7 @@ fn test_relay_roundtrip() {
     let marker = format!("relay-rt-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     check(
         "A",
-        &format!("send --from relaytest -- \"{marker}\""),
+        &format!("send --broadcast --from relaytest -- \"{marker}\""),
         &path_a,
     );
     logln!(log, "  OK: Sent: {marker}");
@@ -1275,7 +1275,7 @@ fn test_relay_roundtrip() {
     let marker_b = format!("relay-rt-b-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     check(
         "B",
-        &format!("send --from relaytest -- \"{marker_b}\""),
+        &format!("send --broadcast --from relaytest -- \"{marker_b}\""),
         &path_b,
     );
     logln!(log, "  OK: Sent: {marker_b}");
