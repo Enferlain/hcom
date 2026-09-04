@@ -11,6 +11,18 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
+## [2026-09-04]
+
+### Added
+
+- Added explicit migration errors for unsupported orchestration flags like `--tail` and `--limit` to guide users to the canonical `--last` flag.
+- Intercepts invalid SQL queries containing `from_agent` and redirects the user to use the correct `from` field.
+- Ambiguous positional arguments in `hcom send` (e.g. multiple bare words) are now blocked with an actionable error.
+
+### Changed
+
+- Normalized orchestration command filter vocabulary (`transcript search` now uses `--last` instead of `--limit`).
+
 ## [2026-09-03]
 
 ### Changed

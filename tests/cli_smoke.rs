@@ -676,6 +676,45 @@ fn start_send_events_roundtrip() {
 }
 
 #[test]
+fn test_unsupported_flags_and_ambiguous_send() {
+    let h = Hcom::new();
+    let name = h.start();
+
+    // 1. transcript --tail
+    let (code, _, err) = h.run(["transcript", &name, "--tail", "5"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("Unsupported flag '--tail'. Use '--last' instead."));
+
+    let (code, _, err) = h.run(["transcript", "timeline", "--tail", "5"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("Unsupported flag '--tail'. Use '--last' instead."));
+
+    let (code, _, err) = h.run(["transcript", "search", "foo", "--tail", "5"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("Unsupported flag '--tail'. Use '--last' instead."));
+
+    // 2. transcript search --limit
+    let (code, _, err) = h.run(["transcript", "search", "foo", "--limit", "5"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("Unsupported flag '--limit'. Use '--last' instead."));
+
+    // 3. events --limit
+    let (code, _, err) = h.run(["events", "--limit", "5"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("Unsupported flag '--limit'. Use '--last' instead."));
+
+    // 4. events --sql from_agent
+    let (code, _, err) = h.run(["events", "--sql", "from_agent='foo'"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("Unknown SQL field 'from_agent'. Use 'from'"));
+
+    // 5. ambiguous send (multiple non-@ positionals)
+    let (code, _, err) = h.run(["send", "--from", "bigboss", &format!("@{name}"), "multiple", "words"]);
+    assert_ne!(code, 0);
+    assert!(err.contains("Ambiguous message text. Use '--' to separate the message"));
+}
+
+#[test]
 fn intent_and_reply_to_roundtrip() {
     // Wiki contract (messaging.md §Intent + event-model.md `msg_intent`/`reply_to_local`):
     // request → ack with --reply-to flattens through `events_v` so threads/replies

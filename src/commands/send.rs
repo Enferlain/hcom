@@ -650,15 +650,15 @@ fn read_stdin() -> Result<String, String> {
 ///   - Single arg with `@` prefix and space → backward compat: entire text is message
 ///   - Mix of @targets and bare text → separate targets from message
 ///   - Pure @targets → targets only, no message
-fn process_positionals(positionals: &[String]) -> (Vec<String>, Option<String>) {
+fn process_positionals(positionals: &[String]) -> Result<(Vec<String>, Option<String>), String> {
     if positionals.is_empty() {
-        return (vec![], None);
+        return Ok((vec![], None));
     }
 
     // Backward compat: single arg starting with @ and containing space
     // e.g. "@luna hi" → whole thing is message (compute_scope extracts @mentions)
     if positionals.len() == 1 && positionals[0].starts_with('@') && positionals[0].contains(' ') {
-        return (vec![], Some(positionals[0].clone()));
+        return Ok((vec![], Some(positionals[0].clone())));
     }
 
     // Separate @targets from bare text
@@ -675,15 +675,14 @@ fn process_positionals(positionals: &[String]) -> (Vec<String>, Option<String>) 
 
     if remaining.len() > 1 {
         // Multiple non-@ args without -- separator → error
-        // Return empty message to trigger "no message" error with helpful hint
-        return (targets, None);
+        return Err("Ambiguous message text. Use '--' to separate the message from the recipients (e.g., hcom send @agent -- Hello).".to_string());
     }
 
     if remaining.len() == 1 {
-        return (targets, Some(remaining[0].clone()));
+        return Ok((targets, Some(remaining[0].clone())));
     }
 
-    (targets, None)
+    Ok((targets, None))
 }
 
 /// Main entry point for `hcom send` command.
@@ -794,7 +793,13 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     //   - Pure @targets → explicit targets
     let (effective_targets, compat_message) =
         if !args.has_separator() && !args.stdin && args.file.is_none() && args.base64.is_none() {
-            process_positionals(&args.positionals)
+            match process_positionals(&args.positionals) {
+                Ok(res) => res,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return 1;
+                }
+            }
         } else {
             // With -- separator or explicit source: validate @targets
             let mut validated = Vec::new();
@@ -1459,7 +1464,7 @@ mod tests {
 
     #[test]
     fn process_empty() {
-        let (targets, msg) = process_positionals(&[]);
+        let Ok((targets, msg)) = process_positionals(&[]) else { panic!("Expected Ok") };
         assert!(targets.is_empty());
         assert!(msg.is_none());
     }
@@ -1826,7 +1831,7 @@ mod tests {
     #[test]
     fn process_compat_at_with_space() {
         // "@luna hi" → full text as message, no targets
-        let (targets, msg) = process_positionals(&["@luna hi".to_string()]);
+        let Ok((targets, msg)) = process_positionals(&["@luna hi".to_string()]) else { panic!("Expected Ok") };
         assert!(targets.is_empty());
         assert_eq!(msg.as_deref(), Some("@luna hi"));
     }
@@ -1834,7 +1839,7 @@ mod tests {
     #[test]
     fn process_bare_text() {
         // "hello everyone" → message text, no targets (broadcast)
-        let (targets, msg) = process_positionals(&["hello everyone".to_string()]);
+        let Ok((targets, msg)) = process_positionals(&["hello everyone".to_string()]) else { panic!("Expected Ok") };
         assert!(targets.is_empty());
         assert_eq!(msg.as_deref(), Some("hello everyone"));
     }
@@ -1842,7 +1847,7 @@ mod tests {
     #[test]
     fn process_pure_targets() {
         // "@luna" → target, no message
-        let (targets, msg) = process_positionals(&["@luna".to_string()]);
+        let Ok((targets, msg)) = process_positionals(&["@luna".to_string()]) else { panic!("Expected Ok") };
         assert_eq!(targets, vec!["luna"]);
         assert!(msg.is_none());
     }
@@ -1850,8 +1855,14 @@ mod tests {
     #[test]
     fn process_target_plus_bare_text() {
         // "@luna", "hello" → target + message
-        let (targets, msg) = process_positionals(&["@luna".to_string(), "hello".to_string()]);
+        let Ok((targets, msg)) = process_positionals(&["@luna".to_string(), "hello".to_string()]) else { panic!("Expected Ok") };
         assert_eq!(targets, vec!["luna"]);
         assert_eq!(msg.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn process_ambiguous_bare_words() {
+        let err = process_positionals(&["@luna".to_string(), "hello".to_string(), "world".to_string()]).unwrap_err();
+        assert!(err.contains("Ambiguous message text"));
     }
 }
