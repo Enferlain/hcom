@@ -578,7 +578,7 @@ impl Proxy {
                         // latches forever instead of self-correcting within one poll,
                         // stalling delivery indefinitely until new output arrives.
                         if ready_signaled.load(Ordering::Acquire)
-                            || matches!(target.known_tool(), Some(crate::tool::Tool::Claude))
+                            || matches!(target.known_tool(), Some(Tool::Claude))
                         {
                             shared::update_delivery_state(
                                 &screen_state,

@@ -1,9 +1,0 @@
-1. Modify `src/core/tips.rs` to adjust the `print_launch_tips` function so that it accepts information about whether the command encountered a failure or diagnostic mode. (Wait, let's look at `LaunchTipsContext` or how it's called in `launch.rs`).
-2. Oh, I see in `launch.rs`: it might be called after `wait_for_launch`. The issue says:
-"Ordinary managed-launch output recommends the high-level wait/result workflow first."
-"Routine success output does not encourage repeated list, term, events, or transcript polling."
-"Failure or diagnostic output provides the relevant escape-hatch commands."
-
-Wait, `LaunchTipsContext` could have a `diagnostic_escape_hatch` boolean, or similar.
-Let's modify `LaunchTipsContext` to include `diagnostic_mode: bool`.
-Then pass `diagnostic_mode` based on whether the inline launch wait resulted in a failure, block, or if the user invoked with `-v` (verbose).
