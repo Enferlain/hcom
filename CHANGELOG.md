@@ -11,6 +11,14 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
+## [2026-09-05]
+
+### Fixed
+
+- Antigravity out-of-workspace file-access prompts are now detected as PTY
+  approval blockers, so unattended hcom workflows can stop decisively instead
+  of reporting a worker as active indefinitely.
+
 ## [2026-09-03]
 
 ### Changed

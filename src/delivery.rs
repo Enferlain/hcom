@@ -1534,6 +1534,7 @@ pub(crate) fn classify_launch_blocker(tail: &str, screen_approval: bool) -> Bloc
                 &[
                     "requesting permission for:",
                     "do you want to proceed?",
+                    "allow access to this file?",
                     "allow this tool?",
                     "approve command",
                 ],
@@ -4079,6 +4080,9 @@ mod tests {
             res.evidence,
             Some("approval prompt detected by provider".to_string())
         );
+        let res = classify_launch_blocker("Allow access to this file?", true);
+        assert_eq!(res.kind, BlockedKind::Confirmation);
+        assert_eq!(res.evidence, Some("Allow access to this file?".to_string()));
 
         // Structured approval outranks command text containing other blocker
         // words, while a distinctive trust prompt remains more specific.
