@@ -287,6 +287,17 @@ fn strip_context_prefix(ctx: &str) -> &str {
             other => other,
         };
     }
+
+    let display_ctx = crate::shared::display_status_context(ctx, false);
+    if display_ctx != ctx {
+        // Since strip_context_prefix returns a static or sliced &str, and display_status_context returns a Cow,
+        // and we know it returns a static string "event filter" when it changes, we can just return it.
+        // Let's ensure the lifetime is correct.
+        if ctx.starts_with(crate::shared::FILTER_WAIT_PREFIX) {
+            return crate::shared::FILTER_WAIT_DISPLAY;
+        }
+    }
+
     const PREFIXES: &[&str] = &[
         "tool:",
         "deliver:",
@@ -1230,6 +1241,7 @@ mod tests {
             ("exit:0", "0"),
             ("stale:active", "active"),
             ("tui:not-ready", "not-ready"),
+            ("filter-wait:4242:1700000000:7", "event filter"),
         ] {
             let mut a = test_agent("nova");
             a.status_context = input.into();
