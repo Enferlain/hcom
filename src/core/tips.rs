@@ -12,6 +12,7 @@ pub struct LaunchTipsContext<'a> {
     pub background: bool,
     pub terminal_mode: &'a str,
     pub terminal_auto_detected: bool,
+    pub diagnostic_mode: bool,
 }
 
 /// Centralized tip text.
@@ -159,61 +160,74 @@ pub fn print_launch_tips(db: &HcomDb, ctx: LaunchTipsContext<'_>) {
     // --- One-time (kv-tracked) ---
 
     if inside_tool {
-        if !ctx.launcher_participating {
-            once(
-                db,
-                &mut tips,
-                ctx.launcher_name,
-                "launch:start",
-                "[tip] Run 'hcom start' to receive notifications/messages from instances",
-            );
-        }
-
         if has_close {
+            // High-level managed workflow
             once(
                 db,
                 &mut tips,
                 ctx.launcher_name,
-                "launch:kill",
-                "[tip] Kill agents and close their panes: hcom kill <name1> <name2> ...",
+                "launch:managed-wait",
+                "[tip] Wait for workflow completion: hcom run <workflow>",
             );
         }
 
-        if !ctx.background {
+        if ctx.diagnostic_mode {
+            if !ctx.launcher_participating {
+                once(
+                    db,
+                    &mut tips,
+                    ctx.launcher_name,
+                    "launch:start",
+                    "[tip] Run 'hcom start' to receive notifications/messages from instances",
+                );
+            }
+
+            if has_close {
+                once(
+                    db,
+                    &mut tips,
+                    ctx.launcher_name,
+                    "launch:kill",
+                    "[tip] Kill agents and close their panes: hcom kill <name1> <name2> ...",
+                );
+            }
+
+            if !ctx.background {
+                once(
+                    db,
+                    &mut tips,
+                    ctx.launcher_name,
+                    "launch:term",
+                    "[tip] View an agent's screen: hcom term <name> | Inject keystrokes: hcom term inject <name> [text] --enter",
+                );
+            }
+
+            if is_tmux || ctx.background {
+                once(
+                    db,
+                    &mut tips,
+                    ctx.launcher_name,
+                    "launch:sub-blocked",
+                    "[tip] Get notified when an agent needs approval: hcom events sub --blocked <name>",
+                );
+            } else {
+                once(
+                    db,
+                    &mut tips,
+                    ctx.launcher_name,
+                    "launch:sub-idle",
+                    "[tip] Get notified when an agent goes idle: hcom events sub --idle <name>",
+                );
+            }
+
             once(
                 db,
                 &mut tips,
                 ctx.launcher_name,
-                "launch:term",
-                "[tip] View an agent's screen: hcom term <name> | Inject keystrokes: hcom term inject <name> [text] --enter",
+                "list:status",
+                get_tip("list:status").unwrap_or(""),
             );
         }
-
-        if is_tmux || ctx.background {
-            once(
-                db,
-                &mut tips,
-                ctx.launcher_name,
-                "launch:sub-blocked",
-                "[tip] Get notified when an agent needs approval: hcom events sub --blocked <name>",
-            );
-        } else {
-            once(
-                db,
-                &mut tips,
-                ctx.launcher_name,
-                "launch:sub-idle",
-                "[tip] Get notified when an agent goes idle: hcom events sub --idle <name>",
-            );
-        }
-
-        once(
-            db,
-            &mut tips,
-            ctx.launcher_name,
-            "list:status",
-            get_tip("list:status").unwrap_or(""),
-        );
     } else {
         once(
             db,

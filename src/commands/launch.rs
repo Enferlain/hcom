@@ -124,7 +124,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
                     hcom_config: &hcom_config,
                     inline_readiness_wait_secs: None,
                 };
-                print_launch_feedback(&db, &launch_result, &output)?;
+                print_launch_feedback(&db, &launch_result, &output, None)?;
                 return Ok(0);
             }
             Err(e) => bail!("Remote launch failed for device {device}: {e}"),
@@ -202,11 +202,12 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         },
     )?;
 
-    print_launch_feedback(&db, &result, &output)?;
     let readiness_state = output
         .inline_readiness_wait_secs
         .filter(|_| result.launched == 1)
         .map(|secs| print_inline_launch_readiness(&db, &result, secs));
+
+    print_launch_feedback(&db, &result, &output, readiness_state.clone())?;
 
     // Log summary
     log_info(
@@ -687,6 +688,7 @@ pub(crate) fn print_launch_feedback(
     db: &HcomDb,
     result: &LaunchResult,
     ctx: &LaunchOutputContext<'_>,
+    readiness_state: Option<InlineLaunchReadiness>,
 ) -> Result<()> {
     if result.failed > 0 {
         for err in &result.errors {
@@ -739,6 +741,12 @@ pub(crate) fn print_launch_feedback(
         ctx.background,
         ctx.run_here.unwrap_or(false),
     );
+    let diagnostic_mode = match readiness_state {
+        Some(InlineLaunchReadiness::Failed) |
+        Some(InlineLaunchReadiness::Blocked) => true,
+        _ => false,
+    };
+
     tips::print_launch_tips(
         db,
         LaunchTipsContext {
@@ -749,6 +757,7 @@ pub(crate) fn print_launch_feedback(
             background: ctx.background,
             terminal_mode: &terminal_mode,
             terminal_auto_detected,
+            diagnostic_mode,
         },
     );
     Ok(())
