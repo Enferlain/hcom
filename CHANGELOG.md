@@ -19,6 +19,8 @@ Rules:
 
 ### Fixed
 
+- Windows targets compile again with the `Tool` import required by ConPTY
+  delivery-state checks.
 - Fixed an issue where auto-thread memberships would outlive workflows, causing
   cross-workflow noise. They now expire atomically when their participant's
   lifecycle closes without affecting unrelated delivery state.

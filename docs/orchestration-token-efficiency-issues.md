@@ -26,7 +26,8 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 
 ### Status overview
 
-- **Working:** 1, 2, 3, 4, 6, 14, 33, 34, 35, 36, 39, 40, 41, 42, and 46.
+- **Working:** 1, 2, 3, 4, 6, 14, 24, 33, 34, 35, 36, 39, 40, 41, 42, 43,
+  and 46.
 - **Partially addressed:** 30, with the remaining native-workflow follow-up
   tracked by issues 8 and 28.
 - **Partially mitigated:** 15; provider-native workspace trust is not an hcom
