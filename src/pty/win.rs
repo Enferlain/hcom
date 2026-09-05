@@ -27,6 +27,7 @@ use super::shared;
 use crate::db::HcomDb;
 use crate::delivery::{EXIT_WAS_KILLED, ScreenState};
 use crate::log::log_error;
+use crate::tool::Tool;
 
 /// True if `path` is a `.cmd`/`.bat` script (case-insensitive), which
 /// `CreateProcessW` cannot execute directly — only `cmd.exe /c` can run those.
