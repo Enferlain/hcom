@@ -32,7 +32,8 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
   tracked by issues 8 and 28.
 - **Partially mitigated:** 15; provider-native workspace trust is not an hcom
   policy decision.
-- **Planned:** 44, the optional Bubblewrap boundary.
+- **Blocking design:** 44, the provider-neutral isolated-workspace boundary
+  required for reliable unattended workers.
 - All other entries remain open unless their section says otherwise.
 
 ## Field evidence from Codex session `019fbf7b-705a-75d1-81bc-d935ab026c1c`
@@ -468,9 +469,10 @@ covered hermetically.
 
 ### 44. Provider-native sandboxes do not provide one reliable worker boundary
 
-Status: **Planned.** Adopt Bubblewrap as an optional hcom-owned outer sandbox
-for interacting workers on Linux. This is a downstream architecture item, not
-part of the immediate Antigravity lifecycle fixes.
+Status: **Blocking design as of 2026-09-05.** Provider permission and sandbox
+failures now prevent routine unattended use, so this is no longer a downstream
+optional item. The implementation contract and staged rollout are specified in
+[Isolated worker workspaces](isolated-worker-workspaces.md).
 
 The outer policy should mount only the declared workspace read/write, expose
 provider credentials and configuration with the minimum required access, hide
@@ -483,6 +485,12 @@ Provider permission systems remain useful for approval UX, but they should not
 be the sole containment boundary. Sandbox startup must be fail-closed: a worker
 must never silently fall back to unrestricted host execution when Bubblewrap is
 unavailable or its policy cannot be installed.
+
+Current preflight finding: the NixOS host supports unprivileged namespaces, but
+its installed Bubblewrap 0.11.2 is below the design's minimum safe version of
+0.12.0. NixOS runtime roots also require read-only `/nix` and
+`/run/current-system/sw` visibility rather than a conventional `/usr`-only
+mount plan.
 
 ### 45. Provider-run cleanup can turn a successful result into wrapper failure
 

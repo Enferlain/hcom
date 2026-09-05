@@ -16,6 +16,10 @@ Rules:
 ### Changed
 
 - Updated the Antigravity workflow default to Gemini 3.8 Flash High.
+- Promoted the provider-neutral isolated-worker boundary from a downstream idea
+  to a blocking daily-use design, including its fail-closed launch contract,
+  PTY integration seam, scoped hcom state, security limits, test matrix, and
+  staged Bubblewrap rollout.
 
 ### Fixed
 
