@@ -171,7 +171,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 let computed_status = get_instance_status(&data, db);
                 let display_status_context =
                     crate::shared::display_status_context(&data.status_context, verbose_output)
-                        .into_owned();
+                        .to_owned();
                 let mut payload = serde_json::json!({
                     "name": lookup_name,
                     "session_id": data.session_id,
@@ -270,7 +270,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
 
             let display_status_context =
                 crate::shared::display_status_context(&data.status_context, verbose_output)
-                    .into_owned();
+                    .to_owned();
 
             let payload = serde_json::json!({
                 "name": full_name,
