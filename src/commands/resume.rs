@@ -172,7 +172,30 @@ pub fn do_resume(
             hcom_config: &hcom_config,
             inline_readiness_wait_secs: None,
         };
-        print_launch_feedback(&db, &launch_result, &output, None)?;
+        print_launch_feedback(&db, &launch_result, &output)?;
+        crate::core::tips::print_launch_tips(
+            &db,
+            crate::core::tips::LaunchTipsContext {
+                launched: launch_result.launched,
+                tag: output.tag.as_deref(),
+                launcher_name: Some(output.launcher_name),
+                launcher_participating: db.get_instance_full(output.launcher_name).ok().flatten().is_some(),
+                background: output.background,
+                terminal_mode: &crate::terminal::resolve_terminal_mode_for_tips(
+                    output.terminal.as_deref(),
+                    &output.hcom_config.terminal,
+                    output.background,
+                    output.run_here.unwrap_or(false),
+                ).0,
+                terminal_auto_detected: crate::terminal::resolve_terminal_mode_for_tips(
+                    output.terminal.as_deref(),
+                    &output.hcom_config.terminal,
+                    output.background,
+                    output.run_here.unwrap_or(false),
+                ).1,
+                diagnostic_mode: launch_result.failed > 0,
+            },
+        );
         return Ok(0);
     }
 
@@ -576,13 +599,6 @@ fn execute_prepared_resume(
     let result = execute_prepared_resume_result(db, name, fork, plan)?;
 
     if print_feedback_now {
-        // Resume/fork share launch's inline readiness wait + exit-code mapping:
-        // when invoked from inside an AI tool we block briefly so the caller
-        // sees ready/blocked/failed instead of a bare "spawned" line.
-        let readiness_state = inline_readiness_wait_secs
-            .filter(|_| result.launched == 1)
-            .map(|secs| crate::commands::launch::print_inline_launch_readiness(db, &result, secs));
-
         let output = LaunchOutputContext {
             action: &plan.output.action,
             tool: &plan.output.tool,
@@ -595,7 +611,46 @@ fn execute_prepared_resume(
             hcom_config,
             inline_readiness_wait_secs,
         };
-        print_launch_feedback(db, &result, &output, readiness_state.clone())?;
+        print_launch_feedback(db, &result, &output)?;
+        // Resume/fork share launch's inline readiness wait + exit-code mapping:
+        // when invoked from inside an AI tool we block briefly so the caller
+        // sees ready/blocked/failed instead of a bare "spawned" line.
+        let readiness_state = inline_readiness_wait_secs
+            .filter(|_| result.launched == 1)
+            .map(|secs| crate::commands::launch::print_inline_launch_readiness(db, &result, secs));
+
+        let diagnostic_mode = match readiness_state {
+            Some(crate::commands::launch::InlineLaunchReadiness::Failed) |
+            Some(crate::commands::launch::InlineLaunchReadiness::Blocked) |
+            Some(crate::commands::launch::InlineLaunchReadiness::Launching) => true,
+            None if result.failed > 0 => true,
+            _ => false,
+        };
+
+        crate::core::tips::print_launch_tips(
+            db,
+            crate::core::tips::LaunchTipsContext {
+                launched: result.launched,
+                tag: output.tag.as_deref(),
+                launcher_name: Some(output.launcher_name),
+                launcher_participating: db.get_instance_full(output.launcher_name).ok().flatten().is_some(),
+                background: output.background,
+                terminal_mode: &crate::terminal::resolve_terminal_mode_for_tips(
+                    output.terminal.as_deref(),
+                    &output.hcom_config.terminal,
+                    output.background,
+                    output.run_here.unwrap_or(false),
+                ).0,
+                terminal_auto_detected: crate::terminal::resolve_terminal_mode_for_tips(
+                    output.terminal.as_deref(),
+                    &output.hcom_config.terminal,
+                    output.background,
+                    output.run_here.unwrap_or(false),
+                ).1,
+                diagnostic_mode,
+            },
+        );
+
         log_info(
             if fork { "fork" } else { "resume" },
             &format!("cmd.{}", if fork { "fork" } else { "resume" }),

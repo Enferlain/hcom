@@ -11,6 +11,12 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
+## [2026-09-05]
+
+### Changed
+
+- Agent-facing launch tips now recommend the high-level `hcom events --wait --sql stopped:<name>` workflow by default for managed runs, keeping `list`, `term`, `events sub`, and `kill` hidden unless the run explicitly hits a diagnostic state (e.g. failure, blocked, or explicit request).
+
 ## [2026-09-03]
 
 ### Changed

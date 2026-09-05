@@ -160,6 +160,16 @@ pub fn print_launch_tips(db: &HcomDb, ctx: LaunchTipsContext<'_>) {
     // --- One-time (kv-tracked) ---
 
     if inside_tool {
+        if !ctx.launcher_participating {
+            once(
+                db,
+                &mut tips,
+                ctx.launcher_name,
+                "launch:start",
+                "[tip] Run 'hcom start' to receive notifications/messages from instances",
+            );
+        }
+
         if has_close {
             // High-level managed workflow
             once(
@@ -167,20 +177,11 @@ pub fn print_launch_tips(db: &HcomDb, ctx: LaunchTipsContext<'_>) {
                 &mut tips,
                 ctx.launcher_name,
                 "launch:managed-wait",
-                "[tip] Wait for workflow completion: hcom run <workflow>",
+                "[tip] Wait for result: hcom events --wait --sql stopped:<name>",
             );
         }
 
         if ctx.diagnostic_mode {
-            if !ctx.launcher_participating {
-                once(
-                    db,
-                    &mut tips,
-                    ctx.launcher_name,
-                    "launch:start",
-                    "[tip] Run 'hcom start' to receive notifications/messages from instances",
-                );
-            }
 
             if has_close {
                 once(
@@ -247,5 +248,85 @@ pub fn print_launch_tips(db: &HcomDb, ctx: LaunchTipsContext<'_>) {
 
     if !tips.is_empty() {
         println!("\n{}", tips.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_test_db() -> (HcomDb, tempfile::TempDir) {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        (db, dir)
+    }
+
+    #[test]
+    fn test_print_launch_tips_ordinary_managed() {
+        unsafe { std::env::set_var("HCOM_LAUNCHED", "1"); }
+        let (db, _dir) = setup_test_db();
+
+        let ctx = LaunchTipsContext {
+            launched: 1,
+            tag: None,
+            launcher_name: Some("test_launcher"),
+            launcher_participating: true,
+            background: true,
+            terminal_mode: "kitty",
+            terminal_auto_detected: false,
+            diagnostic_mode: false,
+        };
+
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), serde_json::json!("test-session"));
+        data.insert("tool".into(), serde_json::json!("claude"));
+        data.insert("status".into(), serde_json::json!("running"));
+        data.insert("created_at".into(), serde_json::json!(1.0));
+        db.save_instance_named("test_instance", &data).unwrap();
+
+        print_launch_tips(&db, ctx);
+
+        // check tip marks
+        assert_eq!(db.kv_get("tip:test_launcher:launch:managed-wait").unwrap(), Some("1".to_string()));
+        assert_eq!(db.kv_get("tip:test_launcher:launch:kill").unwrap(), None);
+        assert_eq!(db.kv_get("tip:test_launcher:launch:term").unwrap(), None);
+        assert_eq!(db.kv_get("tip:test_launcher:launch:sub-blocked").unwrap(), None);
+        assert_eq!(db.kv_get("tip:test_launcher:list:status").unwrap(), None);
+        unsafe { std::env::remove_var("HCOM_LAUNCHED"); }
+    }
+
+    #[test]
+    fn test_print_launch_tips_diagnostic_mode() {
+        unsafe { std::env::set_var("HCOM_LAUNCHED", "1"); }
+        let (db, _dir) = setup_test_db();
+
+        let ctx = LaunchTipsContext {
+            launched: 1,
+            tag: None,
+            launcher_name: Some("test_launcher_diag"),
+            launcher_participating: true,
+            background: true,
+            terminal_mode: "kitty",
+            terminal_auto_detected: false,
+            diagnostic_mode: true,
+        };
+
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), serde_json::json!("test-session"));
+        data.insert("tool".into(), serde_json::json!("claude"));
+        data.insert("status".into(), serde_json::json!("running"));
+        data.insert("created_at".into(), serde_json::json!(1.0));
+        db.save_instance_named("test_instance", &data).unwrap();
+
+        print_launch_tips(&db, ctx);
+
+        assert_eq!(db.kv_get("tip:test_launcher_diag:launch:managed-wait").unwrap(), Some("1".to_string()));
+        assert_eq!(db.kv_get("tip:test_launcher_diag:launch:kill").unwrap(), Some("1".to_string()));
+        assert_eq!(db.kv_get("tip:test_launcher_diag:launch:sub-blocked").unwrap(), Some("1".to_string()));
+        assert_eq!(db.kv_get("tip:test_launcher_diag:list:status").unwrap(), Some("1".to_string()));
+        unsafe { std::env::remove_var("HCOM_LAUNCHED"); }
     }
 }
