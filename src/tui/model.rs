@@ -290,7 +290,12 @@ fn strip_context_prefix(ctx: &str) -> &str {
 
     let display_ctx = crate::shared::display_status_context(ctx, false);
     if display_ctx != ctx {
-        return display_ctx;
+        // Since strip_context_prefix returns a static or sliced &str, and display_status_context returns a Cow,
+        // and we know it returns a static string "event filter" when it changes, we can just return it.
+        // Let's ensure the lifetime is correct.
+        if ctx.starts_with(crate::shared::FILTER_WAIT_PREFIX) {
+            return crate::shared::FILTER_WAIT_DISPLAY;
+        }
     }
 
     const PREFIXES: &[&str] = &[

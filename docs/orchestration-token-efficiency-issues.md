@@ -20,13 +20,13 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 | Priority | Area | Issues | Intended outcome |
 | --- | --- | ---: | --- |
 | P0 | Correctness and state semantics | 13 | Waiting and completion become reliable |
-| P1 | Orchestration abstractions | 17 | Routine supervision moves into deterministic software |
+| P1 | Orchestration abstractions | 15 | Routine supervision moves into deterministic software |
 | P1 | Communication policy | 9 | Useful communication remains available without constant interruption |
 | P2 | Efficiency and maintainability | 7 | Polling, duplicated logic, and context noise are reduced |
 
 ### Status overview
 
-- **Working:** 1, 2, 3, 4, 6, 14, 33, 34, 35, 36, 39, 40, 41, 42, and 46.
+- **Working:** 1, 2, 3, 4, 6, 14, 33, 34, 35, 36, 39, 40, 41, and 42.
 - **Partially addressed:** 30, with the remaining native-workflow follow-up
   tracked by issues 8 and 28.
 - **Partially mitigated:** 15; provider-native workspace trust is not an hcom
@@ -497,28 +497,6 @@ closed their files. Cleanup failure should remain a structured warning when the
 authoritative result was already recovered, while genuine leaked processes or
 credentials should still fail loudly and report their exact path and owner.
 
-### 46. Antigravity file-access approvals are invisible to supervision — working
-
-Antigravity uses a separate terminal dialog for reads outside the workspace:
-`File access`, `Allow access to this file?`, and a numbered allow/deny menu.
-The PTY detector recognized command approvals only, so hcom continued reporting
-the worker as `active/tool:view_file` while an unattended run waited forever for
-input. This recreates the expensive terminal-inspection loop even when a caller
-uses one blocking result wait.
-
-Status: **Working as of 2026-09-05.** The Antigravity screen detector now
-recognizes the complete file-access dialog while rejecting a stale heading
-without its question and affirmative menu. `cargo test antigravity_ --bin hcom`
-passes all 59 selected tests. A live `hcom run agy` reproduction requested the
-same external file, published `blocked/pty:approval`, and let the user-created
-wrapper terminate with status 125 without terminal inspection or approval
-injection.
-
-The wrapper's fail-fast handling remains a user-workflow policy in
-`~/.hcom/scripts/agy.sh`; hcom's repository-owned responsibility is to publish
-the blocker accurately. No provider permission was bypassed or automatically
-accepted.
-
 ## P1: communication policy and context control
 
 ### 19. Every task requires a model-generated acknowledgement
@@ -642,11 +620,6 @@ The observed parent tried plausible but unsupported forms including transcript `
 Normalize common options across commands—for example `--last`, `--after-id`, `--from`, and `--json`—and validate ambiguous send syntax before doing anything. Structured orchestration APIs should avoid shell parsing entirely. When a command rejects an option, return the exact supported equivalent for that command rather than only generic usage.
 
 ### 43. Internal filtered-wait context leaks into user-facing status
-
-Status: **Working as of 2026-09-05.** Normal `hcom list` output, including
-JSON, custom formats, direct field extraction, and the TUI now displays
-`event filter` instead of the internal `filter-wait:<pid>:<epoch>:<sequence>`
-marker. Verbose list output intentionally retains the raw value for diagnosis.
 
 Filtered listen uses a unique `filter-wait:<pid>:<epoch>:<sequence>` status context to prevent its own bookkeeping event from satisfying the filter. `hcom list` and the TUI can expose that raw implementation marker, adding noisy identifiers to the exact status surfaces agents inspect during supervision.
 

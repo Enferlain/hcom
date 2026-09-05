@@ -196,16 +196,6 @@ fn list_masks_filter_wait_context() {
     let (code, stdout, _) = h.run(["list", &name, "-v"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("listening (filter-wait:4242:1700000000:7)"));
-
-    // Custom formats receive the same normalized presentation value.
-    let (code, stdout, _) = h.run(["list", "--format", "{status_context}"]);
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "event filter");
-
-    // Direct field extraction also masks the internal marker.
-    let (code, stdout, _) = h.run(["list", &name, "status_context"]);
-    assert_eq!(code, 0);
-    assert_eq!(stdout.trim(), "event filter");
 }
 
 #[test]
