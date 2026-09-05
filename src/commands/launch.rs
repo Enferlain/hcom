@@ -131,20 +131,26 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
                         launched: launch_result.launched,
                         tag: output.tag.as_deref(),
                         launcher_name: Some(output.launcher_name),
-                        launcher_participating: db.get_instance_full(output.launcher_name).ok().flatten().is_some(),
+                        launcher_participating: db
+                            .get_instance_full(output.launcher_name)
+                            .ok()
+                            .flatten()
+                            .is_some(),
                         background: output.background,
                         terminal_mode: &crate::terminal::resolve_terminal_mode_for_tips(
                             output.terminal.as_deref(),
                             &output.hcom_config.terminal,
                             output.background,
                             output.run_here.unwrap_or(false),
-                        ).0,
+                        )
+                        .0,
                         terminal_auto_detected: crate::terminal::resolve_terminal_mode_for_tips(
                             output.terminal.as_deref(),
                             &output.hcom_config.terminal,
                             output.background,
                             output.run_here.unwrap_or(false),
-                        ).1,
+                        )
+                        .1,
                         diagnostic_mode: launch_result.failed > 0,
                     },
                 );
@@ -233,12 +239,19 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         .map(|secs| print_inline_launch_readiness(&db, &result, secs));
 
     let diagnostic_mode = match readiness_state {
-        Some(InlineLaunchReadiness::Failed) |
-        Some(InlineLaunchReadiness::Blocked) |
-        Some(InlineLaunchReadiness::Launching) => true,
+        Some(InlineLaunchReadiness::Failed)
+        | Some(InlineLaunchReadiness::Blocked)
+        | Some(InlineLaunchReadiness::Launching) => true,
         None if result.failed > 0 => true,
         _ => false,
     };
+
+    let (terminal_mode, terminal_auto_detected) = crate::terminal::resolve_terminal_mode_for_tips(
+        output.terminal.as_deref(),
+        &output.hcom_config.terminal,
+        output.background,
+        output.run_here.unwrap_or(false),
+    );
 
     tips::print_launch_tips(
         &db,
@@ -246,20 +259,14 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             launched: result.launched,
             tag: output.tag.as_deref(),
             launcher_name: Some(output.launcher_name),
-            launcher_participating: db.get_instance_full(output.launcher_name).ok().flatten().is_some(),
+            launcher_participating: db
+                .get_instance_full(output.launcher_name)
+                .ok()
+                .flatten()
+                .is_some(),
             background: output.background,
-            terminal_mode: &crate::terminal::resolve_terminal_mode_for_tips(
-                output.terminal.as_deref(),
-                &output.hcom_config.terminal,
-                output.background,
-                output.run_here.unwrap_or(false),
-            ).0,
-            terminal_auto_detected: crate::terminal::resolve_terminal_mode_for_tips(
-                output.terminal.as_deref(),
-                &output.hcom_config.terminal,
-                output.background,
-                output.run_here.unwrap_or(false),
-            ).1,
+            terminal_mode: &terminal_mode,
+            terminal_auto_detected,
             diagnostic_mode,
         },
     );

@@ -177,12 +177,11 @@ pub fn print_launch_tips(db: &HcomDb, ctx: LaunchTipsContext<'_>) {
                 &mut tips,
                 ctx.launcher_name,
                 "launch:managed-wait",
-                "[tip] Wait for result: hcom events --wait --sql stopped:<name>",
+                "[tip] Wait for result: hcom events --wait --result-from <name>",
             );
         }
 
         if ctx.diagnostic_mode {
-
             if has_close {
                 once(
                     db,
@@ -254,6 +253,30 @@ pub fn print_launch_tips(db: &HcomDb, ctx: LaunchTipsContext<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    struct EnvGuard(&'static str, Option<String>);
+
+    impl EnvGuard {
+        fn set(var: &'static str, value: &str) -> Self {
+            let saved = std::env::var(var).ok();
+            unsafe {
+                std::env::set_var(var, value);
+            }
+            Self(var, saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.1 {
+                    Some(val) => std::env::set_var(self.0, val),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+    }
 
     fn setup_test_db() -> (HcomDb, tempfile::TempDir) {
         crate::config::Config::init();
@@ -265,8 +288,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_print_launch_tips_ordinary_managed() {
-        unsafe { std::env::set_var("HCOM_LAUNCHED", "1"); }
+        let _env = EnvGuard::set("HCOM_LAUNCHED", "1");
         let (db, _dir) = setup_test_db();
 
         let ctx = LaunchTipsContext {
@@ -290,17 +314,23 @@ mod tests {
         print_launch_tips(&db, ctx);
 
         // check tip marks
-        assert_eq!(db.kv_get("tip:test_launcher:launch:managed-wait").unwrap(), Some("1".to_string()));
+        assert_eq!(
+            db.kv_get("tip:test_launcher:launch:managed-wait").unwrap(),
+            Some("1".to_string())
+        );
         assert_eq!(db.kv_get("tip:test_launcher:launch:kill").unwrap(), None);
         assert_eq!(db.kv_get("tip:test_launcher:launch:term").unwrap(), None);
-        assert_eq!(db.kv_get("tip:test_launcher:launch:sub-blocked").unwrap(), None);
+        assert_eq!(
+            db.kv_get("tip:test_launcher:launch:sub-blocked").unwrap(),
+            None
+        );
         assert_eq!(db.kv_get("tip:test_launcher:list:status").unwrap(), None);
-        unsafe { std::env::remove_var("HCOM_LAUNCHED"); }
     }
 
     #[test]
+    #[serial]
     fn test_print_launch_tips_diagnostic_mode() {
-        unsafe { std::env::set_var("HCOM_LAUNCHED", "1"); }
+        let _env = EnvGuard::set("HCOM_LAUNCHED", "1");
         let (db, _dir) = setup_test_db();
 
         let ctx = LaunchTipsContext {
@@ -323,10 +353,23 @@ mod tests {
 
         print_launch_tips(&db, ctx);
 
-        assert_eq!(db.kv_get("tip:test_launcher_diag:launch:managed-wait").unwrap(), Some("1".to_string()));
-        assert_eq!(db.kv_get("tip:test_launcher_diag:launch:kill").unwrap(), Some("1".to_string()));
-        assert_eq!(db.kv_get("tip:test_launcher_diag:launch:sub-blocked").unwrap(), Some("1".to_string()));
-        assert_eq!(db.kv_get("tip:test_launcher_diag:list:status").unwrap(), Some("1".to_string()));
-        unsafe { std::env::remove_var("HCOM_LAUNCHED"); }
+        assert_eq!(
+            db.kv_get("tip:test_launcher_diag:launch:managed-wait")
+                .unwrap(),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            db.kv_get("tip:test_launcher_diag:launch:kill").unwrap(),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            db.kv_get("tip:test_launcher_diag:launch:sub-blocked")
+                .unwrap(),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            db.kv_get("tip:test_launcher_diag:list:status").unwrap(),
+            Some("1".to_string())
+        );
     }
 }
