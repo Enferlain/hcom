@@ -396,29 +396,42 @@ impl ScreenTracker {
                 && (visible.contains("yes") || visible.contains('❯')))
     }
 
-    /// Antigravity-specific approval detection: the agy TUI renders permission
-    /// prompts as plain text in the prompt area ("Requesting permission for: …"
-    /// with a "1. Yes / 4. No" menu). No OSC9 fires, so scrape the screen.
-    /// Requires both the marker and either the question or the control footer
-    /// to avoid flipping on stray occurrences of the marker in scrollback.
+    /// Antigravity-specific approval detection: the agy TUI renders command and
+    /// out-of-workspace file permission prompts as plain text in the prompt area.
+    /// No OSC9 fires, so scrape the screen. Require a prompt-specific marker and
+    /// its matching question/menu so stale prose in scrollback cannot flip the
+    /// worker into a blocked state.
     pub fn is_antigravity_approval_visible(&self) -> bool {
         let screen = self.parser.screen();
         let (_rows, cols) = screen.size();
-        let mut has_marker = false;
-        let mut has_question = false;
-        let mut has_footer = false;
+        let mut has_command_marker = false;
+        let mut has_command_question = false;
+        let mut has_command_footer = false;
+        let mut has_file_marker = false;
+        let mut has_file_question = false;
+        let mut has_file_menu = false;
         for line in screen.rows(0, cols) {
             if line.contains("Requesting permission for:") {
-                has_marker = true;
+                has_command_marker = true;
             }
             if line.contains("Do you want to proceed?") {
-                has_question = true;
+                has_command_question = true;
             }
             if line.contains("tab Amend") && line.contains("edit command") {
-                has_footer = true;
+                has_command_footer = true;
+            }
+            if line.trim() == "File access" {
+                has_file_marker = true;
+            }
+            if line.contains("Allow access to this file?") {
+                has_file_question = true;
+            }
+            if line.contains("Yes, allow access") && line.contains("1.") {
+                has_file_menu = true;
             }
         }
-        has_marker && (has_question || has_footer)
+        (has_command_marker && (has_command_question || has_command_footer))
+            || (has_file_marker && has_file_question && has_file_menu)
     }
 
     /// Cursor-specific approval detection: cursor renders a shell-command
@@ -1395,6 +1408,22 @@ mod tests {
             b"Requesting permission for: rm -rf /tmp/x\r\n  1. Yes\r\n  2. No\r\n  tab Amend . e edit command\r\n",
         );
         assert!(t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_detects_outside_workspace_file_approval() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(
+            b"File access\r\nRead: /home/user/.hcom/scripts/agy.sh\r\nReason: outside workspace\r\nAllow access to this file?\r\n> 1. Yes, allow access\r\n  2. Yes, and always allow non-workspace access\r\n  3. No, deny access\r\n",
+        );
+        assert!(t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_file_access_heading_without_question_is_not_approval() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(b"File access\r\nRead completed successfully\r\n> idle\r\n");
+        assert!(!t.is_antigravity_approval_visible());
     }
 
     // ---- Cursor approval detection ----

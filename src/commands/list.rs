@@ -20,10 +20,7 @@ use crate::shared::{
 
 /// Parsed arguments for `hcom list`.
 #[derive(clap::Parser, Debug)]
-#[command(
-    name = "list",
-    about = "List active agents. Normal output normalizes internal wait contexts; -v exposes raw diagnostic values."
-)]
+#[command(name = "list", about = "List active agents")]
 pub struct ListArgs {
     /// Agent name or "self"
     pub name: Option<String>,
@@ -35,7 +32,7 @@ pub struct ListArgs {
     /// JSON output
     #[arg(long)]
     pub json: bool,
-    /// Verbose output (shows raw internal states)
+    /// Verbose output
     #[arg(short = 'v', long)]
     pub verbose: bool,
     /// Names-only output
@@ -169,14 +166,11 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         match db.get_instance_full(&lookup_name) {
             Ok(Some(data)) => {
                 let computed_status = get_instance_status(&data, db);
-                let display_status_context =
-                    crate::shared::display_status_context(&data.status_context, verbose_output)
-                        .into_owned();
                 let mut payload = serde_json::json!({
                     "name": lookup_name,
                     "session_id": data.session_id,
                     "status": computed_status.status,
-                    "status_context": display_status_context,
+                    "status_context": data.status_context,
                     "status_detail": data.status_detail,
                     "status_age_seconds": computed_status.age_seconds,
                     "stored_status_age_seconds": stored_status_age_seconds(&data),
@@ -201,7 +195,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 } else if json_output {
                     println!("{}", serde_json::to_string(&payload).unwrap_or_default());
                 } else {
-                    print_instance_details(db, &data, &lookup_name, verbose_output);
+                    print_instance_details(db, &data, &lookup_name);
                 }
                 return 0;
             }
@@ -268,14 +262,10 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(serde_json::json!({}));
 
-            let display_status_context =
-                crate::shared::display_status_context(&data.status_context, verbose_output)
-                    .into_owned();
-
             let payload = serde_json::json!({
                 "name": full_name,
                 "status": status,
-                "status_context": display_status_context,
+                "status_context": data.status_context,
                 "status_detail": data.status_detail,
                 "status_age_seconds": age_seconds,
                 "stored_status_age_seconds": stored_status_age_seconds(data),
@@ -626,17 +616,15 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
     0
 }
 
-fn print_instance_details(db: &HcomDb, data: &InstanceRow, display_name: &str, verbose: bool) {
+fn print_instance_details(db: &HcomDb, data: &InstanceRow, display_name: &str) {
     let cs = get_instance_status(data, db);
     let status = cs.status;
 
-    let display_context = crate::shared::display_status_context(&data.status_context, verbose);
-
     // Status line construction
-    let status_line = if display_context.is_empty() {
+    let status_line = if data.status_context.is_empty() {
         status.clone()
     } else {
-        format!("{status} ({})", display_context)
+        format!("{status} ({})", data.status_context)
     };
 
     println!("{display_name}:");

@@ -137,68 +137,6 @@ fn named_list_json_includes_computed_status_metadata() {
 }
 
 #[test]
-fn list_masks_filter_wait_context() {
-    let h = Hcom::new();
-    let name = h.start();
-
-    // Force status to something listable so it appears in list --json without --all
-    let db = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
-    db.execute(
-        "UPDATE instances SET status = 'listening', status_context = 'filter-wait:4242:1700000000:7', status_time = ?2 WHERE name = ?1",
-        rusqlite::params![name, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64],
-    )
-    .unwrap();
-    drop(db);
-
-    // Normal JSON masks it
-    let (code, stdout, _) = h.run(["list", "--json"]);
-    assert_eq!(code, 0);
-    let full: serde_json::Value = serde_json::from_str(&stdout).expect("full list json");
-    let instance = full
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["name"] == name)
-        .expect("worker in full list");
-    assert_eq!(instance["status_context"], "event filter");
-
-    // Verbose JSON reveals it
-    let (code, stdout, _) = h.run(["list", "-v", "--json"]);
-    assert_eq!(code, 0);
-    let full: serde_json::Value = serde_json::from_str(&stdout).expect("full list json");
-    let instance = full
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["name"] == name)
-        .expect("worker in full list");
-    assert_eq!(instance["status_context"], "filter-wait:4242:1700000000:7");
-
-    // Single-instance normal JSON
-    let (code, stdout, _) = h.run(["list", &name, "--json"]);
-    assert_eq!(code, 0);
-    let single: serde_json::Value = serde_json::from_str(&stdout).expect("single list json");
-    assert_eq!(single["status_context"], "event filter");
-
-    // Single-instance verbose JSON
-    let (code, stdout, _) = h.run(["list", &name, "-v", "--json"]);
-    assert_eq!(code, 0);
-    let single: serde_json::Value = serde_json::from_str(&stdout).expect("single list json");
-    assert_eq!(single["status_context"], "filter-wait:4242:1700000000:7");
-
-    // Normal target lookup masks it
-    let (code, stdout, _) = h.run(["list", &name]);
-    assert_eq!(code, 0);
-    assert!(stdout.contains("listening (event filter)"));
-    assert!(!stdout.contains("filter-wait:4242:1700000000:7"));
-
-    // Verbose target lookup reveals it
-    let (code, stdout, _) = h.run(["list", &name, "-v"]);
-    assert_eq!(code, 0);
-    assert!(stdout.contains("listening (filter-wait:4242:1700000000:7)"));
-}
-
-#[test]
 fn events_empty_in_fresh_dir() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["events", "--last", "5"]);

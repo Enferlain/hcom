@@ -69,17 +69,6 @@ pub const ST_INACTIVE: &str = "inactive";
 pub const ST_LAUNCHING: &str = "launching";
 pub const ST_ERROR: &str = "error";
 
-pub const FILTER_WAIT_PREFIX: &str = "filter-wait:";
-pub const FILTER_WAIT_DISPLAY: &str = "event filter";
-
-pub fn display_status_context<'a>(ctx: &'a str, verbose: bool) -> std::borrow::Cow<'a, str> {
-    if !verbose && ctx.starts_with(FILTER_WAIT_PREFIX) {
-        std::borrow::Cow::Borrowed(FILTER_WAIT_DISPLAY)
-    } else {
-        std::borrow::Cow::Borrowed(ctx)
-    }
-}
-
 /// Valid status values (ordered for display priority).
 pub const STATUS_ORDER: &[&str] = &[
     ST_ACTIVE,

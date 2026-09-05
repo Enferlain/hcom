@@ -14,8 +14,6 @@ pub mod tool_detection;
 pub use crate::tool::Tool;
 pub use constants::{
     BIND_MARKER_RE,
-    FILTER_WAIT_DISPLAY,
-    FILTER_WAIT_PREFIX,
     MAX_MESSAGE_SIZE,
     MAX_MESSAGES_PER_DELIVERY,
     // Patterns
@@ -32,7 +30,6 @@ pub use constants::{
     SYSTEM_SENDER,
     TitleMode,
     VALID_TITLE_MODES,
-    display_status_context,
     // Functions
     extract_mentions,
     format_pane_title,
