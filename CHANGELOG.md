@@ -13,6 +13,10 @@ Rules:
 
 ## [2026-09-05]
 
+### Changed
+
+- Updated the Antigravity workflow default to Gemini 3.8 Flash High.
+
 ### Fixed
 
 - Antigravity out-of-workspace file-access prompts are now detected as PTY

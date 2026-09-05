@@ -137,7 +137,7 @@ engine:
           "run", "agy",
           "--name", caller,
           "--dir", workspace,
-          "--model", "gemini-3.7-flash-high",
+          "--model", "gemini-3.8-flash-high",
           "--heartbeat", "15",
           "--timeout", "900",
           "--", prompt,
