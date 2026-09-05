@@ -18,6 +18,8 @@ Rules:
 - Antigravity out-of-workspace file-access prompts are now detected as PTY
   approval blockers, so unattended hcom workflows can stop decisively instead
   of reporting a worker as active indefinitely.
+- Normal `hcom list` and TUI output now describe internal filtered waits as
+  `event filter`; verbose list output retains the raw diagnostic context.
 
 ## [2026-09-03]
 

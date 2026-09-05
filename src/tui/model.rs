@@ -287,6 +287,12 @@ fn strip_context_prefix(ctx: &str) -> &str {
             other => other,
         };
     }
+
+    let display_ctx = crate::shared::display_status_context(ctx, false);
+    if display_ctx != ctx {
+        return display_ctx;
+    }
+
     const PREFIXES: &[&str] = &[
         "tool:",
         "deliver:",
@@ -1230,6 +1236,7 @@ mod tests {
             ("exit:0", "0"),
             ("stale:active", "active"),
             ("tui:not-ready", "not-ready"),
+            ("filter-wait:4242:1700000000:7", "event filter"),
         ] {
             let mut a = test_agent("nova");
             a.status_context = input.into();

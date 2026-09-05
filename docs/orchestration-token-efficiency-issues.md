@@ -643,6 +643,11 @@ Normalize common options across commands—for example `--last`, `--after-id`, `
 
 ### 43. Internal filtered-wait context leaks into user-facing status
 
+Status: **Working as of 2026-09-05.** Normal `hcom list` output, including
+JSON, custom formats, direct field extraction, and the TUI now displays
+`event filter` instead of the internal `filter-wait:<pid>:<epoch>:<sequence>`
+marker. Verbose list output intentionally retains the raw value for diagnosis.
+
 Filtered listen uses a unique `filter-wait:<pid>:<epoch>:<sequence>` status context to prevent its own bookkeeping event from satisfying the filter. `hcom list` and the TUI can expose that raw implementation marker, adding noisy identifiers to the exact status surfaces agents inspect during supervision.
 
 Keep the unique internal marker for correctness, but hide or normalize it at presentation boundaries. Human- and model-facing status should say that the agent is waiting on an event filter without exposing coordination IDs unless diagnostic verbosity is explicitly requested.

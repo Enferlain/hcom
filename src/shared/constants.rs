@@ -69,6 +69,17 @@ pub const ST_INACTIVE: &str = "inactive";
 pub const ST_LAUNCHING: &str = "launching";
 pub const ST_ERROR: &str = "error";
 
+pub const FILTER_WAIT_PREFIX: &str = "filter-wait:";
+pub const FILTER_WAIT_DISPLAY: &str = "event filter";
+
+pub fn display_status_context(ctx: &str, verbose: bool) -> &str {
+    if !verbose && ctx.starts_with(FILTER_WAIT_PREFIX) {
+        FILTER_WAIT_DISPLAY
+    } else {
+        ctx
+    }
+}
+
 /// Valid status values (ordered for display priority).
 pub const STATUS_ORDER: &[&str] = &[
     ST_ACTIVE,
@@ -244,5 +255,15 @@ mod tests {
         assert_eq!(STATUS_ORDER.len(), 6);
         assert_eq!(STATUS_ORDER[0], ST_ACTIVE);
         assert_eq!(STATUS_ORDER[5], ST_INACTIVE);
+    }
+
+    #[test]
+    fn display_status_context_masks_internal_filter_wait_markers() {
+        let marker = "filter-wait:4242:1700000000:7";
+
+        assert_eq!(display_status_context(marker, false), FILTER_WAIT_DISPLAY);
+        assert_eq!(display_status_context(marker, true), marker);
+        assert_eq!(display_status_context("tool:Bash", false), "tool:Bash");
+        assert_eq!(display_status_context("", false), "");
     }
 }
