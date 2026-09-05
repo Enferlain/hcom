@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "hcom",
+  "project_id": "b349599c-9e18-4454-8f81-8cf12c19d844"
+}
