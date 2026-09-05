@@ -144,7 +144,7 @@ fn list_masks_filter_wait_context() {
     // Force status to something listable so it appears in list --json without --all
     let db = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
     db.execute(
-        "UPDATE instances SET status = 'listening', status_context = 'filter-wait:4242:1700000000:7', status_time = ?2 WHERE name = ?1",
+        "UPDATE instances SET status = 'listening', status_context = 'filter-wait:4242:1700000000:7', status_time = ?2, last_stop = ?2 WHERE name = ?1",
         rusqlite::params![name, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64],
     )
     .unwrap();
