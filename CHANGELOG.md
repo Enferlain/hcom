@@ -19,6 +19,9 @@ Rules:
 
 ### Fixed
 
+- Fixed an issue where auto-thread memberships would outlive workflows, causing
+  cross-workflow noise. They now expire atomically when their participant's
+  lifecycle closes without affecting unrelated delivery state.
 - Antigravity out-of-workspace file-access prompts are now detected as PTY
   approval blockers, so unattended hcom workflows can stop decisively instead
   of reporting a worker as active indefinitely.

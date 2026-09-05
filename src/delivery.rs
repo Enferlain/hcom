@@ -2810,8 +2810,8 @@ fn instance_owns_process_binding(db: &HcomDb, process_id: &str, current_name: &s
 
 /// Hard PTY exit cleanup: inactive status, life event, delete instance row.
 pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
-    let snapshot = match db.get_instance_snapshot(current_name) {
-        Ok(Some(snap)) => Some(snap),
+    let instance = match db.get_instance_full(current_name) {
+        Ok(Some(instance)) => instance,
         Ok(None) => {
             log_info(
                 "native",
@@ -2823,6 +2823,19 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
             );
             return;
         }
+        Err(e) => {
+            log_error(
+                "native",
+                "delivery.cleanup",
+                &format!("DB error getting instance identity: {}", e),
+            );
+            return;
+        }
+    };
+
+    let snapshot = match db.get_instance_snapshot(current_name) {
+        Ok(Some(snap)) => Some(snap),
+        Ok(None) => None,
         Err(e) => {
             log_error(
                 "native",
@@ -2847,25 +2860,32 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
         );
     }
 
-    if let Err(e) = db.delete_notify_endpoints(current_name) {
-        log_warn(
+    let mut event_data = serde_json::json!({
+        "action": "stopped",
+        "by": "pty",
+        "reason": exit_reason,
+    });
+    if let Some(snapshot) = snapshot {
+        event_data["snapshot"] = snapshot;
+    }
+    match db.finalize_instance_stop(
+        current_name,
+        instance.created_at,
+        instance.session_id.as_deref(),
+        instance.agent_id.as_deref(),
+        &event_data,
+    ) {
+        Ok(true) => {}
+        Ok(false) => log_info(
             "native",
-            "delivery.cleanup_endpoints_fail",
-            &format!("{}", e),
-        );
-    }
-    if let Err(e) = db.cleanup_subscriptions(current_name) {
-        log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
-    }
-    if let Err(e) = db.log_life_event(current_name, "stopped", "pty", exit_reason, snapshot) {
-        log_warn(
+            "delivery.cleanup_skipped",
+            &format!("Skipping stale PTY cleanup for {}", current_name),
+        ),
+        Err(e) => log_warn(
             "native",
-            "delivery.life_event_fail",
-            &format!("Failed to log life event: {}", e),
-        );
-    }
-    if let Err(e) = db.delete_instance(current_name) {
-        eprintln!("[hcom] warn: delete_instance failed for {current_name}: {e}");
+            "delivery.cleanup_finalize_fail",
+            &format!("Failed to finalize PTY stop: {}", e),
+        ),
     }
 }
 
@@ -3027,6 +3047,28 @@ mod tests {
             .collect();
 
         assert_eq!(events, vec![("samu".to_string(), "killed".to_string())]);
+    }
+
+    #[test]
+    fn pty_cleanup_expires_auto_thread_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('buli', 'pi', 'active', 'running', 0, 1)",
+                [],
+            )
+            .unwrap();
+        db.add_thread_memberships("ops", Some("buli"), &[]);
+        assert_eq!(db.get_thread_members("ops"), vec!["buli".to_string()]);
+
+        cleanup_deleted_instance(&mut db, "buli");
+
+        assert!(db.get_instance_full("buli").unwrap().is_none());
+        assert!(db.get_thread_members("ops").is_empty());
     }
 
     #[test]

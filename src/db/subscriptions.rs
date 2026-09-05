@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::json;
 
 use super::HcomDb;
@@ -374,9 +374,9 @@ pub(crate) fn cleanup_subscriptions(db: &HcomDb, name: &str) -> Result<u32> {
     Ok(deleted as u32)
 }
 
-/// Remove delivery-only thread memberships for an instance name reuse.
-pub(crate) fn cleanup_thread_memberships_for_name_reuse(db: &HcomDb, name: &str) -> Result<u32> {
-    let deleted = db.conn.execute(
+/// Remove automatically created thread memberships owned by an instance.
+pub(crate) fn cleanup_auto_thread_memberships(conn: &Connection, name: &str) -> Result<u32> {
+    let deleted = conn.execute(
         "DELETE FROM kv
          WHERE key LIKE 'events_sub:%'
            AND json_extract(value, '$.caller') = ?
@@ -385,6 +385,11 @@ pub(crate) fn cleanup_thread_memberships_for_name_reuse(db: &HcomDb, name: &str)
         params![name],
     )?;
     Ok(deleted as u32)
+}
+
+/// Remove delivery-only thread memberships for an instance name reuse.
+pub(crate) fn cleanup_thread_memberships_for_name_reuse(db: &HcomDb, name: &str) -> Result<u32> {
+    cleanup_auto_thread_memberships(db.conn(), name)
 }
 
 /// Return active members of a thread in join order.
@@ -623,15 +628,26 @@ pub(crate) fn process_logged_event(
                 .unwrap_or("");
             let sub_caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
             if request_id > 0 && !target.is_empty() {
-                let waterline: i64 = db
+                let waterline: Option<i64> = match db
                     .conn
                     .query_row(
                         "SELECT last_event_id FROM instances WHERE name = ?",
                         params![target],
                         |row| row.get(0),
                     )
-                    .unwrap_or(0);
-                if waterline < request_id {
+                    .optional()
+                {
+                    Ok(waterline) => waterline,
+                    Err(error) => {
+                        crate::log::log_error(
+                            "db",
+                            "check_event_subscriptions.reqwatch_waterline",
+                            &format!("{error}"),
+                        );
+                        continue;
+                    }
+                };
+                if waterline.is_some_and(|waterline| waterline < request_id) {
                     let mut sub_mut = sub.clone();
                     sub_mut["last_id"] = serde_json::json!(event_id);
                     kv_store_sub(db, key, &sub_mut);
@@ -1283,6 +1299,43 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "once sub should be removed after notify"
+        );
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_finalize_stop_notifies_reqwatch_after_target_is_deleted() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "nabe", "antigravity");
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+        let target = db.get_instance_full("nabe").unwrap().unwrap();
+        let data = serde_json::json!({
+            "action": "stopped",
+            "by": "pty",
+            "reason": "closed",
+        });
+
+        let won = db
+            .finalize_instance_stop(
+                "nabe",
+                target.created_at,
+                target.session_id.as_deref(),
+                target.agent_id.as_deref(),
+                &data,
+            )
+            .unwrap();
+
+        assert!(won);
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before + 1,
+            "a finalized stop should notify without a live target row"
+        );
+        assert!(
+            db.kv_get(&format!("events_sub:reqwatch-{request_id}-nabe"))
+                .unwrap()
+                .is_none(),
+            "the once-only request watch should be removed after notification"
         );
         cleanup_test_db(db_path);
     }

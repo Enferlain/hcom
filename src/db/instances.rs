@@ -447,6 +447,7 @@ impl HcomDb {
                    AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1",
                 params![name],
             )?;
+            subscriptions::cleanup_auto_thread_memberships(tx, name)?;
             tx.execute(
                 "INSERT INTO events (timestamp, type, instance, data)
                  VALUES (?, 'life', ?, ?)",
@@ -1157,6 +1158,117 @@ mod tests {
         // Should be ordered by created_at DESC
         assert_eq!(instances[0]["name"], "luna");
         assert_eq!(instances[1]["name"], "nova");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_finalize_instance_stop_expires_auto_thread_memberships() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, session_id) VALUES ('luna', 1000.0, 'sess1')",
+                [],
+            )
+            .unwrap();
+
+        // Add a normal subscription
+        let normal = serde_json::json!({
+            "id": "sub-normal",
+            "caller": "luna",
+            "sql": "type = 'message'",
+            "last_id": 0
+        });
+        db.kv_set("events_sub:sub-normal", Some(&normal.to_string()))
+            .unwrap();
+
+        // Add an auto thread membership
+        let thread_member = serde_json::json!({
+            "id": "sub-thread",
+            "caller": "luna",
+            "thread_name": "debate-1",
+            "auto_thread_member": true,
+            "delivery_only": true,
+            "created": 1000.0,
+            "last_id": 0
+        });
+        db.kv_set("events_sub:sub-thread", Some(&thread_member.to_string()))
+            .unwrap();
+
+        // Delivery-only state without the automatic membership marker is unrelated.
+        let other_delivery_state = serde_json::json!({
+            "id": "sub-delivery-other",
+            "caller": "luna",
+            "delivery_only": true,
+            "created": 1000.0,
+            "last_id": 0
+        });
+        db.kv_set(
+            "events_sub:sub-delivery-other",
+            Some(&other_delivery_state.to_string()),
+        )
+        .unwrap();
+
+        // Another active participant's membership must not be affected.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, session_id) VALUES ('nova', 1000.0, 'sess-nova')",
+                [],
+            )
+            .unwrap();
+        let other_member = serde_json::json!({
+            "id": "sub-thread-other",
+            "caller": "nova",
+            "thread_name": "debate-1",
+            "auto_thread_member": true,
+            "delivery_only": true,
+            "created": 1001.0,
+            "last_id": 0
+        });
+        db.kv_set(
+            "events_sub:sub-thread-other",
+            Some(&other_member.to_string()),
+        )
+        .unwrap();
+
+        let event_data = serde_json::json!({"action": "stopped"});
+        let stale = db
+            .finalize_instance_stop("luna", 999.0, Some("sess1"), None, &event_data)
+            .unwrap();
+        assert!(!stale);
+        assert!(db.kv_get("events_sub:sub-thread").unwrap().is_some());
+
+        let won = db
+            .finalize_instance_stop("luna", 1000.0, Some("sess1"), None, &event_data)
+            .unwrap();
+        assert!(won);
+
+        assert!(
+            db.kv_get("events_sub:sub-normal").unwrap().is_none(),
+            "Normal subscriptions should be removed"
+        );
+        assert!(
+            db.kv_get("events_sub:sub-thread").unwrap().is_none(),
+            "Auto thread memberships should be removed"
+        );
+        assert!(
+            db.kv_get("events_sub:sub-delivery-other")
+                .unwrap()
+                .is_some(),
+            "Unrelated delivery-only state should remain"
+        );
+
+        assert_eq!(db.get_thread_members("debate-1"), vec!["nova".to_string()]);
+
+        // Re-creating an instance with the same name must not resurrect the old auto thread membership
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, session_id) VALUES ('luna', 2000.0, 'sess2')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.get_thread_members("debate-1"), vec!["nova".to_string()]);
 
         cleanup_test_db(db_path);
     }

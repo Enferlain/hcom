@@ -559,11 +559,13 @@ Only `model_actionable` notifications should interrupt the agent by default.
 
 Agents should be able to expose progress without forcing the main model to read and respond. Store progress as structured workflow events, visible to humans and the coordinator but omitted from model context unless requested.
 
-### 24. Thread membership can outlive the workflow
+### 24. Thread membership can outlive the workflow — working
 
-Subscriptions persist until explicitly removed, so old participants can continue receiving traffic.
+Status: **Working as of 2026-09-05.** Automatically created thread memberships (`auto_thread_member`) now reliably expire when their participant closes. This happens natively in the same transaction that finalizes the agent's stopped lifecycle state, preventing later cross-workflow noise. A stale close attempt leaves active membership intact, and cleanup does not affect another participant or unrelated delivery-only state.
 
-Evidence: subscription behavior in [`subscriptions.rs`](../src/db/subscriptions.rs#L436) and thread delivery in [`messages.rs`](../src/messages.rs#L705).
+Previously, subscriptions persisted until explicitly removed, so old participants could continue receiving traffic.
+
+Evidence: membership cleanup in [`subscriptions.rs`](../src/db/subscriptions.rs#L378) and lifecycle finalization in [`instances.rs`](../src/db/instances.rs#L402).
 
 Support workflow-close cleanup, membership expiry, or a configurable TTL.
 
