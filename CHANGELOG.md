@@ -11,6 +11,24 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
+## [2026-09-06]
+
+### Added
+
+- Added validated, immutable isolation profile, workflow/attempt identity, and
+  non-secret isolation-plan types with deterministic plan identities and strict
+  deserialization checks.
+
+### Fixed
+
+- Antigravity feedback surveys are now recognized as non-task prompts and
+  safely skipped; failed dismissal becomes a typed `pty:survey` blocker instead
+  of leaving unattended result waits silently stuck.
+- Antigravity mode banners (`Accept-edits`/`Plan`/`Best-of-N`) on an empty
+  prompt are no longer scraped as uncommitted input text, so targeted delivery
+  to a ready idle worker injects and submits exactly one turn instead of
+  blocking forever on `tui:prompt-has-text`.
+
 ## [2026-09-05]
 
 ### Changed

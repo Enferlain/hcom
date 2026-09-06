@@ -3342,6 +3342,23 @@ mod tests {
     }
 
     #[test]
+    fn gate_antigravity_passes_on_mode_banner_empty_prompt() {
+        // hcom-f6g.10: the accept-edits mode banner on an otherwise empty,
+        // ready agy prompt parses as an empty prompt (screen.rs maps the
+        // banner to input_text=Some("")), so the gate must clear delivery to
+        // inject and submit exactly one turn instead of blocking on
+        // prompt_has_text until an external Enter.
+        let config = ToolConfig::antigravity();
+        let mut screen = safe_screen();
+        screen.prompt_empty = true;
+        screen.input_text = Some(String::new());
+        let state = make_state(screen, 500);
+        let result = evaluate_gate(&config, &state, true);
+        assert!(result.safe);
+        assert_eq!(result.reason, "ok");
+    }
+
+    #[test]
     fn gate_blocks_on_user_activity() {
         let config = ToolConfig::claude();
         let mut screen = safe_screen();

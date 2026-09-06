@@ -820,6 +820,10 @@ impl Proxy {
         // iteration after, so at most one poll cycle of latency for new connections.
         let mut listener_backoff = false;
 
+        // Antigravity feedback-survey dismissal state (hcom-f6g.9); a no-op
+        // for every other target.
+        let mut survey_dismissal = shared::SurveyDismissal::default();
+
         // Start delivery after the integration's explicit fallback timeout if
         // its ready pattern is hidden or never appears. Ad-hoc commands use the
         // explicit Adhoc PTY profile rather than inheriting a known tool's value.
@@ -913,6 +917,13 @@ impl Proxy {
                 && self.screen.is_claude_denial_followup_visible()
             {
                 poll_timeout = poll_timeout.min(APPROVAL_SCRAPE_CLEAR_MS as u16);
+            }
+            // While an Antigravity feedback-survey sighting is active, cap
+            // the poll so the dismissal controller's stability window and
+            // retries fire on time instead of waiting out the 10s idle poll
+            // (hcom-f6g.9).
+            if survey_dismissal.caps_poll() {
+                poll_timeout = poll_timeout.min(shared::SURVEY_POLL_CAP_MS);
             }
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout)) {
                 Ok(0) => {
@@ -1278,6 +1289,20 @@ impl Proxy {
                     }
                 }
             }
+
+            // Antigravity feedback survey: auto-dismiss with Skip (`0`), or
+            // surface the typed pty:survey blocker when dismissal fails. A
+            // non-task UX prompt — never an approval (hcom-f6g.9). Runs on
+            // data and timeout iterations alike so the stability window and
+            // retry cooldown hold even once output goes quiet.
+            shared::run_survey_dismissal(
+                &self.screen,
+                &mut survey_dismissal,
+                &self.config.target,
+                self.config.instance_name.as_deref(),
+                &self.current_status,
+                |bytes| write_all(&self.pty_master, bytes),
+            );
 
             // Drain title notifications. The shared status is read below; the
             // pipe only interrupts poll and coalesces repeated transitions.

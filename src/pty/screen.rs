@@ -138,6 +138,41 @@ fn is_block_border(line: &str) -> bool {
     trimmed.chars().count() >= 20 && trimmed.chars().all(|c| c == '▀' || c == '▄')
 }
 
+/// Mode banners the agy TUI renders on the `>` prompt row while the input is
+/// empty and a non-default agent mode is active (shift+tab cycles `default` →
+/// `accept-edits` → `plan`; Best-of-N is an experiment mode). Captured
+/// verbatim from the agy CLI.
+const ANTIGRAVITY_MODE_BANNERS: &[&str] = &[
+    "Accept-edits mode: file edits auto-approved (shift+tab to cycle)",
+    "Plan mode: research & plan only (shift+tab to cycle)",
+    "Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)",
+];
+
+/// Does this `>`-row text stand in for an empty prompt as an agy mode banner?
+///
+/// The banner replaces the dim `Type your message` placeholder and renders at
+/// least partly non-dim, so intensity cannot distinguish it from typed input —
+/// treating it as text left a ready, empty accept-edits prompt permanently
+/// blocked on `tui:prompt-has-text` and no delivery Enter was ever sent
+/// (hcom-f6g.10). Compare against the known banner text instead. A pane
+/// narrower than the banner wraps it, so a proper prefix longer than the
+/// `… mode:` head (the shortest unambiguous anchor) also matches. A collision
+/// with genuinely typed text fails safe: delivery then sees a mixed prompt
+/// and refuses to submit it.
+fn is_antigravity_mode_banner(text: &str) -> bool {
+    ANTIGRAVITY_MODE_BANNERS.iter().any(|banner| {
+        if *banner == text {
+            return true;
+        }
+        // Everything through "mode:" must be present for a prefix to count.
+        let Some(head_start) = banner.find("mode:") else {
+            return false;
+        };
+        let head_end = banner[..head_start + "mode:".len()].chars().count();
+        banner.starts_with(text) && text.chars().count() > head_end
+    })
+}
+
 /// Screen tracker with vt100 emulation
 pub struct ScreenTracker {
     parser: vt100::Parser,
@@ -432,6 +467,103 @@ impl ScreenTracker {
         }
         (has_command_marker && (has_command_question || has_command_footer))
             || (has_file_marker && has_file_question && has_file_menu)
+    }
+
+    /// Antigravity post-command feedback-survey detection (hcom-f6g.9).
+    ///
+    /// After finishing a turn the agy TUI can render its CLI-experience
+    /// survey in the prompt area:
+    ///
+    /// ```text
+    /// How’s the CLI experience so far? Help us improve:
+    /// [1] Good  [2] Fine  [3] Bad  [0] Skip
+    /// ```
+    ///
+    /// It is a non-task UX prompt, NOT a permission approval: it is
+    /// deliberately disjoint from [`Self::is_antigravity_approval_visible`]
+    /// and must never be reported through the `pty:approval` path. Left
+    /// unanswered it holds the tool's turn open, silently stalling unattended
+    /// result waits, so the PTY loops auto-dismiss it with Skip (`0`) via
+    /// `shared::run_survey_dismissal`.
+    ///
+    /// Recognition requires the complete survey — both question fragments
+    /// plus all four bracketed menu options — within the bottom window of
+    /// the screen where the live prompt area renders. The markers come from
+    /// a real 80-column capture, are matched per rendered row (so they
+    /// assume the ≥50-column widths the TUI renders at), and avoid the
+    /// apostrophe entirely (the curly ’ and ASCII ' both match). Requiring
+    /// every marker keeps partial frames, prose that merely mentions the
+    /// survey, and differently-shaped menus from matching; the tail window
+    /// keeps a verbatim quote sitting far up in transcript scrollback from
+    /// firing a dismissal keystroke at the live prompt below it.
+    ///
+    /// Markers alone are not enough: geometry must prove the survey IS the
+    /// active bottom surface. A live input prompt (`>` row) or permission
+    /// menu rendered BELOW the survey text means the text is a quote in
+    /// transcript/prose above the real surface — a false dismissal there
+    /// would type `0` into the prompt (stalling delivery behind
+    /// `prompt_has_text`) or send a keystroke into an approval menu. Only a
+    /// survey with nothing prompt-like under it is treated as active.
+    pub fn is_antigravity_survey_visible(&self) -> bool {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        const TAIL_ROWS: u16 = 12;
+        let start = rows.saturating_sub(TAIL_ROWS) as usize;
+        let lines: Vec<String> = screen.rows(0, cols).skip(start).collect();
+        let mut has_question = false;
+        let mut has_invite = false;
+        let mut has_good = false;
+        let mut has_fine = false;
+        let mut has_bad = false;
+        let mut has_skip = false;
+        let mut first_marker_row: Option<usize> = None;
+        for (idx, line) in lines.iter().enumerate() {
+            let mut marked = false;
+            if line.contains("CLI experience so far") {
+                has_question = true;
+                marked = true;
+            }
+            if line.contains("Help us improve") {
+                has_invite = true;
+                marked = true;
+            }
+            if line.contains("[1] Good") {
+                has_good = true;
+                marked = true;
+            }
+            if line.contains("[2] Fine") {
+                has_fine = true;
+                marked = true;
+            }
+            if line.contains("[3] Bad") {
+                has_bad = true;
+                marked = true;
+            }
+            if line.contains("[0] Skip") {
+                has_skip = true;
+                marked = true;
+            }
+            if marked && first_marker_row.is_none() {
+                first_marker_row = Some(idx);
+            }
+        }
+        if !(has_question && has_invite && has_good && has_fine && has_bad && has_skip) {
+            return false;
+        }
+        let marker_row = first_marker_row.expect("at least one marker row matched");
+        for line in &lines[marker_row + 1..] {
+            if line.trim_start().starts_with('>') {
+                return false; // live input prompt below the survey text
+            }
+            if line.contains("Requesting permission for:")
+                || line.contains("Do you want to proceed?")
+                || line.contains("Allow access to this file?")
+                || line.contains("Yes, allow access")
+            {
+                return false; // live permission menu below the survey text
+            }
+        }
+        true
     }
 
     /// Cursor-specific approval detection: cursor renders a shell-command
@@ -961,7 +1093,7 @@ impl ScreenTracker {
             let after = trimmed.strip_prefix('>')?.trim_start();
             Some((row_idx, trim_with_nbsp(after)))
         }) {
-            if text.is_empty() {
+            if text.is_empty() || is_antigravity_mode_banner(text) {
                 return Some(String::new());
             }
 
@@ -1424,6 +1556,179 @@ mod tests {
         let mut t = make_tracker(24, 80, "");
         t.process(b"File access\r\nRead completed successfully\r\n> idle\r\n");
         assert!(!t.is_antigravity_approval_visible());
+    }
+
+    // ---- Antigravity feedback survey detection (hcom-f6g.9) ----
+
+    #[test]
+    fn antigravity_detects_feedback_survey() {
+        // Exact observed blocking screen, rendered in the prompt area at the
+        // bottom of the screen.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        let mut lines = vec![""; 18];
+        lines.extend_from_slice(&[
+            "How’s the CLI experience so far? Help us improve:",
+            "[1] Good  [2] Fine  [3] Bad  [0] Skip",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(t.is_antigravity_survey_visible());
+    }
+
+    #[test]
+    fn antigravity_detects_survey_with_ascii_apostrophe() {
+        // The markers avoid the apostrophe, so a build that renders "How's"
+        // with an ASCII quote matches identically.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        let mut lines = vec![""; 18];
+        lines.extend_from_slice(&[
+            "How's the CLI experience so far? Help us improve:",
+            "[1] Good  [2] Fine  [3] Bad  [0] Skip",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(t.is_antigravity_survey_visible());
+    }
+
+    #[test]
+    fn antigravity_detects_survey_with_menu_split_across_rows() {
+        // The menu may render its options across separate rows; each `[N]`
+        // pair stays intact, so the full marker set still co-occurs. (The
+        // question itself is matched per row and assumes the ≥50-column
+        // widths the TUI actually renders at — the observed capture is 80.)
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        let mut lines = vec![""; 17];
+        lines.extend_from_slice(&[
+            "How’s the CLI experience so far? Help us improve:",
+            "[1] Good  [2] Fine",
+            "[3] Bad  [0] Skip",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(t.is_antigravity_survey_visible());
+    }
+
+    #[test]
+    fn antigravity_survey_is_not_an_approval() {
+        // The survey is a non-task UX prompt: it must never be classified as
+        // a permission approval. Conversely a real approval prompt is not a
+        // survey, so the two detectors stay disjoint.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        let mut lines = vec![""; 18];
+        lines.extend_from_slice(&[
+            "How’s the CLI experience so far? Help us improve:",
+            "[1] Good  [2] Fine  [3] Bad  [0] Skip",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_antigravity_approval_visible());
+
+        let mut approval = make_tracker(24, 80, "? for shortcuts");
+        approval.process(
+            b"Requesting permission for: hcom list --name lida\r\nDo you want to proceed?\r\n",
+        );
+        assert!(!approval.is_antigravity_survey_visible());
+    }
+
+    #[test]
+    fn antigravity_survey_menu_without_question_is_not_survey() {
+        // A bracketed rating menu alone (e.g. ordinary tool output listing
+        // options) must not receive the dismissal keystroke.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        let mut lines = vec![""; 19];
+        lines.extend_from_slice(&[
+            "Choose a rating for the run:",
+            "[1] Good  [2] Fine  [3] Bad  [0] Skip",
+            "> ",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_antigravity_survey_visible());
+    }
+
+    #[test]
+    fn antigravity_survey_question_without_menu_is_not_survey() {
+        // Agent prose discussing the survey (question present, no bracketed
+        // menu) must not match.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        let mut lines = vec![""; 19];
+        lines.extend_from_slice(&[
+            "The CLI may ask: How’s the CLI experience so far? Help us improve:",
+            "Please answer honestly.  ? for shortcuts",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_antigravity_survey_visible());
+    }
+
+    #[test]
+    fn antigravity_survey_similar_menu_labels_are_not_survey() {
+        // Question text plus a similarly-shaped follow-up menu whose options
+        // differ — a different prompt must not be dismissed as the survey.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        let mut lines = vec![""; 18];
+        lines.extend_from_slice(&[
+            "How’s the CLI experience so far? Help us improve:",
+            "[1] Excellent  [2] Great  [3] Poor  [0] Skip",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_antigravity_survey_visible());
+    }
+
+    #[test]
+    fn antigravity_survey_partial_frame_is_not_survey() {
+        // Mid-draw frame: question rendered, menu not yet — hold fire.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        let mut lines = vec![""; 18];
+        lines.extend_from_slice(&["How’s the CLI experience so far? Help us improve:"]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_antigravity_survey_visible());
+    }
+
+    #[test]
+    fn antigravity_survey_quoted_in_scrollback_is_ignored() {
+        // A verbatim quote high on the screen (transcript scrollback) with a
+        // live prompt at the bottom must not fire the dismissal keystroke.
+        let mut t = make_tracker(30, 80, "? for shortcuts");
+        let mut lines = vec![
+            "How’s the CLI experience so far? Help us improve:",
+            "[1] Good  [2] Fine  [3] Bad  [0] Skip",
+        ];
+        lines.extend(std::iter::repeat_n("", 26));
+        lines.push("> ");
+        render_rows(&mut t, &lines);
+        assert!(!t.is_antigravity_survey_visible());
+    }
+
+    #[test]
+    fn antigravity_survey_quoted_above_live_prompt_is_ignored() {
+        // Full verbatim quote of the survey sitting in the transcript just
+        // above the live input prompt — both inside the tail window, so the
+        // marker set alone would match. The prompt BELOW the quote proves
+        // the text is not the active surface; firing Skip would type `0`
+        // into the box and stall delivery behind prompt_has_text.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        let mut lines = vec![""; 16];
+        lines.extend_from_slice(&[
+            "How’s the CLI experience so far? Help us improve:",
+            "[1] Good  [2] Fine  [3] Bad  [0] Skip",
+            "> ",
+            "? for shortcuts",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_antigravity_survey_visible());
+    }
+
+    #[test]
+    fn antigravity_survey_quoted_above_approval_menu_is_ignored() {
+        // Same, but a live permission menu sits below the quote: a stray `0`
+        // must never reach an approval surface. The approval itself is
+        // still detected by its own scraper.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        let mut lines = vec![""; 14];
+        lines.extend_from_slice(&[
+            "How’s the CLI experience so far? Help us improve:",
+            "[1] Good  [2] Fine  [3] Bad  [0] Skip",
+            "Requesting permission for: rm -rf /tmp/x",
+            "Do you want to proceed?",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_antigravity_survey_visible());
+        assert!(t.is_antigravity_approval_visible());
     }
 
     // ---- Cursor approval detection ----
@@ -2000,6 +2305,93 @@ mod tests {
         t.process("> <hcom>old message</hcom>\r\n".as_bytes());
         t.process("some agent output\r\n".as_bytes());
         t.process("> \r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_accept_edits_banner_is_not_input_text() {
+        // hcom-f6g.10: rendered plain (non-dim) on the `>` row of a ready,
+        // empty prompt, the accept-edits mode banner was scraped as typed
+        // input and blocked delivery on prompt_has_text forever. It must be
+        // recognized by text, not intensity.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n".as_bytes(),
+        );
+        t.process("? for shortcuts\r\n".as_bytes());
+        assert!(t.is_ready());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+        assert_eq!(t.get_input_box_text("antigravity"), Some(String::new()));
+        assert!(t.is_prompt_empty("antigravity"));
+    }
+
+    #[test]
+    fn antigravity_accept_edits_banner_without_ready_footer_is_not_input_text() {
+        // Same banner with the ready footer off-screen: the banner check
+        // itself (not the is_ready() fallback) must classify it as empty.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n".as_bytes(),
+        );
+        assert!(!t.is_ready());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_plan_and_best_of_n_banners_are_not_input_text() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("> Plan mode: research & plan only (shift+tab to cycle)\r\n".as_bytes());
+        t.process("? for shortcuts\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(
+            "> Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)\r\n"
+                .as_bytes(),
+        );
+        t.process("? for shortcuts\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_wrapped_mode_banner_prefix_is_not_input_text() {
+        // A pane narrower than the banner wraps it; only a prefix of the
+        // banner lands on the `>` row (80-col full text does not fit 40).
+        let mut t = make_tracker(24, 40, "? for shortcuts");
+        t.process("> Accept-edits mode: file edits auto-approved\r\n".as_bytes());
+        t.process("  (shift+tab to cycle)\r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_mode_head_typed_text_is_still_input_text() {
+        // Text reaching only the `… mode:` head is too short to prove a
+        // wrapped banner, so it stays typed input (a genuine collision with
+        // injected delivery fails safe via the mixed-prompt refusal).
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("> Plan mode:\r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("Plan mode:".to_string())
+        );
+        assert!(!t.is_prompt_empty("antigravity"));
+    }
+
+    #[test]
+    fn antigravity_banner_after_submit_keeps_prompt_empty() {
+        // After Enter the cleared prompt shows the banner again; reading it
+        // as text would stall phase-2 clear verification and re-inject.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("> <hcom>test</hcom>\r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("<hcom>test</hcom>".to_string())
+        );
+        t.process("\x1b[1;1H\x1b[2J".as_bytes());
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n".as_bytes(),
+        );
+        t.process("? for shortcuts\r\n".as_bytes());
         assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
     }
 
