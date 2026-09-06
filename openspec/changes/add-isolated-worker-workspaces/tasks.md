@@ -1,6 +1,6 @@
 ## 1. Establish isolation identity and launch configuration
 
-- [ ] 1.1 Add `src/isolation/` with validated `IsolationProfile`, `WorkflowId`, `AttemptId`, and serializable non-secret `IsolationPlan` types; verify parsing, validation, serialization, and secret-exclusion unit tests.
+- [x] 1.1 Add `src/isolation/` with validated `IsolationProfile`, `WorkflowId`, `AttemptId`, and serializable non-secret `IsolationPlan` types; verify parsing, validation, serialization, and secret-exclusion unit tests.
 - [ ] 1.2 Add configuration and `--isolate off|workspace|workspace-git` CLI parsing that hcom consumes without forwarding to providers; verify CLI precedence, unknown-profile rejection, and provider-argv tests.
 - [ ] 1.3 Persist requested/effective isolation metadata with launches, expose it through status output, and enforce the recorded profile/workspace identity during resume; verify round-trip and policy-drift tests.
 
@@ -32,11 +32,11 @@
 
 ## 6. Enable providers in containment-gated order
 
-- [ ] 6.1 Add the small optional `IsolationAdapter` capability for declared public configuration, writable per-run state, authentication material, mounts, and environment; verify that undeclared full provider directories and unsupported credentials fail preflight.
-- [ ] 6.2 Add the Antigravity adapter with isolated settings/auth/session state and compatible launch flags, without native sandbox-bypass flags; verify adapter plan fixtures and fresh-state startup behavior.
-- [ ] 6.3 Run and document the Antigravity Gemini trusted-local live gate for editing, build/test, completion reporting, cancellation, and cleanup; keep the adapter preview-only if any gate fails.
-- [ ] 6.4 Run and document the Antigravity Claude trusted-local live gate for the same matrix, including a previously untrusted fresh worktree; keep the adapter preview-only if any gate fails.
-- [ ] 6.5 Add the GLM adapter and run its trusted-local live gate in a fresh worktree, including edit/test/result, resume-invariant, cancellation, and cleanup checks; keep it preview-only if any gate fails.
+- [ ] 6.1 Add the small optional `IsolationAdapter` capability for declared public configuration, writable per-run state, authentication material, mounts, environment, and workflow-granted operation capabilities; verify that undeclared full provider directories, unsupported credentials, and ungranted operations fail preflight.
+- [ ] 6.2 Add the Antigravity adapter with isolated settings/auth/session state and compatible launch flags, without native sandbox-bypass flags; require an active validated hcom boundary before enabling non-interactive routine work, and verify adapter plan, allow/deny policy, and fresh-state startup fixtures.
+- [ ] 6.3 Run and document the Antigravity Gemini trusted-local live gate for editing, formatting, build/test, authorized GitHub participation, completion reporting, cancellation, and cleanup without routine permission prompts; verify boundary escape and ungranted destructive operations remain blocked, and keep the adapter preview-only if any gate fails.
+- [ ] 6.4 Run and document the Antigravity Claude trusted-local live gate for the same permission and lifecycle matrix, including a previously untrusted fresh worktree; keep the adapter preview-only if any gate fails.
+- [ ] 6.5 Add the GLM adapter and run its trusted-local live gate in a fresh worktree, including non-interactive routine edit/test/GitHub work, blocked boundary escape, result, resume-invariant, cancellation, and cleanup checks; keep it preview-only if any gate fails.
 
 ## 7. Harden observability and roll out deliberately
 

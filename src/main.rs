@@ -19,6 +19,7 @@ mod instance_lifecycle;
 mod instance_names;
 mod instances;
 pub mod integration_spec;
+pub mod isolation;
 pub mod launcher;
 mod log;
 pub mod messages;

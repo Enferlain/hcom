@@ -18,6 +18,11 @@ used reliably for daily development.
   identity instead of exposing the global hcom directory.
 - Add small provider isolation adapters for configuration, session state, and
   authentication requirements.
+- Make the hcom boundary the primary enforcement layer so routine in-boundary
+  read, edit, build, test, and explicitly authorized GitHub operations run
+  without provider approval prompts; reserve intervention for boundary escape,
+  protected resources, credential or policy changes, and ungranted destructive
+  capabilities.
 - Add containment tests with a fake provider before enabling Antigravity and
   Claude-backed GLM.
 - Fail before provider launch on unsupported platforms or invalid isolation

@@ -48,6 +48,38 @@ provider startup fails.
 - **WHEN** isolation is requested for a launch backend that has not implemented the isolation contract
 - **THEN** hcom rejects the launch instead of using the existing host-execution path
 
+### Requirement: Routine in-boundary work is non-interactive
+The outer hcom isolation boundary SHALL be the primary enforcement mechanism
+for isolated workers. Once that boundary is active, provider adapters SHALL let
+ordinary reads, workspace edits, formatting, builds, tests, and Git inspection
+proceed without per-command approval. A workflow MAY also grant scoped GitHub
+capabilities such as reading, creating, commenting on, or reviewing issues and
+pull requests; operations inside those declared capabilities SHALL not require
+repeated provider approval.
+
+Provider approval or a typed hcom blocker SHALL remain required for attempts to
+escape the boundary, access protected host resources, change credentials or
+security policy, perform a remote destructive operation outside the workflow's
+declared capability, or exercise a capability the workflow was not granted.
+Broad non-interactive provider permission MUST NOT be enabled when the outer
+isolation plan is absent, incomplete, or failed.
+
+#### Scenario: Run a routine development command
+- **WHEN** an isolated worker runs a formatter, compiler, test suite, file read, or workspace-scoped edit allowed by its effective plan
+- **THEN** the command proceeds without a provider permission prompt
+
+#### Scenario: Use an authorized GitHub capability
+- **WHEN** a workflow with a scoped GitHub identity grants issue and pull-request participation and the worker performs an operation within that grant
+- **THEN** the operation proceeds without per-command approval and is attributed to that scoped identity
+
+#### Scenario: Attempt an undeclared or destructive capability
+- **WHEN** a worker requests boundary escape, protected host access, credential or policy mutation, or a remote destructive action outside its workflow grant
+- **THEN** the operation is denied or returned as a typed actionable blocker without silently broadening the plan
+
+#### Scenario: Isolation failed before provider startup
+- **WHEN** the outer boundary cannot be installed completely
+- **THEN** hcom does not enable the provider's broad non-interactive permission mode and does not launch the worker unrestricted
+
 ### Requirement: Workspace profile confines filesystem writes
 The `workspace` profile SHALL allow writes only to the canonical declared
 workspace and private per-run scratch or build paths. Unrelated workspaces, the

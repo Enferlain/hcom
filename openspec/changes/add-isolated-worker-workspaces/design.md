@@ -23,6 +23,9 @@ Bubblewrap versions older than 0.12.0.
 - Make the effective boundary inspectable, testable, resumable, and fail-closed.
 - Support normal trusted-repository editing, Rust build/test workflows, and
   isolated hcom completion reporting.
+- Let routine work inside an active outer boundary proceed without repetitive
+  provider approvals while retaining explicit capability gates for dangerous or
+  out-of-scope actions.
 - Establish workflow and attempt identity as the tenancy key for runtime state.
 
 **Non-Goals:**
@@ -171,6 +174,34 @@ is the current blocker. Claude-backed GLM follows against the same runtime.
 directory. Rejected because provider child commands could read durable
 credentials and mutate persistent settings.
 
+### The outer boundary owns enforcement; inner permissions are risk-based
+
+An active, validated hcom isolation plan is the prerequisite for unattended
+provider permissions. Inside that boundary, adapters configure providers to
+proceed automatically for ordinary file reads, workspace edits, formatting,
+builds, tests, and Git inspection. Requiring an LLM-mediated approval for
+commands such as `cargo fmt` adds supervision cost without strengthening the
+filesystem or process boundary.
+
+Remote operations use explicit workflow capabilities and scoped identities.
+For example, a GitHub-participation workflow may grant issue and pull-request
+read/write/review operations to its agent account without prompting for each
+`gh` invocation. Credential changes, repository administration, secret access,
+branch deletion, force operations, merges, or other remote destructive actions
+remain denied unless the workflow grants the narrower capability explicitly.
+
+The provider's permission system remains defense in depth for boundary escape,
+protected resources, security-policy changes, and undeclared capabilities. If
+the hcom boundary is off or fails preflight, adapters must not select broad
+non-interactive modes. Provider prompt recognition is still required so an
+unexpected guard becomes a typed blocker rather than a silent stall.
+
+**Alternative considered:** Maintain a long allowlist of exact routine command
+prefixes. Rejected because normal tools compose commands in many equivalent
+forms, the list becomes provider-specific maintenance, and it still asks the
+model to mediate harmless work. The isolation plan and workflow capability are
+the stable policy units.
+
 ### Networking is honest and staged
 
 Milestone 1 shares host networking only for explicitly trusted local
@@ -228,6 +259,9 @@ after an authoritative result does not erase that result.
 - **[Provider-native and hcom sandboxes conflict]** → Provider adapters select
   compatible flags, and the fake-provider gate proves the outer boundary before
   real-provider tuning.
+- **[Broad provider permissions are enabled without containment]** → Make an
+  active validated isolation plan a hard prerequisite and fail before provider
+  startup rather than weakening either layer.
 
 ## Migration Plan
 
