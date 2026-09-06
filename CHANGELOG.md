@@ -18,6 +18,18 @@ Rules:
 - Added validated, immutable isolation profile, workflow/attempt identity, and
   non-secret isolation-plan types with deterministic plan identities and strict
   deserialization checks.
+- Correlated `hcom events --result-from` waits are now a single atomic attempt
+  wait: besides the authoritative result and stopped-worker transcript
+  recovery, they terminate on a typed actionable blocker (`pty:approval`,
+  `pty:survey`, `elicitation`, unresolved `launch_blocked`), a launch failure,
+  or a stop without a recoverable result. All terminal scans are anchored at
+  the pre-launch `--after-id` cursor, so a blocker that fired between launch
+  readiness and wait registration cannot be missed, and every non-result
+  termination prints one structured outcome preserving the worker generation,
+  workflow thread, attempt cursor, blocker evidence, and recovery guidance.
+  New exit codes: `4` typed blocker, `5` launch failure (`3` remains
+  stopped-without-result and keeps its legacy `result_unavailable`/`timed_out`
+  markers for script compatibility).
 
 ### Fixed
 

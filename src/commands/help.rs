@@ -58,7 +58,7 @@ const EVENTS_HELP: &[HelpEntry] = &[
     ("  --cursor", "Print the current durable event cursor"),
     (
         "  --result-from NAME",
-        "Correlated terminal report; requires one --thread and pre-launch --after-id",
+        "Correlated attempt wait; requires one --thread and pre-launch --after-id. Exits 0 result, 1 deadline, 2 SQL error, 3 stopped-without-result, 4 typed blocker, 5 launch failure",
     ),
     ("  --sql EXPR", "Raw SQL WHERE (ANDed with flags)"),
     (

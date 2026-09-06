@@ -657,6 +657,110 @@ fn cursor_and_result_from_reject_cross_worker_completion() {
 }
 
 #[test]
+fn result_from_returns_structured_blocker_exit_code() {
+    let h = Hcom::new();
+    let caller = h.start();
+    let worker = h.start();
+    let (cursor_code, cursor, cursor_stderr) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_stderr}");
+    let cursor = cursor.trim().to_string();
+
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute(
+        "UPDATE instances
+         SET status = 'blocked', status_context = 'pty:approval',
+             status_detail = 'Bash: cargo test'
+         WHERE name = ?1",
+        [&worker],
+    )
+    .unwrap();
+    let blocker = serde_json::json!({
+        "status": "blocked",
+        "context": "pty:approval",
+        "detail": "Bash: cargo test",
+    });
+    db.execute(
+        "INSERT INTO events (timestamp, type, instance, data)
+         VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'status', ?1, ?2)",
+        rusqlite::params![worker, blocker.to_string()],
+    )
+    .unwrap();
+    drop(db);
+
+    let (code, stdout, stderr) = h.run([
+        "events",
+        "--name",
+        &caller,
+        "--wait",
+        "2",
+        "--after-id",
+        &cursor,
+        "--thread",
+        "blocked-cli-workflow",
+        "--result-from",
+        &worker,
+    ]);
+    assert_eq!(code, 4, "stdout={stdout} stderr={stderr}");
+    let outcome: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(outcome["outcome"], "blocked");
+    assert_eq!(outcome["result_blocked"], true);
+    assert_eq!(outcome["worker"], worker);
+    assert_eq!(outcome["thread"], "blocked-cli-workflow");
+    assert_eq!(outcome["attempt_after_id"].to_string(), cursor);
+    assert_eq!(outcome["context"], "pty:approval");
+    assert_eq!(outcome["evidence"], "Bash: cargo test");
+}
+
+#[test]
+fn result_from_returns_structured_launch_failure_exit_code() {
+    let h = Hcom::new();
+    let caller = h.start();
+    let worker = h.start();
+    let (cursor_code, cursor, cursor_stderr) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_stderr}");
+    let cursor = cursor.trim().to_string();
+
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let failure = serde_json::json!({
+        "action": "launch_failed",
+        "status": "inactive",
+        "context": "launch_failed",
+        "reason": "exited_before_bind",
+        "detail": "provider exited before readiness",
+        "batch_id": "batch-cli-failure",
+    });
+    db.execute(
+        "INSERT INTO events (timestamp, type, instance, data)
+         VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'life', ?1, ?2)",
+        rusqlite::params![worker, failure.to_string()],
+    )
+    .unwrap();
+    drop(db);
+
+    let (code, stdout, stderr) = h.run([
+        "events",
+        "--name",
+        &caller,
+        "--wait",
+        "2",
+        "--after-id",
+        &cursor,
+        "--thread",
+        "failed-cli-workflow",
+        "--result-from",
+        &worker,
+    ]);
+    assert_eq!(code, 5, "stdout={stdout} stderr={stderr}");
+    let outcome: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(outcome["outcome"], "launch_failed");
+    assert_eq!(outcome["result_launch_failed"], true);
+    assert_eq!(outcome["worker"], worker);
+    assert_eq!(outcome["thread"], "failed-cli-workflow");
+    assert_eq!(outcome["attempt_after_id"].to_string(), cursor);
+    assert_eq!(outcome["batch_id"], "batch-cli-failure");
+}
+
+#[test]
 fn start_send_events_roundtrip() {
     let h = Hcom::new();
     let sender = h.start();

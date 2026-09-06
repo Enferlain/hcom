@@ -6,6 +6,14 @@
 //! - Subscribe: `hcom events sub [list | SQL | filters...] [--once] [--for name]`
 //! - Unsubscribe: `hcom events unsub <id>`
 //! - Launch status: `hcom events launch [batch_id] [--timeout N]`
+//!
+//! Correlated result waits (`--wait --result-from NAME --thread ID --after-id
+//! N`) exit `0` on the authoritative result, `1` on deadline, `2` on SQL
+//! error, `3` when the worker stopped without a recoverable result, `4` on a
+//! typed actionable blocker, and `5` on a launch failure. Every non-result
+//! termination prints one structured outcome preserving the worker
+//! generation, workflow thread, attempt cursor, blocker evidence, and
+//! recovery guidance.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::TcpListener;
@@ -32,7 +40,6 @@ struct ResultCorrelation {
     after_id: i64,
 }
 
-const RESULT_UNAVAILABLE_EXIT: i32 = 3;
 const RESULT_RECOVERY_GRACE: Duration = Duration::from_secs(2);
 const RESULT_RECOVERY_RETRY: Duration = Duration::from_millis(200);
 
@@ -64,7 +71,8 @@ pub struct EventsArgs {
         conflicts_with_all = ["wait", "last", "all", "full", "sql", "remote_fetch"]
     )]
     pub cursor: bool,
-    /// Wait for one exact worker result, recovering supported stopped-provider transcripts
+    /// Wait for one exact worker result; also terminates on a typed actionable
+    /// blocker, launch failure, or a stop without a recoverable result
     #[arg(long, requires = "wait", conflicts_with = "remote_fetch")]
     pub result_from: Option<String>,
     /// Raw SQL WHERE clause
@@ -1092,13 +1100,20 @@ fn events_wait(
     let mut next_recovery_retry = start;
     let mut recovery_event_pending = false;
     let mut next_recovery_scan = start;
+    // Correlated waits terminate on more than the result message: a typed
+    // actionable blocker or a launch failure observed after the pre-launch
+    // cursor also ends the attempt with a structured outcome. The scan is
+    // cursor-anchored (not registration-anchored), so a transition that fired
+    // between launch readiness and this wait is found on the first poll.
+    let outcome_wait =
+        result_correlation.map(|correlation| crate::core::result_wait::OutcomeWait {
+            worker: &correlation.exact_worker,
+            generation: &correlation.instance_key,
+            thread: &correlation.thread,
+            attempt_after_id: correlation.after_id,
+        });
 
     let result = loop {
-        if start.elapsed() >= Duration::from_secs(wait_timeout) {
-            println!("{}", json!({"timed_out": true}));
-            break 1;
-        }
-
         // Query for new matching events
         let query = format!("SELECT * FROM events_v WHERE id > ?{filter_query} ORDER BY id");
         let mut found = false;
@@ -1131,6 +1146,25 @@ fn events_wait(
 
         if found {
             break 0;
+        }
+
+        // Terminal non-result outcomes (actionable blocker, launch failure).
+        // Scan failures are non-fatal: a transient read error must not abort a
+        // wait that could still complete with the authoritative result.
+        if let Some(wait) = outcome_wait.as_ref() {
+            match crate::core::result_wait::scan_terminal_outcome(db, wait) {
+                Ok(Some(outcome)) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&outcome.payload).unwrap_or_default()
+                    );
+                    break outcome.exit_code;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("Warning: worker outcome scan failed: {error}");
+                }
+            }
         }
 
         if let Some(correlation) = result_correlation
@@ -1170,14 +1204,18 @@ fn events_wait(
                         eprintln!("Result recovery failed: {error}");
                         println!(
                             "{}",
-                            json!({
-                                "result_unavailable": true,
-                                "worker": correlation.exact_worker,
-                                "thread": correlation.thread,
-                                "reason": error,
-                            })
+                            serde_json::to_string(&crate::core::result_wait::unavailable_payload(
+                                &crate::core::result_wait::OutcomeWait {
+                                    worker: &correlation.exact_worker,
+                                    generation: &correlation.instance_key,
+                                    thread: &correlation.thread,
+                                    attempt_after_id: correlation.after_id,
+                                },
+                                &error,
+                            ),)
+                            .unwrap_or_default()
                         );
-                        break RESULT_UNAVAILABLE_EXIT;
+                        break crate::core::result_wait::RESULT_UNAVAILABLE_EXIT;
                     }
                 }
             }
@@ -1203,7 +1241,13 @@ fn events_wait(
         // Wait for TCP notification or timeout
         let remaining = wait_timeout.saturating_sub(start.elapsed().as_secs());
         if remaining == 0 {
-            println!("{}", json!({"timed_out": true}));
+            println!(
+                "{}",
+                serde_json::to_string(&crate::core::result_wait::deadline_payload(
+                    outcome_wait.as_ref()
+                ))
+                .unwrap_or_default()
+            );
             break 1;
         }
 
@@ -2316,7 +2360,747 @@ mod tests {
                     result_correlation: Some(&correlation),
                 },
             ),
-            RESULT_UNAVAILABLE_EXIT
+            crate::core::result_wait::RESULT_UNAVAILABLE_EXIT
+        );
+    }
+
+    /// Shared fixture: arm a correlated wait exactly as the CLI would.
+    fn arm_result_wait(
+        db: &HcomDb,
+        worker: &str,
+        thread: &str,
+        cursor: i64,
+    ) -> (ResultCorrelation, HashMap<String, Vec<String>>) {
+        use clap::Parser;
+
+        let args = EventsArgs::try_parse_from([
+            "events",
+            "--wait",
+            "1",
+            "--after-id",
+            &cursor.to_string(),
+            "--thread",
+            thread,
+            "--result-from",
+            worker,
+        ])
+        .unwrap();
+        let mut filters = args.filters.to_filter_map();
+        let correlation = apply_result_correlation(db, &args, &mut filters)
+            .unwrap()
+            .unwrap();
+        (correlation, filters)
+    }
+
+    fn outcome_wait_from(
+        correlation: &ResultCorrelation,
+    ) -> crate::core::result_wait::OutcomeWait<'_> {
+        crate::core::result_wait::OutcomeWait {
+            worker: &correlation.exact_worker,
+            generation: &correlation.instance_key,
+            thread: &correlation.thread,
+            attempt_after_id: correlation.after_id,
+        }
+    }
+
+    #[test]
+    fn result_wait_returns_pre_registration_approval_blocker() {
+        // Reproduction of hcom-f6g.11: the worker reported ready, entered
+        // pty:approval before the coordinator armed its wait, and the wait
+        // must still terminate immediately instead of running to deadline.
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("pre-blocked.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_detail, created_at)
+                 VALUES ('agy-worker', 'blocked', 'pty:approval',
+                         'Bash: cargo test -- --nocapture', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "status",
+            "agy-worker",
+            &json!({
+                "status": "blocked",
+                "context": "pty:approval",
+                "detail": "Bash: cargo test -- --nocapture",
+            }),
+        )
+        .unwrap();
+        let (correlation, filters) = arm_result_wait(&db, "agy-worker", "blocked-workflow", cursor);
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        assert_eq!(
+            events_wait(
+                &db,
+                &format!(" AND ({filter_sql})"),
+                1,
+                EventsWaitOptions {
+                    after_id: Some(cursor),
+                    full_output: true,
+                    filters: &filters,
+                    instance_name: None,
+                    result_correlation: Some(&correlation),
+                },
+            ),
+            crate::core::result_wait::RESULT_BLOCKED_EXIT,
+            "a blocker that fired between readiness and wait registration must terminate the wait"
+        );
+    }
+
+    #[test]
+    fn result_wait_blocker_payload_preserves_correlation_and_evidence() {
+        use crate::core::result_wait::scan_terminal_outcome;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("blocked-payload.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_detail, created_at)
+                 VALUES ('agy-worker', 'blocked', 'pty:approval',
+                         'Bash: cargo test -- --nocapture', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "status",
+            "agy-worker",
+            &json!({
+                "status": "blocked",
+                "context": "pty:approval",
+                "detail": "Bash: cargo test -- --nocapture",
+            }),
+        )
+        .unwrap();
+        let (correlation, _filters) =
+            arm_result_wait(&db, "agy-worker", "blocked-workflow", cursor);
+
+        let outcome = scan_terminal_outcome(&db, &outcome_wait_from(&correlation))
+            .unwrap()
+            .expect("a current approval blocker must produce a terminal outcome");
+        assert_eq!(
+            outcome.exit_code,
+            crate::core::result_wait::RESULT_BLOCKED_EXIT
+        );
+        let payload = outcome.payload;
+        assert_eq!(payload["result_blocked"], true);
+        assert_eq!(payload["outcome"], "blocked");
+        assert_eq!(payload["worker"], "agy-worker");
+        assert_eq!(payload["generation"], "agy-worker@1000.000000");
+        assert_eq!(payload["thread"], "blocked-workflow");
+        assert_eq!(payload["attempt_after_id"], cursor);
+        assert_eq!(payload["kind"], "approval");
+        assert_eq!(payload["context"], "pty:approval");
+        assert_eq!(payload["evidence"], "Bash: cargo test -- --nocapture");
+        let recovery = payload["recovery"].as_str().unwrap();
+        assert!(recovery.contains("hcom term agy-worker"));
+        assert!(recovery.contains(&format!("--after-id {cursor}")));
+    }
+
+    #[test]
+    fn result_wait_returns_mid_wait_blocker_transition() {
+        // Race coverage: the approval edge fires while the wait is already
+        // registered and polling.
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("mid-blocked.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('agy-worker', 'listening', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let (correlation, filters) =
+            arm_result_wait(&db, "agy-worker", "mid-blocked-workflow", cursor);
+
+        let writer_path = db_path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut writer_db = HcomDb::open_raw(&writer_path).unwrap();
+            writer_db.ensure_schema().unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            writer_db
+                .conn()
+                .execute(
+                    "UPDATE instances SET status = 'blocked', status_context = 'pty:approval',
+                         status_detail = 'Bash: cargo build'
+                     WHERE name = 'agy-worker'",
+                    [],
+                )
+                .unwrap();
+            writer_db
+                .log_event(
+                    "status",
+                    "agy-worker",
+                    &json!({
+                        "status": "blocked",
+                        "context": "pty:approval",
+                        "detail": "Bash: cargo build",
+                    }),
+                )
+                .unwrap();
+        });
+
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        let status = events_wait(
+            &db,
+            &format!(" AND ({filter_sql})"),
+            3,
+            EventsWaitOptions {
+                after_id: Some(cursor),
+                full_output: true,
+                filters: &filters,
+                instance_name: None,
+                result_correlation: Some(&correlation),
+            },
+        );
+        writer.join().unwrap();
+        assert_eq!(
+            status,
+            crate::core::result_wait::RESULT_BLOCKED_EXIT,
+            "a blocker transition during the wait must terminate it before the deadline"
+        );
+    }
+
+    #[test]
+    fn resolved_blocker_does_not_terminate_result_wait() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("resolved-blocked.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('agy-worker', 'listening', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "status",
+            "agy-worker",
+            &json!({
+                "status": "blocked",
+                "context": "pty:approval",
+                "detail": "Bash: cargo test",
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "status",
+            "agy-worker",
+            &json!({
+                "status": "listening",
+                "context": "pty:approval_cleared",
+            }),
+        )
+        .unwrap();
+        let (correlation, filters) =
+            arm_result_wait(&db, "agy-worker", "resolved-workflow", cursor);
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        assert_eq!(
+            events_wait(
+                &db,
+                &format!(" AND ({filter_sql})"),
+                1,
+                EventsWaitOptions {
+                    after_id: Some(cursor),
+                    full_output: true,
+                    filters: &filters,
+                    instance_name: None,
+                    result_correlation: Some(&correlation),
+                },
+            ),
+            1,
+            "a blocker that already cleared must not end the attempt"
+        );
+    }
+
+    #[test]
+    fn other_worker_blocker_does_not_terminate_result_wait() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("other-blocked.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at) VALUES
+                    ('agy-worker', 'listening', 1000.0),
+                    ('other-worker', 'blocked', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "status",
+            "other-worker",
+            &json!({
+                "status": "blocked",
+                "context": "pty:approval",
+                "detail": "Bash: rm -rf /",
+            }),
+        )
+        .unwrap();
+        let (correlation, filters) =
+            arm_result_wait(&db, "agy-worker", "isolation-workflow", cursor);
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        assert_eq!(
+            events_wait(
+                &db,
+                &format!(" AND ({filter_sql})"),
+                1,
+                EventsWaitOptions {
+                    after_id: Some(cursor),
+                    full_output: true,
+                    filters: &filters,
+                    instance_name: None,
+                    result_correlation: Some(&correlation),
+                },
+            ),
+            1,
+            "another worker's blocker must not terminate this wait"
+        );
+    }
+
+    #[test]
+    fn result_wait_returns_launch_failure_outcome() {
+        use crate::core::result_wait::scan_terminal_outcome;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("launch-failed.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('agy-worker', 'listening', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "life",
+            "agy-worker",
+            &json!({
+                "action": "launch_failed",
+                "batch_id": "batch-199",
+                "reason": "ready_never_observed",
+                "detail": "terminal exited before the worker bound its session",
+            }),
+        )
+        .unwrap();
+        let (correlation, filters) = arm_result_wait(&db, "agy-worker", "failed-workflow", cursor);
+
+        let outcome = scan_terminal_outcome(&db, &outcome_wait_from(&correlation))
+            .unwrap()
+            .expect("a launch failure must produce a terminal outcome");
+        assert_eq!(
+            outcome.exit_code,
+            crate::core::result_wait::RESULT_LAUNCH_FAILED_EXIT
+        );
+        let payload = outcome.payload;
+        assert_eq!(payload["result_launch_failed"], true);
+        assert_eq!(payload["outcome"], "launch_failed");
+        assert_eq!(payload["generation"], "agy-worker@1000.000000");
+        assert_eq!(payload["attempt_after_id"], cursor);
+        assert_eq!(payload["batch_id"], "batch-199");
+        assert_eq!(
+            payload["detail"],
+            "terminal exited before the worker bound its session"
+        );
+
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        assert_eq!(
+            events_wait(
+                &db,
+                &format!(" AND ({filter_sql})"),
+                1,
+                EventsWaitOptions {
+                    after_id: Some(cursor),
+                    full_output: true,
+                    filters: &filters,
+                    instance_name: None,
+                    result_correlation: Some(&correlation),
+                },
+            ),
+            crate::core::result_wait::RESULT_LAUNCH_FAILED_EXIT
+        );
+    }
+
+    #[test]
+    fn result_wait_returns_typed_launch_blocker() {
+        use crate::core::result_wait::scan_terminal_outcome;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("launch-blocked.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at)
+                 VALUES ('agy-worker', 'blocked', 'launch_blocked', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "life",
+            "agy-worker",
+            &json!({
+                "action": "launch_blocked",
+                "batch_id": "batch-77",
+                "reason": "screen_settled_not_ready",
+                "detail": "launch blocked: workspace approval required",
+                "blocked_kind": "workspace_trust",
+                "evidence": "Do you trust the files in this folder?",
+            }),
+        )
+        .unwrap();
+        let (correlation, filters) =
+            arm_result_wait(&db, "agy-worker", "blocked-launch-workflow", cursor);
+
+        let outcome = scan_terminal_outcome(&db, &outcome_wait_from(&correlation))
+            .unwrap()
+            .expect("an unresolved launch blocker must produce a terminal outcome");
+        assert_eq!(
+            outcome.exit_code,
+            crate::core::result_wait::RESULT_BLOCKED_EXIT
+        );
+        let payload = outcome.payload;
+        assert_eq!(payload["kind"], "workspace_trust");
+        assert_eq!(
+            payload["evidence"],
+            "Do you trust the files in this folder?"
+        );
+        assert_eq!(
+            payload["detail"],
+            "launch blocked: workspace approval required"
+        );
+        assert_eq!(payload["reason"], "screen_settled_not_ready");
+        assert_eq!(payload["thread"], "blocked-launch-workflow");
+        assert_eq!(payload["attempt_after_id"], cursor);
+
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        assert_eq!(
+            events_wait(
+                &db,
+                &format!(" AND ({filter_sql})"),
+                1,
+                EventsWaitOptions {
+                    after_id: Some(cursor),
+                    full_output: true,
+                    filters: &filters,
+                    instance_name: None,
+                    result_correlation: Some(&correlation),
+                },
+            ),
+            crate::core::result_wait::RESULT_BLOCKED_EXIT
+        );
+    }
+
+    #[test]
+    fn resolved_launch_blocker_does_not_terminate_result_wait() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("launch-blocked-resolved.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('agy-worker', 'listening', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "life",
+            "agy-worker",
+            &json!({
+                "action": "launch_blocked",
+                "batch_id": "batch-78",
+                "detail": "launch blocked: workspace approval required",
+                "blocked_kind": "workspace_trust",
+            }),
+        )
+        .unwrap();
+        let (correlation, filters) = arm_result_wait(&db, "agy-worker", "resolved-launch", cursor);
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        assert_eq!(
+            events_wait(
+                &db,
+                &format!(" AND ({filter_sql})"),
+                1,
+                EventsWaitOptions {
+                    after_id: Some(cursor),
+                    full_output: true,
+                    filters: &filters,
+                    instance_name: None,
+                    result_correlation: Some(&correlation),
+                },
+            ),
+            1,
+            "a launch blocker the worker progressed past must not end the attempt"
+        );
+    }
+
+    #[test]
+    fn stopped_generation_keeps_cleared_launch_blocker_resolved() {
+        use crate::core::result_wait::scan_terminal_outcome;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("cleared-then-stopped.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at)
+                 VALUES ('agy-worker', 'antigravity', 'listening', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let (correlation, _filters) =
+            arm_result_wait(&db, "agy-worker", "cleared-then-stopped", cursor);
+        db.log_event(
+            "life",
+            "agy-worker",
+            &json!({
+                "action": "launch_blocked",
+                "batch_id": "batch-cleared",
+                "blocked_kind": "workspace_trust",
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "life",
+            "agy-worker",
+            &json!({"action": "ready", "batch_id": "batch-cleared"}),
+        )
+        .unwrap();
+        db.conn()
+            .execute("DELETE FROM instances WHERE name = 'agy-worker'", [])
+            .unwrap();
+        db.log_event(
+            "life",
+            "agy-worker",
+            &json!({
+                "action": "stopped",
+                "snapshot": {
+                    "name": "agy-worker",
+                    "tool": "antigravity",
+                    "created_at": 1000.0,
+                    "session_id": "session-a",
+                }
+            }),
+        )
+        .unwrap();
+
+        assert!(
+            scan_terminal_outcome(&db, &outcome_wait_from(&correlation))
+                .unwrap()
+                .is_none(),
+            "a cleared launch blocker must not reappear after the worker stops"
+        );
+    }
+
+    #[test]
+    fn newer_generation_launch_failure_does_not_terminate_original_wait() {
+        use crate::core::result_wait::scan_terminal_outcome;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("reused-launch-failure.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at)
+                 VALUES ('agy-worker', 'antigravity', 'listening', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let (correlation, _filters) =
+            arm_result_wait(&db, "agy-worker", "original-generation", cursor);
+        db.conn()
+            .execute("DELETE FROM instances WHERE name = 'agy-worker'", [])
+            .unwrap();
+        db.log_event(
+            "life",
+            "agy-worker",
+            &json!({
+                "action": "stopped",
+                "snapshot": {
+                    "name": "agy-worker",
+                    "tool": "antigravity",
+                    "created_at": 1000.0,
+                    "session_id": "session-a",
+                }
+            }),
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at)
+                 VALUES ('agy-worker', 'antigravity', 'inactive', 2000.0)",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "life",
+            "agy-worker",
+            &json!({
+                "action": "launch_failed",
+                "batch_id": "new-generation",
+                "reason": "exited_before_bind",
+            }),
+        )
+        .unwrap();
+
+        assert!(
+            scan_terminal_outcome(&db, &outcome_wait_from(&correlation))
+                .unwrap()
+                .is_none(),
+            "a reused name's launch failure must not satisfy the original generation's wait"
+        );
+    }
+
+    #[test]
+    fn blocker_in_final_poll_interval_wins_over_deadline() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("final-interval-blocker.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('agy-worker', 'listening', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let (correlation, filters) = arm_result_wait(&db, "agy-worker", "final-interval", cursor);
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            let mut writer_db = HcomDb::open_raw(&db_path).unwrap();
+            writer_db.ensure_schema().unwrap();
+            writer_db
+                .conn()
+                .execute(
+                    "UPDATE instances SET status = 'blocked', status_context = 'pty:approval',
+                         status_detail = 'Bash: cargo test'
+                     WHERE name = 'agy-worker'",
+                    [],
+                )
+                .unwrap();
+            writer_db
+                .log_event(
+                    "status",
+                    "agy-worker",
+                    &json!({
+                        "status": "blocked",
+                        "context": "pty:approval",
+                        "detail": "Bash: cargo test",
+                    }),
+                )
+                .unwrap();
+        });
+
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        let status = events_wait(
+            &db,
+            &format!(" AND ({filter_sql})"),
+            1,
+            EventsWaitOptions {
+                after_id: Some(cursor),
+                full_output: true,
+                filters: &filters,
+                instance_name: None,
+                result_correlation: Some(&correlation),
+            },
+        );
+        writer.join().unwrap();
+        assert_eq!(
+            status,
+            crate::core::result_wait::RESULT_BLOCKED_EXIT,
+            "a blocker observed during the final interval must win over the deadline"
+        );
+    }
+
+    #[test]
+    fn scan_ignores_blocked_status_from_a_reused_worker_generation() {
+        use crate::core::result_wait::scan_terminal_outcome;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("reused-name.db")).unwrap();
+        db.ensure_schema().unwrap();
+        // The name was reused by a newer generation (created_at 2000) while
+        // the wait is correlated against the original generation.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_detail, created_at)
+                 VALUES ('agy-worker', 'blocked', 'pty:approval', 'Bash: ls /etc', 2000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "status",
+            "agy-worker",
+            &json!({
+                "status": "blocked",
+                "context": "pty:approval",
+                "detail": "Bash: ls /etc",
+            }),
+        )
+        .unwrap();
+        let wait = crate::core::result_wait::OutcomeWait {
+            worker: "agy-worker",
+            generation: "agy-worker@1000.000000",
+            thread: "reused-workflow",
+            attempt_after_id: cursor,
+        };
+        assert!(
+            scan_terminal_outcome(&db, &wait).unwrap().is_none(),
+            "a reused name's blocker must not satisfy the original generation's wait"
+        );
+    }
+
+    #[test]
+    fn scan_requires_post_cursor_blocked_status_event() {
+        use crate::core::result_wait::scan_terminal_outcome;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("pre-cursor-blocked.db")).unwrap();
+        db.ensure_schema().unwrap();
+        // Blocked status event predates the attempt cursor: only the row is
+        // currently blocked, with no post-cursor evidence event.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_detail, created_at)
+                 VALUES ('agy-worker', 'blocked', 'pty:approval', 'Bash: ls /etc', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "status",
+            "agy-worker",
+            &json!({
+                "status": "blocked",
+                "context": "pty:approval",
+                "detail": "Bash: ls /etc",
+            }),
+        )
+        .unwrap();
+        let cursor = db.get_last_event_id();
+        let wait = crate::core::result_wait::OutcomeWait {
+            worker: "agy-worker",
+            generation: "agy-worker@1000.000000",
+            thread: "anchor-workflow",
+            attempt_after_id: cursor,
+        };
+        assert!(
+            scan_terminal_outcome(&db, &wait).unwrap().is_none(),
+            "the blocker scan is anchored at the attempt cursor, not the live row alone"
         );
     }
 

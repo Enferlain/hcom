@@ -528,6 +528,39 @@ The wrapper's fail-fast handling remains a user-workflow policy in
 the blocker accurately. No provider permission was bypassed or automatically
 accepted.
 
+### 47. Result waits can remain silent after a worker becomes blocked — working
+
+A correlated `hcom events --result-from` wait previously watched only for the
+worker's completion report or stopped-generation recovery. If the worker
+entered a typed approval, survey, elicitation, or launch blocker after being
+reported ready, the same wait remained silent until its task deadline. Starting
+a separate blocker wait could miss the transition between launch readiness and
+wait registration.
+
+Status: **Working as of 2026-09-06.** A correlated result wait now owns one
+atomic terminal decision from the caller's pre-launch cursor: exact result,
+typed actionable blocker, launch failure, stopped-without-result, or deadline.
+Non-result outcomes are structured and retain the exact worker generation,
+workflow thread, attempt cursor, evidence, and recovery guidance. Resolved
+blockers remain resolved after stop, a reused worker name cannot contribute the
+next generation's launch failure, and result/blocker scans run once more before
+the deadline wins. Race, generation-reuse, resolution, final-poll, payload, and
+compatibility regressions are covered by deterministic tests; focused tests,
+workspace check, strict Clippy, and two independent reviews pass.
+
+### 48. Antigravity sandbox-bypass approvals can remain unclassified
+
+Status: **Open P0 as `hcom-f6g.12`.** During the live Claude Opus attempt for
+item 47, Antigravity's sandbox reported a connection issue and asked permission
+to retry `bd show` outside the sandbox. hcom continued reporting
+`active/tool:run_command` for more than 224 seconds instead of publishing
+`blocked/pty:approval`. The new atomic wait can return blockers once hcom emits
+them, but it cannot infer a provider dialog that the PTY classifier missed.
+
+Recognize the complete sandbox-bypass dialog, preserve its command/evidence,
+publish the typed blocker promptly, and verify denial/clearance without ever
+approving the bypass during the test.
+
 ## P1: communication policy and context control
 
 ### 19. Every task requires a model-generated acknowledgement

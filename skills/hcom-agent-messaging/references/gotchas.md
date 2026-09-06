@@ -61,6 +61,18 @@ hcom events --wait 120 --after-id "$cursor" --thread "$thread" --result-from "$w
 
 This tuple prevents a different worker, workflow, or earlier attempt from satisfying the result wait.
 
+The wait is atomic across the whole attempt: because every terminal scan is
+anchored at the pre-launch cursor (not at wait registration), a blocker that
+fired between launch readiness and the wait arming is still caught on the
+first poll. It terminates on the authoritative result (exit `0`), deadline
+(exit `1`), a typed actionable blocker such as `pty:approval`, `pty:survey`,
+`elicitation`, or an unresolved `launch_blocked` (exit `4`), a launch failure
+(exit `5`), or a worker that stopped without a recoverable result (exit `3`).
+Every non-result termination prints one structured JSON outcome preserving the
+worker generation, workflow thread, attempt cursor, blocker evidence, and
+recovery guidance — do not run a separate blocked wait next to it; that path
+is exactly the race this wait removes.
+
 ## SQL LIKE Matching Behavior
 
 `msg_text LIKE '%APPROVED%'` also matches `"approved": true` in JSON because SQLite LIKE is case-insensitive for ASCII characters. This is actually convenient for most use cases.
@@ -76,7 +88,10 @@ hcom events --sql "msg_text LIKE '% APPROVED%' OR msg_text LIKE 'APPROVED%'"
 
 ## hcom events --wait Exit Code
 
-Returns **0** on match, **1** on timeout, **2** on SQL error. Use exit code directly:
+Returns **0** on match, **1** on timeout, **2** on SQL error. With
+`--result-from`, **3** additionally means the worker stopped without a
+recoverable result, **4** a typed actionable blocker, and **5** a launch
+failure. Use exit code directly:
 
 ```bash
 hcom events --wait 60 --sql "msg_thread='${thread}' AND msg_text LIKE '%DONE%'" $name_arg >/dev/null 2>&1

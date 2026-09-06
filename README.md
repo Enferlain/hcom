@@ -296,7 +296,10 @@ hcom list                           # show all active agents
 hcom term [name]                    # view/inject into an agent's PTY screen
 hcom events --wait <filters>         # Block until match for scripting
 hcom events --wait 1800 --after-id N --thread ID --result-from NAME
-                                     # Exact result; recovers supported stopped workers
+                                     # Atomic attempt wait: result, typed blocker,
+                                     # launch failure, stopped-without-result, or
+                                     # deadline — each with worker generation,
+                                     # thread, attempt cursor, and recovery guidance
 hcom update                         # update hcom version
 ```
 
