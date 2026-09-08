@@ -192,7 +192,7 @@ You're participating in the hcom multi-agent network.
 - Your name: {subagent_name}
 - Your parent: {parent_name}
 - Use "--name {subagent_name}" for all hcom commands
-- Announce to parent once: send {target_parent} --intent inform -- "Connected as {subagent_name}"
+- Your connection is already parent-visible via lifecycle events; no join announcement is needed
 
 Messages instantly auto-arrive via <hcom> tags — end your turn to receive them.
 
@@ -215,7 +215,7 @@ Commands:
 
 Rules:
 - Task via hcom → do the work, then send one substantive completion or blocker report with --intent inform; blocked → ask a necessary question with --intent request
-- No filler (greetings, receipt-only acknowledgements, routine progress chatter) except the required one-time connection announcement above
+- No filler (greetings, receipt-only acknowledgements, routine progress chatter)
 - Authority: @{SENDER} > others
 - Use --intent on sends: request (want reply), inform (FYI), ack (responding — only when requested)"#;
 
@@ -550,7 +550,6 @@ pub fn get_subagent_bootstrap(subagent_name: &str, parent_name: &str) -> String 
     let result = SUBAGENT_BOOTSTRAP
         .replace("{subagent_name}", subagent_name)
         .replace("{parent_name}", parent_name)
-        .replace("{target_parent}", &recipient_token(parent_name))
         .replace("{target_name_s}", &recipient_token("name(s)"))
         .replace("{target_luna}", &recipient_token("luna"))
         .replace("{target_nova}", &recipient_token("nova"))
@@ -829,11 +828,13 @@ mod tests {
         assert!(result.contains("--name luna_reviewer_1"));
         assert!(result.contains(SENDER));
         assert!(result.contains("</hcom>"));
+        assert!(!result.contains("Announce to parent"));
+        assert!(!result.contains("Connected as"));
         if cfg!(windows) {
-            assert!(result.contains("send '@luna' --intent inform"));
+            assert!(result.contains("send '@luna' '@nova'"));
             assert!(result.contains("send '@name(s)'"));
         } else {
-            assert!(result.contains("send @luna --intent inform"));
+            assert!(result.contains("send @luna @nova"));
             assert!(result.contains("send @name(s)"));
         }
     }
@@ -1054,8 +1055,11 @@ mod tests {
         assert!(result.contains("report with --intent inform"));
         assert!(result.contains("ask a necessary question"));
         assert!(result.contains("receipt-only acknowledgements"));
-        assert!(result.contains("except the required one-time connection announcement"));
-        assert!(result.contains("Connected as luna_reviewer_1"));
+        assert!(
+            !result.contains("Connected as") && !result.contains("Announce to parent"),
+            "subagent bootstrap must not ask the model to announce its connection"
+        );
+        assert!(result.contains("already parent-visible via lifecycle events"));
         // Explicit ack semantics remain documented.
         assert!(result.contains("intent=ack → don't respond"));
         assert!(result.contains("ack (responding"));

@@ -465,6 +465,55 @@ impl HcomDb {
         Ok(won)
     }
 
+    /// Atomically claim a subagent's one-shot connection gate and, for the
+    /// winner, insert the parent-visible `connected` life event in the same
+    /// transaction.
+    ///
+    /// The conditional `name_announced` 0→1 UPDATE is the ownership CAS (the
+    /// same shape as `finalize_instance_stop`): a manual `hcom start` racing
+    /// the SubagentStop activation ack — or a retried/duplicate ack — all
+    /// target one row, so exactly one caller wins and emits. Losers get
+    /// `Ok(false)` and need no follow-up; they still own whatever output they
+    /// already produced (the bootstrap text). The claim and the event commit
+    /// or roll back together, so the signal can be neither duplicated nor
+    /// lost between the two writes.
+    pub fn claim_subagent_connection(&self, name: &str, parent: &str, via: &str) -> Result<bool> {
+        let mut event_data = serde_json::json!({
+            "action": "connected",
+            "by": via,
+            "reason": "subagent_joined",
+        });
+        if !parent.is_empty() {
+            event_data["parent"] = serde_json::Value::String(parent.to_string());
+        }
+        let data = serde_json::to_string(&event_data)?;
+        let mut event_id = None;
+
+        let won = self.with_immediate_transaction(|tx| {
+            let claimed = tx.execute(
+                "UPDATE instances SET name_announced = 1 WHERE name = ? AND name_announced = 0",
+                params![name],
+            )?;
+            if claimed == 0 {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES (?, 'life', ?, ?)",
+                params![chrono_now_iso(), name, data],
+            )?;
+            event_id = Some(tx.last_insert_rowid());
+            Ok(true)
+        })?;
+
+        // Subscription notifications are best-effort external effects. Run
+        // them only after the claim and event are durable.
+        if let Some(event_id) = event_id {
+            subscriptions::process_logged_event(self, event_id, "life", name, &event_data);
+        }
+        Ok(won)
+    }
+
     /// Check whether `name`'s *current* identity is a subagent slot.
     ///
     /// Classification rules, in order:

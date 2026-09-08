@@ -530,7 +530,7 @@ pub struct EventFilterArgs {
     pub from: Vec<String>,
     #[arg(long)]
     pub mention: Vec<String>,
-    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["created", "started", "ready", "stopped", "batch_launched", "launch_failed", "launch_blocked"]))]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["created", "started", "connected", "ready", "stopped", "batch_launched", "launch_failed", "launch_blocked"]))]
     pub action: Vec<String>,
     #[arg(long, value_parser = parse_timestamp)]
     pub after: Vec<String>,
@@ -1131,6 +1131,30 @@ mod tests {
         };
         let map = args.to_filter_map();
         assert!(map.contains_key("collision"));
+    }
+
+    #[test]
+    fn test_filter_args_action_accepts_connected() {
+        use clap::{Args as _, Command, FromArgMatches as _};
+
+        let cmd = EventFilterArgs::augment_args(Command::new("events"));
+        let matches = cmd
+            .try_get_matches_from(["events", "--action", "connected"])
+            .expect("--action connected must parse");
+        let args = EventFilterArgs::from_arg_matches(&matches).unwrap();
+        assert_eq!(args.action, vec!["connected".to_string()]);
+
+        // Unknown actions still reject at the parser, not at SQL time.
+        let cmd = EventFilterArgs::augment_args(Command::new("events"));
+        assert!(
+            cmd.try_get_matches_from(["events", "--action", "bogus"])
+                .is_err(),
+            "unknown --action values must be rejected by the parser"
+        );
+
+        // The value flows into the life_action SQL clause parents filter on.
+        let sql = build_sql_from_flags(&args.to_filter_map()).unwrap();
+        assert!(sql.contains("life_action = 'connected'"));
     }
 
     #[test]

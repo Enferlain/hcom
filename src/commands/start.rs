@@ -199,9 +199,19 @@ fn start_subagent(db: &HcomDb, info: &InstanceRow) -> Result<i32> {
     if !bootstrap.is_empty() {
         println!("{bootstrap}");
     }
-    let mut updates = serde_json::Map::new();
-    updates.insert("name_announced".into(), serde_json::json!(true));
-    instances::update_instance_position(db, &info.name, &updates);
+
+    // Exactly-once connection gate: one conditional UPDATE claims the row and
+    // the `connected` life event commits in the same transaction, so a hook
+    // activation ack racing this start (or a duplicate ack) can neither
+    // double-emit nor lose the signal. On a DB error the row stays unclaimed,
+    // so a later start re-delivers the bootstrap and retries the claim —
+    // warn, don't fail the start.
+    if let Err(e) = db.claim_subagent_connection(&info.name, parent_name, "cli") {
+        eprintln!(
+            "[hcom] warn: subagent connection claim failed for {}: {e}",
+            info.name
+        );
+    }
 
     Ok(0)
 }
@@ -969,6 +979,101 @@ mod tests {
     fn test_start_args_unknown_flag_errors() {
         let err = StartArgs::try_parse_from(["start", "--bogus"]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_start_subagent_emits_connected_lifecycle_event_once() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_time, last_seen, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, parent_session_id, parent_name, agent_id, tool, status,
+                  status_time, last_seen, created_at)
+                 VALUES ('nova_task_1', 'sess-1', 'nova', 'agent-1', 'claude',
+                         'inactive', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let connected_events = |db: &HcomDb| -> Vec<String> {
+            let mut stmt = db
+                .conn()
+                .prepare(
+                    "SELECT data FROM events
+                     WHERE type = 'life' AND instance = 'nova_task_1'
+                       AND json_extract(data, '$.action') = 'connected'",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+
+        let row = db.get_instance_full("nova_task_1").unwrap().unwrap();
+        assert_eq!(start_subagent(&db, &row).unwrap(), 0);
+
+        let events = connected_events(&db);
+        assert_eq!(
+            events.len(),
+            1,
+            "first start must emit exactly one connected event"
+        );
+        let data: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(data.get("parent").and_then(|v| v.as_str()), Some("nova"));
+        assert_eq!(data.get("by").and_then(|v| v.as_str()), Some("cli"));
+        // Task delivery semantics ride on the same one-shot gate: the
+        // bootstrap is consumed exactly once, and so is the signal.
+        assert_eq!(
+            db.get_instance_full("nova_task_1")
+                .unwrap()
+                .unwrap()
+                .name_announced,
+            1
+        );
+
+        // Idempotent repeat: no second bootstrap, no second signal.
+        let row = db.get_instance_full("nova_task_1").unwrap().unwrap();
+        assert_eq!(start_subagent(&db, &row).unwrap(), 0);
+        assert_eq!(
+            connected_events(&db).len(),
+            1,
+            "repeat start must not re-emit the connected event"
+        );
+
+        // Cross-path: a hook activation ack for the same row loses the
+        // atomic claim, emits nothing, but still advances the cursor.
+        let hook_ack = crate::hooks::DeliveryAck {
+            instance_name: "nova_task_1".to_string(),
+            last_event_id: 3,
+            status_context: "deliver:nova".to_string(),
+            msg_ts: "2026-01-01T00:00:01Z".to_string(),
+            mark_announced: true,
+        };
+        crate::hooks::common::commit_delivery_ack(&db, &hook_ack);
+        assert_eq!(
+            connected_events(&db).len(),
+            1,
+            "hook activation after CLI start must not re-emit connected"
+        );
+        assert_eq!(
+            db.get_instance_full("nova_task_1")
+                .unwrap()
+                .unwrap()
+                .last_event_id,
+            3,
+            "the losing ack still advances the delivery cursor"
+        );
     }
 
     #[test]

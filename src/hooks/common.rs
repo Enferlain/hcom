@@ -289,11 +289,36 @@ pub fn prepare_pending_messages(db: &HcomDb, instance_name: &str) -> Option<Prep
 
 /// Commit a deferred delivery ack — advance cursor and set status.
 pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
+    if ack.mark_announced {
+        // The activation bootstrap this delivery carried is the subagent's
+        // one-shot connection moment. The claim is a single conditional
+        // UPDATE that also inserts the `connected` life event in the same
+        // transaction, so a duplicate ack or a manual `hcom start` racing
+        // this commit can neither double-emit nor lose the signal. It runs
+        // before the cursor/status commit on purpose: if the process dies in
+        // between, the row is announced but the message cursor is not
+        // advanced, so the next SubagentStop redelivers the task message
+        // (bootstrap already flushed) — recovery without a second signal.
+        let parent = db
+            .get_instance_full(&ack.instance_name)
+            .ok()
+            .flatten()
+            .and_then(|row| row.parent_name)
+            .unwrap_or_default();
+        if let Err(e) = db.claim_subagent_connection(&ack.instance_name, &parent, "hook") {
+            log::log_warn(
+                "hooks",
+                "subagent.connected.claim_failed",
+                &format!("name={} err={}", ack.instance_name, e),
+            );
+            // Do not consume the delivery when the one-shot activation claim
+            // failed. Leaving the cursor untouched preserves the existing
+            // at-least-once retry path for both the bootstrap and message.
+            return;
+        }
+    }
     let mut updates = serde_json::Map::new();
     updates.insert("last_event_id".into(), serde_json::json!(ack.last_event_id));
-    if ack.mark_announced {
-        updates.insert("name_announced".into(), serde_json::json!(true));
-    }
     instances::update_instance_position(db, &ack.instance_name, &updates);
 
     lifecycle::set_status(
@@ -2242,6 +2267,95 @@ mod tests {
         let instance = db.get_instance_full("nova").unwrap().unwrap();
         assert_eq!(instance.status, ST_ACTIVE);
         assert!(instance.status_context.starts_with("deliver:"));
+    }
+
+    #[test]
+    fn test_commit_ack_activation_emits_connected_event_once() {
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, parent_name, agent_id, tool, status, status_context,
+                  status_time, created_at, last_event_id)
+                 VALUES ('nova_task_1', 'nova', 'agent-1', 'claude', 'inactive',
+                         'subagent:dormant', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let connected_count = |db: &HcomDb| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE type = 'life' AND instance = 'nova_task_1'
+                       AND json_extract(data, '$.action') = 'connected'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        let ack = crate::hooks::DeliveryAck {
+            instance_name: "nova_task_1".to_string(),
+            last_event_id: 5,
+            status_context: "deliver:nova".to_string(),
+            msg_ts: "2026-01-01T00:00:01Z".to_string(),
+            mark_announced: true,
+        };
+        commit_delivery_ack(&db, &ack);
+
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events
+                 WHERE type = 'life' AND instance = 'nova_task_1'
+                   AND json_extract(data, '$.action') = 'connected'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("activation ack must emit the connected lifecycle event");
+        let data: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data.get("parent").and_then(|v| v.as_str()), Some("nova"));
+        assert_eq!(data.get("by").and_then(|v| v.as_str()), Some("hook"));
+        assert_eq!(
+            db.get_instance_full("nova_task_1")
+                .unwrap()
+                .unwrap()
+                .name_announced,
+            1,
+            "the connected event rides the same one-shot gate as name_announced"
+        );
+
+        // Ordinary deliveries never emit the signal.
+        let plain = crate::hooks::DeliveryAck {
+            instance_name: "nova_task_1".to_string(),
+            last_event_id: 9,
+            status_context: "deliver:nova".to_string(),
+            msg_ts: "2026-01-01T00:00:02Z".to_string(),
+            mark_announced: false,
+        };
+        commit_delivery_ack(&db, &plain);
+        assert_eq!(
+            connected_count(&db),
+            1,
+            "plain delivery ack must not re-emit connected"
+        );
+
+        // A retried/duplicate activation ack loses the atomic claim and
+        // cannot emit a second event.
+        let duplicate = crate::hooks::DeliveryAck {
+            instance_name: "nova_task_1".to_string(),
+            last_event_id: 11,
+            status_context: "deliver:nova".to_string(),
+            msg_ts: "2026-01-01T00:00:03Z".to_string(),
+            mark_announced: true,
+        };
+        commit_delivery_ack(&db, &duplicate);
+        assert_eq!(
+            connected_count(&db),
+            1,
+            "duplicate activation ack must not re-emit connected"
+        );
     }
 
     #[test]

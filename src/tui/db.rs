@@ -927,7 +927,7 @@ fn parse_status_or_life_row(
     if event_type == "life" {
         let action = json_str(&json, "action", "unknown");
         let kind = match action {
-            "ready" | "started" => ActivityKind::Started,
+            "ready" | "started" | "connected" => ActivityKind::Started,
             "stopped" | "killed" => ActivityKind::Stopped,
             _ => ActivityKind::StateChange,
         };
@@ -1010,7 +1010,7 @@ fn parse_status_or_life_row(
                 }
                 detail_text = text;
             }
-            "created" | "started" => {
+            "created" | "started" | "connected" => {
                 let mut parts = Vec::new();
                 if !by.is_empty() {
                     parts.push(format!("by {}", by));
@@ -1765,6 +1765,21 @@ mod tests {
             "expected resume hint in sub-lines, got {:?}",
             ev.sub_lines
         );
+    }
+
+    #[test]
+    fn parse_life_connected_event_renders_like_started() {
+        let ev = parse_status_or_life_row(
+            11,
+            "2026-02-18T00:11:00+00:00",
+            "nova_task_1",
+            "life",
+            r#"{"action":"connected","by":"cli","reason":"subagent_joined","parent":"nova"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(ev.kind, EventKind::Activity(ActivityKind::Started));
+        assert_eq!(ev.detail, "connected (by cli, subagent_joined)");
     }
 
     #[test]

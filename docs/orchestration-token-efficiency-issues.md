@@ -26,7 +26,7 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 
 ### Status overview
 
-- **Working:** 1, 2, 3, 4, 6, 7, 14, 15, 19, 24, 33, 34, 35, 36, 38, 39, 40,
+- **Working:** 1, 2, 3, 4, 6, 7, 14, 15, 19, 21, 24, 33, 34, 35, 36, 38, 39, 40,
   41, 42, 43, and 46.
 - **Partially addressed:** 30, with the remaining native-workflow follow-up
   tracked by issues 8 and 28.
@@ -679,7 +679,17 @@ Evidence: listen-loop guidance in [`bootstrap.rs`](../src/bootstrap.rs#L160).
 
 Move continuous listening into the agent integration or coordinator process. Wake the model only for actionable input.
 
-### 21. Native subagents announce connection in prose
+### 21. Native subagents announce connection in prose — working
+
+Status: **Working as of 2026-09-09; `hcom-lpl` completed.** Native-subagent
+bootstrap no longer asks the model to announce its connection. The CLI and
+Claude hook activation paths instead share an atomic, exactly-once
+`life/connected` event gated by the existing `name_announced` transition. The
+event is available to filters and subscriptions, rendered by the TUI, and does
+not enter the conversational message channel. Duplicate activation
+acknowledgements and CLI/hook races cannot emit twice; a failed hook-side claim
+leaves the delivery cursor untouched for retry. Whether a resumed generation
+should produce a fresh connection event is tracked separately as `hcom-n5t`.
 
 Connection announcements are useful lifecycle information but do not require model-generated chat.
 

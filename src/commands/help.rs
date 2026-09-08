@@ -19,7 +19,7 @@ const FILTER_HELP: &[HelpEntry] = &[
     ),
     (
         "  --action VAL",
-        "created | started | ready | stopped | batch_launched | launch_failed | launch_blocked",
+        "created | started | connected | ready | stopped | batch_launched | launch_failed | launch_blocked",
     ),
     (
         "  --cmd PATTERN",
@@ -135,7 +135,7 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
     ),
     (
         "  life_action",
-        "created, started, ready, stopped, batch_launched, launch_failed, launch_blocked",
+        "created, started, connected, ready, stopped, batch_launched, launch_failed, launch_blocked",
     ),
     ("", ""),
     (
