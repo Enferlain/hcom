@@ -1436,6 +1436,46 @@ impl ScreenTracker {
     }
 }
 
+/// Deterministic Antigravity workspace-trust dialog fixture (hcom-p33).
+///
+/// The folder-trust gate the agy TUI renders on first entry into a workspace
+/// the provider has not trusted, left exactly as the provider drew it. hcom
+/// must surface it as a typed launch blocker — never answer it. The question
+/// wording is the VS Code-family trust dialog Antigravity derives from and one
+/// of the distinctive prompts `delivery::classify_launch_blocker` recognizes.
+#[cfg(test)]
+pub(crate) fn render_antigravity_trust_dialog(t: &mut ScreenTracker) {
+    let mut lines = vec![""; 16];
+    lines.extend_from_slice(&[
+        "Accessing workspace:",
+        "/tmp/hcom-p33-live.example",
+        "Do you trust the contents of this project?",
+        "Antigravity CLI requires permission to read, edit, and execute files here.",
+        "> Yes, I trust this folder",
+        "No, exit",
+        "↑/↓ Navigate · enter Confirm",
+        "accept-edits · Gemini 3.8 Flash · high",
+    ]);
+    t.process(lines.join("\r\n").as_bytes());
+}
+
+/// The exact `visible_tail(10, 1_000)` the trust-dialog fixture produces —
+/// the text `update_delivery_state` publishes while the launch phase is
+/// active and the delivery loop's launch-blocker heuristic classifies.
+/// Shared with the delivery tests so the rendered screen and the classified
+/// tail cannot drift apart.
+#[cfg(test)]
+pub(crate) const ANTIGRAVITY_TRUST_DIALOG_TAIL: &str = concat!(
+    "Accessing workspace:\n",
+    "/tmp/hcom-p33-live.example\n",
+    "Do you trust the contents of this project?\n",
+    "Antigravity CLI requires permission to read, edit, and execute files here.\n",
+    "> Yes, I trust this folder\n",
+    "No, exit\n",
+    "↑/↓ Navigate · enter Confirm\n",
+    "accept-edits · Gemini 3.8 Flash · high",
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1668,6 +1708,38 @@ mod tests {
         let mut t = make_tracker(24, 80, "");
         t.process(b"File access\r\nRead completed successfully\r\n> idle\r\n");
         assert!(!t.is_antigravity_approval_visible());
+    }
+
+    // ---- Antigravity workspace-trust dialog (hcom-p33) ----
+
+    #[test]
+    fn antigravity_trust_dialog_is_not_an_approval_or_survey() {
+        // The trust gate is the provider's own decision surface: it must stay
+        // disjoint from both prompt surfaces hcom acts on (permission
+        // approvals, the feedback survey). hcom only reports it as a typed
+        // launch blocker and never sends a keystroke to it.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        render_antigravity_trust_dialog(&mut t);
+        assert!(!t.is_antigravity_approval_visible());
+        assert!(!t.is_antigravity_survey_visible());
+        assert!(!t.is_ready(), "the trust dialog hides the ready footer");
+    }
+
+    #[test]
+    fn antigravity_trust_dialog_tail_carries_the_distinctive_prompt() {
+        // Lock the junction with the delivery loop: the trust dialog's
+        // visible_tail(10, 1_000) — the exact scrape update_delivery_state
+        // publishes while the launch phase is active — contains the full
+        // distinctive question on a single line.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        render_antigravity_trust_dialog(&mut t);
+        assert_eq!(
+            t.visible_tail(10, 1_000).as_deref(),
+            Some(ANTIGRAVITY_TRUST_DIALOG_TAIL)
+        );
+        assert!(
+            ANTIGRAVITY_TRUST_DIALOG_TAIL.contains("Do you trust the contents of this project?")
+        );
     }
 
     // ---- Antigravity feedback survey detection (hcom-f6g.9) ----

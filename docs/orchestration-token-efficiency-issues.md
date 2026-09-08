@@ -26,12 +26,10 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 
 ### Status overview
 
-- **Working:** 1, 2, 3, 4, 6, 14, 24, 33, 34, 35, 36, 39, 40, 41, 42, 43,
-  and 46.
+- **Working:** 1, 2, 3, 4, 6, 14, 15, 24, 33, 34, 35, 36, 39, 40, 41, 42,
+  43, and 46.
 - **Partially addressed:** 30, with the remaining native-workflow follow-up
   tracked by issues 8 and 28.
-- **Partially mitigated:** 15; provider-native workspace trust is not an hcom
-  policy decision.
 - **Blocking design:** 44, the provider-neutral isolated-workspace boundary
   required for reliable unattended workers.
 - All other entries remain open unless their section says otherwise.
@@ -338,13 +336,31 @@ The launcher has targeted readiness handling for some providers, but Antigravity
 
 Evidence: provider-specific readiness handling in [`launcher.rs`](../src/launcher.rs#L1520).
 
-Status: **Tracked as `hcom-p33` (P1); partially mitigated locally as of
-2026-08-29, not yet live-verified in hcom.**
+Status: **Working as of 2026-09-08 (`hcom-p33`).**
 Antigravity now has native trusted-workspace state and explicit per-workspace file
 grants for the current development workspaces. A fresh live launch entered the
 workspace and completed its read-only task without external input. Earlier
 launches nevertheless stopped at the trust screen twice, so persisted provider
 state has not yet established a reliable launcher contract.
+
+Deterministic coverage landed 2026-09-08 (`hcom-p33`): a rendered Antigravity
+workspace-trust dialog fixture now proves the full path — screen scrape →
+`visible_tail` → typed `workspace_trust` classification → correlated
+`launch_blocked` event → actionable `wait_for_launch` result — firing on the
+first delivery tick without waiting for screen settling, while ordinary task
+text that merely mentions workspace trust stays `unknown`. The blocker is only
+surfaced; no trust approval, confirmation keystroke, or provider trust-state
+mutation occurs.
+
+Live verification on 2026-09-08 used a newly created, untrusted temporary
+workspace with Gemini 3.8 Flash High and left the provider decision unanswered.
+The high-level launch wait terminated with blocked status and its correlated
+record reported `kind=workspace_trust`, the exact evidence `Do you trust the
+contents of this project?`, and `reason=screen_settled_not_ready`. The first
+attempt exposed that current Antigravity wording was newer than the original
+fixture; the matcher and fixture were updated to the observed text before the
+successful rerun. hcom neither approved the prompt nor changed provider trust
+state.
 
 Recognize the prompt only to return a typed `workspace_trust` blocker. hcom must
 not synthesize approval, inject confirmation keys, or mutate Antigravity trust
@@ -493,11 +509,20 @@ its installed Bubblewrap 0.11.2 is below the design's minimum safe version of
 `/run/current-system/sw` visibility rather than a conventional `/usr`-only
 mount plan.
 
-### 45. Provider-run cleanup can turn a successful result into wrapper failure
+### 45. Provider-run cleanup can turn a successful result into wrapper failure — working
 
-Status: **Tracked as `hcom-mxg` (P1).** The current GLM workflow contains
-transcript-preserving and stale-run cleanup logic, but the original concurrent
-cleanup failure still needs a deterministic regression and a live closeout.
+Status: **Fixed and verified on 2026-09-08 (`hcom-mxg`).** The user-created GLM
+workflow now retains transcript trees while atomically staging other profile
+state for bounded cleanup. Recoverable concurrent-writer races emit structured
+warnings without replacing an authoritative result with failure. Credential
+remnants and genuinely live provider processes still fail visibly with their
+path and owner.
+
+Verification covered concurrent writes, transcript retention, top-level and
+nested credential remnants, unkillable-process cleanup, recycled PID identity,
+shell syntax, repository formatting/checks, and three successful live GLM 5.3
+result-and-cleanup runs. The generated repository-local test was rejected and
+removed because this workflow is user-created rather than shipped by hcom.
 
 A live `hcom run glm` probe on 2026-09-03 received the worker's valid,
 correlated completion report and stopped the worker, but the wrapper then

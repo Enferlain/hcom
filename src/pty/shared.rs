@@ -2629,6 +2629,36 @@ mod tests {
     }
 
     #[test]
+    fn update_delivery_state_carries_trust_dialog_tail_for_launch_blocking() {
+        // hcom-p33: an unanswered Antigravity workspace-trust gate must reach
+        // the delivery loop as tail evidence for the launch-blocker heuristic
+        // — not as a permission approval hcom could auto-answer. The trust
+        // decision stays with the provider and the user; hcom only surfaces
+        // the typed blocker.
+        let screen_state = Arc::new(RwLock::new(ScreenState::default()));
+        let mut tracker = ScreenTracker::new_with_instance(24, 80, b"? for shortcuts", None);
+        crate::pty::screen::render_antigravity_trust_dialog(&mut tracker);
+        let launch_phase_active = Arc::new(AtomicBool::new(true));
+        update_delivery_state(
+            &screen_state,
+            &tracker,
+            &PtyTarget::Known(Tool::Antigravity),
+            &launch_phase_active,
+            &|_| {},
+        );
+        let state = screen_state.read().unwrap();
+        assert!(!state.ready, "the trust dialog hides the ready footer");
+        assert!(
+            !state.approval,
+            "the trust gate is not a permission approval"
+        );
+        assert_eq!(
+            state.visible_tail.as_deref(),
+            Some(crate::pty::screen::ANTIGRAVITY_TRUST_DIALOG_TAIL)
+        );
+    }
+
+    #[test]
     #[serial]
     fn update_delivery_state_detects_and_clears_antigravity_sandbox_bypass() {
         let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();

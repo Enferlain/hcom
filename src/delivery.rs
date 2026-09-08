@@ -1478,6 +1478,7 @@ pub(crate) struct BlockedClassification {
 const DISTINCTIVE_TRUST_PROMPTS: &[&str] = &[
     "do you trust the files in this folder?",
     "do you trust the authors of the files in this workspace?",
+    "do you trust the contents of this project?",
     "do you want to trust this folder?",
 ];
 
@@ -4109,6 +4110,9 @@ mod tests {
         );
         assert_eq!(res.kind, BlockedKind::WorkspaceTrust);
 
+        let res = classify_launch_blocker("Do you trust the contents of this project?", false);
+        assert_eq!(res.kind, BlockedKind::WorkspaceTrust);
+
         // Authentication
         let res = classify_launch_blocker("Please login with `claude login`", false);
         assert_eq!(res.kind, BlockedKind::Authentication);
@@ -4195,5 +4199,214 @@ mod tests {
         let res = classify_launch_blocker("", false);
         assert_eq!(res.kind, BlockedKind::Unknown);
         assert_eq!(res.evidence, None);
+    }
+
+    // ---- Antigravity workspace-trust launch blocker (hcom-p33) ----
+
+    /// Saves/restores env vars mutated by a test. Mirrors the guard in
+    /// `core::launch_status` tests; callers must be `#[serial]`.
+    struct EnvVarGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvVarGuard {
+        fn set(values: &[(&'static str, &str)]) -> Self {
+            let saved = values
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect();
+            for (key, value) in values {
+                // SAFETY: callers serialize tests that mutate process env.
+                unsafe { std::env::set_var(key, value) };
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                // SAFETY: guard restores the process env on drop.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn antigravity_trust_dialog_publishes_correlated_workspace_trust_blocker() {
+        let (_dir, db) = open_ready_test_db();
+        let _env = EnvVarGuard::set(&[
+            ("HCOM_LAUNCHED", "1"),
+            ("HCOM_LAUNCHED_BY", "leku"),
+            ("HCOM_LAUNCH_BATCH_ID", "batch-agy-trust"),
+        ]);
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, created_at)
+                 VALUES ('duvi', 'antigravity', 'listening', '', 1)",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "life",
+            "leku",
+            &serde_json::json!({
+                "action": "batch_launched",
+                "batch_id": "batch-agy-trust",
+                "launched": 1,
+                "instances": ["duvi"]
+            }),
+        )
+        .unwrap();
+
+        // The PTY proxy published the rendered trust dialog's tail (locked to
+        // the fixture in pty::screen) and the TUI just painted it, so the
+        // screen has NOT settled — the distinctive prompt must still fire on
+        // this first tick instead of waiting out SETTLE_THRESHOLD.
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.prompt_empty = false;
+        screen.approval = false; // the trust gate is not a permission approval
+        screen.visible_tail = Some(crate::pty::screen::ANTIGRAVITY_TRUST_DIALOG_TAIL.to_string());
+        screen.last_output = Instant::now();
+        let state = make_state(screen, 500);
+        let mut outcome = LaunchOutcome::Pending;
+
+        drive_launch_outcome(
+            &db,
+            &state,
+            "duvi",
+            ST_LISTENING,
+            &LaunchActivityScope::new(db.get_last_event_id(), "duvi"),
+            &ToolConfig::for_tool(crate::tool::Tool::Antigravity),
+            &mut outcome,
+        );
+
+        assert_eq!(outcome, LaunchOutcome::Blocked);
+        // Surfaced, not approved: the row reports the provider's pending trust
+        // decision; no readiness or approval was synthesized on the worker's
+        // behalf (this path never injects a keystroke).
+        let instance = db.get_instance_full("duvi").unwrap().unwrap();
+        assert_eq!(instance.status, ST_BLOCKED);
+        assert_eq!(instance.status_context, "launch_blocked");
+
+        // The correlated high-level wait terminates actionably with the typed
+        // blocker and the exact prompt evidence.
+        let result =
+            crate::core::launch_status::wait_for_launch(&db, None, Some("batch-agy-trust"), 1);
+        assert_eq!(
+            result.status,
+            crate::core::launch_status::LaunchStatus::Blocked
+        );
+        assert_eq!(result.ready, Some(0));
+        assert_eq!(result.blocked, Some(1));
+        let record = result.blocked_records.first().unwrap();
+        assert_eq!(record.instance, "duvi");
+        assert_eq!(record.kind, BlockedKind::WorkspaceTrust);
+        assert_eq!(
+            record.evidence.as_deref(),
+            Some("Do you trust the contents of this project?")
+        );
+        assert_eq!(record.reason.as_deref(), Some("screen_settled_not_ready"));
+        assert!(
+            result
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("duvi"))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ordinary_task_text_mentioning_workspace_trust_is_not_a_trust_blocker() {
+        // Realistic transcript prose: the worker's task text mentions
+        // workspace trust without reproducing the provider's question, so it
+        // must never classify as the distinctive trust prompt.
+        let tail = "Reviewing the workspace trust policy before starting the task\n\
+                    running cargo metadata --no-deps\n\
+                    Compiling hcom v0.1.0";
+        assert!(!has_distinctive_trust_prompt(tail));
+        assert_eq!(
+            classify_launch_blocker(tail, false).kind,
+            BlockedKind::Unknown
+        );
+
+        let (_dir, db) = open_ready_test_db();
+        let _env = EnvVarGuard::set(&[("HCOM_LAUNCHED", "1")]);
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, created_at)
+                 VALUES ('melo', 'antigravity', 'listening', '', 1)",
+                [],
+            )
+            .unwrap();
+
+        // Unsettled screen with no distinctive prompt: no blocker of any kind
+        // may fire yet.
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.prompt_empty = false;
+        screen.visible_tail = Some(tail.to_string());
+        screen.last_output = Instant::now();
+        let state = make_state(screen, 500);
+        let mut outcome = LaunchOutcome::Pending;
+        drive_launch_outcome(
+            &db,
+            &state,
+            "melo",
+            ST_LISTENING,
+            &LaunchActivityScope::new(db.get_last_event_id(), "melo"),
+            &ToolConfig::for_tool(crate::tool::Tool::Antigravity),
+            &mut outcome,
+        );
+        assert_eq!(outcome, LaunchOutcome::Pending);
+        let blocked_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life'
+                   AND json_extract(data, '$.action') = 'launch_blocked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_events, 0);
+
+        // Once the same ordinary text settles, the generic blocker is
+        // `unknown` — the mention never upgrades to workspace_trust.
+        let mut settled = safe_screen();
+        settled.ready = false;
+        settled.prompt_empty = false;
+        settled.visible_tail = Some(tail.to_string());
+        // safe_screen() stamps last_output 10s ago: past SETTLE_THRESHOLD.
+        let settled_state = make_state(settled, 500);
+        drive_launch_outcome(
+            &db,
+            &settled_state,
+            "melo",
+            ST_LISTENING,
+            &LaunchActivityScope::new(db.get_last_event_id(), "melo"),
+            &ToolConfig::for_tool(crate::tool::Tool::Antigravity),
+            &mut outcome,
+        );
+        assert_eq!(outcome, LaunchOutcome::Blocked);
+        let blocked_kind: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.blocked_kind') FROM events
+                 WHERE type = 'life'
+                   AND json_extract(data, '$.action') = 'launch_blocked'
+                   AND instance = 'melo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_kind, "unknown");
     }
 }

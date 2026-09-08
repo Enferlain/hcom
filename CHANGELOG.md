@@ -11,6 +11,14 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
+## [2026-09-08]
+
+### Fixed
+
+- Current Antigravity workspace-trust dialogs are now returned as typed
+  `workspace_trust` launch blockers with the exact prompt evidence, without
+  approving the workspace or changing provider trust state.
+
 ## [2026-09-06]
 
 ### Added
