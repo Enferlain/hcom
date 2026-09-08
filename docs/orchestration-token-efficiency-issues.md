@@ -26,8 +26,8 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 
 ### Status overview
 
-- **Working:** 1, 2, 3, 4, 6, 14, 15, 24, 33, 34, 35, 36, 38, 39, 40, 41,
-  42, 43, and 46.
+- **Working:** 1, 2, 3, 4, 6, 7, 14, 15, 24, 33, 34, 35, 36, 38, 39, 40,
+  41, 42, 43, and 46.
 - **Partially addressed:** 30, with the remaining native-workflow follow-up
   tracked by issues 8 and 28.
 - **Blocking design:** 44, the provider-neutral isolated-workspace boundary
@@ -169,6 +169,15 @@ surviving TUI context annotation never changes status or emits a status event.
 Use screen stability only as a UI hint. It should not establish task completion, abandonment, or readiness for reassignment.
 
 ### 7. Focused regression coverage for wait isolation is missing
+
+Status: **Working as of 2026-09-08; `hcom-dbj` completed.** Existing tests
+already covered unrelated filtered-wait traffic and results present before
+waiter startup. New bounded concurrency tests cover repeated waits across old
+and fresh cursors, simultaneous waits for different worker generations,
+mid-wait cancellation, acknowledgements followed by delayed final results, and
+results delivered after waiter registration. The tests exercise the real
+correlated wait engine with independent WAL-backed connections and exact
+worker/thread/generation filters; no production behavior changed.
 
 The important failure modes are concurrent and semantic, not just parser-level. Add regression tests for:
 

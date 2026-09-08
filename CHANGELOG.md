@@ -13,6 +13,12 @@ Rules:
 
 ## [2026-09-08]
 
+### Added
+
+- Added bounded concurrent regression coverage for correlated waits across
+  repeated cursors, multiple workers, cancellation, acknowledgements, and
+  results arriving on either side of waiter startup.
+
 ### Fixed
 
 - Current Antigravity workspace-trust dialogs are now returned as typed

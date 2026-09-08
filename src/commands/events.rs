@@ -2387,6 +2387,231 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mid_wait_worker_cancellation_returns_result_unavailable() {
+        // Tracker hcom-dbj: the exact worker generation being cancelled
+        // (stopped without a recoverable transcript) while the wait is live
+        // must end the attempt with the structured unavailable exit instead of
+        // running to the deadline. The pre-registration variant is covered by
+        // unsupported_stopped_provider_returns_result_unavailable.
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("mid-wait-cancel.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at)
+                 VALUES ('codex-worker', 'codex', 'listening', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let (correlation, filters) =
+            arm_result_wait(&db, "codex-worker", "cancelled-workflow", cursor);
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut writer_db = HcomDb::open_raw(&db_path).unwrap();
+            writer_db.ensure_schema().unwrap();
+            writer_db
+                .conn()
+                .execute("DELETE FROM instances WHERE name = 'codex-worker'", [])
+                .unwrap();
+            writer_db
+                .log_event(
+                    "life",
+                    "codex-worker",
+                    &json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "name": "codex-worker",
+                            "tool": "codex",
+                            "created_at": 1000.0,
+                        }
+                    }),
+                )
+                .unwrap();
+        });
+
+        let status = run_correlated_wait(&db, &filters, &correlation, cursor, 5);
+        writer.join().unwrap();
+        assert_eq!(
+            status,
+            crate::core::result_wait::RESULT_UNAVAILABLE_EXIT,
+            "a mid-wait cancellation must terminate the attempt, not the deadline"
+        );
+    }
+
+    #[test]
+    fn result_wait_skips_ack_and_completes_on_delayed_final_result() {
+        // Tracker hcom-dbj: the worker's acknowledgement on the exact
+        // worker/thread/generation tuple carries intent=ack and must never
+        // satisfy the result wait; only the later intent=inform report may.
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("ack-then-result.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('claude-worker', 'listening', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let (correlation, filters) = arm_result_wait(&db, "claude-worker", "ack-workflow", cursor);
+        let generation = filters.get("sender_instance_key").unwrap()[0].clone();
+
+        // Deterministic phase: an ack alone never completes the wait, and the
+        // delayed final result completes it without replaying the ack.
+        db.log_event(
+            "message",
+            "claude-worker",
+            &json!({
+                "from": "claude-worker",
+                "scope": "mentions",
+                "mentions": ["caller"],
+                "intent": "ack",
+                "thread": "ack-workflow",
+                "sender_instance_key": generation,
+                "text": "ack: starting work",
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            run_correlated_wait(&db, &filters, &correlation, cursor, 1),
+            1,
+            "an acknowledgement must never complete a result wait"
+        );
+        log_correlated_result(
+            &db,
+            "claude-worker",
+            "ack-workflow",
+            &generation,
+            "final result",
+        );
+        assert_eq!(
+            run_correlated_wait(&db, &filters, &correlation, cursor, 1),
+            0,
+            "the delayed final result completes the wait and skips the ack"
+        );
+
+        // Live phase: a wait already registered when the ack lands must stay
+        // pending until the later inform result. The writer hands back control
+        // after the ack so the assertion window is ordered by events, and the
+        // inform is only delivered after the window proves no early exit.
+        let fresh_cursor = db.get_last_event_id();
+        let live_args = EventsArgs::try_parse_from([
+            "events",
+            "--wait",
+            "6",
+            "--after-id",
+            &fresh_cursor.to_string(),
+            "--thread",
+            "ack-workflow",
+            "--result-from",
+            "claude-worker",
+        ])
+        .unwrap();
+        let mut live_filters = live_args.filters.to_filter_map();
+        let live_correlation = apply_result_correlation(&db, &live_args, &mut live_filters)
+            .unwrap()
+            .unwrap();
+
+        let (ack_landed, ack_receiver) = std::sync::mpsc::channel::<()>();
+        let writer_db_path = db_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let mut writer_db = HcomDb::open_raw(&writer_db_path).unwrap();
+            writer_db.ensure_schema().unwrap();
+            writer_db
+                .log_event(
+                    "message",
+                    "claude-worker",
+                    &json!({
+                        "from": "claude-worker",
+                        "scope": "mentions",
+                        "mentions": ["caller"],
+                        "intent": "ack",
+                        "thread": "ack-workflow",
+                        "sender_instance_key": generation,
+                        "text": "ack: mid-flight",
+                    }),
+                )
+                .unwrap();
+            ack_landed.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(1200));
+            log_correlated_result(
+                &writer_db,
+                "claude-worker",
+                "ack-workflow",
+                &generation,
+                "delayed final result",
+            );
+        });
+
+        let wait_thread = std::thread::spawn(move || {
+            let wait_db = HcomDb::open_raw(&db_path).unwrap();
+            run_correlated_wait(&wait_db, &live_filters, &live_correlation, fresh_cursor, 6)
+        });
+
+        ack_receiver.recv().unwrap();
+        let window = std::time::Instant::now() + Duration::from_millis(700);
+        while std::time::Instant::now() < window {
+            assert!(
+                !wait_thread.is_finished(),
+                "the live wait must stay pending while only the ack exists"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(
+            wait_thread.join().unwrap(),
+            0,
+            "the live wait must complete once the final result lands"
+        );
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn result_delivered_after_waiter_registration_completes_the_wait() {
+        // Tracker hcom-dbj: results arriving immediately after waiter startup
+        // (the pre-startup window is covered by the cursor-anchored tests
+        // above) must be discovered by the live poll loop.
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("post-registration-result.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('claude-worker', 'listening', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let (correlation, filters) = arm_result_wait(&db, "claude-worker", "late-workflow", cursor);
+        let generation = filters.get("sender_instance_key").unwrap()[0].clone();
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let writer_db = HcomDb::open_raw(&db_path).unwrap();
+            log_correlated_result(
+                &writer_db,
+                "claude-worker",
+                "late-workflow",
+                &generation,
+                "result after registration",
+            );
+        });
+
+        let status = run_correlated_wait(&db, &filters, &correlation, cursor, 4);
+        writer.join().unwrap();
+        assert_eq!(
+            status, 0,
+            "a correlated result delivered after registration must complete the wait"
+        );
+    }
+
     /// Shared fixture: arm a correlated wait exactly as the CLI would.
     fn arm_result_wait(
         db: &HcomDb,
@@ -2424,6 +2649,172 @@ mod tests {
             thread: &correlation.thread,
             attempt_after_id: correlation.after_id,
         }
+    }
+
+    /// Run the CLI's correlated wait engine from `after_id` with fixture
+    /// filters whose tag-less names are already resolved.
+    fn run_correlated_wait(
+        db: &HcomDb,
+        filters: &HashMap<String, Vec<String>>,
+        correlation: &ResultCorrelation,
+        after_id: i64,
+        timeout: u64,
+    ) -> i32 {
+        let filter_sql = build_sql_from_flags(filters).unwrap();
+        events_wait(
+            db,
+            &format!(" AND ({filter_sql})"),
+            timeout,
+            EventsWaitOptions {
+                after_id: Some(after_id),
+                full_output: true,
+                filters,
+                instance_name: None,
+                result_correlation: Some(correlation),
+            },
+        )
+    }
+
+    /// Log a correlated terminal report from `worker` on `thread`.
+    fn log_correlated_result(
+        db: &HcomDb,
+        worker: &str,
+        thread: &str,
+        generation: &str,
+        text: &str,
+    ) -> i64 {
+        db.log_event(
+            "message",
+            worker,
+            &json!({
+                "from": worker,
+                "scope": "mentions",
+                "mentions": ["caller"],
+                "intent": "inform",
+                "thread": thread,
+                "sender_instance_key": generation,
+                "text": text,
+            }),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn result_wait_rearm_after_completion_replays_only_from_original_cursor() {
+        // Tracker hcom-dbj: a coordinator that re-arms the same correlated wait
+        // after one completion must deterministically re-consume the exact
+        // attempt result from its pre-launch cursor, and a fresh cursor must
+        // not re-complete on the already-consumed result.
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("rearm-result.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('claude-worker', 'listening', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let (correlation, filters) =
+            arm_result_wait(&db, "claude-worker", "rearm-workflow", cursor);
+        let generation = filters.get("sender_instance_key").unwrap()[0].clone();
+        let result_id = log_correlated_result(
+            &db,
+            "claude-worker",
+            "rearm-workflow",
+            &generation,
+            "attempt one result",
+        );
+
+        assert_eq!(
+            run_correlated_wait(&db, &filters, &correlation, cursor, 1),
+            0,
+            "the first wait must complete on the correlated result"
+        );
+        assert_eq!(
+            run_correlated_wait(&db, &filters, &correlation, cursor, 1),
+            0,
+            "the attempt cursor is durable: a re-armed wait replays the same result"
+        );
+        assert_eq!(
+            run_correlated_wait(&db, &filters, &correlation, result_id, 1),
+            1,
+            "a fresh post-completion cursor must not re-complete on the consumed result"
+        );
+    }
+
+    #[test]
+    fn simultaneous_result_waits_complete_only_on_their_own_worker() {
+        // Tracker hcom-dbj: two live correlated waits for different workers
+        // must not interfere — each terminates only on its own worker's result.
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("parallel-result.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at) VALUES
+                    ('worker-alpha', 'listening', 1000.0),
+                    ('worker-beta', 'listening', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let (alpha_correlation, alpha_filters) =
+            arm_result_wait(&db, "worker-alpha", "workflow-alpha", cursor);
+        let (beta_correlation, beta_filters) =
+            arm_result_wait(&db, "worker-beta", "workflow-beta", cursor);
+        let alpha_generation = alpha_filters.get("sender_instance_key").unwrap()[0].clone();
+        let beta_generation = beta_filters.get("sender_instance_key").unwrap()[0].clone();
+
+        let spawn_wait = |correlation: ResultCorrelation, filters: HashMap<String, Vec<String>>| {
+            let db_path = db_path.clone();
+            std::thread::spawn(move || {
+                let db = HcomDb::open_raw(&db_path).unwrap();
+                run_correlated_wait(&db, &filters, &correlation, cursor, 6)
+            })
+        };
+        let alpha_wait = spawn_wait(alpha_correlation.clone(), alpha_filters.clone());
+        let beta_wait = spawn_wait(beta_correlation.clone(), beta_filters.clone());
+
+        log_correlated_result(
+            &db,
+            "worker-alpha",
+            "workflow-alpha",
+            &alpha_generation,
+            "alpha result",
+        );
+        assert_eq!(
+            alpha_wait.join().unwrap(),
+            0,
+            "worker-alpha's wait must complete on its own result"
+        );
+
+        // A wrongly-wide beta filter would complete on alpha's message within
+        // one 500ms poll tick of its delivery; 700ms here is bounded margin,
+        // not timing dependence.
+        let window = std::time::Instant::now() + Duration::from_millis(700);
+        while std::time::Instant::now() < window {
+            assert!(
+                !beta_wait.is_finished(),
+                "worker-beta's wait must not complete on worker-alpha's result"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        log_correlated_result(
+            &db,
+            "worker-beta",
+            "workflow-beta",
+            &beta_generation,
+            "beta result",
+        );
+        assert_eq!(
+            beta_wait.join().unwrap(),
+            0,
+            "worker-beta's wait must complete on its own delayed result"
+        );
     }
 
     #[test]
