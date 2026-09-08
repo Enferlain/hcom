@@ -26,7 +26,7 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 
 ### Status overview
 
-- **Working:** 1, 2, 3, 4, 6, 7, 14, 15, 24, 33, 34, 35, 36, 38, 39, 40,
+- **Working:** 1, 2, 3, 4, 6, 7, 14, 15, 19, 24, 33, 34, 35, 36, 38, 39, 40,
   41, 42, 43, and 46.
 - **Partially addressed:** 30, with the remaining native-workflow follow-up
   tracked by issues 8 and 28.
@@ -652,7 +652,18 @@ genuine adapter recovery failure.
 
 ## P1: communication policy and context control
 
-### 19. Every task requires a model-generated acknowledgement
+### 19. Every task requires a model-generated acknowledgement — working
+
+Status: **Working as of 2026-09-08; `hcom-g1j` completed.** Normal and
+subagent bootstrap guidance no longer requires an immediate model-generated
+acknowledgement for delegated work. Workers instead send one substantive
+completion or blocker report with `intent=inform`, or a necessary blocked
+question with `intent=request`. Explicit `intent=ack` remains available when
+an acknowledgement is actually requested. The native-subagent connection
+announcement is explicitly exempt until issue 21 moves that lifecycle signal
+out of model-generated prose. All bootstrap variants are covered by regression
+tests, and a live GLM 5.3 Flash task produced no receipt or progress chatter and
+sent only its final substantive report.
 
 Workers are instructed to acknowledge receipt and later send a completion report. The first message consumes inference and wakes the requester despite conveying transport-level information.
 

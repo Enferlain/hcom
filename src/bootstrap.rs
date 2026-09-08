@@ -44,7 +44,7 @@ You run hcom commands on behalf of the human user. The human uses natural langua
 ## MESSAGES
 
 Response rules:
-- From {SENDER} or intent=request → always respond
+- From {SENDER} or intent=request → always respond when you have substantive content; a delegated task's completion, blocker, or necessary question is the response
 - intent=inform → respond only if useful
 - intent=ack → don't respond
 
@@ -78,9 +78,9 @@ If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 
 ## RULES
 
-1. Task via hcom → ack immediately, do work, report via hcom
-2. No filler messages (greetings, thanks, congratulations).
-3. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
+1. Task via hcom → do the work, then send one substantive completion or blocker report with --intent inform. Blocked → ask a necessary question with --intent request.
+2. No filler messages (greetings, receipt-only acknowledgements, thanks, routine progress chatter).
+3. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding — only when an acknowledgement is actually requested).
 4. User says 'the gemini/claude/codex agent' or unclear → run `hcom list` to resolve name
 
 Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
@@ -200,7 +200,7 @@ Messages instantly auto-arrive via <hcom> tags — end your turn to receive them
 - For non-hcom pause/yield, use `hcom listen` instead of `sleep`.
 
 Response rules:
-- From {SENDER} or intent=request → always respond
+- From {SENDER} or intent=request → always respond when you have substantive content; a delegated task's completion, blocker, or necessary question is the response
 - intent=inform → respond only if useful
 - intent=ack → don't respond
 
@@ -214,9 +214,10 @@ Commands:
   {hcom_cmd} <cmd> --help --name {subagent_name}
 
 Rules:
-- Task via hcom → ack, work, report
+- Task via hcom → do the work, then send one substantive completion or blocker report with --intent inform; blocked → ask a necessary question with --intent request
+- No filler (greetings, receipt-only acknowledgements, routine progress chatter) except the required one-time connection announcement above
 - Authority: @{SENDER} > others
-- Use --intent on sends: request (want reply), inform (FYI), ack (responding)"#;
+- Use --intent on sends: request (want reply), inform (FYI), ack (responding — only when requested)"#;
 
 // HELPERS
 
@@ -934,6 +935,131 @@ mod tests {
         assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("HCOM MESSAGE"));
         assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("ACK alone does not complete"));
         assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("no turn is auto-created"));
+    }
+
+    // REGRESSION (tracker item 19): bootstrap must not require model-generated
+    // task acknowledgements. Every get_bootstrap variant shares UNIVERSAL's
+    // rules, so sweep the delivery/lifecycle variants plus the subagent template.
+
+    /// get_bootstrap variants: (label, tool, headless, is_launched, background_name)
+    fn bootstrap_variants() -> Vec<(&'static str, &'static str, bool, bool, Option<&'static str>)> {
+        vec![
+            ("claude_launched", "claude", false, true, None),
+            ("codex_launched", "codex", false, true, None),
+            ("gemini_adhoc", "gemini", false, false, None),
+            ("cursor_launched", "cursor", false, true, None),
+            ("antigravity_launched", "antigravity", false, true, None),
+            ("claude_headless", "claude", true, true, None),
+            (
+                "claude_background",
+                "claude",
+                false,
+                true,
+                Some("agent.log"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_bootstrap_variants_do_not_require_task_ack() {
+        for (label, tool, headless, is_launched, background) in bootstrap_variants() {
+            let (tmp, db) = setup_test_db();
+            let result = get_bootstrap(
+                &db,
+                tmp.path(),
+                "luna",
+                tool,
+                headless,
+                is_launched,
+                "",
+                "",
+                false,
+                background,
+            );
+
+            // Mandatory-ACK rules must be gone from every variant.
+            assert!(
+                !result.contains("ack immediately") && !result.contains("ack, work"),
+                "{label}: bootstrap still requires an immediate task ack"
+            );
+            // Delegated work still requires exactly one substantive report.
+            assert!(
+                result.contains("substantive completion or blocker report"),
+                "{label}: missing completion/blocker report policy"
+            );
+            assert!(
+                result.contains("report with --intent inform"),
+                "{label}: completion reports must use terminal inform intent"
+            );
+            // Blocked workers may ask a necessary question instead of acking.
+            assert!(
+                result.contains("ask a necessary question"),
+                "{label}: missing ask-when-blocked guidance"
+            );
+            // Receipt-only acknowledgements are classified as filler.
+            assert!(
+                result.contains("receipt-only acknowledgements"),
+                "{label}: missing receipt-only-ack filler rule"
+            );
+            // Completion replies stay allowed for requests.
+            assert!(
+                result.contains("always respond"),
+                "{label}: lost respond-to-request rule"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bootstrap_preserves_explicit_ack_semantics() {
+        // intent=ack stays documented for senders and receivers in every variant.
+        for (label, tool, headless, is_launched, background) in bootstrap_variants() {
+            let (tmp, db) = setup_test_db();
+            let result = get_bootstrap(
+                &db,
+                tmp.path(),
+                "luna",
+                tool,
+                headless,
+                is_launched,
+                "",
+                "",
+                false,
+                background,
+            );
+
+            assert!(
+                result.contains("intent=ack → don't respond"),
+                "{label}: lost ack response rule"
+            );
+            assert!(
+                result.contains("ack (responding"),
+                "{label}: lost ack intent documentation"
+            );
+            assert!(
+                result.contains("--intent ack --reply-to 82"),
+                "{label}: lost explicit ack example"
+            );
+        }
+    }
+
+    #[test]
+    fn test_subagent_bootstrap_does_not_require_task_ack() {
+        let result = get_subagent_bootstrap("luna_reviewer_1", "luna");
+
+        assert!(
+            !result.contains("ack immediately") && !result.contains("ack, work"),
+            "subagent bootstrap still requires an immediate task ack"
+        );
+        assert!(result.contains("substantive completion or blocker report"));
+        assert!(result.contains("report with --intent inform"));
+        assert!(result.contains("ask a necessary question"));
+        assert!(result.contains("receipt-only acknowledgements"));
+        assert!(result.contains("except the required one-time connection announcement"));
+        assert!(result.contains("Connected as luna_reviewer_1"));
+        // Explicit ack semantics remain documented.
+        assert!(result.contains("intent=ack → don't respond"));
+        assert!(result.contains("ack (responding"));
+        assert!(result.contains("--intent ack --reply-to 82"));
     }
 
     #[test]

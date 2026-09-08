@@ -21,6 +21,10 @@ Rules:
 
 ### Fixed
 
+- Delegated-task bootstrap guidance no longer requires immediate
+  model-generated acknowledgements or routine progress chatter; workers send a
+  substantive `inform` result or a necessary `request`, while explicit
+  acknowledgement semantics remain available when requested.
 - Current Antigravity workspace-trust dialogs are now returned as typed
   `workspace_trust` launch blockers with the exact prompt evidence, without
   approving the workspace or changing provider trust state.
