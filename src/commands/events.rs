@@ -50,8 +50,8 @@ pub struct EventsArgs {
     /// Subcommand (sub, unsub, launch) or handled as query mode
     #[command(subcommand)]
     pub subcmd: Option<EventsSubcmd>,
-    /// Limit count (default: 20)
-    #[arg(long)]
+    /// Limit count (default: 20; --limit is an accepted alias)
+    #[arg(long, visible_alias = "limit")]
     pub last: Option<usize>,
     /// Include archived sessions
     #[arg(long)]
@@ -427,6 +427,16 @@ pub fn streamline_event(event: &Value, filters: &HashMap<String, Vec<String>>) -
 
 // ── Query events from DB ─────────────────────────────────────────────────
 
+/// Format a user-SQL prepare error, appending the exact public equivalent when
+/// the failure is a recognizable wrong-column attempt (tracker 38).
+fn sql_where_error(err: rusqlite::Error) -> String {
+    let base = format!("Error in SQL WHERE clause: {err}");
+    match crate::core::filters::sql_column_hint(&base) {
+        Some(hint) => format!("{base}\nSQL hint: {hint}"),
+        None => base,
+    }
+}
+
 /// Query events from events_v view. Returns parsed event objects.
 fn query_events(
     db: &HcomDb,
@@ -437,10 +447,7 @@ fn query_events(
     let query =
         format!("SELECT * FROM events_v WHERE 1=1{filter_query} ORDER BY id DESC LIMIT {last_n}");
 
-    let mut stmt = db
-        .conn()
-        .prepare(&query)
-        .map_err(|e| format!("Error in SQL WHERE clause: {e}"))?;
+    let mut stmt = db.conn().prepare(&query).map_err(sql_where_error)?;
 
     let rows = stmt
         .query_map(params, |row| {
@@ -451,7 +458,7 @@ fn query_events(
             let data_str: String = row.get("data")?;
             Ok((id, ts, etype, instance, data_str))
         })
-        .map_err(|e| format!("Error in SQL WHERE clause: {e}"))?;
+        .map_err(sql_where_error)?;
 
     let mut events = Vec::new();
     for row in rows {
@@ -1140,7 +1147,7 @@ fn events_wait(
                 }
             }
             Err(e) => {
-                eprintln!("Error in SQL WHERE clause: {e}");
+                eprintln!("{}", sql_where_error(e));
                 break 2;
             }
         }
@@ -1626,6 +1633,21 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn events_accepts_limit_alias() {
+        // Tracker 38: `hcom events --limit N` must map to --last instead of a
+        // clap rejection.
+        let args = EventsArgs::try_parse_from(["events", "--limit", "5"]).unwrap();
+        assert_eq!(args.last, Some(5));
+    }
+
+    #[test]
+    fn events_canonical_last_still_parses() {
+        let args = EventsArgs::try_parse_from(["events", "--last", "5"]).unwrap();
+        assert_eq!(args.last, Some(5));
+    }
 
     #[test]
     fn test_streamline_event_message() {

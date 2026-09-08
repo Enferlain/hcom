@@ -458,6 +458,37 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
     Ok(clauses.join(" AND "))
 }
 
+/// Wrong-column names seen in `--sql` attempts, each mapped to the public
+/// `events_v` column (and composable flag) that expresses the same filter.
+const SQL_COLUMN_ALIASES: &[(&str, &str, &str)] = &[
+    ("from_agent", "msg_from", "--from"),
+    ("sender", "msg_from", "--from"),
+    ("author", "msg_from", "--from"),
+    ("from", "msg_from", "--from"),
+    ("agent", "instance", "--agent"),
+    ("event_type", "type", "--type"),
+];
+
+/// Name the exact public equivalent for a `no such column: X` SQL error.
+///
+/// Tracker 38: a plausible `--sql "from_agent = 'kuma'"` attempt must return
+/// the supported equivalent (`msg_from` / `--from`) instead of only the raw
+/// SQLite error. Returns `None` for unknown columns and unrelated errors.
+pub fn sql_column_hint(error: &str) -> Option<String> {
+    let name = error
+        .split("no such column: ")
+        .nth(1)?
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()?
+        .trim_matches(|c| c == '"' || c == '\'' || c == '`' || c == ',');
+    let (_, column, flag) = SQL_COLUMN_ALIASES
+        .iter()
+        .find(|(alias, _, _)| *alias == name)?;
+    Some(format!(
+        "events_v has no column '{name}' — use '{column}' instead, e.g. hcom events --sql \"{column} = 'NAME'\" or the flag {flag} NAME"
+    ))
+}
+
 /// Validate timestamp format: must start with YYYY-MM-DD.
 /// YYYY-MM-DD: positions [0-3]=year, [4]='-', [5-6]=month, [7]='-', [8-9]=day
 fn parse_timestamp(s: &str) -> Result<String, String> {
@@ -879,6 +910,43 @@ mod tests {
         filters.insert("instance".into(), vec!["O'Reilly".into()]);
         let sql = build_sql_from_flags(&filters).unwrap();
         assert!(sql.contains("O''Reilly"));
+    }
+
+    // ===== sql_column_hint =====
+
+    #[test]
+    fn test_sql_column_hint_names_from_equivalent() {
+        // Exact error shape produced by `hcom events --sql "from_agent = 'kuma'"`.
+        let hint = sql_column_hint(
+            "no such column: from_agent in SELECT * FROM events_v WHERE 1=1 AND (from_agent = 'kuma') ORDER BY id DESC LIMIT 20 at offset 38",
+        )
+        .unwrap();
+        assert!(hint.contains("msg_from"), "hint={hint}");
+        assert!(hint.contains("--from"), "hint={hint}");
+    }
+
+    #[test]
+    fn test_sql_column_hint_covers_other_common_aliases() {
+        for wrong in ["sender", "author", "from"] {
+            let hint = sql_column_hint(&format!("no such column: {wrong} in SELECT")).unwrap();
+            assert!(hint.contains("msg_from"), "{wrong}: {hint}");
+        }
+        assert!(
+            sql_column_hint("no such column: agent in SELECT")
+                .unwrap()
+                .contains("instance")
+        );
+        assert!(
+            sql_column_hint("no such column: event_type in SELECT")
+                .unwrap()
+                .contains("--type")
+        );
+    }
+
+    #[test]
+    fn test_sql_column_hint_none_for_unknown_or_unrelated() {
+        assert!(sql_column_hint("no such column: zzzz in SELECT").is_none());
+        assert!(sql_column_hint("unable to open database file").is_none());
     }
 
     // ===== resolve_filter_names =====

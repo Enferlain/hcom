@@ -551,6 +551,7 @@ fn seeded_thread_allows_a_recipient_free_followup_without_broadcast() {
     let h = Hcom::new();
     let sender = h.start();
     let recipient = h.start();
+    let decoy = h.start();
     let target = format!("@{recipient}");
 
     let (seed_code, _, seed_stderr) = h.run([
@@ -578,6 +579,60 @@ fn seeded_thread_allows_a_recipient_free_followup_without_broadcast() {
     let (_, event, _) = h.run(["events", "--type", "message", "--last", "1", "--full"]);
     assert!(event.contains(r#""text":"followup""#), "event={event}");
     assert!(event.contains(&recipient), "event={event}");
+
+    // A multi-word bare follow-up is still invalid without `--`; importantly,
+    // a live agent name in its first message position must not silently turn
+    // the failed thread follow-up into a targeted send.
+    let (bare_code, _, bare_stderr) = h.run([
+        "send",
+        "--name",
+        &sender,
+        "--thread",
+        "seeded-thread",
+        &decoy,
+        "hello",
+        "world",
+    ]);
+    assert_ne!(bare_code, 0, "stderr={bare_stderr}");
+    assert!(
+        bare_stderr.contains("No input received on stdin"),
+        "the established failure mode should be preserved: stderr={bare_stderr}"
+    );
+    let (_, bare_event, _) = h.run(["events", "--type", "message", "--last", "1", "--full"]);
+    assert!(
+        bare_event.contains(r#""text":"followup""#),
+        "event={bare_event}"
+    );
+    assert!(!bare_event.contains("hello world"), "event={bare_event}");
+}
+
+#[test]
+fn explicit_broadcast_does_not_retarget_bare_multiword_message() {
+    let h = Hcom::new();
+    let sender = h.start();
+    let recipient = h.start();
+
+    // This missing-`--` form remains invalid, but a live agent name in its
+    // first message position must not silently turn it into a targeted send.
+    let (code, stdout, stderr) = h.run([
+        "send",
+        "--broadcast",
+        "--name",
+        &sender,
+        &recipient,
+        "hello",
+        "world",
+    ]);
+    assert_ne!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains("No input received on stdin"),
+        "the established failure mode should be preserved: stderr={stderr}"
+    );
+    let (_, events, _) = h.run(["events", "--type", "message", "--last", "1", "--full"]);
+    assert!(
+        events.trim().is_empty(),
+        "failed send must not deliver: {events}"
+    );
 }
 
 #[test]
@@ -1713,4 +1768,98 @@ fn pi_e2e_hook_dispatch() {
         .find_map(|line| serde_json::from_str(line).ok())
         .unwrap_or_else(|| panic!("stopped event missing: {stdout}"));
     assert_eq!(stopped["data"]["action"].as_str(), Some("stopped"));
+}
+
+// ── Tracker 38 command-grammar retry traps ────────────────────────────────
+//
+// Each recorded form from the orchestration token-efficiency tracker must be
+// either accepted (mapped to the canonical option) or rejected with the exact
+// supported equivalent instead of a generic clap/stdin error.
+
+#[test]
+fn transcript_tail_alias_is_accepted() {
+    let h = Hcom::new();
+    // A fresh dir has no such agent, so reaching the "not found" error proves
+    // clap parsed `--tail` (mapped to --last) instead of rejecting the flag.
+    let (code, _stdout, stderr) = h.run(["transcript", "nobody", "--tail", "1"]);
+    assert_ne!(code, 0, "stderr={stderr}");
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "--tail must be accepted: stderr={stderr}"
+    );
+    assert!(stderr.contains("not found"), "stderr={stderr}");
+}
+
+#[test]
+fn transcript_canonical_last_still_works() {
+    let h = Hcom::new();
+    let (code, _stdout, stderr) = h.run(["transcript", "nobody", "--last", "1"]);
+    assert_ne!(code, 0, "stderr={stderr}");
+    assert!(stderr.contains("not found"), "stderr={stderr}");
+}
+
+#[test]
+fn events_limit_alias_is_accepted() {
+    let h = Hcom::new();
+    let (code, stdout, stderr) = h.run(["events", "--limit", "5"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.trim().is_empty(), "expected no events, got {stdout}");
+}
+
+#[test]
+fn events_sql_wrong_column_names_canonical_equivalent() {
+    let h = Hcom::new();
+    // Tracker 38: the recorded `from_agent` SQL attempt must name the public
+    // column/flag instead of only the raw SQLite error. Exit stays 2.
+    let (code, _stdout, stderr) = h.run(["events", "--sql", "from_agent = 'kuma'"]);
+    assert_eq!(code, 2, "stderr={stderr}");
+    assert!(stderr.contains("msg_from"), "stderr={stderr}");
+    assert!(stderr.contains("--from"), "stderr={stderr}");
+}
+
+#[test]
+fn events_sql_canonical_msg_from_is_accepted() {
+    let h = Hcom::new();
+    let (code, stdout, stderr) = h.run(["events", "--sql", "msg_from = 'kuma'"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(stdout.trim().is_empty(), "expected no events, got {stdout}");
+}
+
+#[test]
+fn send_positional_agent_form_delivers() {
+    let h = Hcom::new();
+    let me = h.start();
+    // Tracker 38: `hcom send <agent> <message words...>` (no @, no --) must
+    // deliver to the resolved agent instead of failing on stdin.
+    let process_id = format!("{me}-positional-send");
+    let mut cmd = h.cmd();
+    cmd.env("HCOM_PROCESS_ID", &process_id)
+        .args(["send", "--name", &me, &me, "hello", "world"]);
+    let out = cmd.output().expect("spawn hcom send");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "positional send must succeed: stdout={stdout} stderr={stderr}"
+    );
+    assert!(stdout.contains("Sent to:"), "stdout={stdout}");
+
+    let (_, events, _) = h.run(["events", "--type", "message", "--last", "1"]);
+    assert!(events.contains("hello world"), "events={events}");
+    assert!(events.contains(&me), "events={events}");
+}
+
+#[test]
+fn send_ambiguous_positional_words_error_with_canonical_syntax() {
+    let h = Hcom::new();
+    let me = h.start();
+    // Multiple bare words that resolve to no agent must fail fast with the
+    // canonical syntax — not the misleading stdin error.
+    let (code, _stdout, stderr) = h.run(["send", "--name", &me, "alpha", "beta"]);
+    assert_ne!(code, 0, "stderr={stderr}");
+    assert!(stderr.contains("hcom send @<agent> --"), "stderr={stderr}");
+    assert!(
+        !stderr.contains("stdin"),
+        "must not fall into the stdin path: stderr={stderr}"
+    );
 }

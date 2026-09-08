@@ -23,6 +23,9 @@ Target matching:
     @api-                          all local agents with exact tag 'api'
     @luna:BOXE                     exact or uniquely prefixed remote agent
   Partial local names are rejected to avoid accidental fan-out.
+  A bare first word that exactly matches an agent (send luna hi there)
+  is accepted as @luna with the rest as the message.
+  Pipe and heredoc sends still require an explicit @name target.
 
 Inline bundle (attach structured context):
     --title <text>                 Create and attach bundle inline
@@ -697,6 +700,55 @@ fn process_positionals(positionals: &[String]) -> (Vec<String>, Option<String>) 
     (targets, None)
 }
 
+/// Outcome of validating positional args on the no-separator send path.
+#[derive(Debug, PartialEq)]
+enum PositionalSend {
+    /// `hcom send <agent> <message words...>`: the first bare word resolved to
+    /// an agent, so it acts as an @target and the rest is the message.
+    Targeted { target: String, message: String },
+    /// Multiple bare words that cannot form one message under the current
+    /// grammar (only a single bare argument or `--` introduces message text).
+    Ambiguous,
+    /// Any other shape — legacy `process_positionals` handling.
+    Other,
+}
+
+/// Validate the positional send form before reading any message source.
+///
+/// Tracker 38: `hcom send <name> <message>` is a plausible retry trap that
+/// used to fall into misleading stdin/no-message errors. When the first bare
+/// word exactly resolves to an agent (base or tag name), accept it as the
+/// target. Bare words that cannot form a message are rejected up front with
+/// the canonical syntax instead of consulting stdin.
+fn validate_positional_send(
+    db: &HcomDb,
+    positionals: &[String],
+    allow_bare_target: bool,
+) -> PositionalSend {
+    // Explicit broadcasts and recipient-free thread follow-ups already have
+    // unambiguous scopes. Preserve their legacy bare-message parsing rather
+    // than interpreting the first message word as an agent name.
+    if !allow_bare_target {
+        return PositionalSend::Other;
+    }
+    let bare_count = positionals
+        .iter()
+        .filter(|arg| !arg.starts_with('@'))
+        .count();
+    if bare_count < 2 {
+        return PositionalSend::Other;
+    }
+    if let Some(first) = positionals.first().filter(|arg| !arg.starts_with('@'))
+        && let Some(target) = identity::resolve_display_name(db, first)
+    {
+        return PositionalSend::Targeted {
+            target,
+            message: positionals[1..].join(" "),
+        };
+    }
+    PositionalSend::Ambiguous
+}
+
 /// Main entry point for `hcom send` command.
 ///
 /// Returns exit code (0 = success, 1 = error).
@@ -803,9 +855,28 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     //   - Single "@name message" (with space) → entire text is message, @mention parsed by compute_scope
     //   - Non-@ args → message text (broadcast)
     //   - Pure @targets → explicit targets
+    //   - `send <agent> <message words...>` → agent target + message (tracker 38)
     let (effective_targets, compat_message) =
         if !args.has_separator() && !args.stdin && args.file.is_none() && args.base64.is_none() {
-            process_positionals(&args.positionals)
+            match validate_positional_send(
+                db,
+                &args.positionals,
+                !args.broadcast && args.thread.is_none(),
+            ) {
+                PositionalSend::Targeted { target, message } => (vec![target], Some(message)),
+                PositionalSend::Ambiguous => {
+                    eprintln!(
+                        "Error: ambiguous send — multiple bare words cannot form one message."
+                    );
+                    eprintln!(
+                        "Targets require @; put the message after '--' or quote it as one argument:"
+                    );
+                    eprintln!("  hcom send @<agent> -- your message");
+                    eprintln!("  Or: echo 'your message' | hcom send @<agent>");
+                    return 1;
+                }
+                PositionalSend::Other => process_positionals(&args.positionals),
+            }
         } else {
             // With -- separator or explicit source: validate @targets
             let mut validated = Vec::new();
@@ -1867,6 +1938,86 @@ mod tests {
         let (targets, msg) = process_positionals(&["@luna".to_string(), "hello".to_string()]);
         assert_eq!(targets, vec!["luna"]);
         assert_eq!(msg.as_deref(), Some("hello"));
+    }
+
+    // ── validate_positional_send tests (tracker 38) ──
+
+    fn positional_test_db() -> HcomDb {
+        let db = HcomDb::open_raw(std::path::Path::new(":memory:")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at) \
+                 VALUES ('kuma', 'active', strftime('%s','now'))",
+                [],
+            )
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn validate_positional_send_resolves_agent_target() {
+        // `hcom send kuma hello test` → target kuma, message "hello test"
+        let db = positional_test_db();
+        let outcome = validate_positional_send(
+            &db,
+            &["kuma".to_string(), "hello".to_string(), "test".to_string()],
+            true,
+        );
+        assert_eq!(
+            outcome,
+            PositionalSend::Targeted {
+                target: "kuma".to_string(),
+                message: "hello test".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn validate_positional_send_unknown_first_word_is_ambiguous() {
+        let db = positional_test_db();
+        let outcome =
+            validate_positional_send(&db, &["alpha".to_string(), "beta".to_string()], true);
+        assert_eq!(outcome, PositionalSend::Ambiguous);
+    }
+
+    #[test]
+    fn validate_positional_send_leaves_legacy_shapes_alone() {
+        let db = positional_test_db();
+        // Single bare word stays broadcast-message text.
+        assert_eq!(
+            validate_positional_send(&db, &["hello".to_string()], true),
+            PositionalSend::Other
+        );
+        // @target + one bare word already works via process_positionals.
+        assert_eq!(
+            validate_positional_send(&db, &["@kuma".to_string(), "hello".to_string()], true),
+            PositionalSend::Other
+        );
+        // Pure @targets + stdin message must not be reinterpreted.
+        assert_eq!(
+            validate_positional_send(&db, &["@kuma".to_string(), "@nova".to_string()], true,),
+            PositionalSend::Other
+        );
+        // @target followed by two bare words is ambiguous (no message separator).
+        assert_eq!(
+            validate_positional_send(
+                &db,
+                &[
+                    "@kuma".to_string(),
+                    "hello".to_string(),
+                    "world".to_string()
+                ],
+                true,
+            ),
+            PositionalSend::Ambiguous
+        );
+        // Explicit broadcast and seeded-thread modes already define the
+        // recipient scope, so their multi-word bare messages stay untouched.
+        assert_eq!(
+            validate_positional_send(&db, &["kuma".to_string(), "hello".to_string()], false,),
+            PositionalSend::Other
+        );
     }
 
     // ── Wake routing (endpoint probes) ─────────────────────────────────────

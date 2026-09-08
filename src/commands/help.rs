@@ -48,7 +48,7 @@ const EVENTS_HELP: &[HelpEntry] = &[
     ("", ""),
     ("Query:", ""),
     ("  events", "Last 20 events as JSON"),
-    ("  --last N", "Limit count (default: 20)"),
+    ("  --last N", "Limit count (default: 20; alias: --limit)"),
     ("  --all", "Include archived sessions"),
     ("  --wait [SEC]", "Block until match (default: 60s)"),
     (
@@ -207,6 +207,10 @@ const LIST_HELP: &[HelpEntry] = &[
 
 const SEND_HELP: &[HelpEntry] = &[
     ("  send @name -- message text", "Direct message"),
+    (
+        "  send name message text",
+        "Multi-word form: exact bare agent name acts as @name",
+    ),
     ("  send @name1 @name2 -- message", "Multiple targets"),
     ("  send -- message text", "Broadcast to all"),
     ("  send @name", "Message from stdin (pipe or heredoc)"),
@@ -583,7 +587,10 @@ const TRANSCRIPT_HELP: &[HelpEntry] = &[
         "transcript timeline",
         "User prompts across all agents by time",
     ),
-    ("  --last N", "Limit to last N exchanges (default: 10)"),
+    (
+        "  --last N",
+        "Limit to last N exchanges (default: 10; alias: --tail)",
+    ),
     ("  --full", "Show complete assistant responses"),
     ("  --detailed", "Show tool I/O, file edits, errors"),
     ("  --json", "JSON output"),

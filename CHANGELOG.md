@@ -18,6 +18,10 @@ Rules:
 - Current Antigravity workspace-trust dialogs are now returned as typed
   `workspace_trust` launch blockers with the exact prompt evidence, without
   approving the workspace or changing provider trust state.
+- Common command-grammar retries now resolve directly: transcript accepts
+  `--tail`, events accepts `--limit`, invalid `from_agent` SQL points to
+  `msg_from`/`--from`, and exact bare agent names work in multi-word direct
+  sends without weakening explicit broadcast or thread scoping.
 
 ## [2026-09-06]
 

@@ -59,8 +59,8 @@ pub struct TranscriptArgs {
     /// Show tool inputs/outputs, file edits, and errors
     #[arg(long)]
     pub detailed: bool,
-    /// Last N exchanges
-    #[arg(long)]
+    /// Last N exchanges (--tail is an accepted alias)
+    #[arg(long, visible_alias = "tail")]
     pub last: Option<usize>,
     /// Exchange range (flag form)
     #[arg(long = "range")]
@@ -112,8 +112,8 @@ pub struct TranscriptTimelineArgs {
     /// Detailed output
     #[arg(long)]
     pub detailed: bool,
-    /// Last N exchanges per agent
-    #[arg(long)]
+    /// Last N exchanges per agent (--tail is an accepted alias)
+    #[arg(long, visible_alias = "tail")]
     pub last: Option<usize>,
 }
 
@@ -1962,6 +1962,25 @@ mod tests {
         let args = TranscriptArgs::try_parse_from(["transcript", "peso", "3-10"]).unwrap();
         assert_eq!(args.name.as_deref(), Some("peso"));
         assert_eq!(args.range_positional.as_deref(), Some("3-10"));
+    }
+
+    #[test]
+    fn test_transcript_view_accepts_tail_alias() {
+        // Tracker 38: `hcom transcript NAME --tail N` must map to --last instead
+        // of a clap rejection.
+        let args = TranscriptArgs::try_parse_from(["transcript", "kuma", "--tail", "5"]).unwrap();
+        assert_eq!(args.name.as_deref(), Some("kuma"));
+        assert_eq!(args.last, Some(5));
+    }
+
+    #[test]
+    fn test_transcript_timeline_accepts_tail_alias() {
+        let args =
+            TranscriptArgs::try_parse_from(["transcript", "timeline", "--tail", "3"]).unwrap();
+        match args.subcmd {
+            Some(TranscriptSubcmd::Timeline(ref t)) => assert_eq!(t.last, Some(3)),
+            _ => panic!("expected Timeline subcommand"),
+        }
     }
 
     #[test]

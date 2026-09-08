@@ -26,8 +26,8 @@ This register focuses on behavior that causes tool-call spam, consumes the main 
 
 ### Status overview
 
-- **Working:** 1, 2, 3, 4, 6, 14, 15, 24, 33, 34, 35, 36, 39, 40, 41, 42,
-  43, and 46.
+- **Working:** 1, 2, 3, 4, 6, 14, 15, 24, 33, 34, 35, 36, 38, 39, 40, 41,
+  42, 43, and 46.
 - **Partially addressed:** 30, with the remaining native-workflow follow-up
   tracked by issues 8 and 28.
 - **Blocking design:** 44, the provider-neutral isolated-workspace boundary
@@ -768,9 +768,14 @@ automatic_receipts = true
 
 ### 38. Command grammar and filter vocabulary cause trial-and-error calls
 
-Status: **Tracked as `hcom-rja` (P2).** Some positional-send compatibility has
-already improved; the Bead requires reproducing and fixing only the remaining
-traps without breaking canonical syntax.
+Status: **Working as of 2026-09-08; `hcom-rja` completed.** Transcript now
+accepts `--tail` as an alias for `--last`, events accepts `--limit` for
+`--last`, and invalid events SQL using `from_agent` identifies `msg_from` and
+the safer `--from` flag. A direct multi-word `hcom send NAME MESSAGE` resolves
+only an exact live agent name; unresolved and ambiguous forms fail with the
+canonical `@name -- message` syntax. Explicit broadcasts, seeded threads,
+stdin, files, and canonical forms retain their previous behavior. Unit and CLI
+smoke tests cover every recorded trap and the scope-preservation edge cases.
 
 The observed parent tried plausible but unsupported forms including transcript `--tail`, events `--limit`, an SQL `from_agent` field, and a direct positional send. Each required another help, retry, or inspection call.
 
