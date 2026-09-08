@@ -113,7 +113,7 @@ pub(super) fn update_delivery_state(
         // visible_tail is only consumed by the launch-blocked heuristic;
         // skip the screen walk + allocation once launch phase is over.
         state.visible_tail = if launch_phase_active.load(Ordering::Acquire) {
-            screen.visible_tail(5, 500)
+            screen.visible_tail(10, 1_000)
         } else {
             None
         };
@@ -2332,5 +2332,83 @@ mod tests {
         assert!(state.prompt_empty);
         assert_eq!(state.input_text.as_deref(), Some(""));
         assert!(state.last_prompt_submit.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn update_delivery_state_detects_and_clears_antigravity_sandbox_bypass() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, status_time, created_at)
+                 VALUES ('hera', 'antigravity', 'active', 'tool:run_command',
+                         'bd show hcom-f6g.12', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+        let screen_state = Arc::new(RwLock::new(ScreenState::default()));
+        let mut tracker = ScreenTracker::new_with_instance(24, 80, b"? for shortcuts", None);
+        let launch_phase_active = Arc::new(AtomicBool::new(false));
+        let shared_status = Arc::new(RwLock::new(crate::shared::ST_ACTIVE.to_string()));
+        let publish_status = Arc::clone(&shared_status);
+        let publish = move |a: bool| {
+            publish_approval_status(a, Some("hera"), &publish_status);
+        };
+
+        // Render sandbox bypass approval dialog
+        tracker.process(
+            b"Requesting permission for: bd show hcom-f6g.12\r\nAllow sandbox bypass for command execution?\r\n> 1. Yes\r\n  2. Yes, and always allow sandbox bypass for command execution\r\n  3. No, keep sandboxed\r\n  Up/Down Navigate - tab Amend - ctrl+g edit/expand command\r\nesc to cancel\r\n",
+        );
+
+        update_delivery_state(
+            &screen_state,
+            &tracker,
+            &PtyTarget::Known(Tool::Antigravity),
+            &launch_phase_active,
+            &publish,
+        );
+
+        assert!(screen_state.read().unwrap().approval);
+        let blocked = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(blocked.status, ST_BLOCKED);
+        assert_eq!(blocked.status_context, "pty:approval");
+        assert_eq!(blocked.status_detail, "bd show hcom-f6g.12");
+        assert_eq!(*shared_status.read().unwrap(), ST_BLOCKED);
+        let blocked_event: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'status' AND instance = 'hera'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let blocked_event: serde_json::Value = serde_json::from_str(&blocked_event).unwrap();
+        assert_eq!(blocked_event["status"], ST_BLOCKED);
+        assert_eq!(blocked_event["context"], "pty:approval");
+        assert_eq!(blocked_event["detail"], "bd show hcom-f6g.12");
+
+        // When denied / cleared, screen transitions to idle prompt
+        let mut denied = ScreenTracker::new_with_instance(24, 80, b"? for shortcuts", None);
+        denied.process(
+            b"Requesting permission for: bd show hcom-f6g.12\r\nAllow sandbox bypass for command execution?\r\n> 1. Yes\r\n  2. Yes, and always allow\r\n  3. No, keep sandboxed\r\n  Up/Down Navigate - tab Amend - ctrl+g edit/expand command\r\nesc to cancel\r\nuser denied permission to run command\r\n> idle\r\n",
+        );
+
+        update_delivery_state(
+            &screen_state,
+            &denied,
+            &PtyTarget::Known(Tool::Antigravity),
+            &launch_phase_active,
+            &publish,
+        );
+
+        assert!(!screen_state.read().unwrap().approval);
+        let cleared = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(cleared.status, ST_LISTENING);
+        assert_eq!(cleared.status_context, "pty:approval_cleared");
+        assert_eq!(cleared.status_detail, "bd show hcom-f6g.12");
+        assert_eq!(*shared_status.read().unwrap(), ST_LISTENING);
     }
 }

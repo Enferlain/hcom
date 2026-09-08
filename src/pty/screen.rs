@@ -431,29 +431,36 @@ impl ScreenTracker {
                 && (visible.contains("yes") || visible.contains('❯')))
     }
 
-    /// Antigravity-specific approval detection: the agy TUI renders command and
-    /// out-of-workspace file permission prompts as plain text in the prompt area.
-    /// No OSC9 fires, so scrape the screen. Require a prompt-specific marker and
-    /// its matching question/menu so stale prose in scrollback cannot flip the
-    /// worker into a blocked state.
+    /// Antigravity-specific approval detection: the agy TUI renders command,
+    /// out-of-workspace file permission prompts, and sandbox-bypass prompts as
+    /// plain text in the prompt area. No OSC9 fires, so scrape the screen.
+    /// Require a prompt-specific marker and its matching question/menu so stale
+    /// prose in scrollback cannot flip the worker into a blocked state.
     pub fn is_antigravity_approval_visible(&self) -> bool {
         let screen = self.parser.screen();
         let (_rows, cols) = screen.size();
+        let lines: Vec<String> = screen.rows(0, cols).collect();
+
         let mut has_command_marker = false;
         let mut has_command_question = false;
         let mut has_command_footer = false;
+        let mut command_surface_end = None;
         let mut has_file_marker = false;
         let mut has_file_question = false;
         let mut has_file_menu = false;
-        for line in screen.rows(0, cols) {
+        let mut has_sandbox_bypass = false;
+
+        for (idx, line) in lines.iter().enumerate() {
             if line.contains("Requesting permission for:") {
                 has_command_marker = true;
             }
             if line.contains("Do you want to proceed?") {
                 has_command_question = true;
+                command_surface_end = Some(idx);
             }
             if line.contains("tab Amend") && line.contains("edit command") {
                 has_command_footer = true;
+                command_surface_end = Some(idx);
             }
             if line.trim() == "File access" {
                 has_file_marker = true;
@@ -464,9 +471,112 @@ impl ScreenTracker {
             if line.contains("Yes, allow access") && line.contains("1.") {
                 has_file_menu = true;
             }
+
+            // Antigravity sandbox-bypass permission prompt (hcom-f6g.12):
+            // "Requesting permission for: <cmd>" followed by
+            // "Allow sandbox bypass for command execution?" and its
+            // affirmative numbered menu (e.g. `> 1. Yes, allow sandbox bypass`).
+            //
+            // Realistic 80-column wrapping:
+            // - The command after "Requesting permission for:" can wrap over multiple rows.
+            // - The question itself may wrap ("Allow sandbox bypass for" / "command execution?").
+            //
+            // Freshness / stale scrollback rejection:
+            // - Ensure the prompt is an active prompt, not stale scrollback:
+            //   reject if there is a live input prompt (a row starting with `>` that is
+            //   not a numbered menu option) below the menu.
+            if line.contains("Requesting permission for:") {
+                let max_q = (idx + 12).min(lines.len());
+                for q_idx in idx..max_q {
+                    let question_end = (q_idx + 3).min(lines.len());
+                    let question = lines[q_idx..question_end]
+                        .join(" ")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let is_question =
+                        question.contains("Allow sandbox bypass for command execution?");
+                    if is_question {
+                        let menu_start = q_idx + 1;
+                        let max_menu = (menu_start + 8).min(lines.len());
+                        for m_idx in menu_start..max_menu {
+                            let m_line = &lines[m_idx];
+                            let option = m_line
+                                .trim_start()
+                                .trim_start_matches(['>', '❯'])
+                                .trim_start();
+                            let is_affirmative_menu =
+                                option.split_once('.').is_some_and(|(number, label)| {
+                                    !number.is_empty()
+                                        && number.chars().all(|ch| ch.is_ascii_digit())
+                                        && label.trim_start().starts_with("Yes")
+                                });
+                            if is_affirmative_menu {
+                                let menu_tail = &lines[m_idx + 1..];
+                                let footer = menu_tail
+                                    .join(" ")
+                                    .split_whitespace()
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                                    .to_lowercase();
+                                let has_navigation_footer = footer.contains("navigate")
+                                    && footer.contains("tab amend")
+                                    && (footer.contains("edit/expand command")
+                                        || footer.contains("edit command"))
+                                    && footer.contains("esc to cancel");
+                                let has_live_prompt_below = lines[m_idx + 1..].iter().any(|tail| {
+                                    let trimmed = tail.trim_start();
+                                    if !trimmed.starts_with('>') {
+                                        return false;
+                                    }
+                                    // A `>` on a numbered menu option (e.g. `> 1.`, `> 2.`)
+                                    // is the menu cursor, not a live prompt.
+                                    let is_menu_option = trimmed
+                                        .strip_prefix('>')
+                                        .map(|s| {
+                                            let s = s.trim_start();
+                                            s.chars().next().is_some_and(|c| c.is_ascii_digit())
+                                                && s.contains('.')
+                                        })
+                                        .unwrap_or(false);
+                                    !is_menu_option
+                                });
+                                if has_navigation_footer && !has_live_prompt_below {
+                                    has_sandbox_bypass = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if has_sandbox_bypass {
+                        break;
+                    }
+                }
+            }
         }
-        (has_command_marker && (has_command_question || has_command_footer))
+
+        let legacy_command_is_stale = command_surface_end.is_some_and(|end| {
+            lines[end + 1..].iter().any(|tail| {
+                let trimmed = tail.trim_start();
+                if !trimmed.starts_with('>') {
+                    return false;
+                }
+                let is_menu_option = trimmed
+                    .strip_prefix('>')
+                    .map(|s| {
+                        let s = s.trim_start();
+                        s.chars().next().is_some_and(|c| c.is_ascii_digit()) && s.contains('.')
+                    })
+                    .unwrap_or(false);
+                !is_menu_option
+            })
+        });
+
+        (has_command_marker
+            && (has_command_question || has_command_footer)
+            && !legacy_command_is_stale)
             || (has_file_marker && has_file_question && has_file_menu)
+            || has_sandbox_bypass
     }
 
     /// Antigravity post-command feedback-survey detection (hcom-f6g.9).
@@ -559,6 +669,8 @@ impl ScreenTracker {
                 || line.contains("Do you want to proceed?")
                 || line.contains("Allow access to this file?")
                 || line.contains("Yes, allow access")
+                || line.contains("Allow sandbox bypass for command execution?")
+                || line.contains("Yes, allow sandbox bypass")
             {
                 return false; // live permission menu below the survey text
             }
@@ -1725,6 +1837,113 @@ mod tests {
             "[1] Good  [2] Fine  [3] Bad  [0] Skip",
             "Requesting permission for: rm -rf /tmp/x",
             "Do you want to proceed?",
+        ]);
+        render_rows(&mut t, &lines);
+        assert!(!t.is_antigravity_survey_visible());
+        assert!(t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_detects_sandbox_bypass_approval() {
+        let mut t = make_tracker(24, 80, "");
+        assert!(!t.is_antigravity_approval_visible());
+        t.process(
+            b"Requesting permission for:\r\n   bd show hcom-f6g.12\r\nAllow sandbox bypass for command execution?\r\nConfirm the command is safe to run outside of the sandbox with full network access\r\n> 1. Yes\r\n  2. Yes, and always allow in this conversation for commands that start with 'bd'\r\n  3. Yes, and always allow for commands that start with 'bd'\r\n  4. No\r\n  Up/Down Navigate - tab Amend - ctrl+g edit/expand command\r\nesc to cancel\r\n",
+        );
+        assert!(t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_detects_sandbox_bypass_approval_wrapped_80col() {
+        let mut t = make_tracker(24, 80, "");
+        // Realistic 80-column wrapping: command wraps across rows before the question
+        t.process(
+            b"Requesting permission for: cargo test --package hcom --test pty_test --lib --\r\nscreen::tests::antigravity_detects_approval_prompt\r\nAllow sandbox bypass for command execution?\r\n> 1. Yes\r\n  2. Yes, and always allow\r\n  3. No, keep sandboxed\r\n  Up/Down Navigate - tab Amend - ctrl+g edit/expand command\r\nesc to cancel\r\n",
+        );
+        assert!(t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_detects_sandbox_bypass_wrapped_question() {
+        let mut t = make_tracker(24, 80, "");
+        // Question itself wrapped across rows
+        t.process(
+            b"Requesting permission for: bd show hcom-f6g.12\r\nAllow sandbox bypass for\r\ncommand execution?\r\n> 1. Yes\r\n  2. Yes, and always allow\r\n  3. No, keep sandboxed\r\n  Up/Down Navigate - tab Amend - ctrl+g edit/expand command\r\nesc to cancel\r\n",
+        );
+        assert!(t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_detects_sandbox_bypass_question_wrapped_after_command() {
+        let mut t = make_tracker(24, 48, "");
+        t.process(
+            b"Requesting permission for: bd show hcom-f6g.12\r\nAllow sandbox bypass for command\r\nexecution?\r\n> 1. Yes\r\n  2. Yes, and always allow\r\n  3. No\r\n  Up/Down Navigate - tab Amend - edit command\r\nesc to cancel\r\n",
+        );
+        assert!(t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_detects_reordered_sandbox_bypass_affirmative_option() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(
+            b"Requesting permission for: bd show hcom-f6g.12\r\nAllow sandbox bypass for command execution?\r\n> 1. No\r\n  2. Yes, run outside the sandbox once\r\n  Up/Down Navigate - tab Amend - ctrl+g edit/expand command\r\nesc to cancel\r\n",
+        );
+        assert!(t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_sandbox_bypass_ordinary_task_text_is_not_approval() {
+        let mut t = make_tracker(24, 80, "");
+        // Ordinary task text discussing the dialog strings
+        t.process(
+            b"Fix detection of 'Requesting permission for:' together with 'Allow sandbox bypass for command execution?' and its affirmative numbered menu.\r\n> \r\n",
+        );
+        assert!(!t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_sandbox_bypass_incomplete_scrollback_is_not_approval() {
+        let mut t = make_tracker(24, 80, "");
+        // Incomplete prompt: question present but affirmative menu not rendered yet
+        t.process(
+            b"Requesting permission for: bd show hcom-f6g.12\r\nAllow sandbox bypass for command execution?\r\n",
+        );
+        assert!(!t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_sandbox_bypass_stale_scrollback_is_ignored() {
+        let mut t = make_tracker(24, 80, "");
+        // Dialog was answered/denied earlier and a live prompt is now showing below it
+        t.process(
+            b"Requesting permission for: bd show hcom-f6g.12\r\nAllow sandbox bypass for command execution?\r\n> 1. Yes\r\n  2. Yes, and always allow\r\n  3. No, keep sandboxed\r\n  Up/Down Navigate - tab Amend - ctrl+g edit/expand command\r\nesc to cancel\r\nuser denied permission to run command\r\n> idle\r\n",
+        );
+        assert!(!t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_legacy_edit_command_footer_in_stale_scrollback_is_ignored() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(
+            b"Requesting permission for: bd show hcom-f6g.12\r\nAllow sandbox bypass for command execution?\r\n> 1. Yes\r\n  2. No\r\n  Up/Down Navigate - tab Amend - edit command\r\nesc to cancel\r\nuser denied permission to run command\r\n> idle\r\n",
+        );
+        assert!(!t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_survey_quoted_above_sandbox_bypass_is_ignored() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        let mut lines = vec![""; 13];
+        lines.extend_from_slice(&[
+            "How’s the CLI experience so far? Help us improve:",
+            "[1] Good  [2] Fine  [3] Bad  [0] Skip",
+            "Requesting permission for: bd show hcom-f6g.12",
+            "Allow sandbox bypass for command execution?",
+            "> 1. Yes",
+            "  2. Yes, and always allow",
+            "  3. No, keep sandboxed",
+            "  Up/Down Navigate - tab Amend - ctrl+g edit/expand command",
+            "esc to cancel",
         ]);
         render_rows(&mut t, &lines);
         assert!(!t.is_antigravity_survey_visible());

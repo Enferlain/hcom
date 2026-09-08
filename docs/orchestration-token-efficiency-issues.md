@@ -338,7 +338,8 @@ The launcher has targeted readiness handling for some providers, but Antigravity
 
 Evidence: provider-specific readiness handling in [`launcher.rs`](../src/launcher.rs#L1520).
 
-Status: **Partially mitigated locally as of 2026-08-29, not fixed in hcom.**
+Status: **Tracked as `hcom-p33` (P1); partially mitigated locally as of
+2026-08-29, not yet live-verified in hcom.**
 Antigravity now has native trusted-workspace state and explicit per-workspace file
 grants for the current development workspaces. A fresh live launch entered the
 workspace and completed its read-only task without external input. Earlier
@@ -494,6 +495,10 @@ mount plan.
 
 ### 45. Provider-run cleanup can turn a successful result into wrapper failure
 
+Status: **Tracked as `hcom-mxg` (P1).** The current GLM workflow contains
+transcript-preserving and stale-run cleanup logic, but the original concurrent
+cleanup failure still needs a deterministic regression and a live closeout.
+
 A live `hcom run glm` probe on 2026-09-03 received the worker's valid,
 correlated completion report and stopped the worker, but the wrapper then
 exited nonzero because removal of its temporary `provider-runs` directory raced
@@ -550,16 +555,61 @@ workspace check, strict Clippy, and two independent reviews pass.
 
 ### 48. Antigravity sandbox-bypass approvals can remain unclassified
 
-Status: **Open P0 as `hcom-f6g.12`.** During the live Claude Opus attempt for
+Status: **Resolved in `hcom-f6g.12`.** During the live Claude Opus attempt for
 item 47, Antigravity's sandbox reported a connection issue and asked permission
 to retry `bd show` outside the sandbox. hcom continued reporting
 `active/tool:run_command` for more than 224 seconds instead of publishing
 `blocked/pty:approval`. The new atomic wait can return blockers once hcom emits
 them, but it cannot infer a provider dialog that the PTY classifier missed.
 
-Recognize the complete sandbox-bypass dialog, preserve its command/evidence,
-publish the typed blocker promptly, and verify denial/clearance without ever
-approving the bypass during the test.
+The Antigravity approval detector in `src/pty/screen.rs` now recognizes the
+complete sandbox-bypass permission dialog (`Requesting permission for:` together
+with `Allow sandbox bypass for command execution?` and its affirmative numbered
+menu) with realistic 80-column wrapping. Stale scrollback and completed turns
+are rejected via geometry/prompt checks, the gated command detail and evidence
+are preserved on the `blocked/pty:approval` transition, and denial/clearance
+returns lifecycle state to `listening/pty:approval_cleared`. Regressions are
+covered by deterministic screen, shared-state, and correlated result-wait tests.
+A live Gemini 3.8 Flash High reproduction using the freshly built hcom binary
+attempted `bd show hcom-f6g.12` and, without terminal inspection or approval
+input, returned exit `4` with the exact worker generation, workflow thread,
+attempt cursor, and command evidence. The wrapper cleaned up the blocked worker
+automatically.
+
+### 49. Antigravity delivery can remain inert after an approval denial — working
+
+Status: **Resolved by `hcom-f6g.12`; `hcom-f6g.13` closed after live
+verification.** The apparent failure during item 48 used the pre-fix executable,
+which never classified the approval and therefore had no PTY-owned blocker to
+clear when the denial key was injected. It was not an independent delivery bug.
+
+A fresh raw Gemini 3.8 Flash High regression entered `blocked/pty:approval` for
+an outside-workspace file request. A targeted follow-up was queued while the
+worker remained blocked; denying option 3 then published
+`listening/pty:approval_cleared`, and delivery transitioned the same generation
+to `active`. The worker returned the exact `F6G13_RESUMED` marker without direct
+PTY prompt injection. Focused approval falling-edge and injected-clear tests
+also pass.
+
+### 50. Sandboxed Agy workflows need an available completion bridge
+
+Status: **Open as `hcom-f6g.14` (P0 isolation prerequisite).** During the item
+48 implementation run, the then-current user-created `hcom run agy` workflow
+explicitly added `--sandbox`, although an ordinary `hcom agy` launch did not.
+Antigravity's provider-native sandbox failed and the configured
+`proceed-in-sandbox` policy correctly refused to execute commands through a
+host sandbox bypass. The worker could still make edits through non-shell tools,
+but it could not execute its prompt-mandated final `hcom send`. The forced
+`--sandbox` flag was removed from the user workflow on 2026-09-08 so
+`hcom run agy` once again matches normal `hcom agy` launch behavior. This is
+therefore a requirement for the future hcom-owned isolated-workspace rollout,
+not a current defect in the ordinary run workflow.
+
+Before isolated Agy workflows become a daily-use path, their result bridge must
+remain available inside the approved isolation boundary or be owned by the outer
+coordinator rather than relying on a provider shell command. Sandbox failure
+must remain fail-closed, and an interrupted turn must be distinguishable from a
+genuine adapter recovery failure.
 
 ## P1: communication policy and context control
 
@@ -643,6 +693,8 @@ Event wait, listen, filtered listen, hook polling, launch readiness, and PTY mon
 
 ### 29. A targeted message can wake more agents than necessary
 
+Status: **Tracked as `hcom-svq` (P2).**
+
 Message delivery may trigger broad wake behavior even when recipients are known.
 
 Evidence: wake behavior in [`send.rs`](../src/commands/send.rs#L470).
@@ -680,6 +732,10 @@ automatic_receipts = true
 `result_only` should suppress routine chatter, not prevent a blocked worker from asking a necessary question.
 
 ### 38. Command grammar and filter vocabulary cause trial-and-error calls
+
+Status: **Tracked as `hcom-rja` (P2).** Some positional-send compatibility has
+already improved; the Bead requires reproducing and fixing only the remaining
+traps without breaking canonical syntax.
 
 The observed parent tried plausible but unsupported forms including transcript `--tail`, events `--limit`, an SQL `from_agent` field, and a direct positional send. Each required another help, retry, or inspection call.
 

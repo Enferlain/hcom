@@ -33,6 +33,11 @@ Rules:
 
 ### Fixed
 
+- Antigravity sandbox-bypass approval prompts (`Requesting permission for:`
+  paired with `Allow sandbox bypass for command execution?` and its affirmative
+  numbered menu) are now recognized as `blocked/pty:approval` blockers,
+  handling realistic 80-column wrapping, rejecting stale scrollback or task
+  text, and preserving command detail through denial and clearance lifecycles.
 - Antigravity feedback surveys are now recognized as non-task prompts and
   safely skipped; failed dismissal becomes a typed `pty:survey` blocker instead
   of leaving unattended result waits silently stuck.

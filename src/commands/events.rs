@@ -2451,6 +2451,64 @@ mod tests {
     }
 
     #[test]
+    fn result_wait_returns_sandbox_bypass_approval_blocker_and_preserves_command() {
+        // Reproduction of hcom-f6g.12: Antigravity sandbox-bypass prompt
+        // publishes blocked/pty:approval with command detail preserved in status_detail,
+        // and the correlated --result-from wait terminates promptly with RESULT_BLOCKED_EXIT (4).
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("sandbox-bypass-blocked.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_detail, created_at)
+                 VALUES ('agy-worker', 'blocked', 'pty:approval',
+                         'bd show hcom-f6g.12', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "status",
+            "agy-worker",
+            &json!({
+                "status": "blocked",
+                "context": "pty:approval",
+                "detail": "bd show hcom-f6g.12",
+            }),
+        )
+        .unwrap();
+        let (correlation, filters) =
+            arm_result_wait(&db, "agy-worker", "sandbox-bypass-workflow", cursor);
+        let outcome =
+            crate::core::result_wait::scan_terminal_outcome(&db, &outcome_wait_from(&correlation))
+                .unwrap()
+                .expect("sandbox-bypass approval must produce a terminal outcome");
+        assert_eq!(
+            outcome.exit_code,
+            crate::core::result_wait::RESULT_BLOCKED_EXIT
+        );
+        assert_eq!(outcome.payload["evidence"], "bd show hcom-f6g.12");
+        assert_eq!(outcome.payload["detail"], "bd show hcom-f6g.12");
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        assert_eq!(
+            events_wait(
+                &db,
+                &format!(" AND ({filter_sql})"),
+                1,
+                EventsWaitOptions {
+                    after_id: Some(cursor),
+                    full_output: true,
+                    filters: &filters,
+                    instance_name: None,
+                    result_correlation: Some(&correlation),
+                },
+            ),
+            crate::core::result_wait::RESULT_BLOCKED_EXIT,
+            "sandbox-bypass approval blocker must terminate the correlated wait promptly"
+        );
+    }
+
+    #[test]
     fn result_wait_blocker_payload_preserves_correlation_and_evidence() {
         use crate::core::result_wait::scan_terminal_outcome;
 
