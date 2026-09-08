@@ -331,8 +331,8 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
     if (reconcileTimer) { clearInterval(reconcileTimer); reconcileTimer = null }
   }
 
-  // TCP notify server: instant wake when hcom messages arrive.
-  // `crate::notify::wake_all` TCP-connects to this port on every send.
+  // TCP notify server: instant wake for sends addressed to this instance and
+  // for broadcasts. Other observed events are picked up by reconciliation.
   function startNotifyServer(): number | null {
     if (notifyServer) return notifyServer.port
     try {

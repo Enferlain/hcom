@@ -533,6 +533,11 @@ The wrapper's fail-fast handling remains a user-workflow policy in
 the blocker accurately. No provider permission was bypassed or automatically
 accepted.
 
+The low-severity retry follow-up `hcom-495` is also complete. A failed survey
+blocker clear retains the 500ms Unix poll cap but retries status writes on the
+bounded dismissal cadence, and repeated publication/clear failures are
+rate-limited instead of logging on every poll.
+
 ### 47. Result waits can remain silent after a worker becomes blocked — working
 
 A correlated `hcom events --result-from` wait previously watched only for the
@@ -693,7 +698,12 @@ Event wait, listen, filtered listen, hook polling, launch readiness, and PTY mon
 
 ### 29. A targeted message can wake more agents than necessary
 
-Status: **Tracked as `hcom-svq` (P2).**
+Status: **Working as of 2026-09-08; `hcom-svq` completed.** Targeted and
+thread-resolved sends wake only the exact resolved local recipients. Explicit
+broadcasts retain system-wide fan-out, event subscriptions keep their existing
+targeted wake path, and relay push remains unchanged. Non-recipient diagnostic
+waiters observe unrelated targeted events on their bounded re-query cadence
+rather than receiving an immediate global wake.
 
 Message delivery may trigger broad wake behavior even when recipients are known.
 

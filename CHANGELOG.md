@@ -33,6 +33,11 @@ Rules:
 
 ### Fixed
 
+- Targeted and thread-resolved messages now wake only their resolved local
+  recipients; explicit broadcasts retain system-wide wake fan-out.
+- Pending Antigravity survey-blocker clears keep the bounded Unix poll cadence,
+  while failed publication and clearing warnings are rate-limited to avoid
+  repeated log and database work.
 - Raw interactive and headless `hcom claude` launches now default to Claude
   Code's `auto` permission mode, while explicit CLI or `claude_args`
   permission modes continue to override that default.

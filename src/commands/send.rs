@@ -379,8 +379,9 @@ fn print_broadcast_preview(db: &HcomDb, delivered_to: &[String]) {
 }
 
 ///
-/// Validates message, computes scope, logs event, notifies all instances.
-/// Returns delivered_to list (base names).
+/// Validates message, computes scope, logs event, wakes recipients' delivery
+/// loops (system-wide fan-out only for explicit broadcasts). Returns
+/// delivered_to list (base names).
 pub fn send_message(
     db: &HcomDb,
     identity: &SenderIdentity,
@@ -477,8 +478,18 @@ pub fn send_message(
         }
     }
 
-    // Notify all instances (wake delivery loops)
-    crate::notify::wake_all(db);
+    // Wake recipient endpoints. Targeted and thread-resolved sends wake only
+    // their resolved local recipients — `wake` on an instance with no registered
+    // endpoints is a no-op, so stopped/unavailable names stay safe. Explicit
+    // broadcasts keep the system-wide fan-out. Event subscribers are woken
+    // inline by log_event's subscription check, not by this fan-out.
+    if delivery.effective_scope == MessageScope::Broadcast {
+        crate::notify::wake_all(db);
+    } else {
+        for recipient in &delivery.delivered_to {
+            crate::notify::wake(db, recipient, &[]);
+        }
+    }
 
     // Trigger relay push so remote devices see the message immediately
     crate::relay::trigger_push();
@@ -1223,7 +1234,10 @@ mod tests {
     use super::*;
     use clap::Parser;
     use serial_test::serial;
+    use std::io::ErrorKind;
+    use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     type TestEnv = (
         tempfile::TempDir,
@@ -1853,5 +1867,234 @@ mod tests {
         let (targets, msg) = process_positionals(&["@luna".to_string(), "hello".to_string()]);
         assert_eq!(targets, vec!["luna"]);
         assert_eq!(msg.as_deref(), Some("hello"));
+    }
+
+    // ── Wake routing (endpoint probes) ─────────────────────────────────────
+    //
+    // Wakes are TCP connect-and-close pings (notify::wake), so a non-blocking
+    // listener standing in for an instance's wake endpoint observes exactly
+    // which sends poked it. Wakes fire synchronously inside send_message, so
+    // a queued (possibly already-closed) connection is deterministic proof.
+
+    /// Bind a non-blocking listener on an OS-assigned localhost port.
+    fn bind_probe() -> TcpListener {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        listener
+    }
+
+    /// Wait up to `timeout` for the listener to accept a connection.
+    fn await_connect(listener: &TcpListener, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match listener.accept() {
+                Ok(_) => return true,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
+    /// Accept and discard any already-queued wake connections.
+    fn drain_connects(listener: &TcpListener) {
+        while listener.accept().is_ok() {}
+    }
+
+    fn register_probe(db: &HcomDb, name: &str, probe: &TcpListener) {
+        db.upsert_notify_endpoint(name, "pty", probe.local_addr().unwrap().port())
+            .unwrap();
+    }
+
+    fn instance_sender(name: &str) -> SenderIdentity {
+        SenderIdentity {
+            kind: SenderKind::Instance,
+            name: name.into(),
+            instance_data: None,
+            session_id: None,
+        }
+    }
+
+    /// Bug fix (tracker 29): a targeted send resolves an exact delivered_to
+    /// set, so it must wake only that recipient — not every local agent.
+    #[test]
+    #[serial]
+    fn send_message_targeted_wakes_only_resolved_recipient() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at)
+                 VALUES ('luna', 1000.0), ('nova', 1000.0), ('miso', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let nova_probe = bind_probe();
+        let miso_probe = bind_probe();
+        register_probe(&db, "nova", &nova_probe);
+        register_probe(&db, "miso", &miso_probe);
+
+        let delivered = send_message(
+            &db,
+            &instance_sender("luna"),
+            "ping",
+            None,
+            Some(&["nova".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(delivered, vec!["nova".to_string()]);
+
+        assert!(
+            await_connect(&nova_probe, Duration::from_millis(500)),
+            "targeted send must wake the resolved recipient"
+        );
+        assert!(
+            !await_connect(&miso_probe, Duration::from_millis(200)),
+            "targeted send must not wake unrelated agents"
+        );
+
+        cleanup_test_db(path);
+    }
+
+    /// Thread-resolved sends wake only the thread's resolved members, even
+    /// though the original message text had no explicit @targets.
+    #[test]
+    #[serial]
+    fn send_message_thread_resolved_wakes_only_members() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at)
+                 VALUES ('luna', 1000.0), ('nova', 1000.0), ('miso', 1000.0), ('dove', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let nova_probe = bind_probe();
+        let miso_probe = bind_probe();
+        let dove_probe = bind_probe();
+        register_probe(&db, "nova", &nova_probe);
+        register_probe(&db, "miso", &miso_probe);
+        register_probe(&db, "dove", &dove_probe);
+
+        let sender = instance_sender("luna");
+        let envelope = MessageEnvelope {
+            thread: Some("plan-9".into()),
+            ..Default::default()
+        };
+
+        // Seed the thread with @targets (that send is targeted too, so dove
+        // must stay dark throughout), then drain the members' seed wakes.
+        send_message(
+            &db,
+            &sender,
+            "seed",
+            Some(&envelope),
+            Some(&["nova".to_string(), "miso".to_string()]),
+        )
+        .unwrap();
+        drain_connects(&nova_probe);
+        drain_connects(&miso_probe);
+
+        let delivered = send_message(&db, &sender, "round 2", Some(&envelope), None).unwrap();
+        assert_eq!(delivered, vec!["nova".to_string(), "miso".to_string()]);
+
+        assert!(
+            await_connect(&nova_probe, Duration::from_millis(500)),
+            "thread-resolved send must wake thread members"
+        );
+        assert!(
+            await_connect(&miso_probe, Duration::from_millis(500)),
+            "thread-resolved send must wake thread members"
+        );
+        assert!(
+            !await_connect(&dove_probe, Duration::from_millis(200)),
+            "thread-resolved send must not wake non-members"
+        );
+
+        cleanup_test_db(path);
+    }
+
+    /// Explicit broadcasts keep the system-wide wake fan-out.
+    #[test]
+    #[serial]
+    fn send_message_broadcast_keeps_wake_fanout() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at)
+                 VALUES ('luna', 1000.0), ('nova', 1000.0), ('miso', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let nova_probe = bind_probe();
+        let miso_probe = bind_probe();
+        register_probe(&db, "nova", &nova_probe);
+        register_probe(&db, "miso", &miso_probe);
+
+        let delivered =
+            send_message(&db, &instance_sender("luna"), "attention team", None, None).unwrap();
+        let mut sorted = delivered.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["miso".to_string(), "nova".to_string()]);
+
+        assert!(
+            await_connect(&nova_probe, Duration::from_millis(500)),
+            "broadcast must wake every registered recipient"
+        );
+        assert!(
+            await_connect(&miso_probe, Duration::from_millis(500)),
+            "broadcast must wake every registered recipient"
+        );
+
+        cleanup_test_db(path);
+    }
+
+    /// A stopped agent may still have a stale registered endpoint; targeted
+    /// sends must neither wake it nor fail because of it.
+    #[test]
+    #[serial]
+    fn send_message_does_not_wake_stopped_agent_stale_endpoint() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at)
+                 VALUES ('luna', 'listening', '', 1000.0),
+                        ('miso', 'listening', '', 1000.0),
+                        ('vine', 'stopped', '', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let miso_probe = bind_probe();
+        let vine_probe = bind_probe();
+        register_probe(&db, "miso", &miso_probe);
+        register_probe(&db, "vine", &vine_probe);
+
+        let delivered = send_message(
+            &db,
+            &instance_sender("luna"),
+            "ping",
+            None,
+            Some(&["miso".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(delivered, vec!["miso".to_string()]);
+
+        assert!(
+            await_connect(&miso_probe, Duration::from_millis(500)),
+            "intended recipient must be woken"
+        );
+        assert!(
+            !await_connect(&vine_probe, Duration::from_millis(200)),
+            "stopped agent's stale endpoint must stay dark"
+        );
+
+        cleanup_test_db(path);
     }
 }

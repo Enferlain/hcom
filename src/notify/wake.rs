@@ -275,6 +275,27 @@ mod tests {
         let _ = std::fs::remove_file(db_path);
     }
 
+    /// `wake` on an instance with no registered endpoints (stopped or never
+    /// started) must be a safe no-op — the send path calls it per recipient.
+    #[test]
+    fn wake_instance_without_endpoints_is_safe_noop() {
+        let db_path = temp_db_path("no_endpoints");
+        let db = open_db_with_endpoints(&db_path);
+
+        // No notify_endpoints row for "ghost": nothing to ping, nothing to fail.
+        wake(&db, "ghost", &[]);
+
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM notify_endpoints", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
     /// `snapshot_wake_ports` is the API used by finalize_instance_inner to
     /// capture ports BEFORE row deletion. It must return wake ports and skip inject.
     #[test]

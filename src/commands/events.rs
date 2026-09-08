@@ -1075,10 +1075,11 @@ fn events_wait(
     let has_explicit_cursor = after_id.is_some();
     let mut last_id = after_id.unwrap_or_else(|| db.get_last_event_id());
 
-    // Setup TCP notify server for instant wake — only useful when we can
-    // register an `events_wait` wake endpoint for `crate::notify::wake_all`
-    // to poke. Anonymous waits (no instance_name) skip the listener and
-    // fall through to a short poll.
+    // Setup TCP notify server for instant wake. Targeted sends wake this
+    // endpoint when `instance_name` is a resolved recipient; broadcasts wake
+    // every endpoint. A wait observing messages not addressed to this instance,
+    // and anonymous waits without an instance name, fall through to the bounded
+    // re-query cadence below.
     let mut notify_server: Option<TcpListener> = None;
     let mut notify_port: Option<u16> = None;
     if let Some(name) = instance_name
