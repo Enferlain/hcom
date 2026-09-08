@@ -322,6 +322,10 @@ const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[
         "hcom claude --model sonnet|opus|haiku",
         "Use a specific model",
     ),
+    (
+        "hcom claude --permission-mode manual",
+        "Override the default auto permission mode",
+    ),
 ];
 const CLAUDE_HELP_EXTRA_ENV: &[HelpEntry] = &[(
     "HCOM_SUBAGENT_TIMEOUT",

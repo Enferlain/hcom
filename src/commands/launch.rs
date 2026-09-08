@@ -510,6 +510,17 @@ fn append_config_args(config_args: &str, cli_args: &[String]) -> Vec<String> {
     tokens
 }
 
+fn claude_args_with_auto_default(config_args: &str, cli_args: &[String]) -> Vec<String> {
+    let mut args = append_config_args(config_args, cli_args);
+    let has_explicit_permission_mode = args
+        .iter()
+        .any(|arg| arg == "--permission-mode" || arg.starts_with("--permission-mode="));
+    if !has_explicit_permission_mode {
+        args.splice(0..0, ["--permission-mode".to_string(), "auto".to_string()]);
+    }
+    args
+}
+
 pub(crate) fn merge_tool_args(
     tool: &LaunchTool,
     cli_args: &[String],
@@ -517,7 +528,7 @@ pub(crate) fn merge_tool_args(
 ) -> Vec<String> {
     match tool {
         LaunchTool::Claude | LaunchTool::ClaudePty => {
-            append_config_args(&config.claude_args, cli_args)
+            claude_args_with_auto_default(&config.claude_args, cli_args)
         }
         LaunchTool::Gemini => append_config_args(&config.gemini_args, cli_args),
         LaunchTool::Codex => append_config_args(&config.codex_args, cli_args),
@@ -960,16 +971,59 @@ mod tests {
             config.set_field(field, "--future-config value").unwrap();
             let cli = s(&["--future-upstream-flag", "raw-value"]);
             let merged = merge_tool_args(&lt(tool), &cli, &config);
-            assert_eq!(
-                merged,
+            let expected = if tool == "claude" {
+                s(&[
+                    "--permission-mode",
+                    "auto",
+                    "--future-config",
+                    "value",
+                    "--future-upstream-flag",
+                    "raw-value",
+                ])
+            } else {
                 s(&[
                     "--future-config",
                     "value",
                     "--future-upstream-flag",
-                    "raw-value"
+                    "raw-value",
                 ])
+            };
+            assert_eq!(merged, expected);
+        }
+    }
+
+    #[test]
+    fn test_claude_defaults_to_auto_permission_mode() {
+        let config = HcomConfig::default();
+        for tool in ["claude", "claude-pty"] {
+            assert_eq!(
+                merge_tool_args(&lt(tool), &[], &config),
+                s(&["--permission-mode", "auto"]),
+                "{tool} should default to unattended auto mode"
             );
         }
+    }
+
+    #[test]
+    fn test_claude_explicit_permission_mode_replaces_auto_default() {
+        let mut config = HcomConfig::default();
+        config
+            .set_field("claude_args", "--permission-mode manual")
+            .unwrap();
+        assert_eq!(
+            merge_tool_args(&lt("claude"), &[], &config),
+            s(&["--permission-mode", "manual"])
+        );
+
+        let config = HcomConfig::default();
+        assert_eq!(
+            merge_tool_args(
+                &lt("claude"),
+                &s(&["--permission-mode=acceptEdits"]),
+                &config,
+            ),
+            s(&["--permission-mode=acceptEdits"])
+        );
     }
 
     #[test]
@@ -1108,7 +1162,7 @@ mod tests {
         let config = HcomConfig::default();
         let (args, _background) =
             prepare_launch_execution(&lt("claude"), &s(&["task text"]), &config, true);
-        assert_eq!(args, s(&["task text"]));
+        assert_eq!(args, s(&["--permission-mode", "auto", "task text"]));
     }
 
     #[test]
@@ -1125,7 +1179,7 @@ mod tests {
         let config = HcomConfig::default();
         let (args, background) = prepare_launch_execution(&lt("claude"), &s(&[]), &config, false);
         assert!(!background);
-        assert!(args.is_empty());
+        assert_eq!(args, s(&["--permission-mode", "auto"]));
     }
 
     #[test]

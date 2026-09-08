@@ -33,6 +33,9 @@ Rules:
 
 ### Fixed
 
+- Raw interactive and headless `hcom claude` launches now default to Claude
+  Code's `auto` permission mode, while explicit CLI or `claude_args`
+  permission modes continue to override that default.
 - Antigravity sandbox-bypass approval prompts (`Requesting permission for:`
   paired with `Allow sandbox bypass for command execution?` and its affirmative
   numbered menu) are now recognized as `blocked/pty:approval` blockers,

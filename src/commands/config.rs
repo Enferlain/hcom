@@ -1417,6 +1417,7 @@ HCOM_CLAUDE_ARGS - Default args passed to claude on launch
 Example: hcom config claude_args \"--model opus\"
 Clear:   hcom config claude_args \"\"
 
+Claude launches use --permission-mode auto when no permission mode is supplied.
 Merged with launch-time cli args (launch args win on conflict).",
         ),
 
