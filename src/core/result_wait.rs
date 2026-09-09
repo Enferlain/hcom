@@ -72,6 +72,8 @@ fn correlation_fields(wait: &OutcomeWait<'_>) -> Value {
     })
 }
 
+/// Merge the canonical correlation tuple into a structured payload for wait
+/// terminal outcomes.
 fn merge_correlation(payload: &mut Value, wait: &OutcomeWait<'_>) {
     if let (Some(target), Some(fields)) = (
         payload.as_object_mut(),

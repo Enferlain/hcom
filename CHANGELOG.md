@@ -13,6 +13,15 @@ Rules:
 
 ## [2026-09-09]
 
+### Added
+
+- Added the versioned internal record contract for compact worker observation
+  streams, including exact worker generation, durable event cursors, source
+  event timestamps, safe activity categories, and serialization coverage that
+  prevents raw command details, environment values, transcript text, and message
+  bodies from entering stream records. Runtime event streaming is not
+  implemented yet.
+
 ### Fixed
 
 - Native subagent connections now produce an atomic, exactly-once structured
