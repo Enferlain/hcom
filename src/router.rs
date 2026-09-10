@@ -895,7 +895,15 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     // This appends unread hcom messages to the command's stdout — keep in mind
     // when changing output contracts or adding machine-readable modes.
     if let Some(output) = crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json) {
-        print!("{output}");
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        if let Err(error) = stdout
+            .write_all(output.as_bytes())
+            .and_then(|_| stdout.flush())
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            eprintln!("Error: Failed writing pending messages to stdout: {error}");
+        }
     }
 
     result

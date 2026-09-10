@@ -6,6 +6,7 @@
 //! - Subscribe: `hcom events sub [list | SQL | filters...] [--once] [--for name]`
 //! - Unsubscribe: `hcom events unsub <id>`
 //! - Launch status: `hcom events launch [batch_id] [--timeout N]`
+//! - Stream: `hcom events stream [--after-id N] [--full] [--timeout SEC] [filters...]`
 //!
 //! Correlated result waits (`--wait --result-from NAME --thread ID --after-id
 //! N`) exit `0` on the authoritative result, `1` on deadline, `2` on SQL
@@ -16,8 +17,11 @@
 //! recovery guidance.
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::Write;
 use std::net::TcpListener;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -98,6 +102,8 @@ pub enum EventsSubcmd {
     Unsub(EventsUnsubArgs),
     /// Wait for launch to complete
     Launch(EventsLaunchArgs),
+    /// Continuously stream matching events
+    Stream(EventsStreamArgs),
 }
 
 /// Args for `hcom events sub`.
@@ -146,6 +152,29 @@ pub struct EventsLaunchArgs {
     /// Timeout in seconds (default: 30)
     #[arg(long, default_value = "30")]
     pub timeout: u64,
+}
+
+/// Args for `hcom events stream`.
+///
+/// Generic stream mode: emit every event matching the existing composable
+/// filters in ascending durable-ID order and stay active until the optional
+/// overall timeout. This is not a compact worker view and not a conversation
+/// surface; it reads stored events and writes records to stdout only.
+#[derive(clap::Args, Debug)]
+pub struct EventsStreamArgs {
+    /// Only emit events with an ID greater than this cursor
+    /// (default: the current durable cursor when the stream starts)
+    #[arg(long)]
+    pub after_id: Option<i64>,
+    /// Full output (not streamlined)
+    #[arg(long)]
+    pub full: bool,
+    /// Overall lifetime in seconds; the stream exits 0 when it expires
+    #[arg(long)]
+    pub timeout: Option<u64>,
+    /// Composable event filters
+    #[command(flatten)]
+    pub filters: EventFilterArgs,
 }
 
 /// Apply the fail-closed result-correlation contract.
@@ -1048,6 +1077,299 @@ fn cmd_events_launch(db: &HcomDb, args: &EventsLaunchArgs, instance_name: Option
     }
 }
 
+// ── Event Listener ───────────────────────────────────────────────────────
+
+pub(crate) const EVENTS_WAIT_ENDPOINT_KIND: &str = crate::notify::WakeKind::EventsWait.as_str();
+pub(crate) const EVENTS_STREAM_ENDPOINT_KIND: &str = crate::notify::WakeKind::EventsStream.as_str();
+
+const LISTENER_NOTIFY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const LISTENER_FALLBACK_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
+const STREAM_RECHECK_INTERVAL: Duration = Duration::from_millis(500);
+const LISTENER_TCP_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Options for configuring an [`EventListener`].
+pub(crate) struct EventListenerOptions<'a> {
+    pub after_id: Option<i64>,
+    pub instance_name: Option<&'a str>,
+    pub endpoint_kind: &'a str,
+}
+
+/// Internal cursor-ordered event listener with optional TCP wake notification,
+/// bounded database rechecks, and automatic cleanup.
+///
+/// Used by one-shot `events_wait` and continuous `events stream`.
+/// The database stores one endpoint per `(instance, endpoint_kind)`, so the
+/// newest same-kind listener owns targeted wakes. Port-guarded cleanup prevents
+/// an older listener from deleting that replacement endpoint.
+pub(crate) struct EventListener<'a> {
+    db: &'a HcomDb,
+    cursor: i64,
+    has_explicit_cursor: bool,
+    instance_name: Option<String>,
+    endpoint_kind: String,
+    notify_server: Option<TcpListener>,
+    notify_port: Option<u16>,
+}
+
+impl<'a> EventListener<'a> {
+    /// Create and arm an event listener.
+    ///
+    /// Captures the starting cursor boundary before registering any notification
+    /// plumbing so events arriving during setup are still observed.
+    pub(crate) fn new(db: &'a HcomDb, options: EventListenerOptions<'a>) -> Self {
+        let has_explicit_cursor = options.after_id.is_some();
+        let cursor = options.after_id.unwrap_or_else(|| db.get_last_event_id());
+
+        let mut notify_server: Option<TcpListener> = None;
+        let mut notify_port: Option<u16> = None;
+        if let Some(name) = options.instance_name
+            && let Ok(server) = TcpListener::bind("127.0.0.1:0")
+            && let Ok(addr) = server.local_addr()
+        {
+            let port = addr.port();
+            server.set_nonblocking(true).ok();
+            if db
+                .upsert_notify_endpoint(name, options.endpoint_kind, port)
+                .is_ok()
+            {
+                notify_server = Some(server);
+                notify_port = Some(port);
+            }
+        }
+
+        Self {
+            db,
+            cursor,
+            has_explicit_cursor,
+            instance_name: options.instance_name.map(str::to_string),
+            endpoint_kind: options.endpoint_kind.to_string(),
+            notify_server,
+            notify_port,
+        }
+    }
+
+    /// Current durable event cursor boundary.
+    pub(crate) fn cursor(&self) -> i64 {
+        self.cursor
+    }
+
+    /// Whether this listener was initialized with an explicit `--after-id`.
+    pub(crate) fn has_explicit_cursor(&self) -> bool {
+        self.has_explicit_cursor
+    }
+
+    /// Bound TCP notify port, if successfully registered.
+    #[allow(dead_code)]
+    pub(crate) fn endpoint_port(&self) -> Option<u16> {
+        self.notify_port
+    }
+
+    /// Configured endpoint kind in `notify_endpoints`.
+    #[allow(dead_code)]
+    pub(crate) fn endpoint_kind(&self) -> &str {
+        &self.endpoint_kind
+    }
+
+    /// Instance name associated with this listener, if any.
+    #[allow(dead_code)]
+    pub(crate) fn instance_name(&self) -> Option<&str> {
+        self.instance_name.as_deref()
+    }
+
+    /// Whether this listener has an active TCP notification server.
+    pub(crate) fn is_listening(&self) -> bool {
+        self.notify_server.is_some()
+    }
+
+    /// Query new events arriving after `self.cursor` matching `filter_query`,
+    /// ordered by `id ASC`.
+    ///
+    /// `self.cursor` advances past every examined row regardless of parse success.
+    /// If `limit` is specified, stops scanning once `limit` parsed events have been collected.
+    pub(crate) fn query_next_events(
+        &mut self,
+        filter_query: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<Value>, rusqlite::Error> {
+        let query = format!("SELECT * FROM events_v WHERE id > ?{filter_query} ORDER BY id");
+        let mut stmt = self.db.conn().prepare(&query)?;
+        let mut events = Vec::new();
+        // Preserve `events --wait` compatibility: historically only statement
+        // preparation errors produced SQL exit 2. Transient bind/step failures
+        // ended this scan and were retried by the outer bounded loop.
+        let Ok(mut rows) = stmt.query(rusqlite::params![self.cursor]) else {
+            return Ok(events);
+        };
+        loop {
+            let row = match rows.next() {
+                Ok(Some(row)) => row,
+                Ok(None) | Err(_) => break,
+            };
+            if let Ok(id) = row.get::<_, i64>("id") {
+                self.cursor = id;
+            }
+            if let Ok(event) = parse_event_row(row) {
+                events.push(event);
+                if let Some(max) = limit
+                    && events.len() >= max
+                {
+                    break;
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    /// Query the single next matching event arriving after `self.cursor`.
+    /// Advances `self.cursor` up to that event (or the last unparseable row scanned).
+    pub(crate) fn query_next_event(
+        &mut self,
+        filter_query: &str,
+    ) -> Result<Option<Value>, rusqlite::Error> {
+        let mut events = self.query_next_events(filter_query, Some(1))?;
+        Ok(events.pop())
+    }
+
+    /// Query all currently available matching events arriving after `self.cursor`.
+    #[allow(dead_code)]
+    pub(crate) fn query_events(
+        &mut self,
+        filter_query: &str,
+    ) -> Result<Vec<Value>, rusqlite::Error> {
+        self.query_next_events(filter_query, None)
+    }
+
+    /// Query every currently available matching event after `self.cursor`,
+    /// then advance the cursor past the entire scanned range — including rows
+    /// the SQL filter excluded — so a long-lived stream never rescans a
+    /// growing tail of non-matching events.
+    ///
+    /// The boundary jump is safe because event rows are immutable,
+    /// `events.id` is AUTOINCREMENT (future rows always receive higher IDs),
+    /// and the scan is capped at the durable max ID snapshotted before the
+    /// query runs: a row excluded from `(cursor, boundary]` can never match
+    /// later. If row iteration fails midway, the cursor only advances to the
+    /// last row actually examined, preserving the step-wise guarantee of
+    /// [`EventListener::query_next_events`].
+    pub(crate) fn drain_new_events(
+        &mut self,
+        filter_query: &str,
+    ) -> Result<Vec<Value>, rusqlite::Error> {
+        let boundary = self.db.get_last_event_id();
+        if boundary <= self.cursor {
+            return Ok(Vec::new());
+        }
+        let query =
+            format!("SELECT * FROM events_v WHERE id > ? AND id <= ?{filter_query} ORDER BY id");
+        let mut stmt = self.db.conn().prepare(&query)?;
+        let mut events = Vec::new();
+        // Preserve `events --wait` compatibility: only statement preparation
+        // errors surface; transient bind/step failures end this scan and are
+        // retried by the outer bounded loop.
+        let Ok(mut rows) = stmt.query(rusqlite::params![self.cursor, boundary]) else {
+            return Ok(events);
+        };
+        let mut examined = self.cursor;
+        let mut scan_complete = false;
+        loop {
+            let row = match rows.next() {
+                Ok(Some(row)) => row,
+                Ok(None) => {
+                    scan_complete = true;
+                    break;
+                }
+                Err(_) => break,
+            };
+            if let Ok(id) = row.get::<_, i64>("id") {
+                examined = id;
+            }
+            if let Ok(event) = parse_event_row(row) {
+                events.push(event);
+            }
+        }
+        self.cursor = if scan_complete { boundary } else { examined };
+        Ok(events)
+    }
+
+    /// Calculate the bounded recheck duration based on listener state and an optional ceiling.
+    pub(crate) fn bounded_recheck_duration(&self, ceiling: Option<Duration>) -> Duration {
+        let base = if self.endpoint_kind == EVENTS_STREAM_ENDPOINT_KIND {
+            STREAM_RECHECK_INTERVAL
+        } else if self.is_listening() {
+            LISTENER_NOTIFY_POLL_INTERVAL
+        } else {
+            LISTENER_FALLBACK_RECHECK_INTERVAL
+        };
+        match ceiling {
+            Some(limit) => base.min(limit),
+            None => base,
+        }
+    }
+
+    /// Wait for a TCP notification or until `max_wait` elapses.
+    ///
+    /// When a notification server is present, polls for incoming connections in short
+    /// intervals, waking early on arrival. When absent, sleeps for `max_wait`.
+    /// Returns `true` if a notification connection was received, or `false` on timeout.
+    pub(crate) fn wait_tick(&self, max_wait: Duration) -> bool {
+        static DUMMY_INTERRUPT: AtomicBool = AtomicBool::new(false);
+        self.wait_tick_interruptible(max_wait, &DUMMY_INTERRUPT)
+    }
+
+    /// Wait for a TCP notification or until `max_wait` elapses or `interrupted` is flagged.
+    ///
+    /// Periodically checks `interrupted` so loops can break cleanly upon cancellation.
+    pub(crate) fn wait_tick_interruptible(
+        &self,
+        max_wait: Duration,
+        interrupted: &AtomicBool,
+    ) -> bool {
+        let poll_end = Instant::now() + max_wait;
+        let slice = Duration::from_millis(50);
+        if let Some(ref server) = self.notify_server {
+            while Instant::now() < poll_end {
+                if interrupted.load(Ordering::Relaxed) {
+                    return false;
+                }
+                if let Ok((conn, _)) = server.accept() {
+                    let _ = conn.shutdown(std::net::Shutdown::Both);
+                    return true;
+                }
+                let remaining = poll_end.saturating_duration_since(Instant::now());
+                std::thread::sleep(LISTENER_TCP_POLL_INTERVAL.min(remaining).min(slice));
+            }
+            false
+        } else {
+            while Instant::now() < poll_end {
+                if interrupted.load(Ordering::Relaxed) {
+                    return false;
+                }
+                let remaining = poll_end.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(slice));
+            }
+            false
+        }
+    }
+
+    /// Remove this listener's registered notify endpoint from the database.
+    ///
+    /// Idempotent; only removes the specific `(instance, kind)` endpoint owned by this listener.
+    pub(crate) fn cleanup(&mut self) {
+        if let (Some(name), Some(port)) = (&self.instance_name, self.notify_port.take()) {
+            let _ = self
+                .db
+                .delete_notify_endpoint_if_port(name, &self.endpoint_kind, port);
+        }
+        self.notify_server = None;
+    }
+}
+
+impl Drop for EventListener<'_> {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 // ── Wait Mode ────────────────────────────────────────────────────────────
 
 /// Wait mode: block until matching event or timeout.
@@ -1065,8 +1387,6 @@ fn events_wait(
     wait_timeout: u64,
     options: EventsWaitOptions<'_>,
 ) -> i32 {
-    use std::time::Instant;
-
     let EventsWaitOptions {
         after_id,
         full_output,
@@ -1075,35 +1395,18 @@ fn events_wait(
         result_correlation,
     } = options;
 
-    // Capture the boundary before setting up notification plumbing so events
-    // arriving during setup are still observed. An explicit cursor also lets a
-    // caller safely arm a wait before launching work and consume an event that
-    // arrived just before this process started.
-    let has_explicit_cursor = after_id.is_some();
-    let mut last_id = after_id.unwrap_or_else(|| db.get_last_event_id());
-
-    // Setup TCP notify server for instant wake. Targeted sends wake this
-    // endpoint when `instance_name` is a resolved recipient; broadcasts wake
-    // every endpoint. A wait observing messages not addressed to this instance,
-    // and anonymous waits without an instance name, fall through to the bounded
-    // re-query cadence below.
-    let mut notify_server: Option<TcpListener> = None;
-    let mut notify_port: Option<u16> = None;
-    if let Some(name) = instance_name
-        && let Ok(server) = TcpListener::bind("127.0.0.1:0")
-        && let Ok(addr) = server.local_addr()
-    {
-        let port = addr.port();
-        server.set_nonblocking(true).ok();
-        if db.upsert_notify_endpoint(name, "events_wait", port).is_ok() {
-            notify_server = Some(server);
-            notify_port = Some(port);
-        }
-    }
+    let mut listener = EventListener::new(
+        db,
+        EventListenerOptions {
+            after_id,
+            instance_name,
+            endpoint_kind: EVENTS_WAIT_ENDPOINT_KIND,
+        },
+    );
 
     let start = Instant::now();
     let mut recovery_observed_event_id =
-        result_correlation.map_or(last_id, |correlation| correlation.after_id);
+        result_correlation.map_or(listener.cursor(), |correlation| correlation.after_id);
     let mut recovery_error_since: Option<Instant> = None;
     let mut next_recovery_retry = start;
     let mut recovery_event_pending = false;
@@ -1121,39 +1424,23 @@ fn events_wait(
             attempt_after_id: correlation.after_id,
         });
 
-    let result = loop {
+    loop {
         // Query for new matching events
-        let query = format!("SELECT * FROM events_v WHERE id > ?{filter_query} ORDER BY id");
-        let mut found = false;
-        match db.conn().prepare(&query) {
-            Ok(mut stmt) => {
-                if let Ok(mut rows) = stmt.query(rusqlite::params![last_id]) {
-                    while let Ok(Some(row)) = rows.next() {
-                        // Always advance last_id regardless of parse success
-                        if let Ok(id) = row.get::<_, i64>("id") {
-                            last_id = id;
-                        }
-                        if let Ok(event) = parse_event_row(row) {
-                            let output = if full_output {
-                                event.clone()
-                            } else {
-                                streamline_event(&event, filters)
-                            };
-                            println!("{}", serde_json::to_string(&output).unwrap_or_default());
-                            found = true;
-                            break;
-                        }
-                    }
-                }
+        match listener.query_next_event(filter_query) {
+            Ok(Some(event)) => {
+                let output = if full_output {
+                    event
+                } else {
+                    streamline_event(&event, filters)
+                };
+                println!("{}", serde_json::to_string(&output).unwrap_or_default());
+                break 0;
             }
+            Ok(None) => {}
             Err(e) => {
                 eprintln!("{}", sql_where_error(e));
                 break 2;
             }
-        }
-
-        if found {
-            break 0;
         }
 
         // Terminal non-result outcomes (actionable blocker, launch failure).
@@ -1234,7 +1521,7 @@ fn events_wait(
         // complete on their declared event boundary: otherwise unrelated or
         // already-consumed messages can produce a false successful match.
         if filter_query.is_empty()
-            && !has_explicit_cursor
+            && !listener.has_explicit_cursor()
             && let Some(name) = instance_name
         {
             let messages = db.get_unread_messages(name);
@@ -1247,8 +1534,8 @@ fn events_wait(
         }
 
         // Wait for TCP notification or timeout
-        let remaining = wait_timeout.saturating_sub(start.elapsed().as_secs());
-        if remaining == 0 {
+        let remaining_secs = wait_timeout.saturating_sub(start.elapsed().as_secs());
+        if remaining_secs == 0 {
             println!(
                 "{}",
                 serde_json::to_string(&crate::core::result_wait::deadline_payload(
@@ -1259,43 +1546,179 @@ fn events_wait(
             break 1;
         }
 
-        if let Some(ref server) = notify_server {
-            // Use poll-based wait (500ms intervals since TcpListener is non-blocking)
-            let wait_time = std::cmp::min(remaining, 5);
-            let now = Instant::now();
-            let mut wait_duration = Duration::from_secs(wait_time);
-            if recovery_error_since.is_some() {
-                wait_duration =
-                    wait_duration.min(next_recovery_retry.saturating_duration_since(now));
-            }
-            let poll_end = now + wait_duration;
-            while Instant::now() < poll_end {
-                // Try accept (non-blocking)
-                if let Ok((conn, _)) = server.accept() {
-                    let _ = conn.shutdown(std::net::Shutdown::Both);
-                    break; // Got notification, re-check events
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        } else {
-            // No registered listener (anonymous wait or bind failed) — nothing
-            // can TCP-wake us, so re-check the events query on a short tick.
-            let now = Instant::now();
-            let mut wait_duration = Duration::from_millis(500);
-            if recovery_error_since.is_some() {
-                wait_duration =
-                    wait_duration.min(next_recovery_retry.saturating_duration_since(now));
-            }
-            std::thread::sleep(wait_duration);
+        let now = Instant::now();
+        let mut wait_duration =
+            listener.bounded_recheck_duration(Some(Duration::from_secs(remaining_secs)));
+        if recovery_error_since.is_some() {
+            wait_duration = wait_duration.min(next_recovery_retry.saturating_duration_since(now));
         }
+        listener.wait_tick(wait_duration);
+    }
+}
+
+// ── Stream Mode ──────────────────────────────────────────────────────────
+
+/// Stream mode: emit every matching event, stay active.
+struct EventsStreamOptions<'a> {
+    after_id: Option<i64>,
+    full_output: bool,
+    filters: &'a HashMap<String, Vec<String>>,
+    instance_name: Option<&'a str>,
+}
+
+/// Write a record line to a writer and flush it immediately.
+fn write_and_flush_record_to<W: Write>(writer: &mut W, line: &str) -> std::io::Result<()> {
+    writeln!(writer, "{line}")?;
+    writer.flush()
+}
+
+/// Write a record line to stdout and flush it immediately.
+fn write_and_flush_record(line: &str) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    write_and_flush_record_to(&mut stdout, line)
+}
+
+/// Continuous stream: emit every matching event in ascending durable-ID order
+/// and remain active until interrupted, broken pipe, or the overall timeout expires (exit `0`).
+///
+/// Unlike [`events_wait`], no unread-inbox fallback applies and nothing is
+/// synthesized on deadline: a stream that ends at its timeout has already
+/// emitted every match that became durable, which is a normal completion.
+/// Progress is guaranteed by bounded 500ms SQLite rechecks plus targeted TCP
+/// wakes from wake-all senders; a missed wake never loses data, it only delays
+/// the next recheck. Records are emitted through the existing streamlined/full
+/// projections and explicitly flushed after each emitted record.
+/// BrokenPipe on stdout is treated as a clean successful termination (exit `0`).
+/// User interruption (Unix SIGINT/SIGTERM, Windows Ctrl-C/break/close) is
+/// handled cleanly via [`crate::sys::signal`] helpers (exit `0`).
+/// Every termination path removes only this listener's `events_stream` endpoint
+/// and never mutates the observed worker's status, state, or generation.
+fn events_stream(
+    db: &HcomDb,
+    filter_query: &str,
+    stream_timeout: Option<u64>,
+    options: EventsStreamOptions<'_>,
+) -> i32 {
+    let EventsStreamOptions {
+        after_id,
+        full_output,
+        filters,
+        instance_name,
+    } = options;
+
+    let interrupted = Arc::new(AtomicBool::new(false));
+    crate::sys::signal::register_int(&interrupted);
+    crate::sys::signal::register_term(&interrupted);
+
+    let mut listener = EventListener::new(
+        db,
+        EventListenerOptions {
+            after_id,
+            instance_name,
+            endpoint_kind: EVENTS_STREAM_ENDPOINT_KIND,
+        },
+    );
+
+    let deadline = match stream_timeout {
+        Some(seconds) => match Instant::now().checked_add(Duration::from_secs(seconds)) {
+            Some(deadline) => Some(deadline),
+            None => {
+                eprintln!("Error: --timeout exceeds the supported duration");
+                return 1;
+            }
+        },
+        None => None,
     };
 
-    // Cleanup TCP notify endpoint
-    if let (Some(name), Some(_port)) = (instance_name, notify_port) {
-        let _ = db.delete_notify_endpoint(name, "events_wait");
+    loop {
+        if interrupted.load(Ordering::Relaxed) {
+            return 0;
+        }
+
+        // Query for new matching events and emit the whole ordered batch.
+        match listener.drain_new_events(filter_query) {
+            Ok(events) => {
+                for event in events {
+                    if interrupted.load(Ordering::Relaxed) {
+                        return 0;
+                    }
+                    let output = if full_output {
+                        event
+                    } else {
+                        streamline_event(&event, filters)
+                    };
+                    let line = serde_json::to_string(&output).unwrap_or_default();
+                    if let Err(err) = write_and_flush_record(&line) {
+                        if err.kind() == std::io::ErrorKind::BrokenPipe {
+                            return 0;
+                        }
+                        eprintln!("Error: Failed writing to stdout: {err}");
+                        return 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{}", sql_where_error(e));
+                return 2;
+            }
+        }
+
+        if interrupted.load(Ordering::Relaxed) {
+            return 0;
+        }
+
+        // Remain active until the optional overall deadline.
+        let Some(deadline) = deadline else {
+            listener.wait_tick_interruptible(listener.bounded_recheck_duration(None), &interrupted);
+            continue;
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            return 0;
+        }
+        listener.wait_tick_interruptible(
+            listener.bounded_recheck_duration(Some(deadline.saturating_duration_since(now))),
+            &interrupted,
+        );
+    }
+}
+
+/// Handle `hcom events stream`.
+///
+/// Exit codes: `0` when the stream completes cleanly (timeout, broken pipe, or
+/// signal interruption), `1` on filter errors, query-mode flag conflicts, or
+/// stdout write errors, `2` on SQL errors.
+fn cmd_events_stream(db: &HcomDb, args: &EventsStreamArgs, instance_name: Option<&str>) -> i32 {
+    // Convert clap filter args to FilterMap
+    let mut filters = args.filters.to_filter_map();
+    resolve_filter_names(&mut filters, db);
+
+    // Build filter SQL (validation happens inside build_sql_from_flags)
+    let mut filter_query = String::new();
+    if !filters.is_empty() {
+        match build_sql_from_flags(&filters) {
+            Ok(flag_sql) if !flag_sql.is_empty() => {
+                filter_query.push_str(&format!(" AND ({flag_sql})"));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Error: Filter error: {e}");
+                return 1;
+            }
+        }
     }
 
-    result
+    events_stream(
+        db,
+        &filter_query,
+        args.timeout,
+        EventsStreamOptions {
+            after_id: args.after_id,
+            full_output: args.full,
+            filters: &filters,
+            instance_name,
+        },
+    )
 }
 
 /// Parse a row from events_v into a JSON value.
@@ -1399,6 +1822,27 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
             }
             EventsSubcmd::Unsub(unsub_args) => {
                 return cmd_events_unsub(db, unsub_args);
+            }
+            EventsSubcmd::Stream(stream_args) => {
+                // `events stream` owns its own flag set. A query-mode flag
+                // typed before the subcommand would otherwise parse and then
+                // be silently ignored, so reject the combination instead of
+                // guessing which surface the caller meant.
+                if args.wait.is_some()
+                    || args.after_id.is_some()
+                    || args.full
+                    || args.all
+                    || args.last.is_some()
+                    || args.sql.is_some()
+                    || args.device.is_some()
+                    || args.filters.has_filters()
+                {
+                    eprintln!(
+                        "Error: query-mode flags and filters before `stream` are not supported; pass stream flags and filters after `events stream`"
+                    );
+                    return 1;
+                }
+                return cmd_events_stream(db, stream_args, instance_name.as_deref());
             }
         }
     }
@@ -1771,6 +2215,38 @@ mod tests {
         let data = result.get("data").unwrap();
 
         assert!(data.get("mentions").is_some());
+    }
+
+    #[test]
+    fn streamline_preserves_sender_instance_key_for_correlated_waits() {
+        // Compatibility pin before listener extraction: a correlated result
+        // wait always filters on sender_instance_key, so its streamlined
+        // output must keep the generation key scripts use to verify which
+        // worker generation produced the result.
+        let event = json!({
+            "id": 7,
+            "ts": "2025-02-23T15:30:45.123456",
+            "type": "message",
+            "instance": "claude-worker",
+            "data": {
+                "from": "claude-worker",
+                "intent": "inform",
+                "text": "correlated result",
+                "sender_instance_key": "claude-worker@1000.000000",
+            }
+        });
+
+        let mut filters = HashMap::new();
+        filters.insert(
+            "sender_instance_key".to_string(),
+            vec!["claude-worker@1000.000000".to_string()],
+        );
+        let result = streamline_event(&event, &filters);
+
+        assert_eq!(
+            result["data"]["sender_instance_key"].as_str(),
+            Some("claude-worker@1000.000000")
+        );
     }
 
     #[test]
@@ -3689,6 +4165,90 @@ mod tests {
     }
 
     #[test]
+    fn default_cursor_wait_consumes_only_events_arriving_after_start() {
+        // Compatibility pin before listener extraction: a wait armed without
+        // --after-id captures the current durable cursor as its boundary. A
+        // non-matching event landing mid-wait must not satisfy it, while a
+        // matching event landing mid-wait must.
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("default-cursor.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+
+        let filters = HashMap::from([("type".to_string(), vec!["status".to_string()])]);
+        let filter_sql = build_sql_from_flags(&filters).unwrap();
+        let filter_query = format!(" AND ({filter_sql})");
+
+        let chatter_path = db_path.clone();
+        let chatter_started = Instant::now();
+        let chatter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut writer_db = HcomDb::open_raw(&chatter_path).unwrap();
+            writer_db.ensure_schema().unwrap();
+            writer_db
+                .log_event(
+                    "message",
+                    "nova",
+                    &json!({"from": "nova", "scope": "broadcast", "text": "chatter"}),
+                )
+                .unwrap();
+            chatter_started.elapsed()
+        });
+        let non_match_result = events_wait(
+            &db,
+            &filter_query,
+            1,
+            EventsWaitOptions {
+                after_id: None,
+                full_output: false,
+                filters: &filters,
+                instance_name: None,
+                result_correlation: None,
+            },
+        );
+        let chatter_elapsed = chatter.join().unwrap();
+        assert!(
+            chatter_elapsed < Duration::from_secs(1),
+            "the non-matching event must actually arrive before the wait deadline"
+        );
+        assert_eq!(
+            non_match_result, 1,
+            "a mid-wait non-matching event must not satisfy the default-cursor wait"
+        );
+
+        let status_path = db_path.clone();
+        let status = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut writer_db = HcomDb::open_raw(&status_path).unwrap();
+            writer_db.ensure_schema().unwrap();
+            writer_db
+                .log_event(
+                    "status",
+                    "nova",
+                    &json!({"status": "active", "context": "test"}),
+                )
+                .unwrap();
+        });
+        assert_eq!(
+            events_wait(
+                &db,
+                &filter_query,
+                3,
+                EventsWaitOptions {
+                    after_id: None,
+                    full_output: false,
+                    filters: &filters,
+                    instance_name: None,
+                    result_correlation: None,
+                },
+            ),
+            0,
+            "a mid-wait matching event must complete the default-cursor wait"
+        );
+        status.join().unwrap();
+    }
+
+    #[test]
     fn test_events_args_no_wait() {
         use clap::Parser;
         let args = EventsArgs::try_parse_from(["events", "--full"]).unwrap();
@@ -3776,5 +4336,772 @@ mod tests {
             }
             _ => panic!("Expected Launch subcommand"),
         }
+    }
+
+    #[test]
+    fn test_listener_cursor_ordering_and_batching() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("listener-cursor.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        // Seed 3 initial events
+        let id1 = db
+            .log_event("status", "nova", &json!({"status": "init"}))
+            .unwrap();
+        let id2 = db
+            .log_event("status", "nova", &json!({"status": "working"}))
+            .unwrap();
+        let id3 = db
+            .log_event(
+                "message",
+                "nova",
+                &json!({"from": "nova", "scope": "broadcast", "text": "hello"}),
+            )
+            .unwrap();
+        assert_eq!(db.get_last_event_id(), id3);
+
+        // 1. Armed with default cursor (after_id: None) starts at db.get_last_event_id()
+        let mut default_listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: None,
+                instance_name: None,
+                endpoint_kind: EVENTS_WAIT_ENDPOINT_KIND,
+            },
+        );
+        assert_eq!(default_listener.cursor(), id3);
+        assert!(!default_listener.has_explicit_cursor());
+
+        // 2. Armed with explicit cursor (after_id: Some(id1)) starts at id1
+        let mut explicit_listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: Some(id1),
+                instance_name: None,
+                endpoint_kind: EVENTS_WAIT_ENDPOINT_KIND,
+            },
+        );
+        assert_eq!(explicit_listener.cursor(), id1);
+        assert!(explicit_listener.has_explicit_cursor());
+
+        // Querying explicit_listener step-by-step with filter
+        let filter = " AND (type = 'status')";
+        let next = explicit_listener.query_next_event(filter).unwrap();
+        assert!(next.is_some());
+        let ev = next.unwrap();
+        assert_eq!(ev["id"].as_i64(), Some(id2));
+        // id3 is a message, so filtering by status yields None in SQL; cursor remains at id2
+        let next_none = explicit_listener.query_next_event(filter).unwrap();
+        assert!(next_none.is_none());
+        assert_eq!(explicit_listener.cursor(), id2);
+
+        // Querying without filter encounters id3 (message) and advances cursor to id3
+        let next_msg = explicit_listener.query_next_event("").unwrap();
+        assert!(next_msg.is_some());
+        assert_eq!(next_msg.unwrap()["id"].as_i64(), Some(id3));
+        assert_eq!(explicit_listener.cursor(), id3);
+
+        // Seed new events
+        let id4 = db
+            .log_event("status", "nova", &json!({"status": "step 1"}))
+            .unwrap();
+        let id5 = db
+            .log_event("status", "nova", &json!({"status": "step 2"}))
+            .unwrap();
+        let id6 = db
+            .log_event(
+                "message",
+                "nova",
+                &json!({"from": "nova", "scope": "broadcast", "text": "done"}),
+            )
+            .unwrap();
+
+        // Default listener queries all events in batch
+        let all_new = default_listener.query_events("").unwrap();
+        assert_eq!(all_new.len(), 3);
+        let ids: Vec<i64> = all_new.iter().filter_map(|e| e["id"].as_i64()).collect();
+        assert_eq!(
+            ids,
+            vec![id4, id5, id6],
+            "events must be in strictly ascending ID order"
+        );
+        assert_eq!(default_listener.cursor(), id6);
+
+        // Subsequent query has no events and does not replay
+        let empty = default_listener.query_events("").unwrap();
+        assert!(
+            empty.is_empty(),
+            "querying again must not replay already-consumed events"
+        );
+        assert_eq!(default_listener.cursor(), id6);
+    }
+
+    #[test]
+    fn test_listener_cleanup_on_drop_and_explicit() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("listener-cleanup.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        // 1. Drop-based cleanup
+        {
+            let listener = EventListener::new(
+                &db,
+                EventListenerOptions {
+                    after_id: None,
+                    instance_name: Some("auto_drop_agent"),
+                    endpoint_kind: EVENTS_WAIT_ENDPOINT_KIND,
+                },
+            );
+            assert!(listener.is_listening());
+            assert!(db.has_notify_endpoint_kind("auto_drop_agent", EVENTS_WAIT_ENDPOINT_KIND));
+            let port = listener.endpoint_port().unwrap();
+            assert!(port > 0);
+        }
+        // Dropped -> endpoint deleted
+        assert!(
+            !db.has_notify_endpoint_kind("auto_drop_agent", EVENTS_WAIT_ENDPOINT_KIND),
+            "drop must remove registered notify endpoint"
+        );
+
+        // 2. Explicit cleanup and idempotency
+        let mut explicit_listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: None,
+                instance_name: Some("explicit_cleanup_agent"),
+                endpoint_kind: EVENTS_WAIT_ENDPOINT_KIND,
+            },
+        );
+        assert!(db.has_notify_endpoint_kind("explicit_cleanup_agent", EVENTS_WAIT_ENDPOINT_KIND));
+        explicit_listener.cleanup();
+        assert!(
+            !db.has_notify_endpoint_kind("explicit_cleanup_agent", EVENTS_WAIT_ENDPOINT_KIND),
+            "explicit cleanup must remove registered notify endpoint"
+        );
+        assert_eq!(explicit_listener.endpoint_port(), None);
+        // Idempotent: second cleanup call should not panic or fail
+        explicit_listener.cleanup();
+        drop(explicit_listener);
+
+        // 3. Anonymous listener has no endpoint registered
+        let mut anon_listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: None,
+                instance_name: None,
+                endpoint_kind: EVENTS_WAIT_ENDPOINT_KIND,
+            },
+        );
+        assert!(!anon_listener.is_listening());
+        assert_eq!(anon_listener.endpoint_port(), None);
+        anon_listener.cleanup();
+    }
+
+    #[test]
+    fn test_listener_cleanup_preserves_same_kind_replacement() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("listener-replacement.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        let old_listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: None,
+                instance_name: Some("shared_identity"),
+                endpoint_kind: EVENTS_STREAM_ENDPOINT_KIND,
+            },
+        );
+        let replacement = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: None,
+                instance_name: Some("shared_identity"),
+                endpoint_kind: EVENTS_STREAM_ENDPOINT_KIND,
+            },
+        );
+        let replacement_port = replacement.endpoint_port().unwrap();
+
+        drop(old_listener);
+
+        let stored_port: u16 = db
+            .conn()
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = 'shared_identity' AND kind = 'events_stream'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_port, replacement_port);
+
+        drop(replacement);
+        assert!(!db.has_notify_endpoint_kind("shared_identity", EVENTS_STREAM_ENDPOINT_KIND));
+    }
+
+    #[test]
+    fn test_registered_stream_keeps_prompt_fallback_rechecks() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stream-recheck.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        let listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: None,
+                instance_name: Some("stream_observer"),
+                endpoint_kind: EVENTS_STREAM_ENDPOINT_KIND,
+            },
+        );
+        assert!(listener.is_listening());
+        assert_eq!(
+            listener.bounded_recheck_duration(None),
+            STREAM_RECHECK_INTERVAL
+        );
+    }
+
+    #[test]
+    fn test_listener_simultaneous_endpoint_kinds_coexist() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("listener-coexist.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        let wait_listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: None,
+                instance_name: Some("shared_identity"),
+                endpoint_kind: EVENTS_WAIT_ENDPOINT_KIND,
+            },
+        );
+        let stream_listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: None,
+                instance_name: Some("shared_identity"),
+                endpoint_kind: EVENTS_STREAM_ENDPOINT_KIND,
+            },
+        );
+
+        assert!(wait_listener.is_listening());
+        assert!(stream_listener.is_listening());
+
+        let wait_port = wait_listener.endpoint_port().unwrap();
+        let stream_port = stream_listener.endpoint_port().unwrap();
+        assert_ne!(
+            wait_port, stream_port,
+            "each listener must bind a distinct port"
+        );
+
+        assert_eq!(wait_listener.endpoint_kind(), "events_wait");
+        assert_eq!(stream_listener.endpoint_kind(), "events_stream");
+
+        // Both endpoints must coexist simultaneously for the same instance
+        assert!(db.has_notify_endpoint_kind("shared_identity", EVENTS_WAIT_ENDPOINT_KIND));
+        assert!(db.has_notify_endpoint_kind("shared_identity", EVENTS_STREAM_ENDPOINT_KIND));
+
+        // Dropping the wait listener must remove ONLY its own endpoint kind
+        drop(wait_listener);
+        assert!(
+            !db.has_notify_endpoint_kind("shared_identity", EVENTS_WAIT_ENDPOINT_KIND),
+            "dropping wait listener must delete events_wait endpoint"
+        );
+        assert!(
+            db.has_notify_endpoint_kind("shared_identity", EVENTS_STREAM_ENDPOINT_KIND),
+            "events_stream endpoint must still be intact after wait listener dropped"
+        );
+
+        // Dropping the stream listener removes its endpoint
+        drop(stream_listener);
+        assert!(
+            !db.has_notify_endpoint_kind("shared_identity", EVENTS_STREAM_ENDPOINT_KIND),
+            "dropping stream listener must delete events_stream endpoint"
+        );
+    }
+
+    #[test]
+    fn test_listener_wait_tick_notification_and_timeout() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("listener-tick.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        let listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: None,
+                instance_name: Some("tick_agent"),
+                endpoint_kind: EVENTS_WAIT_ENDPOINT_KIND,
+            },
+        );
+        assert!(listener.is_listening());
+        let port = listener.endpoint_port().unwrap();
+
+        // 1. TCP notification triggers early wake
+        let waker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let addr = format!("127.0.0.1:{port}");
+            let _ = std::net::TcpStream::connect_timeout(
+                &addr.parse().unwrap(),
+                Duration::from_millis(200),
+            );
+        });
+
+        let start = Instant::now();
+        let woken = listener.wait_tick(Duration::from_secs(3));
+        assert!(
+            woken,
+            "wait_tick must return true when TCP wake is received"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(1500),
+            "wait_tick must return early on notification rather than waiting full max_wait"
+        );
+        waker.join().unwrap();
+
+        // 2. Timeout returns false when no notification arrives
+        let start = Instant::now();
+        let timed_out = listener.wait_tick(Duration::from_millis(60));
+        assert!(
+            !timed_out,
+            "wait_tick must return false when no wake arrives"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(60));
+    }
+
+    #[test]
+    fn test_events_stream_args() {
+        let args = EventsArgs::try_parse_from([
+            "events",
+            "stream",
+            "--after-id",
+            "42",
+            "--timeout",
+            "5",
+            "--full",
+            "--type",
+            "message",
+        ])
+        .unwrap();
+        match args.subcmd {
+            Some(EventsSubcmd::Stream(ref stream)) => {
+                assert_eq!(stream.after_id, Some(42));
+                assert_eq!(stream.timeout, Some(5));
+                assert!(stream.full);
+                assert_eq!(stream.filters.event_type, vec!["message"]);
+            }
+            _ => panic!("Expected Stream subcommand"),
+        }
+
+        let defaults = EventsArgs::try_parse_from(["events", "stream"]).unwrap();
+        match defaults.subcmd {
+            Some(EventsSubcmd::Stream(ref stream)) => {
+                assert_eq!(stream.after_id, None);
+                assert_eq!(stream.timeout, None);
+                assert!(!stream.full);
+                assert!(!stream.filters.has_filters());
+            }
+            _ => panic!("Expected Stream subcommand"),
+        }
+    }
+
+    #[test]
+    fn stream_rejects_query_mode_flags_before_subcommand() {
+        // Top-level --after-id still requires --wait, so it cannot arm a stream.
+        assert!(EventsArgs::try_parse_from(["events", "--after-id", "42", "stream"]).is_err());
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stream-conflict.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        for argv in [
+            vec!["events", "--wait", "1", "stream"],
+            vec!["events", "--wait", "1", "--after-id", "7", "stream"],
+            vec!["events", "--full", "stream"],
+            vec!["events", "--last", "5", "stream"],
+            vec!["events", "--all", "stream"],
+            vec!["events", "--sql", "1=1", "stream"],
+            vec!["events", "--device", "ABCD", "stream"],
+            vec!["events", "--type", "message", "stream"],
+        ] {
+            let args = EventsArgs::try_parse_from(argv.clone()).unwrap();
+            assert_eq!(
+                cmd_events(&db, &args, None),
+                1,
+                "query-mode flags before `stream` must be rejected: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_listener_drains_ordered_matches_and_advances_past_excluded_tail() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stream-drain.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        let m1 = db
+            .log_event("message", "nova", &json!({"from": "nova", "text": "one"}))
+            .unwrap();
+        let _noise1 = db
+            .log_event("status", "nova", &json!({"status": "working"}))
+            .unwrap();
+        let m2 = db
+            .log_event("message", "nova", &json!({"from": "nova", "text": "two"}))
+            .unwrap();
+        let noise2 = db
+            .log_event("status", "nova", &json!({"status": "done"}))
+            .unwrap();
+
+        let mut listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: Some(m1 - 1),
+                instance_name: None,
+                endpoint_kind: EVENTS_STREAM_ENDPOINT_KIND,
+            },
+        );
+
+        let filter = " AND (type = 'message')";
+        let batch = listener.drain_new_events(filter).unwrap();
+        let ids: Vec<i64> = batch.iter().filter_map(|e| e["id"].as_i64()).collect();
+        assert_eq!(
+            ids,
+            vec![m1, m2],
+            "matches must be drained in ascending durable-ID order"
+        );
+        assert!(
+            listener.cursor() >= noise2,
+            "the scan boundary must advance past SQL-excluded rows so the excluded tail is not rescanned"
+        );
+
+        // Already-scanned rows are never replayed.
+        assert!(
+            listener.drain_new_events(filter).unwrap().is_empty(),
+            "re-draining without new events must not replay consumed rows"
+        );
+
+        // The advanced boundary must not skip a later matching ID.
+        let m3 = db
+            .log_event("message", "nova", &json!({"from": "nova", "text": "three"}))
+            .unwrap();
+        let next = listener.drain_new_events(filter).unwrap();
+        assert_eq!(
+            next.first().and_then(|e| e["id"].as_i64()),
+            Some(m3),
+            "a matching event after the advanced boundary must still be drained"
+        );
+
+        // Resuming from the last emitted ID replays nothing before it.
+        let mut resumed = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: Some(m2),
+                instance_name: None,
+                endpoint_kind: EVENTS_STREAM_ENDPOINT_KIND,
+            },
+        );
+        assert_eq!(
+            resumed
+                .drain_new_events(filter)
+                .unwrap()
+                .first()
+                .and_then(|e| e["id"].as_i64()),
+            Some(m3),
+            "resume after the last emitted ID must not replay consumed events"
+        );
+    }
+
+    #[test]
+    fn stream_listener_default_cursor_consumes_only_post_arm_events() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stream-default-cursor.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        let before = db
+            .log_event(
+                "message",
+                "nova",
+                &json!({"from": "nova", "text": "before arm"}),
+            )
+            .unwrap();
+        assert_eq!(db.get_last_event_id(), before);
+
+        let mut listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: None,
+                instance_name: None,
+                endpoint_kind: EVENTS_STREAM_ENDPOINT_KIND,
+            },
+        );
+        assert_eq!(
+            listener.cursor(),
+            before,
+            "a default-cursor stream must arm at the current durable cursor"
+        );
+        assert!(
+            listener.drain_new_events("").unwrap().is_empty(),
+            "events durable before arming must not be emitted by default"
+        );
+
+        let after = db
+            .log_event(
+                "message",
+                "nova",
+                &json!({"from": "nova", "text": "after arm"}),
+            )
+            .unwrap();
+        let batch = listener.drain_new_events("").unwrap();
+        assert_eq!(
+            batch.first().and_then(|e| e["id"].as_i64()),
+            Some(after),
+            "only events arriving after the arm cursor may be emitted"
+        );
+    }
+
+    #[test]
+    fn stream_stays_active_until_timeout_and_exits_zero() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db_path = temp.path().join("stream-timeout.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+        let cursor = db.get_last_event_id();
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let writer_db = HcomDb::open_raw(&db_path).unwrap();
+            writer_db
+                .log_event("message", "nova", &json!({"from": "nova", "text": "live"}))
+                .unwrap();
+        });
+
+        let args = EventsArgs::try_parse_from([
+            "events",
+            "stream",
+            "--after-id",
+            &cursor.to_string(),
+            "--timeout",
+            "1",
+        ])
+        .unwrap();
+        let Some(EventsSubcmd::Stream(stream_args)) = args.subcmd else {
+            panic!("Expected Stream subcommand");
+        };
+
+        let start = Instant::now();
+        let code = cmd_events_stream(&db, &stream_args, None);
+        let elapsed = start.elapsed();
+        writer.join().unwrap();
+        assert_eq!(code, 0, "a stream that reaches its timeout must exit 0");
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "the stream must stay active for the whole timeout window, exited after {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the stream must end at its timeout rather than hang, exited after {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn stream_filter_errors_exit_one() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stream-filter-error.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        // Message-type and status-type filters cannot be combined.
+        let args = EventsArgs::try_parse_from([
+            "events", "stream", "--from", "nova", "--status", "blocked",
+        ])
+        .unwrap();
+        let Some(EventsSubcmd::Stream(stream_args)) = args.subcmd else {
+            panic!("Expected Stream subcommand");
+        };
+        assert_eq!(cmd_events_stream(&db, &stream_args, None), 1);
+    }
+
+    #[test]
+    fn stream_timeout_overflow_exits_one() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stream-timeout-overflow.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        let args =
+            EventsArgs::try_parse_from(["events", "stream", "--timeout", &u64::MAX.to_string()])
+                .unwrap();
+        let Some(EventsSubcmd::Stream(stream_args)) = args.subcmd else {
+            panic!("Expected Stream subcommand");
+        };
+        assert_eq!(cmd_events_stream(&db, &stream_args, None), 1);
+    }
+
+    struct FailingWriter {
+        fail_on_flush: bool,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if !self.fail_on_flush {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated broken pipe on write",
+                ))
+            } else {
+                Ok(buf.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_on_flush {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated broken pipe on flush",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_write_and_flush_record_detects_broken_pipe() {
+        let mut on_write = FailingWriter {
+            fail_on_flush: false,
+        };
+        let err = write_and_flush_record_to(&mut on_write, "{\"test\":true}").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+
+        let mut on_flush = FailingWriter {
+            fail_on_flush: true,
+        };
+        let err = write_and_flush_record_to(&mut on_flush, "{\"test\":true}").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn test_listener_wait_tick_interruptible_wakes_early() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("interruptible-wake.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        let listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: None,
+                instance_name: None,
+                endpoint_kind: EVENTS_STREAM_ENDPOINT_KIND,
+            },
+        );
+
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&interrupted);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            flag_clone.store(true, Ordering::Relaxed);
+        });
+
+        let start = Instant::now();
+        let woken = listener.wait_tick_interruptible(Duration::from_secs(5), &interrupted);
+        let elapsed = start.elapsed();
+        assert!(!woken, "interruption should return false for TCP wake");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "interrupted wait_tick must return early, took {elapsed:?}"
+        );
+        assert!(interrupted.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_events_stream_cleanup_preserves_other_endpoints_and_instances() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stream-cleanup-isolation.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        // Seed other endpoints for the same listener and for another instance
+        db.upsert_notify_endpoint("listener-inst", "pty", 7777)
+            .unwrap();
+        db.upsert_notify_endpoint("other-inst", "events_stream", 8888)
+            .unwrap();
+
+        // Seed an observed worker in instances table
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, status_detail, session_id, created_at)
+                 VALUES ('observed-worker', 'active', 'workflow:step2', 'in progress', 'sess-123', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        // Arm a stream listener for listener-inst
+        let listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: None,
+                instance_name: Some("listener-inst"),
+                endpoint_kind: EVENTS_STREAM_ENDPOINT_KIND,
+            },
+        );
+        assert!(listener.is_listening());
+
+        // Verify the events_stream endpoint was added
+        let stream_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE instance = 'listener-inst' AND kind = 'events_stream'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stream_count, 1);
+
+        // Explicitly drop/cleanup the listener
+        drop(listener);
+
+        // Assert: listener-inst's events_stream endpoint is deleted
+        let stream_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE instance = 'listener-inst' AND kind = 'events_stream'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stream_count, 0, "events_stream endpoint must be removed");
+
+        // Assert: listener-inst's pty endpoint is preserved
+        let pty_port: u16 = db
+            .conn()
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = 'listener-inst' AND kind = 'pty'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pty_port, 7777, "pty endpoint must remain untouched");
+
+        // Assert: other-inst's events_stream endpoint is preserved
+        let other_port: u16 = db
+            .conn()
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = 'other-inst' AND kind = 'events_stream'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            other_port, 8888,
+            "other instances' endpoints must remain untouched"
+        );
+
+        // Assert: observed worker's status, context, detail, session_id in instances are completely unchanged
+        let (status, context, detail, sess): (String, String, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT status, status_context, status_detail, session_id FROM instances WHERE name = 'observed-worker'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+        assert_eq!(context, "workflow:step2");
+        assert_eq!(detail, "in progress");
+        assert_eq!(sess, "sess-123");
     }
 }

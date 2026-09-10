@@ -5,7 +5,7 @@
 //! families share this table:
 //!
 //! - **Wake endpoints** (kinds: `pty`, `hook`, `listen`, `listen_filter`,
-//!   `events_wait`, `plugin`) — connect-and-close wakes a poll loop in the
+//!   `events_wait`, `events_stream`, `plugin`) — connect-and-close wakes a poll loop in the
 //!   target process. See `crate::notify::WakeKind`.
 //! - **Inject endpoint** (kind: `inject`) — bidirectional RPC for PTY input
 //!   and screen queries. Lives in the same table for historical reasons; the
@@ -60,6 +60,19 @@ impl HcomDb {
         self.conn.execute(
             "DELETE FROM notify_endpoints WHERE instance = ? AND kind = ?",
             params![name, kind],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a specific notify endpoint only if it still belongs to `port`.
+    ///
+    /// Long-lived listeners use this during cleanup so an older listener cannot
+    /// remove a replacement endpoint registered by a newer process with the
+    /// same `(instance, kind)` identity.
+    pub fn delete_notify_endpoint_if_port(&self, name: &str, kind: &str, port: u16) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM notify_endpoints WHERE instance = ? AND kind = ? AND port = ?",
+            params![name, kind, port as i64],
         )?;
         Ok(())
     }
@@ -141,6 +154,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn delete_notify_endpoint_if_port_preserves_replacement() {
+        let (db, db_path) = setup_full_test_db();
+
+        db.upsert_notify_endpoint("test", "events_stream", 5555)
+            .unwrap();
+        db.upsert_notify_endpoint("test", "events_stream", 6666)
+            .unwrap();
+        db.delete_notify_endpoint_if_port("test", "events_stream", 5555)
+            .unwrap();
+
+        let port: i64 = db
+            .conn
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = 'test' AND kind = 'events_stream'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(port, 6666);
 
         cleanup_test_db(db_path);
     }

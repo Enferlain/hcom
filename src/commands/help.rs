@@ -85,6 +85,25 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
         "  Exit codes: 0 ready, 1 error/no_launches, 2 timeout/blocked",
     ),
     ("", ""),
+    ("Stream (continuous JSON lines, stays active):", ""),
+    (
+        "  events stream [filters]",
+        "Emit every match in durable-ID order (filters above)",
+    ),
+    (
+        "    --after-id ID",
+        "Start after this durable cursor (default: current cursor)",
+    ),
+    (
+        "    --timeout SEC",
+        "Exit 0 after SEC seconds (default: run until stopped)",
+    ),
+    ("    --full", "Raw events, not streamlined"),
+    (
+        "",
+        "  Exit codes: 0 timeout reached, 1 input/filter error, 2 SQL error",
+    ),
+    ("", ""),
     (
         "Subscribe (next matching event delivered as messages from [hcom-events]):",
         "",
@@ -1252,6 +1271,20 @@ mod tests {
         assert!(get_command_help("send").contains("--broadcast"));
         assert!(get_command_help("events").contains("--cursor"));
         assert!(get_command_help("events").contains("--result-from NAME"));
+    }
+
+    #[test]
+    fn events_stream_mode_is_documented() {
+        let help = get_command_help("events");
+        assert!(
+            help.contains("events stream [filters]"),
+            "events help must document the stream subcommand"
+        );
+        assert!(help.contains("--timeout SEC"));
+        assert!(
+            help.contains("0 timeout reached, 1 input/filter error, 2 SQL error"),
+            "events help must document the stream exit codes"
+        );
     }
 
     #[test]

@@ -1,13 +1,13 @@
 ## 1. Reconcile the Staged Contract
 
 - [x] 1.1 Adapt `core/progress.rs` into a stream-owned compact record contract, remove `input_required` payloads and exit codes, and restore wait-only visibility in `core/result_wait.rs`; verify exact serialization fields, event cursors, and secret-bearing fixtures.
-- [ ] 1.2 Pin existing `events --wait` first-match output, cursor, timeout, correlated result, blocker, failure, and stopped-result recovery behavior with compatibility tests before listener extraction.
+- [x] 1.2 Pin existing `events --wait` first-match output, cursor, timeout, correlated result, blocker, failure, and stopped-result recovery behavior with compatibility tests before listener extraction.
 
 ## 2. Shared Listener and Stream CLI
 
-- [ ] 2.1 Extract cursor-ordered event querying, optional notify-endpoint registration, bounded rechecks, and cleanup into an internal listener used by wait and stream; verify wait compatibility tests remain unchanged and simultaneous endpoint kinds do not collide.
-- [ ] 2.2 Add `events stream` with its own arguments for existing filters, `--after-id`, streamlined/full output, and optional timeout; verify parser conflicts, help text, multiple ordered matches, default current-cursor behavior, and resume without replay.
-- [ ] 2.3 Implement explicit flush-on-record output plus clean interruption, timeout, and broken-pipe handling; verify the stream removes only its own endpoint and never changes observed worker state.
+- [x] 2.1 Extract cursor-ordered event querying, optional notify-endpoint registration, bounded rechecks, and cleanup into an internal listener used by wait and stream; verify wait compatibility tests remain unchanged and simultaneous endpoint kinds do not collide.
+- [x] 2.2 Add `events stream` with its own arguments for existing filters, `--after-id`, streamlined/full output, and optional timeout; verify parser conflicts, help text, multiple ordered matches, default current-cursor behavior, and resume without replay.
+- [x] 2.3 Implement explicit flush-on-record output plus clean interruption, timeout, and broken-pipe handling; verify the stream removes only its own endpoint and never changes observed worker state.
 
 ## 3. Compact Worker Observation
 

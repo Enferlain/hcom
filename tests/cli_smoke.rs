@@ -411,6 +411,991 @@ fn idle_wait_ignores_transport_listen_but_accepts_provider_idle() {
 }
 
 #[test]
+fn events_wait_timeout_prints_legacy_marker_and_exits_one() {
+    let h = Hcom::new();
+    let _worker = h.start();
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+
+    // Compatibility pin before listener extraction: a plain (uncorrelated)
+    // wait that runs to its deadline must keep printing the exact legacy
+    // one-line marker existing scripts grep for.
+    let (code, stdout, stderr) = h.run(["events", "--wait", "1", "--after-id", &cursor]);
+    assert_eq!(code, 1, "stdout={stdout} stderr={stderr}");
+    assert_eq!(
+        stdout.trim(),
+        r#"{"timed_out":true}"#,
+        "plain wait deadline output changed: stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn events_wait_prints_only_the_first_matching_event_streamlined() {
+    let h = Hcom::new();
+    let _worker = h.start();
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    for text in ["first progress report", "second progress report"] {
+        let data = serde_json::json!({
+            "from": "seed-worker",
+            "scope": "broadcast",
+            "text": text,
+            "sender_kind": "instance",
+            "delivered_to": ["caller"],
+            "mentions": ["caller"],
+            "reply_to": "12",
+            "sender_instance_key": "seed-worker@1000.000000",
+        });
+        db.execute(
+            "INSERT INTO events (timestamp, type, instance, data)
+             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message', 'seed-worker', ?1)",
+            rusqlite::params![data.to_string()],
+        )
+        .unwrap();
+    }
+    let ids: Vec<i64> = db
+        .prepare("SELECT id FROM events WHERE instance = 'seed-worker' ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    drop(db);
+    assert_eq!(ids.len(), 2, "seeded two message events");
+
+    // Compatibility pin before listener extraction: one-shot wait emits the
+    // FIRST matching event after the cursor in the default streamlined shape
+    // and exits, never consuming past that single match.
+    let (code, stdout, stderr) = h.run([
+        "events",
+        "--wait",
+        "2",
+        "--after-id",
+        &cursor,
+        "--type",
+        "message",
+    ]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "wait must emit exactly one match and exit: {stdout}"
+    );
+    let event: serde_json::Value = serde_json::from_str(lines[0])
+        .unwrap_or_else(|e| panic!("wait output must be one JSON event: {e}\n{stdout}"));
+    assert_eq!(
+        event["id"].as_i64(),
+        Some(ids[0]),
+        "the first event after the cursor must win: {stdout}"
+    );
+    assert_eq!(event["type"], "message");
+    assert_eq!(event["instance"], "seed-worker");
+    assert_eq!(event["data"]["text"], "first progress report");
+    assert_eq!(
+        event["ts"].as_str().map(str::len),
+        Some(19),
+        "streamlined wait output truncates ts to seconds: {stdout}"
+    );
+    for stripped in [
+        "sender_kind",
+        "scope",
+        "delivered_to",
+        "mentions",
+        "reply_to",
+        "sender_instance_key",
+    ] {
+        assert!(
+            event["data"].get(stripped).is_none(),
+            "streamlined wait output must drop '{stripped}': {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("second progress report"),
+        "wait must not consume past the first match: {stdout}"
+    );
+}
+
+/// Seed one event row directly and return its durable ID.
+fn seed_stream_event(h: &Hcom, event_type: &str, text: &str) -> i64 {
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    // Status events never become inbox messages, so an identity running the
+    // command never gets a delivery block appended to its stdout.
+    let data = if event_type == "status" {
+        serde_json::json!({
+            "status": text,
+            "context": "test",
+            "detail": text,
+        })
+    } else {
+        serde_json::json!({
+            "from": "seed-worker",
+            "scope": "broadcast",
+            "text": text,
+            "sender_kind": "instance",
+            "delivered_to": ["caller"],
+            "mentions": ["caller"],
+            "reply_to": "12",
+            "sender_instance_key": "seed-worker@1000.000000",
+        })
+    };
+    db.execute(
+        "INSERT INTO events (timestamp, type, instance, data)
+         VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?1, 'seed-worker', ?2)",
+        rusqlite::params![event_type, data.to_string()],
+    )
+    .unwrap();
+    db.last_insert_rowid()
+}
+
+#[test]
+fn events_stream_help_documents_cursor_and_output_flags() {
+    let h = Hcom::new();
+    // `hcom events stream --help` renders the per-command native help for
+    // `events`, which must document the stream mode alongside wait and sub.
+    let (code, stdout, stderr) = h.run(["events", "stream", "--help"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    for needle in [
+        "events stream [filters]",
+        "--after-id ID",
+        "--timeout SEC",
+        "--full",
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "events help must document '{needle}': {stdout}"
+        );
+    }
+}
+
+#[test]
+fn events_stream_rejects_query_mode_flags() {
+    let h = Hcom::new();
+
+    // The stream subcommand has no --wait of its own.
+    let (code, _stdout, stderr) = h.run(["events", "stream", "--wait", "1"]);
+    assert_ne!(code, 0, "stream must not accept a --wait flag");
+    assert!(
+        stderr.contains("unexpected argument"),
+        "expected clap rejection, got: {stderr}"
+    );
+
+    // Top-level --after-id still requires --wait.
+    let (code, _stdout, _stderr) = h.run(["events", "--after-id", "5", "stream"]);
+    assert_ne!(
+        code, 0,
+        "top-level --after-id without --wait must not parse"
+    );
+
+    // Query-mode flags typed before the subcommand are rejected, not ignored.
+    let (code, _stdout, stderr) = h.run(["events", "--wait", "1", "stream"]);
+    assert_eq!(code, 1, "query-mode --wait before stream must fail closed");
+    assert!(
+        stderr.contains("query-mode"),
+        "expected the query-mode flag conflict hint, got: {stderr}"
+    );
+
+    let (code, _stdout, stderr) = h.run(["events", "--type", "message", "stream"]);
+    assert_eq!(code, 1, "parent-level stream filters must fail closed");
+    assert!(
+        stderr.contains("filters before `stream`"),
+        "expected the stream-filter placement hint, got: {stderr}"
+    );
+}
+
+#[test]
+fn events_stream_emits_every_match_in_order_until_timeout() {
+    let h = Hcom::new();
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+
+    let first = seed_stream_event(&h, "message", "first progress report");
+    let _noise = seed_stream_event(&h, "status", "unrelated noise");
+    let second = seed_stream_event(&h, "message", "second progress report");
+
+    let started = Instant::now();
+    let (code, stdout, stderr) = h.run([
+        "events",
+        "stream",
+        "--after-id",
+        &cursor,
+        "--timeout",
+        "1",
+        "--type",
+        "message",
+    ]);
+    assert_eq!(code, 0, "stream timeout is a normal completion: {stderr}");
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "stream must remain active for the whole timeout window"
+    );
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "stream must emit every match, not just the first: {stdout}"
+    );
+    let events: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("stream output must be JSON lines: {e}\n{stdout}"))
+        })
+        .collect();
+    assert_eq!(
+        events[0]["id"].as_i64(),
+        Some(first),
+        "matches must be emitted in ascending durable-ID order: {stdout}"
+    );
+    assert_eq!(events[1]["id"].as_i64(), Some(second));
+    assert_eq!(events[0]["data"]["text"], "first progress report");
+    assert_eq!(events[1]["data"]["text"], "second progress report");
+    assert_eq!(
+        events[0]["ts"].as_str().map(str::len),
+        Some(19),
+        "default stream output is the streamlined projection: {stdout}"
+    );
+    for stripped in ["sender_kind", "scope", "delivered_to", "reply_to"] {
+        assert!(
+            events[0]["data"].get(stripped).is_none(),
+            "streamlined stream output must drop '{stripped}': {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("unrelated noise"),
+        "non-matching events must be filtered out: {stdout}"
+    );
+}
+
+#[test]
+fn events_stream_full_output_keeps_raw_event_fields() {
+    let h = Hcom::new();
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+    seed_stream_event(&h, "message", "raw report");
+
+    let (code, stdout, stderr) = h.run([
+        "events",
+        "stream",
+        "--after-id",
+        &cursor,
+        "--timeout",
+        "1",
+        "--full",
+        "--type",
+        "message",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let event: serde_json::Value = serde_json::from_str(
+        stdout
+            .lines()
+            .next()
+            .unwrap_or_else(|| panic!("no output: {stdout}")),
+    )
+    .unwrap_or_else(|e| panic!("stream --full output must be one JSON event: {e}\n{stdout}"));
+    assert!(
+        event["ts"].as_str().map(str::len) > Some(19),
+        "--full must keep the untruncated timestamp: {stdout}"
+    );
+    assert!(
+        event["data"].get("scope").is_some() && event["data"].get("sender_kind").is_some(),
+        "--full must bypass streamlining: {stdout}"
+    );
+}
+
+#[test]
+fn events_stream_default_cursor_consumes_only_post_arm_events() {
+    let h = Hcom::new();
+    // Prime the temp tree so the events table exists before direct seeding.
+    let (prime_code, _prime_out, prime_err) = h.run(["events", "--cursor"]);
+    assert_eq!(prime_code, 0, "stderr={prime_err}");
+    seed_stream_event(&h, "status", "before arming");
+
+    // Run the stream as a registered identity so its `events_stream` notify
+    // endpoint appears once armed. The listener captures the durable cursor
+    // BEFORE registering the endpoint, so endpoint visibility proves the
+    // default cursor was already captured — closing the arming race that
+    // --after-id exists to solve.
+    let process_id = "stream-default-cursor-proc";
+    let name = h.start_with_process_id(process_id);
+    let child = h
+        .cmd()
+        .env("HCOM_PROCESS_ID", process_id)
+        .args(["events", "stream", "--timeout", "4", "--type", "status"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hcom events stream");
+
+    let armed = {
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let registered: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'events_stream'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if registered > 0 {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert!(
+        armed,
+        "identity-backed stream must register an events_stream endpoint"
+    );
+
+    let after = seed_stream_event(&h, "status", "after arming");
+    let output = child.wait_with_output().expect("wait for stream exit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stream must exit 0 at timeout: {stderr}"
+    );
+
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("bad stream line {line:?}: {e}\nfull stdout: {stdout}"))
+        })
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "default cursor must skip events durable before arming: {stdout}"
+    );
+    assert_eq!(events[0]["id"].as_i64(), Some(after));
+    assert!(
+        !stdout.contains("before arming"),
+        "pre-arm events must not replay: {stdout}"
+    );
+
+    // Exit must clean up the stream's own listener registration.
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let leftover: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'events_stream'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    assert_eq!(
+        leftover, 0,
+        "stream exit must remove its endpoint (owned by {name})"
+    );
+}
+
+#[test]
+fn events_stream_resumes_after_last_emitted_id_without_replay() {
+    let h = Hcom::new();
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+    let first = seed_stream_event(&h, "message", "resume one");
+    let second = seed_stream_event(&h, "message", "resume two");
+
+    let (code, stdout, stderr) = h.run([
+        "events",
+        "stream",
+        "--after-id",
+        &cursor,
+        "--timeout",
+        "1",
+        "--type",
+        "message",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "first stream run: {stdout}");
+
+    let third = seed_stream_event(&h, "message", "resume three");
+    let (code, stdout, stderr) = h.run([
+        "events",
+        "stream",
+        "--after-id",
+        &second.to_string(),
+        "--timeout",
+        "1",
+        "--type",
+        "message",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let events: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("stream JSON line"))
+        .collect();
+    assert_eq!(
+        events.len(),
+        1,
+        "resuming after the last emitted ID must not replay consumed events: {stdout}"
+    );
+    assert_eq!(events[0]["id"].as_i64(), Some(third));
+    assert!(!stdout.contains("resume one") && !stdout.contains("resume two"));
+    assert!(
+        first < second && second < third,
+        "seeded IDs must be ascending for a meaningful resume assertion"
+    );
+}
+
+#[test]
+fn events_stream_picks_up_events_arriving_mid_stream() {
+    let h = Hcom::new();
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+
+    // Spawn the stream and let it arm before the event becomes durable.
+    let child = h
+        .cmd()
+        .args([
+            "events",
+            "stream",
+            "--after-id",
+            &cursor,
+            "--timeout",
+            "3",
+            "--type",
+            "message",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hcom events stream");
+
+    std::thread::sleep(Duration::from_millis(400));
+    seed_stream_event(&h, "message", "live mid-stream update");
+
+    let output = child.wait_with_output().expect("wait for stream exit");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stream must exit 0 at timeout: {stderr}"
+    );
+    assert!(
+        stdout.contains("live mid-stream update"),
+        "an event arriving mid-stream must be emitted by the bounded recheck: {stdout}"
+    );
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "only the mid-stream event matches: {stdout}"
+    );
+}
+
+#[test]
+fn events_stream_explicit_flush_emits_record_immediately() {
+    use std::io::BufRead;
+
+    let h = Hcom::new();
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+
+    // The record must arrive before this timeout expires; allowing the timeout
+    // to terminate the process keeps the assertion portable to Windows.
+    let mut child = h
+        .cmd()
+        .args([
+            "events",
+            "stream",
+            "--after-id",
+            &cursor,
+            "--timeout",
+            "3",
+            "--type",
+            "message",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hcom events stream");
+
+    let stdout = child.stdout.take().expect("take stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let reader_handle = std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let res = reader.read_line(&mut line);
+        tx.send((res, line)).unwrap();
+    });
+
+    std::thread::sleep(Duration::from_millis(200));
+    seed_stream_event(&h, "message", "flush test payload");
+
+    // The line must arrive immediately, well before the 3-second timeout.
+    let (res, line) = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("record must be flushed immediately to stdout rather than buffered");
+    assert!(res.is_ok());
+    assert!(line.contains("flush test payload"));
+
+    let status = child.wait().expect("wait for stream exit");
+    assert!(status.success(), "stream must exit 0 on clean timeout");
+    reader_handle.join().unwrap();
+}
+
+#[test]
+fn events_stream_broken_pipe_terminates_cleanly_zero_and_cleans_up_endpoint() {
+    use std::io::BufRead;
+
+    let h = Hcom::new();
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+
+    let process_id = "stream-broken-pipe-proc";
+    let name = h.start_with_process_id(process_id);
+
+    // Setup extra endpoints and observed worker in instances table
+    {
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        db.execute(
+            "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES (?, 'pty', 7171, 1000.0)",
+            rusqlite::params![name],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES ('other-worker', 'events_stream', 8181, 1000.0)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO instances (name, status, status_context, status_detail, session_id, created_at, last_stop)
+             VALUES ('observed-worker', 'active', 'step-pipe', 'working', 'sess-pipe', 2000000000.0, 2000000000)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let mut child = h
+        .cmd()
+        .env("HCOM_PROCESS_ID", process_id)
+        .args([
+            "events",
+            "stream",
+            "--after-id",
+            &cursor,
+            "--timeout",
+            "30",
+            "--type",
+            "message",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hcom events stream");
+
+    // Wait for the stream's own endpoint to be registered
+    let stream_port: u16 = {
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let port: Option<u16> = db
+                .query_row(
+                    "SELECT port FROM notify_endpoints WHERE instance = ? AND kind = 'events_stream'",
+                    rusqlite::params![name],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(port) = port {
+                break port;
+            }
+            if Instant::now() >= deadline {
+                panic!("events_stream endpoint failed to arm in time");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+
+    let stdout = child.stdout.take().expect("take child stdout");
+    let mut reader = std::io::BufReader::new(stdout);
+
+    // Seed first event and read it
+    seed_stream_event(&h, "message", "first pipe event");
+    let mut first_line = String::new();
+    reader.read_line(&mut first_line).unwrap();
+    assert!(first_line.contains("first pipe event"));
+
+    // Drop the reader, closing the pipe
+    drop(reader);
+
+    // Seed second event so child attempts to write to the broken pipe
+    seed_stream_event(&h, "message", "second pipe event");
+    // Wake listener via TCP notification
+    let _ = std::net::TcpStream::connect(format!("127.0.0.1:{stream_port}"));
+
+    // Wait for child to exit
+    let output = child.wait_with_output().expect("wait for stream exit");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "broken pipe must result in clean exit 0, got {:?}, stderr={stderr}",
+        output.status
+    );
+
+    // Direct DB assertions:
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+
+    // 1. events_stream endpoint for this listener must be removed
+    let stream_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ? AND kind = 'events_stream'",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stream_count, 0,
+        "listener's events_stream endpoint must be removed on broken pipe"
+    );
+
+    // 2. other endpoint (pty) for this listener must be preserved
+    let pty_port: u16 = db
+        .query_row(
+            "SELECT port FROM notify_endpoints WHERE instance = ? AND kind = 'pty'",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pty_port, 7171, "listener's pty endpoint must be preserved");
+
+    // 3. other instance's endpoint must be preserved
+    let other_port: u16 = db
+        .query_row(
+            "SELECT port FROM notify_endpoints WHERE instance = 'other-worker' AND kind = 'events_stream'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        other_port, 8181,
+        "other instance endpoint must be preserved"
+    );
+
+    // 4. observed worker in instances table must be unchanged
+    let (worker_status, worker_context, worker_detail, worker_sess): (String, String, String, String) = db
+        .query_row(
+            "SELECT status, status_context, status_detail, session_id FROM instances WHERE name = 'observed-worker'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(worker_status, "active");
+    assert_eq!(worker_context, "step-pipe");
+    assert_eq!(worker_detail, "working");
+    assert_eq!(worker_sess, "sess-pipe");
+}
+
+#[test]
+#[cfg(unix)]
+fn events_stream_sigint_interruption_terminates_cleanly_zero_and_cleans_up_endpoint() {
+    let h = Hcom::new();
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+
+    let process_id = "stream-sigint-proc";
+    let name = h.start_with_process_id(process_id);
+
+    // Setup extra endpoints and observed worker in instances table
+    {
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        db.execute(
+            "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES (?, 'pty', 7272, 1000.0)",
+            rusqlite::params![name],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES ('other-worker', 'events_stream', 8282, 1000.0)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO instances (name, status, status_context, status_detail, session_id, created_at, last_stop)
+             VALUES ('observed-worker', 'active', 'step-sigint', 'working', 'sess-sigint', 2000000000.0, 2000000000)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let mut child = h
+        .cmd()
+        .env("HCOM_PROCESS_ID", process_id)
+        .args([
+            "events",
+            "stream",
+            "--after-id",
+            &cursor,
+            "--timeout",
+            "30",
+            "--type",
+            "message",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hcom events stream");
+
+    // Wait for the stream's own endpoint to be registered
+    {
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let registered: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ? AND kind = 'events_stream'",
+                    rusqlite::params![name],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if registered > 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("events_stream endpoint failed to arm in time");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // Send SIGINT to the running stream process and prove it did not merely
+    // reach the command's 30-second timeout path.
+    let interrupted_at = Instant::now();
+    unsafe {
+        nix::libc::kill(child.id() as i32, nix::libc::SIGINT);
+    }
+
+    let status = child.wait().expect("wait for stream exit");
+    assert!(
+        status.success(),
+        "SIGINT must result in clean exit 0, got {status:?}"
+    );
+    assert!(
+        interrupted_at.elapsed() < Duration::from_secs(10),
+        "SIGINT must terminate promptly rather than falling through to timeout"
+    );
+
+    // Direct DB assertions:
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+
+    // 1. events_stream endpoint for this listener must be removed
+    let stream_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ? AND kind = 'events_stream'",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stream_count, 0,
+        "listener's events_stream endpoint must be removed on SIGINT"
+    );
+
+    // 2. other endpoint (pty) for this listener must be preserved
+    let pty_port: u16 = db
+        .query_row(
+            "SELECT port FROM notify_endpoints WHERE instance = ? AND kind = 'pty'",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pty_port, 7272, "listener's pty endpoint must be preserved");
+
+    // 3. other instance's endpoint must be preserved
+    let other_port: u16 = db
+        .query_row(
+            "SELECT port FROM notify_endpoints WHERE instance = 'other-worker' AND kind = 'events_stream'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        other_port, 8282,
+        "other instance endpoint must be preserved"
+    );
+
+    // 4. observed worker in instances table must be unchanged
+    let (worker_status, worker_context, worker_detail, worker_sess): (String, String, String, String) = db
+        .query_row(
+            "SELECT status, status_context, status_detail, session_id FROM instances WHERE name = 'observed-worker'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(worker_status, "active");
+    assert_eq!(worker_context, "step-sigint");
+    assert_eq!(worker_detail, "working");
+    assert_eq!(worker_sess, "sess-sigint");
+}
+
+#[test]
+#[cfg(unix)]
+fn events_stream_sigterm_interruption_terminates_cleanly_zero_and_cleans_up_endpoint() {
+    let h = Hcom::new();
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+
+    let process_id = "stream-sigterm-proc";
+    let name = h.start_with_process_id(process_id);
+
+    // Setup extra endpoints and observed worker in instances table
+    {
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        db.execute(
+            "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES (?, 'pty', 7373, 1000.0)",
+            rusqlite::params![name],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO notify_endpoints (instance, kind, port, updated_at) VALUES ('other-worker', 'events_stream', 8383, 1000.0)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO instances (name, status, status_context, status_detail, session_id, created_at, last_stop)
+             VALUES ('observed-worker', 'active', 'step-sigterm', 'working', 'sess-sigterm', 2000000000.0, 2000000000)",
+            [],
+        )
+        .unwrap();
+    }
+
+    let mut child = h
+        .cmd()
+        .env("HCOM_PROCESS_ID", process_id)
+        .args([
+            "events",
+            "stream",
+            "--after-id",
+            &cursor,
+            "--timeout",
+            "30",
+            "--type",
+            "message",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hcom events stream");
+
+    // Wait for the stream's own endpoint to be registered
+    {
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let registered: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ? AND kind = 'events_stream'",
+                    rusqlite::params![name],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if registered > 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("events_stream endpoint failed to arm in time");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // Send SIGTERM to the running stream process and prove it did not merely
+    // reach the command's 30-second timeout path.
+    let interrupted_at = Instant::now();
+    unsafe {
+        nix::libc::kill(child.id() as i32, nix::libc::SIGTERM);
+    }
+
+    let status = child.wait().expect("wait for stream exit");
+    assert!(
+        status.success(),
+        "SIGTERM must result in clean exit 0, got {status:?}"
+    );
+    assert!(
+        interrupted_at.elapsed() < Duration::from_secs(10),
+        "SIGTERM must terminate promptly rather than falling through to timeout"
+    );
+
+    // Direct DB assertions:
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+
+    // 1. events_stream endpoint for this listener must be removed
+    let stream_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ? AND kind = 'events_stream'",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stream_count, 0,
+        "listener's events_stream endpoint must be removed on SIGTERM"
+    );
+
+    // 2. other endpoint (pty) for this listener must be preserved
+    let pty_port: u16 = db
+        .query_row(
+            "SELECT port FROM notify_endpoints WHERE instance = ? AND kind = 'pty'",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pty_port, 7373, "listener's pty endpoint must be preserved");
+
+    // 3. other instance's endpoint must be preserved
+    let other_port: u16 = db
+        .query_row(
+            "SELECT port FROM notify_endpoints WHERE instance = 'other-worker' AND kind = 'events_stream'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        other_port, 8383,
+        "other instance endpoint must be preserved"
+    );
+
+    // 4. observed worker in instances table must be unchanged
+    let (worker_status, worker_context, worker_detail, worker_sess): (String, String, String, String) = db
+        .query_row(
+            "SELECT status, status_context, status_detail, session_id FROM instances WHERE name = 'observed-worker'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(worker_status, "active");
+    assert_eq!(worker_context, "step-sigterm");
+    assert_eq!(worker_detail, "working");
+    assert_eq!(worker_sess, "sess-sigterm");
+}
+
+#[test]
 fn send_without_identity_errors_with_hint() {
     let h = Hcom::new();
     let (code, _stdout, stderr) = h.run(["send", "@nobody", "--", "hi"]);

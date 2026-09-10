@@ -36,6 +36,8 @@ pub enum WakeKind {
     ListenFilter,
     /// `hcom events --wait` blocking poll.
     EventsWait,
+    /// `hcom events stream` continuous poll.
+    EventsStream,
     /// OpenCode plugin runtime.
     Plugin,
 }
@@ -49,6 +51,7 @@ impl WakeKind {
         WakeKind::Listen,
         WakeKind::ListenFilter,
         WakeKind::EventsWait,
+        WakeKind::EventsStream,
         WakeKind::Plugin,
     ];
 
@@ -65,6 +68,7 @@ impl WakeKind {
             WakeKind::Listen => "listen",
             WakeKind::ListenFilter => "listen_filter",
             WakeKind::EventsWait => "events_wait",
+            WakeKind::EventsStream => "events_stream",
             WakeKind::Plugin => "plugin",
         }
     }
