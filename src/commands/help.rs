@@ -43,27 +43,41 @@ const FILTER_HELP: &[HelpEntry] = &[
 const EVENTS_HELP: &[HelpEntry] = &[
     (
         "",
-        "Query the event stream (messages, status changes, file edits, lifecycle)",
+        "Query or observe events (messages, status changes, file edits, lifecycle).",
     ),
+    (
+        "",
+        "Five distinct observation modes: snapshot, one-shot wait, conversational subscription,",
+    ),
+    ("", "generic stream, and compact exact-worker observation."),
     ("", ""),
-    ("Query:", ""),
-    ("  events", "Last 20 events as JSON"),
+    ("Snapshot query (point-in-time past events):", ""),
+    ("  events", "Last 20 events as JSON (default limit)"),
     ("  --last N", "Limit count (default: 20; alias: --limit)"),
     ("  --all", "Include archived sessions"),
-    ("  --wait [SEC]", "Block until match (default: 60s)"),
-    (
-        "  --after-id ID",
-        "Only match events after this durable cursor (requires --wait)",
-    ),
     ("  --cursor", "Print the current durable event cursor"),
-    (
-        "  --result-from NAME",
-        "Correlated attempt wait; requires one --thread and pre-launch --after-id. Exits 0 result, 1 deadline, 2 SQL error, 3 stopped-without-result, 4 typed blocker, 5 launch failure",
-    ),
     ("  --sql EXPR", "Raw SQL WHERE (ANDed with flags)"),
     (
         "  --remote-fetch --device ID",
         "One-shot fetch from remote device",
+    ),
+    ("", ""),
+    ("One-shot wait (blocks until first match, then exits):", ""),
+    (
+        "  --wait [SEC]",
+        "Block until match (default: 60s); exits on first match (filters and --sql apply)",
+    ),
+    (
+        "  --after-id ID",
+        "Only match events after this durable cursor (requires --wait)",
+    ),
+    (
+        "  --sql EXPR",
+        "Raw SQL WHERE for wait criteria (filters and SQL apply to wait too)",
+    ),
+    (
+        "  --result-from NAME",
+        "Correlated attempt wait; requires one --thread and pre-launch --after-id. Exits 0 result, 1 deadline, 2 SQL error, 3 stopped-without-result, 4 typed blocker, 5 launch failure",
     ),
 ];
 
@@ -88,7 +102,7 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
     ("Stream (continuous JSON lines, stays active):", ""),
     (
         "  events stream [filters]",
-        "Emit every match in durable-ID order (filters above)",
+        "Generic live stream: emit every match in durable-ID order (filters above)",
     ),
     (
         "    --after-id ID",
@@ -105,7 +119,7 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
     ),
     (
         "    --compact",
-        "Typed status for --follow; model-safe; conflicts --full/filters",
+        "Compact worker observation: typed status for --follow; model-safe; conflicts --full/filters",
     ),
     (
         "    --heartbeat SEC",
@@ -127,13 +141,13 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
     ("", "    1 input/filter/correlation error, 2 SQL error"),
     ("", ""),
     (
-        "Subscribe (next matching event delivered as messages from [hcom-events]):",
+        "Subscribe (conversational notification delivered as messages from [hcom-events]):",
         "",
     ),
     ("  events sub list", "List active subscriptions"),
     (
         "  events sub [filters] [--once]",
-        "Subscribe using filter flags (listed above)",
+        "Subscribe using filter flags (conversational notification)",
     ),
     (
         "  events sub \"SQL WHERE\" [--once]",
@@ -151,11 +165,26 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
     ),
     ("", ""),
     ("Examples:", ""),
-    ("  events --cmd git --agent peso", ""),
-    ("  events sub --idle peso", "Notified when peso goes idle"),
+    ("  events --last 10", "Snapshot: view recent 10 events"),
+    (
+        "  events --wait 60 --type message",
+        "One-shot wait: block until next message",
+    ),
+    (
+        "  events stream --agent peso",
+        "Generic stream: tail live events for peso",
+    ),
+    (
+        "  events stream --follow worker --compact",
+        "Compact observation: model-safe worker status",
+    ),
+    (
+        "  events sub --idle peso",
+        "Subscribe: notify when peso goes idle",
+    ),
     (
         "  events sub --file '*.py' --once",
-        "One-shot: next .py file write",
+        "Subscribe: one-shot notification on next .py file write",
     ),
     ("", ""),
     ("SQL reference (events_v view):", ""),
@@ -1402,5 +1431,26 @@ mod tests {
         ));
         assert!(!help.contains("Fork agent session (claude/codex/opencode/kilo/pi/omp/kimi)"));
         assert_eq!(forkable_tool_names(), "claude/codex/opencode/kilo/pi/omp");
+    }
+
+    #[test]
+    fn events_help_clearly_distinguishes_five_observation_modes() {
+        let help = get_command_help("events");
+        assert!(
+            help.contains(
+                "Five distinct observation modes: snapshot, one-shot wait, conversational \
+                 subscription,"
+            ),
+            "events help must describe the observation choices"
+        );
+        assert!(help.contains("Snapshot query (point-in-time past events):"));
+        assert!(help.contains("One-shot wait (blocks until first match, then exits):"));
+        assert!(help.contains("(filters and --sql apply)"));
+        assert!(help.contains("filters and SQL apply to wait too"));
+        assert!(help.contains("Generic live stream: emit every match in durable-ID order"));
+        assert!(help.contains("Compact worker observation: typed status for --follow; model-safe"));
+        assert!(help.contains(
+            "Subscribe (conversational notification delivered as messages from [hcom-events]):"
+        ));
     }
 }

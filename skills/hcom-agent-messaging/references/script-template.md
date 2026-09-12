@@ -71,7 +71,7 @@ worker=$(echo "$launch_out" | grep '^Names: ' | sed 's/^Names: //' | tr -d ' ')
 echo "worker: $worker"
 
 # --- wait for completion signal ---
-# use hcom events --wait, NEVER sleep
+# use hcom events --wait, NEVER sleep. --wait is a single-event synchronization primitive (never streams)
 hcom events --wait 120 \
   --sql "type='message' AND msg_thread='${thread}' AND msg_text LIKE '%DONE%'" \
   $name_arg >/dev/null 2>&1 && echo "PASS" || echo "TIMEOUT"

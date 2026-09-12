@@ -6909,4 +6909,596 @@ mod tests {
         assert_eq!(detail, "in progress");
         assert_eq!(sess, "sess-123");
     }
+
+    #[test]
+    fn events_stream_has_no_subscription_request_watch_inbox_or_message_side_effects() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stream-no-side-effects.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('worker', 'active', 1000.0), ('listener', 'active', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        // Baseline: kv sub/reqwatch keys and message events are empty
+        let sub_count_before: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:sub-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sub_count_before, 0);
+
+        let reqwatch_count_before: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reqwatch_count_before, 0);
+
+        let msg_count_before: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(msg_count_before, 0);
+
+        // Seed several events from worker: status, command, message
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "status",
+            "worker",
+            &json!({"status": "active", "context": "tool:Bash", "detail": "git status"}),
+        )
+        .unwrap();
+        db.log_event(
+            "status",
+            "worker",
+            &json!({"status": "active", "context": "tool:Edit", "detail": "src/lib.rs"}),
+        )
+        .unwrap();
+        db.log_event(
+            "message",
+            "worker",
+            &json!({
+                "from": "worker",
+                "scope": "broadcast",
+                "text": "regular message body",
+                "sender_instance_key": "worker@1000.000000"
+            }),
+        )
+        .unwrap();
+
+        // Run generic stream with timeout
+        let filters = HashMap::new();
+        let mut output = Vec::new();
+        let exit = events_stream_to(
+            &db,
+            "",
+            Some(1),
+            &mut output,
+            EventsStreamOptions {
+                after_id: Some(cursor),
+                full_output: false,
+                filters: &filters,
+                instance_name: Some("listener"),
+                generation_follow: None,
+                compact: None,
+            },
+        );
+        assert_eq!(exit, 0);
+
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(
+            !output_str.trim().is_empty(),
+            "stream must emit non-empty output"
+        );
+        let records: Vec<Value> = output_str
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("valid NDJSON line"))
+            .collect();
+        assert!(
+            !records.is_empty(),
+            "must have emitted at least one valid NDJSON record"
+        );
+        assert_eq!(records[0]["type"], "status");
+        assert_eq!(records[0]["instance"], "worker");
+
+        // Assert: stream execution created ZERO subscriptions in kv
+        let sub_count_after: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:sub-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sub_count_after, 0,
+            "events stream must not insert into kv subscriptions"
+        );
+
+        // Assert: stream execution created ZERO request watches in kv
+        let reqwatch_count_after: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            reqwatch_count_after, 0,
+            "events stream must not create request-watch rows"
+        );
+
+        // Assert: stream execution created ZERO synthetic [hcom-events] notification messages
+        let syn_msg_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message' AND (instance = 'hcom-events' \
+                 OR json_extract(data, '$.from') = 'hcom-events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            syn_msg_count, 0,
+            "events stream must not insert synthetic notification messages"
+        );
+
+        // Assert: listener's events_stream endpoint is cleanly removed
+        let endpoint_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE instance = 'listener' AND kind = \
+                 'events_stream'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            endpoint_count, 0,
+            "events stream endpoint must be cleaned up after stream ends"
+        );
+    }
+
+    #[test]
+    fn worker_correlated_request_reply_remains_functional_while_compact_stream_active() {
+        use crate::commands::send::send_message;
+        use crate::messages::{MessageEnvelope, MessageIntent};
+        use crate::shared::{SenderIdentity, SenderKind};
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db =
+            HcomDb::open_raw(&temp.path().join("compact-stream-request-reply.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at)
+                 VALUES ('worker', 'active', 1000.0), ('coord', 'active', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let cursor = db.get_last_event_id();
+        let generation = discover_worker_generation(&db, "--follow", "worker", cursor).unwrap();
+
+        // Run compact stream following worker in a background thread
+        let db_path = temp.path().join("compact-stream-request-reply.db");
+        let stream_start = Instant::now();
+        let stream_handle = std::thread::spawn(move || {
+            let stream_db = HcomDb::open_raw(&db_path).unwrap();
+            let filters = HashMap::new();
+            let mut output = Vec::new();
+            let exit = events_stream_to(
+                &stream_db,
+                "",
+                Some(5),
+                &mut output,
+                EventsStreamOptions {
+                    after_id: Some(cursor),
+                    full_output: false,
+                    filters: &filters,
+                    instance_name: Some("observer"),
+                    generation_follow: Some(WorkerGenerationFollow {
+                        generation,
+                        stopped: false,
+                    }),
+                    compact: Some(CompactStreamConfig {
+                        heartbeat: None,
+                        clock: Arc::new(Instant::now),
+                    }),
+                },
+            );
+            (exit, output)
+        });
+
+        // Let the stream listener arm
+        std::thread::sleep(Duration::from_millis(50));
+
+        // 1. Worker reports active status
+        db.log_event(
+            "status",
+            "worker",
+            &json!({
+                "status": "active",
+                "context": "tool:Bash",
+                "detail": "git status"
+            }),
+        )
+        .unwrap();
+
+        // 2. Worker sends an ordinary correlated intent=request to coordinator
+        let worker_identity = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "worker".into(),
+            instance_data: Some(json!({ "created_at": 1000.0 })),
+            session_id: None,
+        };
+        let request_envelope = MessageEnvelope {
+            intent: Some(MessageIntent::Request),
+            thread: Some("approval-task".into()),
+            ..Default::default()
+        };
+        let delivered = send_message(
+            &db,
+            &worker_identity,
+            "Requesting review for step 1",
+            Some(&request_envelope),
+            Some(&["coord".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(delivered, vec!["coord".to_string()]);
+
+        // Verify request watch was created in kv
+        let reqwatch_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reqwatch_count, 1, "request watch must be created in kv");
+
+        // Verify request message was recorded in events table
+        let (req_id, req_text): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT id, json_extract(data, '$.text') FROM events WHERE type = 'message' AND \
+                 instance = 'worker' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(req_text, "Requesting review for step 1");
+
+        // 3. Coordinator replies with intent=inform and reply_to=req_id
+        let coord_identity = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "coord".into(),
+            instance_data: Some(json!({ "created_at": 1000.0 })),
+            session_id: None,
+        };
+        let reply_envelope = MessageEnvelope {
+            intent: Some(MessageIntent::Inform),
+            thread: Some("approval-task".into()),
+            reply_to: Some(req_id.to_string()),
+            ..Default::default()
+        };
+        let reply_delivered = send_message(
+            &db,
+            &coord_identity,
+            "Step 1 approved",
+            Some(&reply_envelope),
+            Some(&["worker".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(reply_delivered, vec!["worker".to_string()]);
+
+        // Verify request watch was satisfied and canceled by the correlated reply
+        let reqwatch_count_after: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            reqwatch_count_after, 0,
+            "request watch must be canceled by correlated reply"
+        );
+
+        // Verify reply message was recorded in events table
+        let (reply_id, reply_text): (i64, String) = db
+            .conn()
+            .query_row(
+                "SELECT id, json_extract(data, '$.text') FROM events WHERE type = 'message' AND \
+                 instance = 'coord' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reply_text, "Step 1 approved");
+        assert!(reply_id > req_id);
+
+        // 4. Worker continues with file activity, then stops
+        db.log_event(
+            "status",
+            "worker",
+            &json!({
+                "status": "active",
+                "context": "tool:Write",
+                "detail": "src/auth.rs"
+            }),
+        )
+        .unwrap();
+
+        db.log_event(
+            "life",
+            "worker",
+            &json!({
+                "action": "stopped",
+                "snapshot": { "name": "worker", "created_at": 1000.0 }
+            }),
+        )
+        .unwrap();
+
+        // 5. Join the stream thread
+        let (exit_code, output) = stream_handle.join().unwrap();
+        let elapsed = stream_start.elapsed();
+        assert_eq!(
+            exit_code, 0,
+            "compact stream must exit 0 at terminal stop boundary"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "compact stream must exit at worker stop boundary well before timeout (elapsed: {elapsed:?})"
+        );
+
+        let stream_text = String::from_utf8(output).unwrap();
+
+        // Verify compact stream output NEVER contains message text or conversation
+        assert!(
+            !stream_text.contains("Requesting review for step 1"),
+            "compact stream must NEVER emit request message body: {stream_text}"
+        );
+        assert!(
+            !stream_text.contains("Step 1 approved"),
+            "compact stream must NEVER emit reply message body: {stream_text}"
+        );
+        assert!(
+            !stream_text.contains("approval-task"),
+            "compact stream must NEVER emit thread name from message: {stream_text}"
+        );
+
+        // Parse records as valid compact JSON
+        let records: Vec<Value> = stream_text
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("valid compact JSON line"))
+            .collect();
+        assert!(
+            !records.is_empty(),
+            "compact stream must emit valid records"
+        );
+
+        let last_record = records.last().unwrap();
+        assert_eq!(
+            last_record["activity"]["type"], "phase",
+            "last compact record must be phase activity: {last_record}"
+        );
+        assert_eq!(
+            last_record["activity"]["phase"], "stopped",
+            "last compact record must be phase stopped terminal boundary: {last_record}"
+        );
+
+        for rec in &records {
+            assert_eq!(rec["schema_version"], 1);
+            assert_eq!(rec["generation"], "worker@1000.000000");
+        }
+
+        // The only subscriptions in kv are the thread auto-subscriptions created by send_message
+        // for the messaging participants (worker & coord). Observer/stream created zero subscriptions.
+        let observer_subs: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:sub-%' AND value LIKE \
+                 '%observer%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            observer_subs, 0,
+            "no subscriptions created for observer/stream"
+        );
+
+        // Message events table has ONLY the 2 explicit messages exchanged
+        let total_msgs: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            total_msgs, 2,
+            "only the 2 legitimate messages in events table"
+        );
+    }
+
+    #[test]
+    fn events_snapshot_default_preserves_immediate_exit_and_no_stream() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("snapshot-default.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        db.log_event("status", "nova", &json!({"status": "active"}))
+            .unwrap();
+        db.log_event("status", "nova", &json!({"status": "idle"}))
+            .unwrap();
+
+        // Running snapshot query: events without --wait or subcmd
+        let args = EventsArgs {
+            last: Some(20),
+            all: false,
+            wait: None,
+            after_id: None,
+            cursor: false,
+            result_from: None,
+            filters: EventFilterArgs::default(),
+            sql: None,
+            full: false,
+            remote_fetch: false,
+            device: None,
+            subcmd: None,
+        };
+
+        let exit = cmd_events(&db, &args, None);
+        assert_eq!(exit, 0, "snapshot query must exit 0 immediately");
+
+        // Assert: no events_stream endpoint registered
+        let stream_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'events_stream'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stream_count, 0,
+            "snapshot query must not register events_stream endpoints"
+        );
+
+        // Assert: no subscriptions created in kv
+        let sub_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sub_count, 0);
+    }
+
+    #[test]
+    fn events_wait_default_preserves_single_match_terminal_only_output() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("wait-default.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        let cursor = db.get_last_event_id();
+        let id1 = db
+            .log_event("status", "worker", &json!({"status": "working"}))
+            .unwrap();
+        let _id2 = db
+            .log_event("status", "worker", &json!({"status": "idle"}))
+            .unwrap();
+
+        // Arm a wait listener (as used by events --wait)
+        let mut listener = EventListener::new(
+            &db,
+            EventListenerOptions {
+                after_id: Some(cursor),
+                instance_name: Some("waiter"),
+                endpoint_kind: EVENTS_WAIT_ENDPOINT_KIND,
+            },
+        );
+        assert_eq!(listener.endpoint_kind(), "events_wait");
+
+        // One-shot wait consumes ONLY the single first match and does not stream further
+        let next = listener.query_next_event("").unwrap();
+        assert!(next.is_some());
+        let event = next.unwrap();
+        assert_eq!(event["id"].as_i64(), Some(id1));
+
+        // Dropping listener removes events_wait endpoint cleanly
+        drop(listener);
+        let wait_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'events_wait'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wait_count, 0);
+    }
+
+    #[test]
+    fn events_sub_default_preserves_subscription_without_stdout_stream() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("sub-default.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at) VALUES ('subscriber', 'active', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let sub_args = EventsSubArgs {
+            once: true,
+            for_agent: None,
+            device: None,
+            on_hit: None,
+            as_name: None,
+            from_bigboss: false,
+            filters: EventFilterArgs {
+                agent: vec!["worker".to_string()],
+                ..Default::default()
+            },
+            rest: Vec::new(),
+        };
+
+        let exit = cmd_events_sub(&db, &sub_args, Some("subscriber"));
+        assert_eq!(exit, 0, "events sub must exit 0 immediately");
+
+        // Assert: subscription row created in kv table
+        let sub_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:sub-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sub_count, 1,
+            "events sub must insert exactly 1 subscription in kv"
+        );
+
+        // Assert: no events_stream endpoint created
+        let stream_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'events_stream'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stream_count, 0,
+            "events sub must not register events_stream endpoints"
+        );
+    }
 }

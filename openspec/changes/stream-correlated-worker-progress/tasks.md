@@ -17,12 +17,12 @@
 
 ## 4. Messaging and Compatibility Isolation
 
-- [ ] 4.1 Prove streaming has no subscription, request-watch, inbox, or message side effects; verify a worker can send and receive an ordinary correlated `intent=request`/reply while a compact stream remains active.
-- [ ] 4.2 Preserve existing `events`, `events --wait`, `events sub`, and `hcom run` defaults; verify no stream starts without an explicit command or workflow option and existing scripts retain terminal-only wait output.
-- [ ] 4.3 Update CLI and workflow-authoring guidance to describe snapshot, one-shot wait, conversational subscription, generic stream, and compact worker observation as distinct choices.
+- [x] 4.1 Prove streaming has no subscription, request-watch, inbox, or message side effects; verify a worker can send and receive an ordinary correlated `intent=request`/reply while a compact stream remains active.
+- [x] 4.2 Preserve existing `events`, `events --wait`, `events sub`, and `hcom run` defaults; verify no stream starts without an explicit command or workflow option and existing scripts retain terminal-only wait output.
+- [x] 4.3 Update CLI and workflow-authoring guidance to describe snapshot, one-shot wait, conversational subscription, generic stream, and compact worker observation as distinct choices.
 
 ## 5. Integration and Live Verification
 
-- [ ] 5.1 Add hermetic integration coverage for simultaneous wait/stream listeners, unrelated workers, cursor races, noisy activity, exact-generation reuse, interruption, timeout, broken pipe, and final cleanup; verify the focused suite is stable across repeated runs.
-- [ ] 5.2 Run one live worker flow with the compact stream kept as a yielded background process while the parent performs other work and exchanges one normal hcom request/reply; verify status remains bounded, no diagnostic polling occurs, one-shot result waiting remains unchanged, and the worker survives stream termination.
-- [ ] 5.3 Run formatting, focused and workspace tests, `cargo check --workspace --all-targets`, strict Clippy, and independent review; record results and any host-side live-output limitations in Beads and the changelog.
+- [x] 5.1 Add hermetic integration coverage for simultaneous wait/stream listeners, unrelated workers, cursor races, noisy activity, exact-generation reuse, interruption, timeout, broken pipe, and final cleanup; verify the focused suite is stable across repeated runs.
+- [x] 5.2 Run one live worker flow with the compact stream kept as a yielded background process while the parent performs other work and exchanges one normal hcom request/reply; verify status remains bounded, no diagnostic polling occurs, one-shot result waiting remains unchanged, and the worker survives stream termination.
+- [x] 5.3 Run formatting, focused and workspace tests, `cargo check --workspace --all-targets`, strict Clippy, and independent review; record results and any host-side live-output limitations in Beads and the changelog.

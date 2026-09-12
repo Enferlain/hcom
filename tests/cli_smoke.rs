@@ -1404,6 +1404,791 @@ fn events_stream_sigterm_interruption_terminates_cleanly_zero_and_cleans_up_endp
 }
 
 #[test]
+fn events_stream_has_no_subscription_request_watch_or_inbox_side_effects() {
+    let h = Hcom::new();
+    let _worker = h.start();
+
+    // Baseline: kv table has no subscriptions or request watches
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let sub_count_before: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:sub-%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sub_count_before, 0);
+
+    let reqwatch_before: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reqwatch_before, 0);
+    let listener_proc = "stream-no-side-effects-proc";
+    let _listener = h.start_with_process_id(listener_proc);
+
+    // Seed events: status and message
+    let _first = seed_stream_event(&h, "status", "working on task");
+    let _second = seed_stream_event(&h, "message", "broadcasting update");
+
+    // Run stream with timeout starting from beginning
+    let (code, stdout, stderr) = h.run_as_process(
+        listener_proc,
+        ["events", "stream", "--after-id", "0", "--timeout", "1"],
+    );
+    assert_eq!(code, 0, "stream should exit 0 on timeout: {stderr}");
+    assert!(stdout.contains("working on task"));
+
+    // Check DB state after stream: no subscriptions, no request watches, no synthetic notification messages
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let sub_count_after: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:sub-%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        sub_count_after, 0,
+        "events stream must not create subscriptions in kv"
+    );
+
+    let reqwatch_after: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reqwatch_after, 0,
+        "events stream must not create request-watch rows"
+    );
+
+    let syn_msg_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE type = 'message' AND (instance = 'hcom-events' OR \
+             json_extract(data, '$.from') = 'hcom-events')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        syn_msg_count, 0,
+        "events stream must not create [hcom-events] messages"
+    );
+
+    let stream_endpoints: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'events_stream'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stream_endpoints, 0,
+        "events_stream endpoints must be cleaned up"
+    );
+}
+
+#[test]
+fn compact_stream_coexists_with_correlated_request_reply() {
+    let h = Hcom::new();
+    let worker = h.start();
+    let coordinator = h.start();
+
+    let (cursor_code, cursor_out, _) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0);
+    let cursor = cursor_out.trim().to_string();
+    let observer_proc = "stream-observer-proc";
+    let _observer = h.start_with_process_id(observer_proc);
+
+    let stream_start = Instant::now();
+    // Spawn compact stream as background child process
+    let child = h
+        .cmd()
+        .env("HCOM_PROCESS_ID", observer_proc)
+        .args([
+            "events",
+            "stream",
+            "--after-id",
+            &cursor,
+            "--follow",
+            &worker,
+            "--compact",
+            "--timeout",
+            "10",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn compact stream child");
+
+    // Wait for the stream's own endpoint to be registered
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut armed = false;
+    while Instant::now() < deadline {
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'events_stream'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if count > 0 {
+            armed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        armed,
+        "compact stream endpoint must be registered before proceeding"
+    );
+
+    // 1. Worker reports active status
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute(
+        "INSERT INTO events (timestamp, type, instance, data)
+         VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'status', ?1, ?2)",
+        rusqlite::params![
+            worker,
+            serde_json::json!({
+                "status": "active",
+                "context": "tool:Bash",
+                "detail": "cargo test"
+            })
+            .to_string()
+        ],
+    )
+    .unwrap();
+    drop(db);
+
+    // 2. Worker sends request to coordinator
+    let (req_code, _, req_err) = h.run([
+        "send",
+        &format!("@{coordinator}"),
+        "--name",
+        &worker,
+        "--intent",
+        "request",
+        "--thread",
+        "cr-flow",
+        "--",
+        "requesting review for step 1",
+    ]);
+    assert_eq!(req_code, 0, "request send failed: stderr={req_err}");
+
+    // Verify request watch was created in kv and fetch the request event ID
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let (reqwatch, req_event_id): (i64, i64) = db
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'), \
+                    (SELECT id FROM events WHERE type = 'message' AND instance = ?1 ORDER BY id DESC LIMIT 1)",
+            rusqlite::params![worker],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(reqwatch, 1, "request watch must be created in kv");
+    drop(db);
+
+    // 2. Coordinator replies
+    let (rep_code, _, rep_err) = h.run([
+        "send",
+        &format!("@{worker}"),
+        "--name",
+        &coordinator,
+        "--intent",
+        "inform",
+        "--thread",
+        "cr-flow",
+        "--reply-to",
+        &req_event_id.to_string(),
+        "--",
+        "step 1 review passed",
+    ]);
+    assert_eq!(rep_code, 0, "reply send failed: stderr={rep_err}");
+
+    // Verify request watch was canceled by correlated reply
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let reqwatch_after: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reqwatch_after, 0,
+        "request watch must be canceled by correlated reply"
+    );
+    drop(db);
+
+    // 3. Worker stops cleanly
+    let (stop_code, _, stop_err) = h.run(["stop", &worker]);
+    assert_eq!(stop_code, 0, "stop worker failed: stderr={stop_err}");
+
+    // Wait for the stream child process to exit cleanly at the worker's terminal stop boundary
+    let output = child.wait_with_output().expect("wait on child stream");
+    let stream_duration = stream_start.elapsed();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "compact stream child must exit 0: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stream_duration < Duration::from_secs(8),
+        "compact stream must exit at worker stop boundary well before timeout (elapsed: {stream_duration:?})"
+    );
+
+    let stream_stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Verify compact stream never emits message bodies or conversational content
+    assert!(
+        !stream_stdout.contains("requesting review for step 1"),
+        "compact stream must not emit request text: {stream_stdout}"
+    );
+    assert!(
+        !stream_stdout.contains("step 1 review passed"),
+        "compact stream must not emit reply text: {stream_stdout}"
+    );
+    assert!(
+        !stream_stdout.contains("cr-flow"),
+        "compact stream must not emit thread name: {stream_stdout}"
+    );
+
+    let stream_stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stream_stdout.lines().collect();
+    assert!(
+        !lines.is_empty(),
+        "compact stream should have emitted records: stdout={stream_stdout} stderr={stream_stderr}"
+    );
+    let last_record: serde_json::Value =
+        serde_json::from_str(lines.last().unwrap()).expect("valid last compact JSON record");
+    assert_eq!(
+        last_record["activity"]["type"], "phase",
+        "last compact record must be phase activity: {last_record}"
+    );
+    assert_eq!(
+        last_record["activity"]["phase"], "stopped",
+        "last compact record must be phase stopped terminal boundary: {last_record}"
+    );
+    for line in lines {
+        let rec: serde_json::Value = serde_json::from_str(line).expect("valid compact JSON record");
+        assert_eq!(rec["schema_version"], 1);
+        assert!(rec["generation"].is_string());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn simultaneous_wait_and_stream_listeners_coexist_and_clean_up_independently() {
+    use std::io::BufRead;
+
+    let h = Hcom::new();
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+
+    let wait_proc = "simultaneous-wait-proc";
+    let stream_proc = "simultaneous-stream-proc";
+    let wait_name = h.start_with_process_id(wait_proc);
+    let stream_name = h.start_with_process_id(stream_proc);
+
+    let wait_child = h
+        .cmd()
+        .env("HCOM_PROCESS_ID", wait_proc)
+        .args([
+            "events",
+            "--wait",
+            "10",
+            "--after-id",
+            &cursor,
+            "--type",
+            "message",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn events --wait");
+
+    let mut stream_child = h
+        .cmd()
+        .env("HCOM_PROCESS_ID", stream_proc)
+        .args([
+            "events",
+            "stream",
+            "--after-id",
+            &cursor,
+            "--timeout",
+            "10",
+            "--type",
+            "message",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn events stream");
+
+    let stream_stdout = stream_child.stdout.take().expect("take stream stdout");
+    let mut stream_reader = std::io::BufReader::new(stream_stdout);
+
+    // Wait until both endpoints are armed simultaneously
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut wait_armed = false;
+    let mut stream_armed = false;
+    while Instant::now() < deadline {
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let wait_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ?1 AND kind = 'events_wait'",
+                rusqlite::params![wait_name],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let stream_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ?1 AND kind = 'events_stream'",
+                rusqlite::params![stream_name],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if wait_count > 0 {
+            wait_armed = true;
+        }
+        if stream_count > 0 {
+            stream_armed = true;
+        }
+        if wait_armed && stream_armed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(wait_armed, "events_wait endpoint must be armed");
+    assert!(stream_armed, "events_stream endpoint must be armed");
+
+    // Seed first event for both listeners
+    seed_stream_event(&h, "message", "simultaneous match 1");
+
+    // Wait child must terminate immediately on the first match
+    let wait_output = wait_child.wait_with_output().expect("wait for wait child");
+    assert_eq!(
+        wait_output.status.code(),
+        Some(0),
+        "events --wait must exit 0: stderr={}",
+        String::from_utf8_lossy(&wait_output.stderr)
+    );
+    let wait_stdout = String::from_utf8_lossy(&wait_output.stdout);
+    assert!(
+        wait_stdout.contains("simultaneous match 1"),
+        "wait stdout must contain first match: {wait_stdout}"
+    );
+
+    // Stream child also emits match 1
+    let mut line1 = String::new();
+    stream_reader
+        .read_line(&mut line1)
+        .expect("read match 1 from stream");
+    assert!(line1.contains("simultaneous match 1"));
+
+    // Verify immediately: events_wait endpoint is removed, but events_stream endpoint is preserved
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let wait_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ?1 AND kind = 'events_wait'",
+            rusqlite::params![wait_name],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let stream_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ?1 AND kind = 'events_stream'",
+            rusqlite::params![stream_name],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        wait_count, 0,
+        "events_wait endpoint must be cleaned up after exit"
+    );
+    assert_eq!(
+        stream_count, 1,
+        "events_stream endpoint must remain active while stream runs"
+    );
+    drop(db);
+
+    // Seed second event - stream will receive this as well
+    seed_stream_event(&h, "message", "simultaneous match 2");
+
+    // Deterministically observe second event emission from the stream before sending SIGINT
+    let mut line2 = String::new();
+    stream_reader
+        .read_line(&mut line2)
+        .expect("read match 2 from stream");
+    assert!(line2.contains("simultaneous match 2"));
+
+    // Signal stream child to interrupt cleanly (SIGINT)
+    unsafe {
+        nix::libc::kill(stream_child.id() as i32, nix::libc::SIGINT);
+    }
+    let status = stream_child.wait().expect("wait for stream child");
+    assert!(
+        status.success(),
+        "stream child must exit 0 on SIGINT: status={status:?}"
+    );
+
+    // Verify stream endpoint is also cleaned up
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let stream_count_after: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ?1 AND kind = 'events_stream'",
+            rusqlite::params![stream_name],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stream_count_after, 0,
+        "events_stream endpoint must be cleaned up after exit"
+    );
+}
+
+#[test]
+fn compact_stream_follow_isolates_unrelated_workers_noisy_activity_and_generation_reuse() {
+    let h = Hcom::new();
+    let (cursor_code, cursor_out, cursor_err) = h.run(["events", "--cursor"]);
+    assert_eq!(cursor_code, 0, "stderr={cursor_err}");
+    let cursor = cursor_out.trim().to_string();
+
+    let worker = h.start_with_process_id("worker-proc-1");
+    let unrelated_worker = h.start_with_process_id("unrelated-proc-2");
+
+    let observer_proc = "stream-follow-observer";
+    let observer_name = h.start_with_process_id(observer_proc);
+
+    let stream_start = Instant::now();
+    let child = h
+        .cmd()
+        .env("HCOM_PROCESS_ID", observer_proc)
+        .args([
+            "events",
+            "stream",
+            "--after-id",
+            &cursor,
+            "--follow",
+            &worker,
+            "--compact",
+            "--timeout",
+            "10",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn compact stream follow child");
+
+    // Wait for the stream's own endpoint to be registered
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut armed = false;
+    while Instant::now() < deadline {
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'events_stream' AND instance = ?1",
+                rusqlite::params![observer_name],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if count > 0 {
+            armed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(armed, "compact stream endpoint must be registered");
+
+    // 1. Emit noisy repetitive activity for `worker`
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    for _ in 0..5 {
+        db.execute(
+            "INSERT INTO events (timestamp, type, instance, data)
+             VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'status', ?1, ?2)",
+            rusqlite::params![
+                worker,
+                serde_json::json!({
+                    "status": "active",
+                    "context": "tool:Bash",
+                    "detail": "cargo test --noisy"
+                })
+                .to_string()
+            ],
+        )
+        .unwrap();
+    }
+
+    // 2. Emit activity for `unrelated_worker`
+    db.execute(
+        "INSERT INTO events (timestamp, type, instance, data)
+         VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'status', ?1, ?2)",
+        rusqlite::params![
+            unrelated_worker,
+            serde_json::json!({
+                "status": "active",
+                "context": "tool:Grep",
+                "detail": "unrelated noise detail"
+            })
+            .to_string()
+        ],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO events (timestamp, type, instance, data)
+         VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'message', ?1, ?2)",
+        rusqlite::params![
+            unrelated_worker,
+            serde_json::json!({
+                "from": unrelated_worker,
+                "scope": "direct",
+                "delivered_to": ["different-instance"],
+                "text": "unrelated worker secret message"
+            })
+            .to_string()
+        ],
+    )
+    .unwrap();
+    drop(db);
+
+    // 3. Worker stops cleanly
+    let (stop_code, _, stop_err) = h.run(["stop", &worker]);
+    assert_eq!(stop_code, 0, "stop worker failed: stderr={stop_err}");
+
+    // 4. Simulate generation reuse under the same name `worker`
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    db.execute(
+        "INSERT INTO instances (name, status, status_context, status_detail, session_id, created_at, last_stop)
+         VALUES (?1, 'active', 'reused-gen', 'working', 'sess-reused', 3000000000.0, NULL)",
+        rusqlite::params![worker],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO events (timestamp, type, instance, data)
+         VALUES (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'status', ?1, ?2)",
+        rusqlite::params![
+            worker,
+            serde_json::json!({
+                "status": "active",
+                "context": "tool:NewGen",
+                "detail": "reused generation activity"
+            })
+            .to_string()
+        ],
+    )
+    .unwrap();
+    drop(db);
+
+    // Stream child must terminate at worker's stop boundary, well before the 10-second timeout
+    let output = child.wait_with_output().expect("wait on child stream");
+    let stream_duration = stream_start.elapsed();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "compact stream child must exit 0: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stream_duration < Duration::from_secs(8),
+        "compact stream must exit at worker stop boundary well before timeout (elapsed: {stream_duration:?})"
+    );
+
+    let stream_stdout = String::from_utf8_lossy(&output.stdout);
+    let stream_stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = stream_stdout.lines().collect();
+    assert!(
+        !lines.is_empty(),
+        "compact stream should emit records: stdout={stream_stdout} stderr={stream_stderr}"
+    );
+
+    // The stream must never contain content from unrelated worker
+    assert!(
+        !stream_stdout.contains("unrelated noise detail"),
+        "must not contain unrelated worker detail: {stream_stdout}"
+    );
+    assert!(
+        !stream_stdout.contains("unrelated worker secret message"),
+        "must not contain unrelated worker message: {stream_stdout}"
+    );
+
+    // The stream must never contain content from reused generation
+    assert!(
+        !stream_stdout.contains("reused generation activity"),
+        "must not contain reused generation activity: {stream_stdout}"
+    );
+
+    // Terminal record must be phase 'stopped'
+    let last_record: serde_json::Value =
+        serde_json::from_str(lines.last().unwrap()).expect("valid last compact JSON record");
+    assert_eq!(
+        last_record["activity"]["type"], "phase",
+        "last compact record must be phase activity: {last_record}"
+    );
+    assert_eq!(
+        last_record["activity"]["phase"], "stopped",
+        "last compact record must be phase stopped terminal boundary: {last_record}"
+    );
+
+    // Verify noisy repeated status was coalesced/deduplicated:
+    // We emitted 5 identical active status events; only 1 active phase record should exist
+    let active_phase_count = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|rec| rec["activity"]["type"] == "phase" && rec["activity"]["phase"] == "active")
+        .count();
+    assert_eq!(
+        active_phase_count, 1,
+        "noisy identical phases must be deduplicated to 1, found {active_phase_count}: {stream_stdout}"
+    );
+
+    // Verify endpoint cleanup
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let stream_endpoints: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'events_stream' AND instance = ?1",
+            rusqlite::params![observer_name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stream_endpoints, 0,
+        "events_stream endpoint must be cleaned up on completion"
+    );
+}
+
+#[test]
+fn events_snapshot_default_preserves_non_streaming_exit() {
+    let h = Hcom::new();
+    let _worker = h.start();
+    let _event = seed_stream_event(&h, "status", "test-snapshot-status");
+
+    let (code, stdout, stderr) = h.run(["events"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(!lines.is_empty(), "snapshot should emit events");
+    for line in lines {
+        let _parsed: serde_json::Value =
+            serde_json::from_str(line).expect("snapshot line must be valid JSON");
+    }
+
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let stream_endpoints: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'events_stream'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stream_endpoints, 0,
+        "snapshot must not create stream endpoints"
+    );
+}
+
+#[test]
+fn events_sub_default_preserves_subscription_without_stdout_stream() {
+    let h = Hcom::new();
+    let worker = h.start();
+
+    let (code, stdout, stderr) = h.run([
+        "events", "sub", "--name", &worker, "--agent", &worker, "--once",
+    ]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("Subscription sub-"), "stdout={stdout}");
+
+    // Check kv subscription exists
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let sub_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:sub-%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sub_count, 1, "sub must create a subscription row in kv");
+
+    let stream_endpoints: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'events_stream'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stream_endpoints, 0,
+        "events sub must not create stream endpoints"
+    );
+}
+
+#[test]
+fn hcom_run_preserves_terminal_only_wait_output_and_no_implicit_stream() {
+    let h = Hcom::new();
+    let _worker = h.start();
+
+    // Create a workflow script in $HCOM_DIR/scripts/run-wait-test.sh
+    let scripts_dir = h.path().join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let script_path = scripts_dir.join("run-wait-test.sh");
+    let hcom_cmd = h.bash_hcom_command();
+    let script_content = format!(
+        r#"#!/bin/bash
+# Test that events --wait inside a script captures only single-event wait output
+OUT=$({hcom_cmd} events --wait 2 --after-id 0 --type message)
+echo "OUT_CAPTURED: $OUT"
+"#
+    );
+    std::fs::write(&script_path, script_content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+    }
+
+    // Seed two message events
+    let _first = seed_stream_event(&h, "message", "first work report");
+    let _second = seed_stream_event(&h, "message", "second work report");
+
+    // Run via `hcom run run-wait-test`
+    let (code, stdout, stderr) = h.run(["run", "run-wait-test"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+
+    assert!(stdout.contains("OUT_CAPTURED:"));
+    assert!(stdout.contains("first work report"));
+    assert!(
+        !stdout.contains("second work report"),
+        "wait must not stream past first match: {stdout}"
+    );
+
+    // Check no events_stream endpoint was ever registered
+    let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let stream_endpoints: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM notify_endpoints WHERE kind = 'events_stream'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stream_endpoints, 0, "no events_stream endpoints created");
+}
+
+#[test]
 fn send_without_identity_errors_with_hint() {
     let h = Hcom::new();
     let (code, _stdout, stderr) = h.run(["send", "@nobody", "--", "hi"]);

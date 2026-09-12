@@ -294,12 +294,17 @@ hcom                                # TUI dashboard
 hcom send -b @luna -- hey           # one-off message to an agent
 hcom list                           # show all active agents
 hcom term [name]                    # view/inject into an agent's PTY screen
-hcom events --wait <filters>         # Block until match for scripting
+hcom events [filters]               # Snapshot past events (NDJSON, immediate exit)
+hcom events --wait <filters>         # One-shot wait: blocks until first match, then exits
 hcom events --wait 1800 --after-id N --thread ID --result-from NAME
                                      # Atomic attempt wait: result, typed blocker,
                                      # launch failure, stopped-without-result, or
                                      # deadline — each with worker generation,
                                      # thread, attempt cursor, and recovery guidance
+hcom events sub [filters]           # Conversational subscription delivered as messages
+hcom events stream [filters]        # Generic live stream in durable-ID order
+hcom events stream --follow NAME --compact
+                                     # Model-safe typed worker progress observation
 hcom update                         # update hcom version
 ```
 

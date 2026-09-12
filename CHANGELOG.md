@@ -11,6 +11,29 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
+## [2026-09-12]
+
+### Added
+
+- Added explicit continuous `hcom events stream` observation with durable
+  cursors, existing event filters, line-flushed generic output, and optional
+  exact-generation `--follow NAME --compact` progress records with bounded
+  phase, file, command-category, and heartbeat updates.
+- Added hermetic coverage for simultaneous wait and stream listeners, cursor
+  races, unrelated and reused worker generations, noisy activity, interruption,
+  timeout, broken pipes, cleanup, and ordinary request/reply messaging alongside
+  compact observation.
+
+### Changed
+
+- Event and workflow guidance now distinguishes snapshot queries, one-shot
+  waits, conversational subscriptions, generic streams, and compact worker
+  observation. Existing `events`, `events --wait`, `events sub`, and `hcom run`
+  behavior remains opt-in and unchanged by streaming.
+- Tool hosts may need to poll the existing yielded process handle to display
+  newly flushed stream records; `hcom` does not daemonize the stream or issue
+  follow-up event queries on the host's behalf.
+
 ## [2026-09-09]
 
 ### Added

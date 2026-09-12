@@ -187,6 +187,16 @@ The bootstrap teaches agents: `request -> always respond`, `inform -> respond on
 | `@mentions` | Target specific agents | Controls delivery scope |
 | Broadcast (no @) | Everyone needs to see | Delivers to all active/listening agents |
 
+## Event Observation Modes: Snapshot vs Wait vs Sub vs Stream vs Compact Follow
+
+| Mechanism | Command | Output & Lifecycle | When to use |
+|-----------|---------|-------------------|-------------|
+| **Snapshot** | `hcom events [filters]` | Point-in-time past events (NDJSON), exits immediately | One-off checks, past event queries |
+| **One-shot wait** | `hcom events --wait SEC [filters]` | Blocks until first match, prints single event, exits 0 on match | Script step synchronization (`--wait` never streams) |
+| **Conversational sub** | `hcom events sub [filters]` | Durable subscription in DB; notifies via `[hcom-events]` messages | Reactive agents, asynchronous file/status triggers |
+| **Generic stream** | `hcom events stream [filters]` | Continuous NDJSON live stream in durable-ID order | Logging, external dashboards (can carry raw data/secrets) |
+| **Compact worker follow** | `hcom events stream --follow NAME --compact` | Bounded, typed progress NDJSON (`phase`, `file`, `command`, `heartbeat`) | Model-safe agent progress observation; stops at worker exit |
+
 ## TTY/PTY Issues
 
 **Agent shows as "blocked" in hcom list:**
