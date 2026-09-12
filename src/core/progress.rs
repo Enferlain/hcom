@@ -47,13 +47,6 @@
 //!   [`PROGRESS_SCHEMA_VERSION`] together with the documentation above and
 //!   the contract tests below.
 
-// Staged contract: the classifier and stream CLI (OpenSpec
-// stream-correlated-worker-progress tasks 2.x/3.x) are the consumers of this
-// module. The binary target cannot see test-only usage, so dead-code analysis
-// is suppressed there until the stream CLI is wired up; test builds keep the
-// lint armed.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use serde_json::Value;
 
 /// Current contract version for compact worker progress records.
@@ -142,6 +135,11 @@ impl CompactRecord {
 }
 
 /// Build one versioned compact record as a JSON [`Value`] for an observed event.
+///
+/// Contract-test helper: production code serializes [`CompactRecord`] values
+/// directly (`core::compact` and the stream writer), so this convenience
+/// constructor is exercised only by tests and is dead in the binary target.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn compact_record(
     cursor: i64,
     generation: &str,

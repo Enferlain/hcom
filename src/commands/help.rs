@@ -100,9 +100,31 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
     ),
     ("    --full", "Raw events, not streamlined"),
     (
-        "",
-        "  Exit codes: 0 timeout reached, 1 input/filter error, 2 SQL error",
+        "    --follow NAME",
+        "Follow one exact worker generation (needs --after-id; no filters)",
     ),
+    (
+        "    --compact",
+        "Typed status for --follow; model-safe; conflicts --full/filters",
+    ),
+    (
+        "    --heartbeat SEC",
+        "Compact quiet heartbeat interval, >=1 second (needs --compact)",
+    ),
+    (
+        "",
+        "  Generic output (full or streamlined) can carry raw or",
+    ),
+    (
+        "",
+        "  secret-bearing event data; only --follow --compact is",
+    ),
+    ("", "  model-context safe"),
+    (
+        "",
+        "  Exit codes: 0 done (timeout, stop boundary, interrupt, or closed pipe),",
+    ),
+    ("", "    1 input/filter/correlation error, 2 SQL error"),
     ("", ""),
     (
         "Subscribe (next matching event delivered as messages from [hcom-events]):",
@@ -1282,8 +1304,12 @@ mod tests {
         );
         assert!(help.contains("--timeout SEC"));
         assert!(
-            help.contains("0 timeout reached, 1 input/filter error, 2 SQL error"),
+            help.contains("0 done (timeout, stop boundary, interrupt, or closed pipe)"),
             "events help must document the stream exit codes"
+        );
+        assert!(
+            help.contains("1 input/filter/correlation error, 2 SQL error"),
+            "events help must document the stream failure exit codes"
         );
     }
 

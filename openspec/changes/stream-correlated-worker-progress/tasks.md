@@ -11,9 +11,9 @@
 
 ## 3. Compact Worker Observation
 
-- [ ] 3.1 Separate worker-generation discovery from result-message filter injection and bind compact following to one live/post-cursor generation; verify missing, ambiguous, stopped, and rapidly reused names fail closed or terminate at the correct boundary.
-- [ ] 3.2 Implement the typed compact classifier with phase deduplication, file/command coalescing, allowlisted command categories, optional rate-limited heartbeats, and deterministic injected timing; verify noisy traces have a bounded output count and raw command, argument, environment, transcript, and message text never serialize.
-- [ ] 3.3 Keep generic stream output compatible with existing event projections while documenting that only compact mode is safe for model context; verify generic filters retain their current AND/OR and type-validation semantics.
+- [x] 3.1 Separate worker-generation discovery from result-message filter injection and bind compact following to one live/post-cursor generation; verify missing, ambiguous, stopped, and rapidly reused names fail closed or terminate at the correct boundary.
+- [x] 3.2 Implement the typed compact classifier with phase deduplication, file/command coalescing, allowlisted command categories, optional rate-limited heartbeats, and deterministic injected timing; verify noisy traces have a bounded output count and raw command, argument, environment, transcript, and message text never serialize.
+- [x] 3.3 Keep generic stream output compatible with existing event projections while documenting that only compact mode is safe for model context; verify generic filters retain their current AND/OR and type-validation semantics.
 
 ## 4. Messaging and Compatibility Isolation
 

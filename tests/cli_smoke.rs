@@ -565,6 +565,14 @@ fn events_stream_help_documents_cursor_and_output_flags() {
         "--after-id ID",
         "--timeout SEC",
         "--full",
+        "--follow NAME",
+        "--compact",
+        "--heartbeat SEC",
+        "no filters",
+        "conflicts --full/filters",
+        "closed pipe",
+        "secret-bearing event data",
+        "only --follow --compact is",
     ] {
         assert!(
             stdout.contains(needle),

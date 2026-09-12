@@ -122,12 +122,21 @@ one live or post-cursor generation and records its immutable instance key.
 Message events can be checked directly against `sender_instance_key`. Status,
 file, command, and ordinary lifecycle events are currently name-scoped, so they
 are accepted only while the resolved generation owns that live instance name
-and before its matching stopped snapshot. The matching stop boundary ends a
-generation-follow stream before a later worker can reuse the name. Ambiguous or
-missing generations fail closed.
+and before its matching terminal stopped snapshot. Provider soft stops mark
+execution-loop boundaries while retaining the live generation; they remain
+observable but do not end the stream, and compact projection reports them as
+`listening` rather than the terminal `stopped` phase. The matching terminal
+stop boundary ends a generation-follow stream before a later worker can reuse
+the name. Ambiguous or missing generations fail closed.
 
 Alternative: filter solely by display name. Rejected because a long-lived
 stream could silently cross into a replacement worker.
+
+One-shot `--result-from` waits keep their existing provider-turn semantics:
+a soft stop may trigger transcript recovery when a worker did not send its
+authoritative result. Continuous streams instead interpret only a terminal
+stop as the end of the worker generation. This distinction preserves existing
+workflow recovery without making background observation end between turns.
 
 ### 6. Keep messaging completely independent
 
@@ -154,8 +163,9 @@ while other work continues.
 ## Risks / Trade-offs
 
 - **[Status events lack immutable generation keys]** -> Resolve one generation,
-  gate name-scoped events by live ownership, and end at its matching stop
-  snapshot; test rapid name reuse and pre/post-boundary events.
+  gate name-scoped events by live ownership, distinguish provider soft loop
+  stops from terminal stops, and end at the matching terminal snapshot; test
+  soft continuation, rapid name reuse, and pre/post-boundary events.
 - **[Internal rechecks create database load]** -> Use one cursor query per
   bounded interval, consume batches, and wake early when existing notification
   plumbing can do so.

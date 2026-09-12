@@ -41,9 +41,11 @@ for deterministic continuation.
 ### Requirement: Stream output is live and lifecycle-safe
 The system SHALL encode stream records as line-delimited structured output and
 SHALL flush every emitted record. A stream SHALL run until explicitly stopped,
-its optional timeout expires, or an explicitly selected correlated lifecycle
-boundary occurs. Exiting a stream MUST clean up listener state and MUST NOT stop
-or otherwise mutate the observed worker.
+its optional timeout expires, or an explicitly selected correlated terminal
+lifecycle boundary occurs. A provider's soft execution-loop stop MUST remain
+observable without ending a follow while that worker generation remains live.
+Exiting a stream MUST clean up listener state and MUST NOT stop or otherwise
+mutate the observed worker.
 
 #### Scenario: Tool host keeps the command live
 - **WHEN** a tool host yields the running stream process into the background
@@ -80,8 +82,13 @@ durable cursor, and correlated worker generation.
 ### Requirement: Worker-generation following does not cross reuse boundaries
 When a stream follows a worker attempt, the system SHALL bind observation to one
 immutable worker generation. Name-only status and lifecycle events MAY be used
-only while that generation owns the live name and before its matching stop
-boundary; a later worker reusing the display name MUST NOT enter the stream.
+only while that generation owns the live name and before its matching terminal
+stop boundary. Provider soft stops that retain the live generation MUST NOT end
+the stream; a later worker reusing the display name MUST NOT enter the stream.
+
+#### Scenario: Provider execution loop stops but worker remains live
+- **WHEN** the followed generation emits a soft stop and remains available for another turn
+- **THEN** the stream continues following the same generation and compact output reports a nonterminal listening phase rather than stopped
 
 #### Scenario: Worker name is reused
 - **WHEN** the followed generation stops and another generation later acquires the same display name

@@ -1585,7 +1585,7 @@ fn stop_instance_inner(
 /// the inactive status and preserves the row for `hcom r`.
 ///
 /// Clears session bindings (and process bindings unless `keep_process_binding`),
-/// and logs a stopped life event with snapshot, but does not delete the instance row.
+/// and logs a soft stopped life event with snapshot, but does not delete the instance row.
 ///
 /// OMP soft-stop passes `keep_process_binding: true` so the live process can rebind
 /// via `bind_session_to_process` on the next turn. Antigravity passes `false`.
@@ -1665,13 +1665,17 @@ pub fn soft_finalize_session(
     }
     let _ = db.cleanup_subscriptions(instance_name);
 
-    if let Err(e) = db.log_life_event(
-        instance_name,
-        "stopped",
-        "session",
-        &format!("exit:{}", reason),
-        Some(snapshot),
-    ) {
+    // A soft stop marks an execution-loop boundary, not the end of the worker
+    // generation. Keep that distinction durable so continuous observers do
+    // not mistake a provider's next listening turn for a replacement worker.
+    let event_data = serde_json::json!({
+        "action": "stopped",
+        "by": "session",
+        "reason": format!("exit:{reason}"),
+        "soft": true,
+        "snapshot": snapshot,
+    });
+    if let Err(e) = db.log_event_with_ts("life", instance_name, &event_data, None) {
         log::log_warn(
             "hooks",
             "sessionend.soft.life_event_failed",
@@ -2915,6 +2919,18 @@ mod tests {
             Some("vine")
         );
         assert_eq!(db.get_process_binding("pid-soft").unwrap(), None);
+        let event_data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'life' AND instance = 'vine' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event_data: serde_json::Value = serde_json::from_str(&event_data).unwrap();
+        assert_eq!(event_data["action"], "stopped");
+        assert_eq!(event_data["soft"], true);
+        assert_eq!(event_data["snapshot"]["name"], "vine");
     }
 
     #[test]

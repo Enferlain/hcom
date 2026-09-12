@@ -70,6 +70,23 @@ pub const FILE_OP_CONTEXTS: &[&str] = &[
 /// Shell tool contexts.
 pub const SHELL_TOOL_CONTEXTS: &str = "('tool:Bash', 'tool:run_shell_command', 'tool:shell', 'tool:run_command', 'tool:Shell', 'tool:run_terminal_cmd', 'tool:execute_command', 'tool:shell_command', 'tool:bash', 'tool:powershell')";
 
+/// Shell tool contexts as a list for exact membership checks.
+///
+/// Must stay in sync with [`SHELL_TOOL_CONTEXTS`]; `shell_tuple_matches_list`
+/// pins the two forms to the same vocabulary.
+pub const SHELL_TOOL_CONTEXT_LIST: &[&str] = &[
+    "tool:Bash",
+    "tool:run_shell_command",
+    "tool:shell",
+    "tool:run_command",
+    "tool:Shell",
+    "tool:run_terminal_cmd",
+    "tool:execute_command",
+    "tool:shell_command",
+    "tool:bash",
+    "tool:powershell",
+];
+
 /// Parsed filter values — multiple values per key (OR semantics).
 pub type FilterMap = HashMap<String, Vec<String>>;
 
@@ -825,6 +842,22 @@ mod tests {
             "NotebookEdit"
         ));
         assert!(FILE_OP_CONTEXTS.contains(&"tool:NotebookEdit"));
+    }
+
+    #[test]
+    fn shell_tuple_matches_list() {
+        let tuple = format!(
+            "({})",
+            SHELL_TOOL_CONTEXT_LIST
+                .iter()
+                .map(|context| format!("'{context}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(
+            tuple, SHELL_TOOL_CONTEXTS,
+            "the shell SQL tuple and its list must carry the same vocabulary in the same order"
+        );
     }
 
     #[test]

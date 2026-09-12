@@ -6,7 +6,13 @@
 //! - Subscribe: `hcom events sub [list | SQL | filters...] [--once] [--for name]`
 //! - Unsubscribe: `hcom events unsub <id>`
 //! - Launch status: `hcom events launch [batch_id] [--timeout N]`
-//! - Stream: `hcom events stream [--after-id N] [--full] [--timeout SEC] [filters...]`
+//! - Stream: `hcom events stream [--after-id N] [--full] [--timeout SEC]
+//!   [--follow NAME [--compact [--heartbeat SEC]]] [filters...]`
+//!
+//! Generic stream output reuses the raw full/streamlined event projections
+//! and may contain raw or secret-bearing event data (command text, message
+//! bodies, file detail); only the `--follow --compact` projection is
+//! intended as model-context-safe.
 //!
 //! Correlated result waits (`--wait --result-from NAME --thread ID --after-id
 //! N`) exit `0` on the authoritative result, `1` on deadline, `2` on SQL
@@ -16,7 +22,7 @@
 //! generation, workflow thread, attempt cursor, blocker evidence, and
 //! recovery guidance.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -25,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::core::compact::{CompactClassifier, CompactStreamConfig};
 use crate::core::filters::{
     EventFilterArgs, build_sql_from_flags, resolve_filter_names, validate_type_constraints,
 };
@@ -44,8 +51,250 @@ struct ResultCorrelation {
     after_id: i64,
 }
 
+/// One immutable worker generation selected at a durable attempt boundary.
+///
+/// The stop cursor is known when discovery finds a post-cursor stopped
+/// snapshot. A live generation has no stop cursor until its matching lifecycle
+/// event is observed by the stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerGeneration {
+    exact_worker: String,
+    instance_key: String,
+    after_id: i64,
+    stop_event_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationEventDisposition {
+    /// Not from the followed generation; skip without ending the stream.
+    Ignore,
+    /// From the followed generation; emit and keep following.
+    Observe,
+    /// The followed generation's matching stop boundary; emit it and end
+    /// the stream.
+    ObserveAndStop,
+    /// The followed generation already ended before this event; end the
+    /// stream without emitting activity from a later generation.
+    Terminate,
+}
+
+/// Stateful boundary gate for a stream following one worker generation.
+///
+/// Message events carry an immutable sender key and are matched directly.
+/// Other worker activity is name-scoped and is accepted only until the exact
+/// generation's terminal stopped snapshot is encountered. Provider soft stops
+/// mark execution-loop boundaries while retaining the same generation, so they
+/// remain observable without ending the follow. Once terminally stopped, later
+/// activity from a worker reusing the name is ignored even if a caller
+/// accidentally continues feeding events to the gate. When discovery already
+/// located the terminal stop boundary, an event past it means the stream armed
+/// too late: the follow terminates instead of silently ignoring a reused name.
+#[derive(Debug, Clone)]
+struct WorkerGenerationFollow {
+    generation: WorkerGeneration,
+    stopped: bool,
+}
+
+impl WorkerGenerationFollow {
+    fn classify(&mut self, event: &Value) -> GenerationEventDisposition {
+        if self.stopped {
+            return GenerationEventDisposition::Ignore;
+        }
+
+        let Some(event_id) = event.get("id").and_then(Value::as_i64) else {
+            return GenerationEventDisposition::Ignore;
+        };
+        if event_id <= self.generation.after_id {
+            return GenerationEventDisposition::Ignore;
+        }
+        if let Some(stop_id) = self.generation.stop_event_id
+            && event_id > stop_id
+        {
+            self.stopped = true;
+            return GenerationEventDisposition::Terminate;
+        }
+
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let instance = event
+            .get("instance")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let data = event.get("data").unwrap_or(&Value::Null);
+
+        if event_type == "life" && data.get("action").and_then(Value::as_str) == Some("stopped") {
+            if data.get("placeholder").and_then(Value::as_bool) == Some(true) {
+                return GenerationEventDisposition::Ignore;
+            }
+            if data.get("soft").and_then(Value::as_bool) == Some(true) {
+                return if data
+                    .get("snapshot")
+                    .and_then(|snapshot| sender_instance_key(instance, snapshot))
+                    .as_deref()
+                    == Some(self.generation.instance_key.as_str())
+                {
+                    GenerationEventDisposition::Observe
+                } else {
+                    GenerationEventDisposition::Ignore
+                };
+            }
+            let snapshot_key = data
+                .get("snapshot")
+                .and_then(|snapshot| sender_instance_key(instance, snapshot))
+                .map(|key| key.to_string());
+            match snapshot_key.as_deref() {
+                Some(key) if key == self.generation.instance_key => {
+                    self.stopped = true;
+                    self.generation.stop_event_id = Some(event_id);
+                    return GenerationEventDisposition::ObserveAndStop;
+                }
+                Some(_) => return GenerationEventDisposition::Ignore,
+                None if instance.eq_ignore_ascii_case(&self.generation.exact_worker) => {
+                    // Every production terminal stop carries an immutable
+                    // snapshot. If a malformed event violates that invariant,
+                    // fail closed rather than crossing into name reuse.
+                    self.stopped = true;
+                    return GenerationEventDisposition::Terminate;
+                }
+                None => return GenerationEventDisposition::Ignore,
+            }
+        }
+
+        if event_type == "message" {
+            return if data.get("sender_instance_key").and_then(Value::as_str)
+                == Some(self.generation.instance_key.as_str())
+            {
+                GenerationEventDisposition::Observe
+            } else {
+                GenerationEventDisposition::Ignore
+            };
+        }
+
+        if instance.eq_ignore_ascii_case(&self.generation.exact_worker) {
+            GenerationEventDisposition::Observe
+        } else {
+            GenerationEventDisposition::Ignore
+        }
+    }
+}
+
 const RESULT_RECOVERY_GRACE: Duration = Duration::from_secs(2);
 const RESULT_RECOVERY_RETRY: Duration = Duration::from_millis(200);
+
+/// Resolve exactly one live or post-cursor stopped generation for `worker`.
+///
+/// Discovery is intentionally independent from any event filters so result
+/// waits and compact streams can share generation identity without sharing
+/// message-only terminal semantics. `label` names the caller-facing operation
+/// (e.g. `--result-from`) and is embedded in the resolution errors so each
+/// caller keeps its existing actionable error text.
+fn discover_worker_generation(
+    db: &HcomDb,
+    label: &str,
+    worker: &str,
+    after_id: i64,
+) -> Result<WorkerGeneration, String> {
+    let mut generations: BTreeMap<String, WorkerGeneration> = BTreeMap::new();
+
+    if let Some(exact_worker) = crate::identity::resolve_display_name(db, worker)
+        && let Some(instance_data) = db
+            .get_instance(&exact_worker)
+            .map_err(|error| format!("failed to read {label} worker: {error}"))?
+        && let Some(instance_key) = sender_instance_key(&exact_worker, &instance_data)
+    {
+        generations.insert(
+            instance_key.clone(),
+            WorkerGeneration {
+                exact_worker,
+                instance_key,
+                after_id,
+                stop_event_id: None,
+            },
+        );
+    }
+
+    // A worker can terminate before a follower arms. The immutable pre-delete
+    // snapshot is the only authoritative identity after its live row is gone.
+    // Soft execution-loop stops retain the live generation and are generation
+    // evidence, but never terminal boundaries. Keeping them in discovery makes
+    // a later replacement under the same display name fail closed as ambiguous.
+    // Ignore all stops at or before the caller's attempt cursor so historical
+    // generations cannot be revived.
+    let mut statement = db
+        .conn()
+        .prepare(
+            "SELECT id, instance, data FROM events
+             WHERE id > ?1 AND type = 'life'
+               AND json_valid(data)
+               AND json_extract(data, '$.action') = 'stopped'
+               AND json_extract(data, '$.placeholder') IS NOT TRUE
+             ORDER BY id",
+        )
+        .map_err(|error| format!("failed to inspect stopped workers: {error}"))?;
+    let stopped = statement
+        .query_map(rusqlite::params![after_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("failed to inspect stopped workers: {error}"))?;
+    for row in stopped {
+        let (event_id, name, data) =
+            row.map_err(|error| format!("failed to inspect stopped worker row: {error}"))?;
+        let Ok(data) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        let soft = data.get("soft").and_then(Value::as_bool) == Some(true);
+        let Some(snapshot) = data.get("snapshot") else {
+            continue;
+        };
+        let tag = snapshot
+            .get("tag")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let display_name = tag.map_or_else(|| name.clone(), |tag| format!("{tag}-{name}"));
+        if !name.eq_ignore_ascii_case(worker) && !display_name.eq_ignore_ascii_case(worker) {
+            continue;
+        }
+        let Some(instance_key) = sender_instance_key(&name, snapshot) else {
+            continue;
+        };
+        generations
+            .entry(instance_key.clone())
+            .and_modify(|generation| {
+                if !soft {
+                    generation.stop_event_id = Some(
+                        generation
+                            .stop_event_id
+                            .map_or(event_id, |current| current.min(event_id)),
+                    );
+                }
+            })
+            .or_insert(WorkerGeneration {
+                exact_worker: name,
+                instance_key,
+                after_id,
+                stop_event_id: (!soft).then_some(event_id),
+            });
+    }
+
+    let mut generations = generations.into_values();
+    let Some(generation) = generations.next() else {
+        return Err(format!(
+            "{label} worker '{worker}' has no generation after the attempt cursor"
+        ));
+    };
+    if generations.next().is_some() {
+        return Err(format!(
+            "{label} worker '{worker}' resolves to multiple generations after the attempt cursor"
+        ));
+    }
+    Ok(generation)
+}
 
 /// Parsed arguments for `hcom events`.
 #[derive(clap::Parser, Debug)]
@@ -154,12 +403,33 @@ pub struct EventsLaunchArgs {
     pub timeout: u64,
 }
 
+/// Parse a heartbeat interval in seconds, rejecting anything below one
+/// second: a zero-second heartbeat would fire on every 500ms recheck poll
+/// and degenerate into output spam, the exact failure the rate limit exists
+/// to prevent.
+fn parse_heartbeat_secs(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|secs| *secs >= 1)
+        .ok_or_else(|| format!("invalid heartbeat '{value}': must be at least 1 second"))
+}
+
 /// Args for `hcom events stream`.
 ///
 /// Generic stream mode: emit every event matching the existing composable
 /// filters in ascending durable-ID order and stay active until the optional
 /// overall timeout. This is not a compact worker view and not a conversation
 /// surface; it reads stored events and writes records to stdout only.
+/// Generic output is NOT secret-safe: full and streamlined projections
+/// carry raw event data (command text, message bodies, file detail), so
+/// only feed it to a model after filtering for exactly what is wanted.
+///
+/// Worker-following mode (`--follow`) binds the stream to one exact worker
+/// generation discovered at `--after-id` and ends at that generation's
+/// matching stop boundary; it cannot be combined with filters. `--compact`
+/// selects the typed compact status projection for the followed generation,
+/// which is the only stream output safe for model context.
 #[derive(clap::Args, Debug)]
 pub struct EventsStreamArgs {
     /// Only emit events with an ID greater than this cursor
@@ -172,6 +442,21 @@ pub struct EventsStreamArgs {
     /// Overall lifetime in seconds; the stream exits 0 when it expires
     #[arg(long)]
     pub timeout: Option<u64>,
+    /// Follow one exact worker generation: observe only that generation's
+    /// events and end the stream at its matching stop boundary
+    /// (requires --after-id; cannot be combined with filters)
+    #[arg(long, requires = "after_id")]
+    pub follow: Option<String>,
+    /// Emit the typed compact worker-status projection for the followed
+    /// generation instead of raw events; the only output safe for model
+    /// context (requires --follow; cannot be combined with --full or filters)
+    #[arg(long, requires = "follow", conflicts_with = "full")]
+    pub compact: bool,
+    /// Quiet-heartbeat interval in seconds (at least 1) for compact mode:
+    /// while the followed generation produces no correlated activity, emit
+    /// at most one rate-limited heartbeat per interval
+    #[arg(long, requires = "compact", value_parser = parse_heartbeat_secs)]
+    pub heartbeat: Option<u64>,
     /// Composable event filters
     #[command(flatten)]
     pub filters: EventFilterArgs,
@@ -212,70 +497,9 @@ fn apply_result_correlation(
     }
 
     let after_id = args.after_id.expect("checked above");
-    let mut generations = BTreeSet::new();
-
-    if let Some(exact_worker) = crate::identity::resolve_display_name(db, worker)
-        && let Some(instance_data) = db
-            .get_instance(&exact_worker)
-            .map_err(|error| format!("failed to read --result-from worker: {error}"))?
-        && let Some(instance_key) = sender_instance_key(&exact_worker, &instance_data)
-    {
-        generations.insert((exact_worker, instance_key));
-    }
-
-    // A worker commonly reports and then stops before the coordinator arms
-    // its wait. Stopping deletes the live instance row, but the lifecycle event
-    // retains the immutable pre-delete snapshot. Only consider stops after the
-    // caller's pre-launch cursor so an earlier generation cannot be revived.
-    let mut statement = db
-        .conn()
-        .prepare(
-            "SELECT instance, data FROM events
-             WHERE id > ?1 AND type = 'life'
-               AND json_valid(data)
-               AND json_extract(data, '$.action') = 'stopped'
-               AND json_extract(data, '$.placeholder') IS NOT TRUE
-             ORDER BY id",
-        )
-        .map_err(|error| format!("failed to inspect stopped workers: {error}"))?;
-    let stopped = statement
-        .query_map(rusqlite::params![after_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|error| format!("failed to inspect stopped workers: {error}"))?;
-    for row in stopped {
-        let (name, data) =
-            row.map_err(|error| format!("failed to inspect stopped worker row: {error}"))?;
-        let Ok(data) = serde_json::from_str::<Value>(&data) else {
-            continue;
-        };
-        let Some(snapshot) = data.get("snapshot") else {
-            continue;
-        };
-        let tag = snapshot
-            .get("tag")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty());
-        let display_name = tag.map_or_else(|| name.clone(), |tag| format!("{tag}-{name}"));
-        if !name.eq_ignore_ascii_case(worker) && !display_name.eq_ignore_ascii_case(worker) {
-            continue;
-        }
-        if let Some(instance_key) = sender_instance_key(&name, snapshot) {
-            generations.insert((name, instance_key));
-        }
-    }
-
-    let mut generations = generations.into_iter();
-    let Some((exact_worker, instance_key)) = generations.next() else {
-        return Err(format!(
-            "--result-from worker '{worker}' has no generation after the attempt cursor"
-        ));
-    };
-    if generations.next().is_some() {
-        return Err(format!(
-            "--result-from worker '{worker}' resolves to multiple generations after the attempt cursor"
-        ));
-    }
+    let generation = discover_worker_generation(db, "--result-from", worker, after_id)?;
+    let exact_worker = generation.exact_worker;
+    let instance_key = generation.instance_key;
     filters.insert("type".into(), vec!["message".into()]);
     filters.insert("from".into(), vec![exact_worker.clone()]);
     filters.insert("intent".into(), vec!["inform".into()]);
@@ -293,6 +517,10 @@ fn apply_result_correlation(
 /// generation has stopped. The stop snapshot supplies immutable session and
 /// transcript metadata; the provider adapter additionally requires the unique
 /// workflow thread marker inside that transcript.
+///
+/// Soft stops intentionally count here: provider turn-end without an authored
+/// result message is the existing one-shot transcript-recovery trigger. Only a
+/// continuous generation follow treats a soft stop as nonterminal.
 fn recover_correlated_stopped_result(
     db: &HcomDb,
     correlation: &ResultCorrelation,
@@ -396,7 +624,10 @@ fn recover_correlated_stopped_result(
 
 /// Remove bloat fields from event for ~35% token reduction.
 ///
-/// Preserves fields used in active filters.
+/// Preserves fields used in active filters. This is a token-reduction
+/// projection, not a security boundary: streamlined output still carries raw
+/// event data such as command text and message bodies, so only the compact
+/// projection (`--follow --compact`) is model-context-safe.
 pub fn streamline_event(event: &Value, filters: &HashMap<String, Vec<String>>) -> Value {
     let mut data = event.get("data").cloned().unwrap_or_else(|| json!({}));
 
@@ -1564,6 +1795,8 @@ struct EventsStreamOptions<'a> {
     full_output: bool,
     filters: &'a HashMap<String, Vec<String>>,
     instance_name: Option<&'a str>,
+    generation_follow: Option<WorkerGenerationFollow>,
+    compact: Option<CompactStreamConfig>,
 }
 
 /// Write a record line to a writer and flush it immediately.
@@ -1572,14 +1805,20 @@ fn write_and_flush_record_to<W: Write>(writer: &mut W, line: &str) -> std::io::R
     writer.flush()
 }
 
-/// Write a record line to stdout and flush it immediately.
-fn write_and_flush_record(line: &str) -> std::io::Result<()> {
-    let mut stdout = std::io::stdout().lock();
-    write_and_flush_record_to(&mut stdout, line)
+/// Serialize and flush one compact record as its own NDJSON line.
+fn write_compact_record_to<W: Write>(
+    writer: &mut W,
+    record: &crate::core::progress::CompactRecord,
+) -> std::io::Result<()> {
+    let line = serde_json::to_string(record)
+        .expect("compact record is data-only and cannot fail to serialize");
+    write_and_flush_record_to(writer, &line)
 }
 
 /// Continuous stream: emit every matching event in ascending durable-ID order
-/// and remain active until interrupted, broken pipe, or the overall timeout expires (exit `0`).
+/// and remain active until interrupted, broken pipe, the overall timeout expires
+/// (exit `0`), or — when bound to one worker generation — that generation's
+/// matching stop boundary.
 ///
 /// Unlike [`events_wait`], no unread-inbox fallback applies and nothing is
 /// synthesized on deadline: a stream that ends at its timeout has already
@@ -1593,10 +1832,34 @@ fn write_and_flush_record(line: &str) -> std::io::Result<()> {
 /// handled cleanly via [`crate::sys::signal`] helpers (exit `0`).
 /// Every termination path removes only this listener's `events_stream` endpoint
 /// and never mutates the observed worker's status, state, or generation.
+///
+/// A generation follow carries two fail-closed arming invariants: the drain
+/// must be unfiltered (caller SQL could exclude the exact stop boundary and
+/// admit activity from a reused name), and the listener cursor must equal the
+/// generation's discovery cursor (arming later could skip past the boundary).
+///
+/// With a compact config the same follow gating drives the typed
+/// [`crate::core::compact`] projection instead of raw event projections: only
+/// bounded, secret-safe compact records can reach stdout, and optional quiet
+/// heartbeats are polled between drains.
 fn events_stream(
     db: &HcomDb,
     filter_query: &str,
     stream_timeout: Option<u64>,
+    options: EventsStreamOptions<'_>,
+) -> i32 {
+    let mut stdout = std::io::stdout().lock();
+    events_stream_to(db, filter_query, stream_timeout, &mut stdout, options)
+}
+
+/// Writer-general core of [`events_stream`] so the generation-follow binding
+/// and compact projection can be exercised end to end without touching
+/// process stdout.
+fn events_stream_to<W: Write>(
+    db: &HcomDb,
+    filter_query: &str,
+    stream_timeout: Option<u64>,
+    writer: &mut W,
     options: EventsStreamOptions<'_>,
 ) -> i32 {
     let EventsStreamOptions {
@@ -1604,7 +1867,34 @@ fn events_stream(
         full_output,
         filters,
         instance_name,
+        mut generation_follow,
+        compact,
     } = options;
+
+    if let Some(follow) = generation_follow.as_ref() {
+        if !filter_query.is_empty() {
+            eprintln!("Error: generation following cannot be combined with event filters");
+            return 1;
+        }
+        if after_id != Some(follow.generation.after_id) {
+            eprintln!("Error: generation following must arm at its discovery cursor");
+            return 1;
+        }
+    }
+
+    // Compact records identify their exact worker generation, so the typed
+    // projection exists only inside a generation follow.
+    let mut compact_classifier = None;
+    if let Some(config) = compact {
+        let Some(follow) = generation_follow.as_ref() else {
+            eprintln!("Error: compact mode requires generation following");
+            return 1;
+        };
+        compact_classifier = Some(CompactClassifier::new(
+            follow.generation.instance_key.clone(),
+            config,
+        ));
+    }
 
     let interrupted = Arc::new(AtomicBool::new(false));
     crate::sys::signal::register_int(&interrupted);
@@ -1642,18 +1932,57 @@ fn events_stream(
                     if interrupted.load(Ordering::Relaxed) {
                         return 0;
                     }
-                    let output = if full_output {
-                        event
-                    } else {
-                        streamline_event(&event, filters)
-                    };
-                    let line = serde_json::to_string(&output).unwrap_or_default();
-                    if let Err(err) = write_and_flush_record(&line) {
-                        if err.kind() == std::io::ErrorKind::BrokenPipe {
-                            return 0;
+                    let disposition = generation_follow
+                        .as_mut()
+                        .map_or(GenerationEventDisposition::Observe, |follow| {
+                            follow.classify(&event)
+                        });
+                    if disposition == GenerationEventDisposition::Ignore {
+                        continue;
+                    }
+                    if disposition == GenerationEventDisposition::Terminate {
+                        // Fail closed if an internal caller skipped past a
+                        // known boundary or a malformed terminal event cannot
+                        // be tied safely to an immutable generation.
+                        eprintln!(
+                            "Warning: followed worker generation cannot be safely correlated at \
+                             event {}; ending the stream",
+                            event
+                                .get("id")
+                                .and_then(Value::as_i64)
+                                .map_or_else(|| "unknown".to_string(), |id| id.to_string())
+                        );
+                        return 0;
+                    }
+                    if let Some(classifier) = compact_classifier.as_mut() {
+                        // Compact mode replaces the raw projections: only
+                        // bounded, typed records can reach stdout here.
+                        for record in classifier.observe(&event) {
+                            if let Err(err) = write_compact_record_to(writer, &record) {
+                                if err.kind() == std::io::ErrorKind::BrokenPipe {
+                                    return 0;
+                                }
+                                eprintln!("Error: Failed writing to stdout: {err}");
+                                return 1;
+                            }
                         }
-                        eprintln!("Error: Failed writing to stdout: {err}");
-                        return 1;
+                    } else {
+                        let output = if full_output {
+                            event
+                        } else {
+                            streamline_event(&event, filters)
+                        };
+                        let line = serde_json::to_string(&output).unwrap_or_default();
+                        if let Err(err) = write_and_flush_record_to(writer, &line) {
+                            if err.kind() == std::io::ErrorKind::BrokenPipe {
+                                return 0;
+                            }
+                            eprintln!("Error: Failed writing to stdout: {err}");
+                            return 1;
+                        }
+                    }
+                    if disposition == GenerationEventDisposition::ObserveAndStop {
+                        return 0;
                     }
                 }
             }
@@ -1665,6 +1994,20 @@ fn events_stream(
 
         if interrupted.load(Ordering::Relaxed) {
             return 0;
+        }
+
+        // Quiet heartbeats are polled between drains: promptness is bounded
+        // by the listener recheck cadence, and the classifier rate-limits
+        // them to one per heartbeat interval.
+        if let Some(classifier) = compact_classifier.as_mut()
+            && let Some(record) = classifier.poll_heartbeat()
+            && let Err(err) = write_compact_record_to(writer, &record)
+        {
+            if err.kind() == std::io::ErrorKind::BrokenPipe {
+                return 0;
+            }
+            eprintln!("Error: Failed writing to stdout: {err}");
+            return 1;
         }
 
         // Remain active until the optional overall deadline.
@@ -1685,12 +2028,46 @@ fn events_stream(
 
 /// Handle `hcom events stream`.
 ///
-/// Exit codes: `0` when the stream completes cleanly (timeout, broken pipe, or
-/// signal interruption), `1` on filter errors, query-mode flag conflicts, or
-/// stdout write errors, `2` on SQL errors.
+/// Exit codes: `0` when the stream completes cleanly (timeout, broken pipe,
+/// signal interruption, or a followed generation's stop boundary), `1` on
+/// filter errors, query-mode flag conflicts, correlation errors, or stdout
+/// write errors, `2` on SQL errors.
 fn cmd_events_stream(db: &HcomDb, args: &EventsStreamArgs, instance_name: Option<&str>) -> i32 {
     // Convert clap filter args to FilterMap
     let mut filters = args.filters.to_filter_map();
+
+    // Worker following owns the whole drain: caller filters could exclude the
+    // exact stop boundary and admit activity from a reused name.
+    let mut generation_follow = None;
+    let mut compact = None;
+    if let Some(worker) = args.follow.as_deref() {
+        if !filters.is_empty() {
+            eprintln!("Error: --follow cannot be combined with event filters");
+            return 1;
+        }
+        let after_id = args
+            .after_id
+            .expect("--follow requires --after-id (enforced by the parser)");
+        match discover_worker_generation(db, "--follow", worker, after_id) {
+            Ok(generation) => {
+                generation_follow = Some(WorkerGenerationFollow {
+                    generation,
+                    stopped: false,
+                });
+            }
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return 1;
+            }
+        }
+        if args.compact {
+            compact = Some(CompactStreamConfig {
+                heartbeat: args.heartbeat.map(Duration::from_secs),
+                clock: Arc::new(Instant::now),
+            });
+        }
+    }
+
     resolve_filter_names(&mut filters, db);
 
     // Build filter SQL (validation happens inside build_sql_from_flags)
@@ -1717,6 +2094,8 @@ fn cmd_events_stream(db: &HcomDb, args: &EventsStreamArgs, instance_name: Option
             full_output: args.full,
             filters: &filters,
             instance_name,
+            generation_follow,
+            compact,
         },
     )
 }
@@ -2272,6 +2651,1187 @@ mod tests {
         let args = EventsArgs::try_parse_from(["events", "--cursor"]).unwrap();
         assert!(args.cursor);
         assert!(EventsArgs::try_parse_from(["events", "--cursor", "--wait", "1"]).is_err());
+    }
+
+    #[test]
+    fn worker_generation_discovery_fails_closed_when_missing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("missing-generation.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        let error =
+            discover_worker_generation(&db, "--result-from", "missing-worker", 0).unwrap_err();
+        assert_eq!(
+            error,
+            "--result-from worker 'missing-worker' has no generation after the attempt cursor"
+        );
+    }
+
+    #[test]
+    fn worker_generation_discovery_recovers_stopped_tagged_generation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stopped-generation.db")).unwrap();
+        db.ensure_schema().unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "life",
+            "worker",
+            &json!({
+                "action": "stopped",
+                "snapshot": {
+                    "name": "worker",
+                    "tag": "impl",
+                    "created_at": 1000.0
+                }
+            }),
+        )
+        .unwrap();
+        let stop_event_id = db.get_last_event_id();
+
+        let generation =
+            discover_worker_generation(&db, "--result-from", "impl-worker", cursor).unwrap();
+        assert_eq!(generation.exact_worker, "worker");
+        assert_eq!(generation.instance_key, "worker@1000.000000");
+        assert_eq!(generation.after_id, cursor);
+        assert_eq!(generation.stop_event_id, Some(stop_event_id));
+    }
+
+    #[test]
+    fn worker_generation_discovery_resolves_live_generation() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("live-generation.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tag, created_at) VALUES ('worker', 'impl', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+
+        let generation =
+            discover_worker_generation(&db, "followed", "impl-worker", cursor).unwrap();
+        assert_eq!(generation.exact_worker, "worker");
+        assert_eq!(generation.instance_key, "worker@1000.000000");
+        assert_eq!(generation.after_id, cursor);
+        assert_eq!(
+            generation.stop_event_id, None,
+            "a live generation has no stop boundary yet"
+        );
+    }
+
+    #[test]
+    fn worker_generation_discovery_does_not_treat_soft_stop_as_terminal() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("soft-stop-generation.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('worker', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "life",
+            "worker",
+            &json!({
+                "action": "stopped",
+                "soft": true,
+                "snapshot": { "name": "worker", "created_at": 1000.0 }
+            }),
+        )
+        .unwrap();
+
+        let generation = discover_worker_generation(&db, "--follow", "worker", cursor).unwrap();
+        assert_eq!(generation.instance_key, "worker@1000.000000");
+        assert_eq!(
+            generation.stop_event_id, None,
+            "a soft execution-loop stop must not become the generation boundary"
+        );
+    }
+
+    #[test]
+    fn worker_generation_discovery_rejects_replacement_after_soft_stop() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("soft-stop-reuse.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('worker', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "life",
+            "worker",
+            &json!({
+                "action": "stopped",
+                "soft": true,
+                "snapshot": { "name": "worker", "created_at": 1000.0 }
+            }),
+        )
+        .unwrap();
+        db.delete_instance("worker").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('worker', 2000.0)",
+                [],
+            )
+            .unwrap();
+
+        let error = discover_worker_generation(&db, "--follow", "worker", cursor).unwrap_err();
+        assert_eq!(
+            error,
+            "--follow worker 'worker' resolves to multiple generations after the attempt cursor"
+        );
+    }
+
+    #[test]
+    fn worker_generation_discovery_rejects_rapid_name_reuse() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("reused-generation.db")).unwrap();
+        db.ensure_schema().unwrap();
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "life",
+            "worker",
+            &json!({
+                "action": "stopped",
+                "snapshot": { "name": "worker", "created_at": 1000.0 }
+            }),
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('worker', 2000.0)",
+                [],
+            )
+            .unwrap();
+
+        let error = discover_worker_generation(&db, "--result-from", "worker", cursor).unwrap_err();
+        assert_eq!(
+            error,
+            "--result-from worker 'worker' resolves to multiple generations after the attempt cursor"
+        );
+    }
+
+    #[test]
+    fn generation_follow_stops_at_exact_boundary_and_ignores_reused_name() {
+        let generation = WorkerGeneration {
+            exact_worker: "worker".to_string(),
+            instance_key: "worker@1000.000000".to_string(),
+            after_id: 10,
+            stop_event_id: None,
+        };
+        let mut follow = WorkerGenerationFollow {
+            generation,
+            stopped: false,
+        };
+
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 11,
+                "type": "status",
+                "instance": "worker",
+                "data": { "status": "active" }
+            })),
+            GenerationEventDisposition::Observe
+        );
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 12,
+                "type": "message",
+                "instance": "worker",
+                "data": { "sender_instance_key": "worker@2000.000000" }
+            })),
+            GenerationEventDisposition::Ignore,
+            "messages require the immutable generation key"
+        );
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 12,
+                "type": "status",
+                "instance": "other-worker",
+                "data": { "status": "active" }
+            })),
+            GenerationEventDisposition::Ignore,
+            "name-scoped events from a different instance must not enter the follow"
+        );
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 12,
+                "type": "life",
+                "instance": "worker",
+                "data": {
+                    "action": "stopped",
+                    "placeholder": true,
+                    "snapshot": { "name": "worker", "created_at": 1000.0 }
+                }
+            })),
+            GenerationEventDisposition::Ignore,
+            "placeholder stops are not lifecycle boundaries for the generation"
+        );
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 12,
+                "type": "life",
+                "instance": "worker",
+                "data": {
+                    "action": "stopped",
+                    "snapshot": { "name": "worker", "created_at": 2000.0 }
+                }
+            })),
+            GenerationEventDisposition::Ignore,
+            "another generation's stop must not be emitted or terminate this follow"
+        );
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 12,
+                "type": "life",
+                "instance": "worker",
+                "data": {
+                    "action": "stopped",
+                    "soft": true,
+                    "snapshot": { "name": "worker", "created_at": 1000.0 }
+                }
+            })),
+            GenerationEventDisposition::Observe,
+            "a soft stop remains visible without ending the live generation"
+        );
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 12,
+                "type": "status",
+                "instance": "worker",
+                "data": { "status": "listening" }
+            })),
+            GenerationEventDisposition::Observe,
+            "the same generation must remain observable after its soft stop"
+        );
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 13,
+                "type": "life",
+                "instance": "worker",
+                "data": {
+                    "action": "stopped",
+                    "snapshot": { "name": "worker", "created_at": 1000.0 }
+                }
+            })),
+            GenerationEventDisposition::ObserveAndStop
+        );
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 14,
+                "type": "status",
+                "instance": "worker",
+                "data": { "status": "active", "created_at": 2000.0 }
+            })),
+            GenerationEventDisposition::Ignore,
+            "later activity from a reused display name must not cross the stop boundary"
+        );
+    }
+
+    #[test]
+    fn generation_follow_replays_stopped_generation_only_through_known_boundary() {
+        let mut follow = WorkerGenerationFollow {
+            generation: WorkerGeneration {
+                exact_worker: "worker".to_string(),
+                instance_key: "worker@1000.000000".to_string(),
+                after_id: 20,
+                stop_event_id: Some(22),
+            },
+            stopped: false,
+        };
+
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 21,
+                "type": "status",
+                "instance": "worker",
+                "data": { "status": "active" }
+            })),
+            GenerationEventDisposition::Observe
+        );
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 22,
+                "type": "life",
+                "instance": "worker",
+                "data": {
+                    "action": "stopped",
+                    "snapshot": { "name": "worker", "created_at": 1000.0 }
+                }
+            })),
+            GenerationEventDisposition::ObserveAndStop,
+            "replaying a discovered post-cursor stop must end the follow at its boundary"
+        );
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 23,
+                "type": "status",
+                "instance": "worker",
+                "data": { "status": "active" }
+            })),
+            GenerationEventDisposition::Ignore
+        );
+    }
+
+    #[test]
+    fn generation_follow_fails_closed_on_unkeyable_terminal_stop() {
+        let mut follow = WorkerGenerationFollow {
+            generation: WorkerGeneration {
+                exact_worker: "worker".to_string(),
+                instance_key: "worker@1000.000000".to_string(),
+                after_id: 20,
+                stop_event_id: None,
+            },
+            stopped: false,
+        };
+
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 21,
+                "type": "life",
+                "instance": "worker",
+                "data": { "action": "stopped" }
+            })),
+            GenerationEventDisposition::Terminate,
+            "a malformed terminal stop under the followed name must fail closed"
+        );
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 22,
+                "type": "status",
+                "instance": "worker",
+                "data": { "status": "active" }
+            })),
+            GenerationEventDisposition::Ignore
+        );
+    }
+
+    #[test]
+    fn generation_follow_terminates_when_armed_past_the_known_stop_boundary() {
+        let mut follow = WorkerGenerationFollow {
+            generation: WorkerGeneration {
+                exact_worker: "worker".to_string(),
+                instance_key: "worker@1000.000000".to_string(),
+                after_id: 20,
+                stop_event_id: Some(22),
+            },
+            stopped: false,
+        };
+
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 23,
+                "type": "status",
+                "instance": "worker",
+                "data": { "status": "active", "created_at": 2000.0 }
+            })),
+            GenerationEventDisposition::Terminate,
+            "a stream armed after the boundary must end instead of trailing a reused name"
+        );
+        assert_eq!(
+            follow.classify(&json!({
+                "id": 24,
+                "type": "status",
+                "instance": "worker",
+                "data": { "status": "active", "created_at": 2000.0 }
+            })),
+            GenerationEventDisposition::Ignore
+        );
+    }
+
+    #[test]
+    fn generation_follow_stream_emits_through_exact_stop_boundary() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("follow-stream-boundary.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('worker', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let generation = discover_worker_generation(&db, "followed", "worker", cursor).unwrap();
+        assert_eq!(generation.stop_event_id, None);
+
+        db.log_event("status", "worker", &json!({ "status": "active" }))
+            .unwrap();
+        db.log_event(
+            "life",
+            "worker",
+            &json!({
+                "action": "stopped",
+                "snapshot": { "name": "worker", "created_at": 1000.0 }
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "status",
+            "worker",
+            &json!({ "status": "active", "created_at": 2000.0 }),
+        )
+        .unwrap();
+
+        let filters = HashMap::new();
+        let mut output = Vec::new();
+        let started = Instant::now();
+        let exit = events_stream_to(
+            &db,
+            "",
+            Some(5),
+            &mut output,
+            EventsStreamOptions {
+                after_id: Some(cursor),
+                full_output: true,
+                filters: &filters,
+                instance_name: None,
+                generation_follow: Some(WorkerGenerationFollow {
+                    generation,
+                    stopped: false,
+                }),
+                compact: None,
+            },
+        );
+        assert_eq!(exit, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the matching stop boundary must end the stream before its timeout"
+        );
+        let records = String::from_utf8(output).unwrap();
+        let lines: Vec<Value> = records
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "only the bound generation's activity and its stop boundary may be emitted"
+        );
+        assert_eq!(lines[0]["type"], "status");
+        assert_eq!(lines[0]["instance"], "worker");
+        assert_eq!(lines[1]["type"], "life");
+        assert_eq!(lines[1]["data"]["action"], "stopped");
+    }
+
+    #[test]
+    fn generation_follow_stream_continues_through_soft_stop() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("follow-stream-soft-stop.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('worker', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let generation = discover_worker_generation(&db, "--follow", "worker", cursor).unwrap();
+
+        db.log_event(
+            "life",
+            "worker",
+            &json!({
+                "action": "stopped",
+                "soft": true,
+                "snapshot": { "name": "worker", "created_at": 1000.0 }
+            }),
+        )
+        .unwrap();
+        db.log_event("status", "worker", &json!({ "status": "listening" }))
+            .unwrap();
+        db.log_event(
+            "life",
+            "worker",
+            &json!({
+                "action": "stopped",
+                "snapshot": { "name": "worker", "created_at": 1000.0 }
+            }),
+        )
+        .unwrap();
+
+        let filters = HashMap::new();
+        let mut output = Vec::new();
+        let started = Instant::now();
+        let exit = events_stream_to(
+            &db,
+            "",
+            Some(5),
+            &mut output,
+            EventsStreamOptions {
+                after_id: Some(cursor),
+                full_output: true,
+                filters: &filters,
+                instance_name: None,
+                generation_follow: Some(WorkerGenerationFollow {
+                    generation,
+                    stopped: false,
+                }),
+                compact: None,
+            },
+        );
+        assert_eq!(exit, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the terminal stop must still end the stream before timeout"
+        );
+        let lines: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["data"]["soft"], true);
+        assert_eq!(lines[1]["data"]["status"], "listening");
+        assert_eq!(lines[2]["data"]["action"], "stopped");
+        assert!(lines[2]["data"].get("soft").is_none());
+    }
+
+    #[test]
+    fn generation_follow_stream_skips_unrelated_and_wrong_generation_activity() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("follow-stream-gating.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('worker', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let generation = discover_worker_generation(&db, "followed", "worker", cursor).unwrap();
+
+        db.log_event("status", "other-worker", &json!({ "status": "active" }))
+            .unwrap();
+        db.log_event(
+            "message",
+            "worker",
+            &json!({
+                "from": "worker",
+                "intent": "inform",
+                "text": "reused generation message",
+                "sender_instance_key": "worker@2000.000000"
+            }),
+        )
+        .unwrap();
+        db.log_event("status", "worker", &json!({ "status": "blocked" }))
+            .unwrap();
+
+        let filters = HashMap::new();
+        let mut output = Vec::new();
+        let exit = events_stream_to(
+            &db,
+            "",
+            Some(1),
+            &mut output,
+            EventsStreamOptions {
+                after_id: Some(cursor),
+                full_output: true,
+                filters: &filters,
+                instance_name: None,
+                generation_follow: Some(WorkerGenerationFollow {
+                    generation,
+                    stopped: false,
+                }),
+                compact: None,
+            },
+        );
+        assert_eq!(exit, 0, "a follow stream that reaches its timeout exits 0");
+        let records = String::from_utf8(output).unwrap();
+        let lines: Vec<Value> = records
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "other instances and reused-generation messages must not be emitted"
+        );
+        assert_eq!(lines[0]["type"], "status");
+        assert_eq!(lines[0]["instance"], "worker");
+        assert_eq!(lines[0]["data"]["status"], "blocked");
+    }
+
+    #[test]
+    fn generation_follow_stream_enforces_arming_invariants() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("follow-invariants.db")).unwrap();
+        db.ensure_schema().unwrap();
+        let follow = WorkerGenerationFollow {
+            generation: WorkerGeneration {
+                exact_worker: "worker".to_string(),
+                instance_key: "worker@1000.000000".to_string(),
+                after_id: 7,
+                stop_event_id: None,
+            },
+            stopped: false,
+        };
+        let filters = HashMap::new();
+
+        // Caller SQL could exclude the exact stop boundary of the followed
+        // generation and admit activity from a reused name.
+        assert_eq!(
+            events_stream_to(
+                &db,
+                " AND (instance = 'worker')",
+                Some(1),
+                &mut Vec::new(),
+                EventsStreamOptions {
+                    after_id: Some(7),
+                    full_output: true,
+                    filters: &filters,
+                    instance_name: None,
+                    generation_follow: Some(follow.clone()),
+                    compact: None,
+                },
+            ),
+            1,
+            "a follow drain combined with caller filters must fail closed"
+        );
+
+        // A listener armed away from the discovery cursor could skip past the
+        // stop boundary between the two cursors.
+        assert_eq!(
+            events_stream_to(
+                &db,
+                "",
+                Some(1),
+                &mut Vec::new(),
+                EventsStreamOptions {
+                    after_id: None,
+                    full_output: true,
+                    filters: &filters,
+                    instance_name: None,
+                    generation_follow: Some(follow.clone()),
+                    compact: None,
+                },
+            ),
+            1,
+            "a follow stream must not arm at an implicit current cursor"
+        );
+        assert_eq!(
+            events_stream_to(
+                &db,
+                "",
+                Some(1),
+                &mut Vec::new(),
+                EventsStreamOptions {
+                    after_id: Some(8),
+                    full_output: true,
+                    filters: &filters,
+                    instance_name: None,
+                    generation_follow: Some(follow),
+                    compact: None,
+                },
+            ),
+            1,
+            "a follow stream must arm exactly at its discovery cursor"
+        );
+    }
+
+    #[test]
+    fn compact_stream_projects_typed_records_and_ends_at_stop_boundary() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("compact-stream-projection.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('worker', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let generation = discover_worker_generation(&db, "--follow", "worker", cursor).unwrap();
+
+        // A noisy, secret-bearing trace: repeated file bursts, repeated
+        // command bursts with credentials, one message body, and the stop.
+        for id in 0..50 {
+            db.log_event(
+                "status",
+                "worker",
+                &json!({
+                    "status": "active",
+                    "context": "tool:Edit",
+                    "detail": format!("src/file{id}.rs"),
+                }),
+            )
+            .unwrap();
+        }
+        for id in 0..50 {
+            db.log_event(
+                "status",
+                "worker",
+                &json!({
+                    "status": "active",
+                    "context": "tool:Bash",
+                    "detail": format!("curl -H 'Authorization: Bearer secret-{id}' https://internal.example"),
+                }),
+            )
+            .unwrap();
+        }
+        db.log_event(
+            "message",
+            "worker",
+            &json!({
+                "from": "worker",
+                "intent": "inform",
+                "text": "the database password is hunter2",
+                "sender_instance_key": "worker@1000.000000",
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "life",
+            "worker",
+            &json!({
+                "action": "stopped",
+                "snapshot": { "name": "worker", "created_at": 1000.0 },
+            }),
+        )
+        .unwrap();
+
+        // A frozen manual clock keeps every drain inside one cadence window,
+        // so the record count is deterministic.
+        let clock_state = std::sync::Arc::new(std::sync::Mutex::new(Instant::now()));
+        let clock = {
+            let state = std::sync::Arc::clone(&clock_state);
+            std::sync::Arc::new(move || *state.lock().unwrap())
+        };
+        let filters = HashMap::new();
+        let mut output = Vec::new();
+        let started = Instant::now();
+        let exit = events_stream_to(
+            &db,
+            "",
+            Some(5),
+            &mut output,
+            EventsStreamOptions {
+                after_id: Some(cursor),
+                full_output: false,
+                filters: &filters,
+                instance_name: None,
+                generation_follow: Some(WorkerGenerationFollow {
+                    generation,
+                    stopped: false,
+                }),
+                compact: Some(CompactStreamConfig {
+                    heartbeat: None,
+                    clock,
+                }),
+            },
+        );
+        assert_eq!(exit, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the stop boundary must end the compact stream before its timeout"
+        );
+
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            !text.contains("secret-"),
+            "raw command arguments must never serialize: {text}"
+        );
+        assert!(
+            !text.contains("Authorization"),
+            "raw command text must never serialize: {text}"
+        );
+        assert!(
+            !text.contains("hunter2"),
+            "message bodies must never serialize: {text}"
+        );
+
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        // Bounded regardless of the 101 noisy events: one phase, one file
+        // record, one command record, and the terminal stopped phase.
+        assert_eq!(
+            lines.len(),
+            4,
+            "a noisy trace must produce a bounded compact record count: {text}"
+        );
+        assert_eq!(
+            lines[0]["activity"],
+            json!({"type": "phase", "phase": "active"})
+        );
+        assert_eq!(
+            lines[1]["activity"],
+            json!({"type": "file", "path": "src/file0.rs"})
+        );
+        assert_eq!(
+            lines[2]["activity"],
+            json!({"type": "command", "category": "other"})
+        );
+        assert_eq!(
+            lines[3]["activity"],
+            json!({"type": "phase", "phase": "stopped"})
+        );
+        for line in &lines {
+            assert_eq!(line["schema_version"], 1);
+            assert_eq!(line["generation"], "worker@1000.000000");
+            assert!(line["cursor"].as_i64().is_some());
+            assert!(line["ts"].as_str().is_some());
+            assert!(line.get("thread").is_none());
+        }
+    }
+
+    #[test]
+    fn compact_stream_heartbeats_are_bounded_while_quiet() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("compact-stream-heartbeat.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('worker', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let generation = discover_worker_generation(&db, "--follow", "worker", cursor).unwrap();
+
+        let phase_event = db
+            .log_event("status", "worker", &json!({ "status": "active" }))
+            .unwrap();
+
+        // Deterministic injected timing: the classifier reads the clock
+        // exactly once per observe and once per heartbeat poll. One event is
+        // pre-logged, so calls 1 (observe) and 2 (first poll) stay frozen,
+        // and every later poll jumps an hour ahead: the second poll fires the
+        // heartbeat, and the rate limit keeps all further polls quiet no
+        // matter how often the 500ms recheck loop runs before the 1s timeout.
+        let clock_calls = Arc::new(std::sync::Mutex::new(0u32));
+        let clock: crate::core::compact::CompactClock = {
+            let calls = Arc::clone(&clock_calls);
+            Arc::new(move || {
+                let mut count = calls.lock().unwrap();
+                *count += 1;
+                if *count <= 2 {
+                    Instant::now()
+                } else {
+                    Instant::now() + Duration::from_secs(3600)
+                }
+            })
+        };
+
+        let filters = HashMap::new();
+        let mut output = Vec::new();
+        let exit = events_stream_to(
+            &db,
+            "",
+            Some(1),
+            &mut output,
+            EventsStreamOptions {
+                after_id: Some(cursor),
+                full_output: false,
+                filters: &filters,
+                instance_name: None,
+                generation_follow: Some(WorkerGenerationFollow {
+                    generation,
+                    stopped: false,
+                }),
+                compact: Some(CompactStreamConfig {
+                    heartbeat: Some(Duration::from_secs(1)),
+                    clock,
+                }),
+            },
+        );
+        assert_eq!(exit, 0, "a quiet compact stream ends at its timeout");
+
+        let text = String::from_utf8(output).unwrap();
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "exactly the phase record plus one rate-limited heartbeat: {text}"
+        );
+        assert_eq!(
+            lines[0]["activity"],
+            json!({"type": "phase", "phase": "active"})
+        );
+        assert_eq!(
+            lines[1]["activity"],
+            json!({"type": "heartbeat", "phase": "active"}),
+            "heartbeats carry the last known phase"
+        );
+        assert_eq!(lines[1]["cursor"], json!(phase_event));
+        assert_eq!(lines[1]["generation"], "worker@1000.000000");
+    }
+
+    #[test]
+    fn compact_stream_requires_a_generation_follow() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("compact-without-follow.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        let filters = HashMap::new();
+        let clock: crate::core::compact::CompactClock = Arc::new(Instant::now);
+        assert_eq!(
+            events_stream_to(
+                &db,
+                "",
+                Some(1),
+                &mut Vec::new(),
+                EventsStreamOptions {
+                    after_id: Some(0),
+                    full_output: false,
+                    filters: &filters,
+                    instance_name: None,
+                    generation_follow: None,
+                    compact: Some(CompactStreamConfig {
+                        heartbeat: None,
+                        clock,
+                    }),
+                },
+            ),
+            1,
+            "compact records identify a worker generation, so compact mode without following must fail closed"
+        );
+    }
+
+    #[test]
+    fn compact_stream_flags_parse_and_fail_closed() {
+        use clap::Parser;
+
+        let args = EventsArgs::try_parse_from([
+            "events",
+            "stream",
+            "--after-id",
+            "7",
+            "--follow",
+            "kuma",
+            "--compact",
+            "--heartbeat",
+            "30",
+            "--timeout",
+            "60",
+        ])
+        .unwrap();
+        match args.subcmd {
+            Some(EventsSubcmd::Stream(ref stream)) => {
+                assert_eq!(stream.follow.as_deref(), Some("kuma"));
+                assert!(stream.compact);
+                assert_eq!(stream.heartbeat, Some(30));
+            }
+            _ => panic!("Expected Stream subcommand"),
+        }
+
+        // --compact selects the projection only inside a follow.
+        assert!(EventsArgs::try_parse_from(["events", "stream", "--compact"]).is_err());
+        // Following needs an explicit attempt cursor.
+        assert!(EventsArgs::try_parse_from(["events", "stream", "--follow", "kuma"]).is_err());
+        // Heartbeats exist only in compact mode.
+        assert!(
+            EventsArgs::try_parse_from([
+                "events",
+                "stream",
+                "--follow",
+                "kuma",
+                "--after-id",
+                "1",
+                "--heartbeat",
+                "5",
+            ])
+            .is_err()
+        );
+        // Compact owns the output projection, so --full is a conflict.
+        assert!(
+            EventsArgs::try_parse_from([
+                "events",
+                "stream",
+                "--follow",
+                "kuma",
+                "--after-id",
+                "1",
+                "--compact",
+                "--full",
+            ])
+            .is_err()
+        );
+        // A zero-second heartbeat would degenerate into per-poll output.
+        assert!(
+            EventsArgs::try_parse_from([
+                "events",
+                "stream",
+                "--follow",
+                "kuma",
+                "--after-id",
+                "1",
+                "--compact",
+                "--heartbeat",
+                "0",
+            ])
+            .is_err(),
+            "--heartbeat 0 must be rejected at parse time"
+        );
+        // One second is the smallest accepted interval.
+        let minimal = EventsArgs::try_parse_from([
+            "events",
+            "stream",
+            "--follow",
+            "kuma",
+            "--after-id",
+            "1",
+            "--compact",
+            "--heartbeat",
+            "1",
+        ])
+        .unwrap();
+        match minimal.subcmd {
+            Some(EventsSubcmd::Stream(ref stream)) => assert_eq!(stream.heartbeat, Some(1)),
+            _ => panic!("Expected Stream subcommand"),
+        }
+    }
+
+    #[test]
+    fn compact_stream_drops_hostile_file_detail() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("compact-hostile-detail.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('worker', 1000.0)",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let generation = discover_worker_generation(&db, "--follow", "worker", cursor).unwrap();
+
+        // File-context detail that is not a displayable path must never enter
+        // the compact output, while ordinary paths still project.
+        db.log_event(
+            "status",
+            "worker",
+            &json!({
+                "status": "active",
+                "context": "tool:Write",
+                "detail": "src/lib.rs\nrm -rf /",
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "status",
+            "worker",
+            &json!({
+                "status": "active",
+                "context": "tool:Edit",
+                "detail": "password=hunter2 as free-form prose",
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "status",
+            "worker",
+            &json!({
+                "status": "active",
+                "context": "tool:Write",
+                "detail": "src/\u{202E}spoof.rs",
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "status",
+            "worker",
+            &json!({ "status": "active", "context": "tool:Edit", "detail": "src/clean.rs" }),
+        )
+        .unwrap();
+
+        let filters = HashMap::new();
+        let mut output = Vec::new();
+        let exit = events_stream_to(
+            &db,
+            "",
+            Some(1),
+            &mut output,
+            EventsStreamOptions {
+                after_id: Some(cursor),
+                full_output: false,
+                filters: &filters,
+                instance_name: None,
+                generation_follow: Some(WorkerGenerationFollow {
+                    generation,
+                    stopped: false,
+                }),
+                compact: Some(CompactStreamConfig {
+                    heartbeat: None,
+                    clock: Arc::new(Instant::now),
+                }),
+            },
+        );
+        assert_eq!(exit, 0);
+
+        let text = String::from_utf8(output).unwrap();
+        assert!(
+            !text.contains("rm -rf") && !text.contains("hunter2") && !text.contains("spoof"),
+            "hostile file detail must never serialize: {text}"
+        );
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "one phase record plus the single clean file record: {text}"
+        );
+        assert_eq!(
+            lines[1]["activity"],
+            json!({"type": "file", "path": "src/clean.rs"})
+        );
+    }
+
+    fn parse_stream_args(argv: &[&str]) -> EventsStreamArgs {
+        use clap::Parser;
+        match EventsArgs::try_parse_from(argv).unwrap().subcmd {
+            Some(EventsSubcmd::Stream(stream)) => stream,
+            _ => panic!("Expected Stream subcommand"),
+        }
+    }
+
+    #[test]
+    fn compact_stream_cmd_rejects_filters_and_unresolvable_generations() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("compact-stream-cmd.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        // Caller filters could exclude the exact stop boundary.
+        let filtered = parse_stream_args(&[
+            "events",
+            "stream",
+            "--after-id",
+            "1",
+            "--follow",
+            "kuma",
+            "--compact",
+            "--type",
+            "status",
+        ]);
+        assert_eq!(cmd_events_stream(&db, &filtered, None), 1);
+
+        // A stream generic follow of an unresolvable worker fails closed.
+        let generic_follow =
+            parse_stream_args(&["events", "stream", "--after-id", "1", "--follow", "ghost"]);
+        assert_eq!(cmd_events_stream(&db, &generic_follow, None), 1);
+
+        // So does its compact projection.
+        let compact_follow = parse_stream_args(&[
+            "events",
+            "stream",
+            "--after-id",
+            "1",
+            "--follow",
+            "ghost",
+            "--compact",
+        ]);
+        assert_eq!(cmd_events_stream(&db, &compact_follow, None), 1);
     }
 
     #[test]
@@ -4906,15 +6466,260 @@ mod tests {
         let mut db = HcomDb::open_raw(&temp.path().join("stream-filter-error.db")).unwrap();
         db.ensure_schema().unwrap();
 
-        // Message-type and status-type filters cannot be combined.
-        let args = EventsArgs::try_parse_from([
+        // Cross-type constraints keep failing closed through the stream:
+        // message-type + status-type,
+        let message_status = EventsArgs::try_parse_from([
             "events", "stream", "--from", "nova", "--status", "blocked",
+        ])
+        .unwrap();
+        // message-type + life-type,
+        let message_life = EventsArgs::try_parse_from([
+            "events", "stream", "--intent", "inform", "--action", "ready",
+        ])
+        .unwrap();
+        // and the typed --idle predicate against --agent.
+        let idle_agent =
+            EventsArgs::try_parse_from(["events", "stream", "--idle", "kuma", "--agent", "kuma"])
+                .unwrap();
+        for args in [message_status, message_life, idle_agent] {
+            let Some(EventsSubcmd::Stream(stream_args)) = args.subcmd else {
+                panic!("Expected Stream subcommand");
+            };
+            assert_eq!(
+                cmd_events_stream(&db, &stream_args, None),
+                1,
+                "stream filter composition must retain type-validation failures"
+            );
+        }
+    }
+
+    /// Build the generic stream filter SQL exactly as `cmd_events_stream`
+    /// does, so composition tests exercise the shared filter pipeline.
+    fn stream_filter_query(args: &EventsStreamArgs, db: &HcomDb) -> Result<String, String> {
+        let mut filters = args.filters.to_filter_map();
+        resolve_filter_names(&mut filters, db);
+        let flag_sql = build_sql_from_flags(&filters)?;
+        if !filters.is_empty() && !flag_sql.is_empty() {
+            Ok(format!(" AND ({flag_sql})"))
+        } else {
+            Ok(String::new())
+        }
+    }
+
+    /// Run a generic stream to completion (a zero-second timeout drains every
+    /// currently durable match and exits immediately) and return the parsed
+    /// NDJSON records.
+    fn run_generic_stream(
+        db: &HcomDb,
+        filter_query: &str,
+        full_output: bool,
+        filters: &HashMap<String, Vec<String>>,
+    ) -> Vec<Value> {
+        let mut output = Vec::new();
+        let exit = events_stream_to(
+            db,
+            filter_query,
+            Some(0),
+            &mut output,
+            EventsStreamOptions {
+                after_id: Some(0),
+                full_output,
+                filters,
+                instance_name: None,
+                generation_follow: None,
+                compact: None,
+            },
+        );
+        assert_eq!(exit, 0);
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn generic_stream_repeated_filter_values_compose_as_or() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stream-or-filter.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        db.log_event("message", "nova", &json!({"from": "nova", "text": "one"}))
+            .unwrap();
+        db.log_event("status", "kuma", &json!({ "status": "active" }))
+            .unwrap();
+        db.log_event("life", "kuma", &json!({"action": "stopped"}))
+            .unwrap();
+
+        let args = EventsArgs::try_parse_from([
+            "events", "stream", "--type", "status", "--type", "message",
         ])
         .unwrap();
         let Some(EventsSubcmd::Stream(stream_args)) = args.subcmd else {
             panic!("Expected Stream subcommand");
         };
-        assert_eq!(cmd_events_stream(&db, &stream_args, None), 1);
+        let lines = run_generic_stream(
+            &db,
+            &stream_filter_query(&stream_args, &db).unwrap(),
+            false,
+            &HashMap::new(),
+        );
+
+        let mut types: Vec<&str> = lines
+            .iter()
+            .map(|line| line["type"].as_str().unwrap())
+            .collect();
+        types.sort_unstable();
+        assert_eq!(
+            types,
+            ["message", "status"],
+            "repeated values of one filter keep OR semantics through the stream"
+        );
+    }
+
+    #[test]
+    fn generic_stream_distinct_filters_compose_as_and() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stream-and-filter.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        db.log_event("message", "nova", &json!({"from": "nova", "text": "match"}))
+            .unwrap();
+        db.log_event("status", "nova", &json!({ "status": "active" }))
+            .unwrap();
+        db.log_event("message", "kuma", &json!({"from": "kuma", "text": "no"}))
+            .unwrap();
+
+        let args = EventsArgs::try_parse_from([
+            "events", "stream", "--agent", "nova", "--type", "message",
+        ])
+        .unwrap();
+        let Some(EventsSubcmd::Stream(stream_args)) = args.subcmd else {
+            panic!("Expected Stream subcommand");
+        };
+        let lines = run_generic_stream(
+            &db,
+            &stream_filter_query(&stream_args, &db).unwrap(),
+            false,
+            &HashMap::new(),
+        );
+
+        assert_eq!(lines.len(), 1, "distinct filters keep AND semantics");
+        assert_eq!(lines[0]["type"], "message");
+        assert_eq!(lines[0]["instance"], "nova");
+    }
+
+    #[test]
+    fn generic_stream_expands_shortcut_filters() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stream-shortcut-filter.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        db.log_event(
+            "status",
+            "kuma",
+            &json!({"status": "blocked", "context": "approval"}),
+        )
+        .unwrap();
+        db.log_event("status", "kuma", &json!({ "status": "active" }))
+            .unwrap();
+        db.log_event(
+            "status",
+            "nova",
+            &json!({"status": "blocked", "context": "approval"}),
+        )
+        .unwrap();
+
+        // --blocked NAME expands to --agent NAME --status blocked.
+        let args = EventsArgs::try_parse_from(["events", "stream", "--blocked", "kuma"]).unwrap();
+        let Some(EventsSubcmd::Stream(stream_args)) = args.subcmd else {
+            panic!("Expected Stream subcommand");
+        };
+        let lines = run_generic_stream(
+            &db,
+            &stream_filter_query(&stream_args, &db).unwrap(),
+            false,
+            &HashMap::new(),
+        );
+
+        assert_eq!(lines.len(), 1, "shortcut expansion must survive the stream");
+        assert_eq!(lines[0]["instance"], "kuma");
+        assert_eq!(lines[0]["data"]["status"], "blocked");
+    }
+
+    #[test]
+    fn generic_stream_projections_match_existing_event_projections() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("stream-projections.db")).unwrap();
+        db.ensure_schema().unwrap();
+
+        let long_detail =
+            "cargo test --features 'secret-feature-token=hunter2' --release --all-targets --locked";
+        db.log_event(
+            "status",
+            "nova",
+            &json!({
+                "status": "active",
+                "context": "tool:Bash",
+                "detail": long_detail,
+                "position": 42,
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "life",
+            "nova",
+            &json!({
+                "action": "stopped",
+                "snapshot": {"name": "nova", "created_at": 1000.0, "tool": "claude"},
+            }),
+        )
+        .unwrap();
+        db.log_event(
+            "message",
+            "nova",
+            &json!({
+                "from": "nova",
+                "intent": "inform",
+                "text": "body with password hunter2",
+                "reply_to": "81",
+                "sender_instance_key": "nova@1000.000000",
+                "mentions": ["kuma"],
+            }),
+        )
+        .unwrap();
+
+        let filters = HashMap::new();
+
+        // Full output is the raw event view: nothing the streamliner would
+        // trim is trimmed.
+        let full = run_generic_stream(&db, "", true, &filters);
+        assert_eq!(full.len(), 3);
+        assert_eq!(full[0]["data"]["detail"], json!(long_detail));
+        assert_eq!(full[0]["data"]["position"], json!(42));
+        assert!(full[1]["data"]["snapshot"].is_object());
+        assert_eq!(full[2]["data"]["reply_to"], json!("81"));
+
+        // Streamlined output is exactly the existing snapshot projection:
+        // equality with streamline_event pins compatibility with query and
+        // wait output rather than a stream-specific shape.
+        let streamlined = run_generic_stream(&db, "", false, &filters);
+        assert_eq!(streamlined.len(), 3);
+        for (streamed, raw) in streamlined.iter().zip(&full) {
+            assert_eq!(streamed, &streamline_event(raw, &filters));
+        }
+        // Spot-check the known trims happened through the stream path.
+        let detail = streamlined[0]["data"]["detail"].as_str().unwrap();
+        assert!(detail.ends_with("...") && detail.len() < long_detail.len());
+        assert!(streamlined[0]["data"].get("position").is_none());
+        assert!(streamlined[1]["data"].get("snapshot").is_none());
+        assert!(streamlined[2]["data"].get("reply_to").is_none());
+        assert!(streamlined[2]["data"].get("mentions").is_none());
+        assert_eq!(
+            streamlined[0]["ts"].as_str().unwrap().len(),
+            full[0]["ts"].as_str().unwrap()[..19].len(),
+            "timestamps truncate to the existing 19-char projection"
+        );
     }
 
     #[test]
