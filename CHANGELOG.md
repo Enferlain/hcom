@@ -11,6 +11,15 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
+## [2026-09-15]
+
+### Fixed
+
+- Missing transcript search tools now retain the actionable not-found diagnostic
+  when an inaccessible `PATH` entry makes process spawning report permission
+  denied, while real non-executable candidates and explicit paths still surface
+  their permission errors.
+
 ## [2026-09-12]
 
 ### Added

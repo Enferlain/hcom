@@ -33,7 +33,64 @@ fn run_search_tool(program: &str, args: &[&str]) -> Result<Option<std::process::
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(format!(
             "required search tool `{program}` was not found on PATH"
         )),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            // A bare name that only hit EACCES on an inaccessible PATH
+            // directory (common on WSL with /mnt/c entries) is still "not
+            // found"; an explicit path, or a real candidate we cannot
+            // execute, keeps the permission error.
+            let is_bare_name = Path::new(program)
+                .parent()
+                .is_none_or(|p| p.as_os_str().is_empty());
+            if !is_bare_name
+                || search_tool_candidate_on_path(program, std::env::var_os("PATH").as_deref())
+            {
+                Err(format!("could not run `{program}`: {err}"))
+            } else {
+                Err(format!(
+                    "required search tool `{program}` was not found on PATH"
+                ))
+            }
+        }
         Err(err) => Err(format!("could not run `{program}`: {err}")),
+    }
+}
+
+/// Whether a PATH entry holds a file that could be `program`, so a spawn
+/// PermissionDenied came from a real candidate rather than an inaccessible
+/// PATH directory alone. Candidate enumeration matches `which` (PATHEXT on
+/// Windows) via [`crate::terminal::which_candidates`].
+fn search_tool_candidate_on_path(program: &str, path_env: Option<&std::ffi::OsStr>) -> bool {
+    let Some(path_env) = path_env else {
+        // execvp falls back to the default confstr PATH when PATH is unset.
+        #[cfg(unix)]
+        return ["/usr/bin", "/bin"]
+            .iter()
+            .any(|dir| is_candidate_file(&Path::new(dir).join(program)));
+        #[cfg(not(unix))]
+        return false;
+    };
+    std::env::split_paths(path_env).any(|dir| {
+        // An empty PATH entry denotes the current directory (execvp semantics).
+        let dir = if dir.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            dir
+        };
+        crate::terminal::which_candidates(&dir, program)
+            .iter()
+            .any(|candidate| is_candidate_file(candidate))
+    })
+}
+
+/// A candidate counts only if it is a regular file, or a symlink whose target
+/// cannot be resolved for lack of permission — both fail to exec with EACCES,
+/// so the spawn error must be surfaced rather than downgraded to "not found".
+/// Dangling symlinks (ENOENT) do not count; exec fails NotFound for them.
+fn is_candidate_file(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file(),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => path.is_symlink(),
+        Err(_) => false,
     }
 }
 
@@ -2028,5 +2085,145 @@ mod tests {
         let err =
             run_search_tool("__hcom_definitely_missing_search_tool__", &["pattern"]).unwrap_err();
         assert!(err.contains("was not found on PATH"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn search_tool_candidate_scan_tolerates_inaccessible_path_entries() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let inacc_dir = temp_dir.path().join("inaccessible");
+        std::fs::create_dir(&inacc_dir).unwrap();
+        std::fs::set_permissions(&inacc_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let acc_dir = temp_dir.path().join("accessible");
+        std::fs::create_dir(&acc_dir).unwrap();
+        // A real candidate, but not executable.
+        let bad_tool = acc_dir.join("bad_tool");
+        std::fs::write(&bad_tool, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&bad_tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A directory named like a tool is not an executable candidate.
+        std::fs::create_dir(acc_dir.join("sub_dir")).unwrap();
+
+        let path_env = OsString::from(format!("{}:{}", inacc_dir.display(), acc_dir.display()));
+
+        // A missing bare tool stays missing even though one PATH entry EACCESes.
+        assert!(!search_tool_candidate_on_path(
+            "__hcom_definitely_missing_search_tool__",
+            Some(&path_env)
+        ));
+        // A real (even non-executable) candidate file is found.
+        assert!(search_tool_candidate_on_path("bad_tool", Some(&path_env)));
+        // A directory named like the tool does not count.
+        assert!(!search_tool_candidate_on_path("sub_dir", Some(&path_env)));
+
+        // Restore so the tempdir can be removed on hosts where deletion needs it.
+        let _ = std::fs::set_permissions(&inacc_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn missing_search_tool_with_inaccessible_path_entry_is_still_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct EnvGuard {
+            original_path: Option<std::ffi::OsString>,
+            inacc_dir: PathBuf,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.inacc_dir,
+                    std::fs::Permissions::from_mode(0o700),
+                );
+                // SAFETY: serialized test restoring process env
+                unsafe {
+                    match &self.original_path {
+                        Some(val) => std::env::set_var("PATH", val),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        // PATH shape matching the WSL failure: an inaccessible directory
+        // ahead of an accessible one holding a real candidate.
+        let inacc_dir = temp_dir.path().join("inaccessible");
+        std::fs::create_dir(&inacc_dir).unwrap();
+        std::fs::set_permissions(&inacc_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let acc_dir = temp_dir.path().join("accessible");
+        std::fs::create_dir(&acc_dir).unwrap();
+        let unexec_file = acc_dir.join("test_unexec_search_tool");
+        std::fs::write(&unexec_file, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&unexec_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let orig_path = std::env::var_os("PATH");
+        // Bound as `_guard` so it stays alive until test end and restores
+        // PATH even on assertion panic.
+        let _guard = EnvGuard {
+            original_path: orig_path.clone(),
+            inacc_dir: inacc_dir.clone(),
+        };
+        let test_path = match &orig_path {
+            Some(p) => format!(
+                "{}:{}:{}",
+                inacc_dir.display(),
+                acc_dir.display(),
+                p.to_string_lossy()
+            ),
+            None => format!("{}:{}", inacc_dir.display(), acc_dir.display()),
+        };
+        // SAFETY: serialized test mutating process env
+        unsafe {
+            std::env::set_var("PATH", &test_path);
+        }
+
+        // Missing bare tool: the actionable missing-tool diagnostic, not
+        // "could not run: Permission denied" leaked from the PATH entry.
+        let missing_err =
+            run_search_tool("__hcom_definitely_missing_search_tool__", &["pattern"]).unwrap_err();
+        assert!(
+            missing_err.contains("was not found on PATH"),
+            "expected 'was not found on PATH', got: {missing_err}"
+        );
+
+        // Real non-executable candidate: keeps the permission error.
+        let unexec_err = run_search_tool("test_unexec_search_tool", &["pattern"]).unwrap_err();
+        assert!(
+            unexec_err.contains("could not run `test_unexec_search_tool`"),
+            "expected 'could not run `test_unexec_search_tool`', got: {unexec_err}"
+        );
+        assert!(
+            unexec_err.contains("Permission denied") || unexec_err.contains("os error 13"),
+            "expected permission error detail, got: {unexec_err}"
+        );
+        assert!(
+            !unexec_err.contains("was not found on PATH"),
+            "must not report a real candidate as missing, got: {unexec_err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_executable_search_tool_at_explicit_path_keeps_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let tool = temp_dir.path().join("hcom_unexecutable_search_tool");
+        std::fs::write(&tool, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Explicit paths never do PATH search, so PermissionDenied is real.
+        let err = run_search_tool(tool.to_str().unwrap(), &["pattern"]).unwrap_err();
+        assert!(
+            err.contains("could not run") && !err.contains("was not found on PATH"),
+            "expected permission error for explicit path, got: {err}"
+        );
     }
 }
