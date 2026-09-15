@@ -22,11 +22,13 @@ Bubblewrap versions older than 0.12.0.
   policy separately for every CLI.
 - Make the effective boundary inspectable, testable, resumable, and fail-closed.
 - Support normal trusted-repository editing, Rust build/test workflows, and
-  isolated hcom completion reporting.
+  isolated hcom messaging, progress observation, and completion reporting.
 - Let routine work inside an active outer boundary proceed without repetitive
   provider approvals while retaining explicit capability gates for dangerous or
   out-of-scope actions.
 - Establish workflow and attempt identity as the tenancy key for runtime state.
+- Keep workflow identity and workspace ownership independent so later sessions
+  can explicitly share a workspace without collapsing their isolation state.
 
 **Non-Goals:**
 
@@ -35,6 +37,8 @@ Bubblewrap versions older than 0.12.0.
 - Claiming hostile-code containment while networking remains shared.
 - Supporting native-print, macOS, Windows, arbitrary global hcom messaging, or
   untrusted GitHub-event workloads in the first milestone.
+- Defining concurrent-edit, locking, conflict-resolution, or branch-ownership
+  policy for a future shared-workspace mode.
 
 ## Decisions
 
@@ -65,8 +69,11 @@ Core values:
 
 - `IsolationProfile`: `off`, `workspace`, or `workspace-git`.
 - `WorkflowId` and `AttemptId`: opaque validated identifiers.
+- `WorkloadTrust`: an explicit trust/provenance classification; a local path is
+  not itself evidence that its contents or task input are trusted.
 - `IsolationPlan`: canonical workspace, Git paths, mounts, environment keys,
-  backend, network mode, runtime path, and plan identity.
+  backend, network mode, trust, runtime path, stable workflow-policy identity,
+  and attempt-specific plan identity.
 - `IsolationRuntime`: owns prepared sidecars and cleanup state.
 
 The plan is serializable, but secret values are never part of it or launch
@@ -98,10 +105,13 @@ requesting host bypass.
 
 The Linux backend begins with an empty mount namespace and adds validated
 read-only runtime roots, the workspace, Git metadata, private temp/runtime
-paths, declared caches, provider state, and workflow-scoped hcom state. It uses
-separate user, PID, IPC, UTS, and cgroup namespaces, a new session, parent-death
-handling, and dropped capabilities. Nested user namespaces are disabled when
-the host supports that control.
+paths, declared caches, provider state, and a workflow-scoped broker endpoint.
+It uses separate user, PID, IPC, UTS, and cgroup namespaces, parent-death
+handling, dropped capabilities, and mandatory nested-user-namespace disabling.
+The existing PTY proxy already creates a session and controlling terminal, so
+the backend does not add Bubblewrap's `--new-session` unless the PTY containment
+suite proves that doing so preserves `/dev/tty`, terminal sizing, signals, and
+interactive input.
 
 `hcom isolation doctor` verifies:
 
@@ -129,43 +139,77 @@ the existing system roots required by the provider and development tools.
 The workspace is canonicalized before untrusted execution. Linked-worktree Git
 indirection is resolved explicitly. The workspace is mounted read-write, then
 its `.git` file/directory and common Git directory are over-mounted read-only in
-the `workspace` profile. `workspace-git` makes only those exact Git paths
-writable.
+the `workspace` profile. Read-only Git execution sets `GIT_OPTIONAL_LOCKS=0` so
+inspection does not fail while attempting an optional index refresh.
+
+`workspace-git` must not imply branch-level protection that ordinary writable
+Git metadata cannot enforce. The preview profile uses dedicated disposable Git
+state, such as a private clone, when branch mutation is enabled; directly
+mounting a shared worktree's common Git directory read-write is not sufficient.
 
 Writable build output remains inside the workspace or a private runtime path.
 Nix stores and dependency source caches are read-only. Credential files such as
-Cargo's credentials are excluded.
+Cargo's credentials are excluded. Each plan also constructs a private `HOME`,
+`XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR`, and
+adds only the public operating-system files needed for identity, DNS, and TLS.
+Provider and external-service proxy endpoints, CA material, and safe placeholder
+environment values are contributed explicitly by an adapter or broker.
 
 **Alternative considered:** Bind the host root read-only and overlay writable
 paths. Rejected because it exposes unrelated files and secrets and makes the
 allowlist harder to audit.
 
-### hcom state is workflow-scoped
+### hcom state is host-owned and workflow-scoped
 
-Create a private hcom directory for each workflow/attempt. The host coordinator
-and sandboxed participants use that database for lifecycle and result events.
-High-level `hcom run` prints the correlated result to its caller, so the parent
-does not need membership in the private database.
+The sandbox never receives a writable SQLite database. A per-run broker owned
+by the host-side PTY coordinator exposes only the hcom operations authorized for
+the workflow and binds each request to the recorded workflow, attempt, worker
+generation, thread, and message intent. The broker writes accepted lifecycle,
+message, request, blocker, result, and bounded progress events into host-owned
+hcom state.
 
-The runtime path is keyed by `WorkflowId` and `AttemptId`, not only an instance
-name. This introduces the minimum first-class workflow identity needed for
-tenancy without redesigning existing message and instance tables.
+Normal `hcom agy` and `hcom claude` workers therefore remain visible and
+reachable through ordinary hcom messaging and the compact event stream. The
+high-level `hcom run` wrapper may consume the same correlated result channel,
+but it is not the only supported interaction model and does not define the
+tenancy boundary.
+
+Runtime and broker identities are keyed by `WorkflowId` and `AttemptId`, not
+only an instance name. This introduces the minimum first-class workflow
+identity needed for tenancy without mounting global state or redesigning every
+existing message and instance table.
 
 **Alternative considered:** Mount global `~/.hcom` read-write. Rejected because
 the worker could inspect or corrupt unrelated messages, scripts, transcripts,
 configuration, and launches.
 
-**Alternative considered:** Build the full global communication broker first.
-Rejected for milestone 1 because high-level result return is sufficient for the
-daily worker workflow. The narrow broker follows when arbitrary cross-workflow
-messaging is required.
+**Alternative considered:** Mount a private workflow SQLite database read-write.
+Rejected because a worker with shell access could inspect, rewrite, or forge
+participant state and because the separate database would disconnect ordinary
+hcom messaging and progress streams. A narrow per-run broker is smaller than a
+general cross-workflow broker and is required in milestone 1.
+
+### Workflow identity does not own the workspace
+
+Workflow and attempt identities authorize communication and runtime resources;
+they are not derived from the canonical workspace path and cleanup never owns
+or deletes that workspace. Initial launches may require an exclusive workspace
+grant, but plan, broker, and lifecycle records must allow a future explicit
+shared grant to reference the same workspace from multiple sessions while
+keeping their identities, messages, results, and cleanup independent.
+
+The future sharing mode still needs a deliberate coordination policy for
+concurrent edits, branches, locking, and conflict handling. This change only
+preserves that design path; it does not enable implicit workspace sharing.
 
 ### Provider-specific behavior is a small capability
 
 Keep `IntegrationSpec` declarative. Add a small optional `IsolationAdapter` that
 classifies public configuration, writable per-run state, authentication, and
-additional validated mounts/environment. Do not create one large provider trait
-covering launch, hooks, delivery, transcript, session, and isolation.
+additional validated mounts/environment plus credential or service-broker
+handles. Secret values are not serialized into an isolation plan or exposed in
+the Bubblewrap argument vector. Do not create one large provider trait covering
+launch, hooks, delivery, transcript, session, and isolation.
 
 Antigravity is the first real adapter after fake-provider containment because it
 is the current blocker. Claude-backed GLM follows against the same runtime.
@@ -183,7 +227,16 @@ builds, tests, and Git inspection. Requiring an LLM-mediated approval for
 commands such as `cargo fmt` adds supervision cost without strengthening the
 filesystem or process boundary.
 
-Remote operations use explicit workflow capabilities and scoped identities.
+An adapter may disable a conflicting provider-native sandbox or select the
+provider's broad non-interactive mode only after the outer boundary is active
+and every external-service credential available to the child is scoped or
+brokered. Provider flags named "bypass" are not categorically forbidden: their
+safety comes from the enforced outer boundary and capability surface, not their
+name. Without those prerequisites the adapter fails before startup.
+
+Remote operations use explicit workflow capabilities enforced by scoped
+identities or service brokers; provider auto-approval alone is not
+authorization.
 For example, a GitHub-participation workflow may grant issue and pull-request
 read/write/review operations to its agent account without prompting for each
 `gh` invocation. Credential changes, repository administration, secret access,
@@ -204,11 +257,15 @@ the stable policy units.
 
 ### Networking is honest and staged
 
-Milestone 1 shares host networking only for explicitly trusted local
-repositories and reports `network=host` on every launch. This provides
-filesystem/process isolation for immediate use but is not described as hardened
-against exfiltration. Untrusted issue text, pull requests, and repositories are
-rejected until brokered credentials and egress exist.
+Milestone 1 records an explicit `trusted-local` workload classification and
+shares host networking only for that class, reporting both trust and
+`network=host` on every launch. A local path does not establish trust by
+itself. Trust may come from an explicit launch choice or a stored policy keyed
+to canonical workspace and repository identity, so daily use does not require a
+repeated prompt. This provides filesystem/process isolation for immediate use
+but is not described as hardened against exfiltration. Untrusted issue text,
+pull requests, and repositories are rejected until brokered credentials and
+egress exist.
 
 **Alternative considered:** Disable networking. Rejected for real providers
 because inference requires network access.
@@ -219,9 +276,10 @@ repository data could still leave through arbitrary egress.
 
 ### Isolation lifecycle is durable and observable
 
-Store requested profile, effective backend, canonical workspace, workflow ID,
-attempt ID, Git policy, network mode, runtime path, and a non-secret plan digest
-with the launch. `hcom list -v` and structured launch results expose them.
+Store requested profile, effective backend, canonical workspace, workload
+trust, workflow ID, stable workflow-policy identity, attempt ID, Git policy,
+network mode, runtime path, and an attempt-specific non-secret plan digest with
+the launch. `hcom list -v` and structured launch results expose them.
 
 Lifecycle stages are:
 
@@ -231,9 +289,11 @@ preflight -> plan_resolved -> namespace_started -> provider_started
 ```
 
 Setup failures emit a typed `isolation` blocker with the failed stage. Resume
-must reproduce the recorded boundary. Cancellation and timeout terminate the
-provider namespace before deleting writable runtime state. A cleanup warning
-after an authoritative result does not erase that result.
+creates a new attempt and runtime path but must reproduce the stable recorded
+workflow policy; the attempt plan digest is expected to change. Cancellation
+and timeout terminate the provider namespace before deleting writable runtime
+state. A cleanup warning after an authoritative result does not erase that
+result.
 
 ## Risks / Trade-offs
 
@@ -247,39 +307,58 @@ after an authoritative result does not erase that result.
   version/platform preflight, renderable plans, canonical paths, an empty-root
   allowlist, and fake-provider containment tests.
 - **[Read-only Git metadata breaks tools that take locks]** → Test common Git
-  inspection commands and reserve explicit `workspace-git` for workflows that
-  genuinely own branch mutation.
+  inspection commands with optional locks disabled and reserve
+  `workspace-git` for disposable, dedicated Git state.
 - **[NixOS closures require many runtime paths]** → Mount the Nix store and
   system profile read-only and test executable resolution separately from
   conventional Linux.
-- **[Private hcom state reduces ad-hoc communication]** → Prioritize reliable
-  high-level workflow results; add an authenticated narrow broker later.
+- **[A writable worker database permits state forgery]** → Keep SQLite on the
+  host and expose only an authenticated, workflow-scoped broker protocol.
+- **[The broker accidentally becomes a second orchestration framework]** → Keep
+  it transport-only: authorize and relay typed hcom operations without model
+  reasoning, task scheduling, or a required daemon.
 - **[A new workflow identity starts a larger domain migration]** → Introduce
   opaque IDs and launch metadata only; defer broad schema normalization.
 - **[Provider-native and hcom sandboxes conflict]** → Provider adapters select
   compatible flags, and the fake-provider gate proves the outer boundary before
   real-provider tuning.
 - **[Broad provider permissions are enabled without containment]** → Make an
-  active validated isolation plan a hard prerequisite and fail before provider
-  startup rather than weakening either layer.
+  active validated isolation plan plus scoped external-service credentials a
+  hard prerequisite and fail before provider startup rather than weakening
+  either layer.
+- **[Process isolation is mistaken for resource limiting]** → Document that a
+  cgroup namespace does not impose CPU, memory, disk, or network quotas; rely on
+  timeout/kill initially and track quotas separately.
 
 ## Migration Plan
 
-1. Add plan/config types, workflow/attempt IDs, CLI parsing, `doctor`, and
-   `explain` without changing launches.
+1. Add plan/config types, explicit workload trust, stable workflow-policy and
+   attempt identities, CLI parsing, `doctor`, and `explain` without changing
+   launches.
 2. Upgrade the development host to Bubblewrap 0.12.0 or newer and make the
    doctor gate authoritative.
 3. Add the Bubblewrap process builder and fake-provider containment suite at the
    PTY child-spawn seam.
-4. Add workflow-scoped hcom state and correlated high-level result return.
+4. Add the host-owned workflow broker and prove ordinary messages, requests,
+   compact progress, blockers, and results without exposing a database file.
 5. Enable the Antigravity adapter behind explicit `--isolate workspace` preview
-   selection and run Gemini then Claude live gates.
-6. Enable Claude-backed GLM in a fresh worktree and run cleanup/resume gates.
+   selection and run Gemini then Claude live gates through normal interactive
+   hcom launches as well as the optional high-level wrapper.
+6. Enable Claude-backed GLM in a fresh worktree and run communication,
+   cleanup, and resume gates.
 7. Make `workspace` the delegated-workflow default only after the full trusted
    local workflow matrix passes.
-8. Add brokered credentials, egress, and global hcom messaging before enabling
-   untrusted workloads.
+8. Add constrained egress and hardened credential brokering before enabling
+   untrusted workloads; design explicit shared-workspace coordination as a
+   separate follow-up.
 
 Rollback is configuration-only until step 7 because isolation is opt-in. After
 it becomes the delegated default, users may explicitly select `off`; hcom must
 never select `off` automatically after an isolation failure.
+
+## Open Questions
+
+- When explicit workspace sharing is added, what coordination model should
+  govern concurrent edits, branch ownership, locking, and conflict handling?
+  The current design only guarantees that workflow identity, communication,
+  result correlation, and cleanup remain independent from workspace ownership.
