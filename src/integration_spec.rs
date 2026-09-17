@@ -460,7 +460,7 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
     },
     status_detail: StatusDetailSpec {
         bash: &["Bash"],
-        file: &["Write", "Edit"],
+        file: &["Read", "Write", "Edit"],
         delegate: &["Task", "Agent"],
     },
 };

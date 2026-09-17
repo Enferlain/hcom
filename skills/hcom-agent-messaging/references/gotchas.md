@@ -17,6 +17,53 @@ hcom 1 claude --tag worker --headless --hcom-prompt "..."
 hcom 1 claude --tag worker --go --headless --hcom-prompt "..."
 ```
 
+## Worker Launched With an Empty Prompt
+
+**Cause:** `--hcom-prompt "$MAYBE_UNSET_VAR"` expanded to nothing. The session
+starts, idles at the UI, and burns a terminal slot for the whole run.
+
+**Fix:** Construct the prompt directly from literals or validated variables,
+and refuse to launch on an empty one:
+
+```bash
+task="Run the test suite and report failures"
+[ -n "$task" ] || { echo "refusing to launch with an empty prompt" >&2; exit 1; }
+hcom 1 claude --go --hcom-prompt "$task"
+```
+
+## Recreated Short Streams (Observation Loop)
+
+**Cause:** Following a worker by re-running `hcom events --last N`, or by
+starting a new short `events stream` every few tool calls. Every recreation
+loses ordering, re-reads old records, and multiplies overhead — a real
+delegation accumulated 73 tool calls of pure observation this way while the
+actual blocker sat hidden.
+
+**Fix:** Keep one durable cursor/stream per observation:
+
+```bash
+name=luna                       # the worker's name, from the launch output
+cursor=$(hcom events --cursor)  # capture before launch
+# one continuous follow, anchored at the pre-launch cursor:
+hcom events stream --follow "$name" --compact --heartbeat 15 --after-id "$cursor"
+# or, when the task was sent on an explicit workflow thread:
+thread=task-123
+hcom events --wait 600 --after-id "$cursor" --thread "$thread" --result-from "$name"
+```
+
+`--after-id` is an exclusive durable-event cursor: events with IDs at or below
+it are deliberately ignored. Capture it before launch to bind observation to
+that attempt. Do not use a short timeout and then recreate the observer; one
+long-lived stream is cheaper and preserves ordering. If a compact follower is
+attached to an already-running worker, hcom seeds heartbeat state from the
+live worker row without replaying older events.
+
+Act on blockers the stream surfaces (`blocked:approval`, `pty:approval`,
+unresolved `launch_blocked`): resolve the approval or redirect the task. After
+a plausible stall, make at most one targeted inspection —
+`hcom term "$name"` — then either fix the cause or kill the worker. Do not
+loop inspections.
+
 ## Agent Not Receiving Messages
 
 **Diagnosis steps:**
@@ -195,7 +242,7 @@ The bootstrap teaches agents: `request -> always respond`, `inform -> respond on
 | **One-shot wait** | `hcom events --wait SEC [filters]` | Blocks until first match, prints single event, exits 0 on match | Script step synchronization (`--wait` never streams) |
 | **Conversational sub** | `hcom events sub [filters]` | Durable subscription in DB; notifies via `[hcom-events]` messages | Reactive agents, asynchronous file/status triggers |
 | **Generic stream** | `hcom events stream [filters]` | Continuous NDJSON live stream in durable-ID order | Logging, external dashboards (can carry raw data/secrets) |
-| **Compact worker follow** | `hcom events stream --follow NAME --compact` | Bounded, typed progress NDJSON (`phase`, `file`, `command`, `heartbeat`) | Model-safe agent progress observation; stops at worker exit |
+| **Compact worker follow** | `hcom events stream --follow NAME --compact --after-id <cursor>` | Bounded, typed progress NDJSON (`phase`, `file`, `command`, `heartbeat`) | Model-safe agent progress observation; stops at worker exit |
 
 ## TTY/PTY Issues
 

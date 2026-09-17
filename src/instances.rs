@@ -116,6 +116,7 @@ mod tests {
             launch_context: None,
             name_announced: 0,
             idle_since: None,
+            pending_tool_use_id: String::new(),
         }
     }
 

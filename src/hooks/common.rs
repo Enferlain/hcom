@@ -1744,6 +1744,55 @@ pub fn update_tool_status(
     );
 }
 
+/// `update_tool_status` variant guarded at DB write time: the active:tool
+/// write is refused while an interactive approval is current, so a
+/// PermissionRequest that lands after the caller's snapshot cannot be
+/// overwritten by a late-arriving PreToolUse.
+pub fn update_tool_status_unless_approval(
+    db: &HcomDb,
+    instance_name: &str,
+    tool: &str,
+    tool_name: &str,
+    tool_input: &Value,
+) {
+    let detail = super::family::extract_tool_detail(tool, tool_name, tool_input);
+    let current_data = db.get_instance_full(instance_name).ok().flatten();
+    let applied = match db.set_status_if_no_approval(
+        instance_name,
+        ST_ACTIVE,
+        &format!("tool:{}", tool_name),
+        &detail,
+    ) {
+        Ok(applied) => applied,
+        Err(e) => {
+            eprintln!("[hcom] warn: guarded tool status DB write failed for {instance_name}: {e}");
+            return;
+        }
+    };
+    if !applied {
+        // An approval is pending at write time: leave the blocked row alone.
+        return;
+    }
+    if current_data
+        .as_ref()
+        .is_none_or(|row| row.status != ST_ACTIVE)
+    {
+        crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+    }
+    crate::instance_lifecycle::emit_status_event(
+        db,
+        instance_name,
+        current_data.as_ref(),
+        ST_ACTIVE,
+        &format!("tool:{}", tool_name),
+        &detail,
+        "",
+        "",
+        "",
+        std::panic::Location::caller(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

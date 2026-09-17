@@ -814,17 +814,27 @@ mod tests {
 
     #[test]
     fn test_activity_contexts_cover_integration_specs() {
+        // Read-only file tools emit file-op activity (and status detail) but
+        // must stay out of the file-write filter vocabulary.
+        let read_only = ["Read", "read_file"];
         for spec in crate::integration_spec::ALL {
             for operation in spec.status_detail.file {
                 let context = format!("tool:{operation}");
                 assert!(
-                    sql_context_list_contains(FILE_WRITE_CONTEXTS, operation),
-                    "missing file-write context {context} for {}",
-                    spec.name
-                );
-                assert!(
                     FILE_OP_CONTEXTS.contains(&context.as_str()),
                     "missing file-op context {context} for {}",
+                    spec.name
+                );
+                if read_only.contains(operation) {
+                    assert!(
+                        !sql_context_list_contains(FILE_WRITE_CONTEXTS, operation),
+                        "read-only tool {context} must not count as a file write"
+                    );
+                    continue;
+                }
+                assert!(
+                    sql_context_list_contains(FILE_WRITE_CONTEXTS, operation),
+                    "missing file-write context {context} for {}",
                     spec.name
                 );
             }

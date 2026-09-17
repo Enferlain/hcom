@@ -534,7 +534,15 @@ fn route_claude_hook(
 
     if hook_type == HOOK_PRE && is_subagent_tool(tool_name) {
         let task_start = Instant::now();
-        common::update_tool_status(db, instance_name, "claude", tool_name, &payload.tool_input);
+        // Same write-time approval guard as handle_pretooluse: a sibling Task
+        // call in the pending tool's parallel batch must not hide the blocker.
+        common::update_tool_status_unless_approval(
+            db,
+            instance_name,
+            "claude",
+            tool_name,
+            &payload.tool_input,
+        );
         timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
         return (0, String::new(), None, timing);
     }
@@ -642,9 +650,9 @@ fn route_subagent_actor_hook(
 
     // A subagent's own Agent/Task calls just update its status; the child it
     // spawns still attaches to the root (see `handle_subagent_start`), not to
-    // this acting subagent.
+    // this acting subagent. Write-time approval guard, same as the root path.
     if hook_type == HOOK_PRE && is_subagent_tool(tool_name) {
-        common::update_tool_status(
+        common::update_tool_status_unless_approval(
             db,
             &subagent_instance,
             "claude",
@@ -1493,6 +1501,90 @@ fn tool_use_id(payload: &HookPayload) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// True while the row's blocked state is an interactive approval prompt,
+/// whether detected through the PermissionRequest hook or the PTY screen.
+fn has_pending_approval(instance: &InstanceRow) -> bool {
+    instance.status == ST_BLOCKED
+        && matches!(
+            instance.status_context.as_str(),
+            "approval" | "pty:approval"
+        )
+}
+
+/// Does this terminal hook belong to the tool that opened the pending
+/// interactive approval? Claude runs tools of one turn in parallel, so a
+/// completing sibling must not clear an approval it did not open.
+fn terminal_hook_owns_pending_approval(instance: &InstanceRow, payload: &HookPayload) -> bool {
+    if !has_pending_approval(instance) {
+        return true;
+    }
+    let recorded = instance.pending_tool_use_id.as_str();
+    if recorded.is_empty() {
+        // The approval was recorded without a tool_use_id (older payloads).
+        // Fall back to the formatted tool detail, which carries the
+        // distinguishing input (command, file path, ...).
+        return family::extract_tool_detail("claude", &payload.tool_name, &payload.tool_input)
+            == instance.status_detail;
+    }
+    // Fail closed: only the exact recorded owner id resolves the approval. A
+    // terminal hook without a tool_use_id cannot prove ownership, even when
+    // its formatted detail happens to match.
+    tool_use_id(payload) == Some(recorded)
+}
+
+/// Restore a non-approval status transition, guarded at DB write time:
+/// applies only while no interactive approval is current, so a
+/// PermissionRequest that landed after the caller's snapshot survives this
+/// write. Emits the paired status event (old_* from that snapshot) and wakes
+/// the delivery loops only when the write applied.
+#[allow(clippy::too_many_arguments)]
+fn restore_unless_approval(
+    db: &HcomDb,
+    instance_name: &str,
+    snapshot: Option<&InstanceRow>,
+    status: &str,
+    context: &str,
+    detail: &str,
+    tool_name: &str,
+    tool_use_id: &str,
+    site: &str,
+) {
+    match db.set_status_if_no_approval(instance_name, status, context, detail) {
+        Ok(true) => {
+            crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+            lifecycle::emit_status_event(
+                db,
+                instance_name,
+                snapshot,
+                status,
+                context,
+                detail,
+                "",
+                tool_name,
+                tool_use_id,
+                std::panic::Location::caller(),
+            );
+        }
+        Ok(false) => {
+            log::log_info(
+                "hooks",
+                "claude.approval_landed_before_restore",
+                &format!(
+                    "instance={} site={} tool_use_id={}",
+                    instance_name, site, tool_use_id
+                ),
+            );
+        }
+        Err(e) => {
+            log::log_warn(
+                "hooks",
+                "claude.restore_write_failed",
+                &format!("instance={} site={} err={}", instance_name, site, e),
+            );
+        }
+    }
+}
+
 /// PreToolUse: status tracking plus a verified actor capability for shell tools.
 fn handle_pretooluse(
     db: &HcomDb,
@@ -1512,7 +1604,11 @@ fn handle_pretooluse(
         }
     }
 
-    common::update_tool_status(db, instance_name, "claude", tool_name, tool_input);
+    // A tool-status write must never overwrite an interactive approval: the
+    // guard is evaluated at DB write time, so a PermissionRequest landing
+    // after any snapshot still wins. The pending tool's own PreToolUse
+    // always precedes its PermissionRequest.
+    common::update_tool_status_unless_approval(db, instance_name, "claude", tool_name, tool_input);
 
     if !is_shell_tool(tool_name) {
         return (0, String::new());
@@ -1630,23 +1726,75 @@ fn handle_tool_failure(
     agent_id: Option<&str>,
 ) -> (i32, String) {
     revoke_shell_actor_for_hook(db, session_id, payload, agent_id);
+    let instance = db.get_instance_full(instance_name).ok().flatten();
+    if instance
+        .as_ref()
+        .is_some_and(|row| !terminal_hook_owns_pending_approval(row, payload))
+    {
+        // A sibling failure cannot resolve another tool's interactive
+        // approval; the prompt is still sitting at the approval UI.
+        log::log_info(
+            "hooks",
+            "claude.approval_sibling_failure_ignored",
+            &format!(
+                "instance={} pending_tool_use_id={} sibling_tool_use_id={}",
+                instance_name,
+                instance
+                    .as_ref()
+                    .map(|row| row.pending_tool_use_id.as_str())
+                    .unwrap_or_default(),
+                tool_use_id(payload).unwrap_or("")
+            ),
+        );
+        return (0, String::new());
+    }
     let error = payload
         .raw
         .get("error")
         .and_then(|value| value.as_str())
         .unwrap_or("tool failed");
-    lifecycle::set_status(
-        db,
-        instance_name,
-        ST_ACTIVE,
-        &format!("tool_failed:{}", payload.tool_name),
-        lifecycle::StatusUpdate {
-            detail: error,
-            tool_name: &payload.tool_name,
-            tool_use_id: tool_use_id(payload).unwrap_or(""),
-            ..Default::default()
-        },
-    );
+    if let Some(row) = instance.as_ref().filter(|row| has_pending_approval(row)) {
+        // The failing tool owned the pending approval: resolve it under the
+        // atomic ownership guard so a replacement approval cannot be cleared.
+        let resolved = lifecycle::resolve_approval_status(
+            db,
+            row,
+            ST_ACTIVE,
+            &format!("tool_failed:{}", payload.tool_name),
+            lifecycle::StatusUpdate {
+                detail: error,
+                tool_name: &payload.tool_name,
+                tool_use_id: tool_use_id(payload).unwrap_or(""),
+                ..Default::default()
+            },
+        );
+        if !resolved {
+            log::log_info(
+                "hooks",
+                "claude.approval_replaced_before_failure",
+                &format!(
+                    "instance={} expected_owner={} tool_use_id={}",
+                    instance_name,
+                    row.pending_tool_use_id,
+                    tool_use_id(payload).unwrap_or("")
+                ),
+            );
+        }
+    } else {
+        // No approval was current at this handler's read; guard the restore
+        // at DB write time so one landing in between survives the failure.
+        restore_unless_approval(
+            db,
+            instance_name,
+            instance.as_ref(),
+            ST_ACTIVE,
+            &format!("tool_failed:{}", payload.tool_name),
+            error,
+            &payload.tool_name,
+            tool_use_id(payload).unwrap_or(""),
+            "tool_failure",
+        );
+    }
     (0, String::new())
 }
 
@@ -1658,16 +1806,30 @@ fn handle_permission_denied(
     agent_id: Option<&str>,
 ) -> (i32, String) {
     revoke_shell_actor_for_hook(db, session_id, payload, agent_id);
-    let approval_is_current = db
-        .get_instance_full(instance_name)
-        .ok()
-        .flatten()
-        .is_some_and(|row| row.status == ST_BLOCKED && row.status_context == "approval");
-    if !approval_is_current {
+    let row = db.get_instance_full(instance_name).ok().flatten();
+    let Some(row) = row else {
+        return (0, String::new());
+    };
+    if !has_pending_approval(&row) {
         // Rule/policy denials can be reported while Claude is still reasoning.
         // Only an interactive approval that we previously marked blocked is an
         // idle "What should Claude do instead?" prompt. This guard also keeps a
         // late denial from overwriting a newer provider-owned lifecycle state.
+        return (0, String::new());
+    }
+    if !terminal_hook_owns_pending_approval(&row, payload) {
+        // A rule denial for a sibling parallel tool must not resolve another
+        // tool's interactive approval; the prompt is still at the approval UI.
+        log::log_info(
+            "hooks",
+            "claude.approval_sibling_denial_ignored",
+            &format!(
+                "instance={} pending_tool_use_id={} sibling_tool_use_id={}",
+                instance_name,
+                row.pending_tool_use_id,
+                tool_use_id(payload).unwrap_or("")
+            ),
+        );
         return (0, String::new());
     }
     let reason = payload
@@ -1675,9 +1837,11 @@ fn handle_permission_denied(
         .get("reason")
         .and_then(|value| value.as_str())
         .unwrap_or("permission denied");
-    lifecycle::set_status(
+    // Resolve under the atomic ownership guard so a replacement approval
+    // that landed after the snapshot above survives this denial.
+    let resolved = lifecycle::resolve_approval_status(
         db,
-        instance_name,
+        &row,
         ST_LISTENING,
         &format!("denied:{}", payload.tool_name),
         lifecycle::StatusUpdate {
@@ -1687,6 +1851,19 @@ fn handle_permission_denied(
             ..Default::default()
         },
     );
+    if !resolved {
+        log::log_info(
+            "hooks",
+            "claude.approval_replaced_before_denial",
+            &format!(
+                "instance={} expected_owner={} tool_use_id={}",
+                instance_name,
+                row.pending_tool_use_id,
+                tool_use_id(payload).unwrap_or("")
+            ),
+        );
+        return (0, String::new());
+    }
     // Keep headless Stop-hook polling consistent with Claude's idle-prompt
     // notification. set_status itself wakes the PTY delivery loop.
     common::notify_hook_instance_with_db(db, instance_name);
@@ -1704,15 +1881,17 @@ fn handle_stop_failure(db: &HcomDb, payload: &HookPayload, instance_name: &str) 
         .get("error_details")
         .and_then(|value| value.as_str())
         .unwrap_or(error);
-    lifecycle::set_status(
+    let snapshot = db.get_instance_full(instance_name).ok().flatten();
+    restore_unless_approval(
         db,
         instance_name,
+        snapshot.as_ref(),
         ST_INACTIVE,
         &format!("failure:{}", error),
-        lifecycle::StatusUpdate {
-            detail,
-            ..Default::default()
-        },
+        detail,
+        "",
+        tool_use_id(payload).unwrap_or(""),
+        "stop_failure",
     );
     (0, String::new())
 }
@@ -1730,19 +1909,66 @@ fn handle_posttooluse(
     let mut outputs: Vec<Value> = Vec::new();
     let mut delivery_ack = None;
 
-    // Clear blocked status if tool completed
+    // Clear blocked status if the completing tool owns the pending approval.
+    // Claude runs the tools of one turn in parallel, so a sibling completing
+    // while another tool waits at the approval UI must not hide that blocker,
+    // and a stale completion for a replaced approval must not clear the newer
+    // one — the guarded update re-verifies the recorded owner at write time.
     if instance_data.status == ST_BLOCKED {
-        lifecycle::set_status(
-            db,
-            instance_name,
-            ST_ACTIVE,
-            &format!("approved:{}", tool_name),
-            lifecycle::StatusUpdate {
+        if has_pending_approval(instance_data) {
+            if terminal_hook_owns_pending_approval(instance_data, payload) {
+                let resolved = lifecycle::resolve_approval_status(
+                    db,
+                    instance_data,
+                    ST_ACTIVE,
+                    &format!("approved:{}", tool_name),
+                    lifecycle::StatusUpdate {
+                        tool_name,
+                        tool_use_id: tool_use_id(payload).unwrap_or(""),
+                        ..Default::default()
+                    },
+                );
+                if !resolved {
+                    log::log_info(
+                        "hooks",
+                        "claude.approval_replaced_before_completion",
+                        &format!(
+                            "instance={} expected_owner={} tool_use_id={}",
+                            instance_name,
+                            instance_data.pending_tool_use_id,
+                            tool_use_id(payload).unwrap_or("")
+                        ),
+                    );
+                }
+            } else {
+                log::log_info(
+                    "hooks",
+                    "claude.approval_sibling_completion_ignored",
+                    &format!(
+                        "instance={} pending_tool_use_id={} sibling_tool_use_id={}",
+                        instance_name,
+                        instance_data.pending_tool_use_id,
+                        tool_use_id(payload).unwrap_or("")
+                    ),
+                );
+            }
+        } else {
+            // Non-approval blocked contexts (elicitation, launch_blocked)
+            // keep the historical restore on completion — conditionally at DB
+            // write time, so an approval that landed after the routed
+            // snapshot survives this sibling completion.
+            restore_unless_approval(
+                db,
+                instance_name,
+                Some(instance_data),
+                ST_ACTIVE,
+                &format!("approved:{}", tool_name),
+                "",
                 tool_name,
-                tool_use_id: tool_use_id(payload).unwrap_or(""),
-                ..Default::default()
-            },
-        );
+                tool_use_id(payload).unwrap_or(""),
+                "posttooluse",
+            );
+        }
     }
 
     // Shell-specific: persist updates and check bootstrap
@@ -2000,17 +2226,17 @@ fn handle_permission_request(
     }
 
     let detail = family::extract_tool_detail("claude", &payload.tool_name, &payload.tool_input);
-    lifecycle::set_status(
+    // One atomic write records the blocked state, its detail, and the owning
+    // tool_use_id together — no reader can observe a half-recorded approval,
+    // and a sibling terminal hook can never resolve an approval it did not
+    // open. A prompt currently showing is authoritative and replaces any
+    // prior row state, including an older approval.
+    lifecycle::mark_pending_approval(
         db,
         instance_name,
-        ST_BLOCKED,
-        "approval",
-        lifecycle::StatusUpdate {
-            detail: &detail,
-            tool_name: &payload.tool_name,
-            tool_use_id: tool_use_id(payload).unwrap_or(""),
-            ..Default::default()
-        },
+        &detail,
+        &payload.tool_name,
+        tool_use_id(payload).unwrap_or(""),
     );
     (0, String::new())
 }
@@ -2070,13 +2296,39 @@ fn handle_notify(
         return (0, String::new());
     }
     if message.starts_with("Claude needs your permission") {
-        lifecycle::set_status(
-            db,
-            instance_name,
-            ST_BLOCKED,
-            "approval",
-            Default::default(),
-        );
+        // This back-compat payload carries no tool identity, and a hook-owned
+        // approval (PermissionRequest) is strictly richer. The conditional
+        // single write only applies while no interactive approval is current
+        // AT WRITE TIME, so a PermissionRequest arriving concurrently can
+        // never be clobbered by this path.
+        let snapshot = db.get_instance_full(instance_name).ok().flatten();
+        match db.record_legacy_pending_approval(instance_name) {
+            Ok(true) => {
+                if snapshot.as_ref().is_none_or(|row| row.status != ST_BLOCKED) {
+                    crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+                }
+                lifecycle::emit_status_event(
+                    db,
+                    instance_name,
+                    snapshot.as_ref(),
+                    ST_BLOCKED,
+                    "approval",
+                    "",
+                    "",
+                    "",
+                    "",
+                    std::panic::Location::caller(),
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                log::log_warn(
+                    "hooks",
+                    "claude.notify.legacy_approval_write_failed",
+                    &format!("instance={} err={}", instance_name, e),
+                );
+            }
+        }
         return (0, String::new());
     }
     (0, String::new())
@@ -7080,5 +7332,895 @@ mod tests {
         assert_eq!(row.status, ST_ACTIVE);
         assert_eq!(row.status_context, "prompt");
         assert!(!db.is_idle("tori"));
+    }
+
+    // ---- Parallel tool lifecycle vs. pending approval (issue hcom-1bv) ----
+    //
+    // Claude runs the tool calls of one turn in parallel. When one Read sits
+    // at the approval UI and a sibling Read completes out of order, the
+    // shared instance row must keep reporting the unresolved approval until
+    // that specific approval resolves (its own completion or denial) or the
+    // turn demonstrably ends.
+
+    fn insert_active_claude_instance(db: &HcomDb, name: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, last_seen, created_at, last_event_id)
+                 VALUES (?1, 'sess-1', 'claude', 'active', 'prompt', 0, 0, 0, 0)",
+                [name],
+            )
+            .unwrap();
+        bind_validated_session(db, "sess-1", name);
+    }
+
+    fn route_claude_json(db: &HcomDb, ctx: &HcomContext, hook_type: &str, raw: Value) {
+        let mut payload = HookPayload::from_claude(raw);
+        let _ = route_claude_hook(db, ctx, hook_type, &mut payload);
+    }
+
+    fn external_read_permission_request() -> Value {
+        serde_json::json!({
+            "session_id": "sess-1",
+            "tool_name": "Read",
+            "tool_use_id": "tool-ext",
+            "tool_input": { "file_path": "/home/imi/.config/finance-sync/config.json" },
+        })
+    }
+
+    fn repo_read_payload(tool_use_id: &str) -> Value {
+        serde_json::json!({
+            "session_id": "sess-1",
+            "tool_name": "Read",
+            "tool_use_id": tool_use_id,
+            "tool_input": { "file_path": "/home/imi/Projects/hcom/src/main.rs" },
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn test_parallel_read_sibling_posttooluse_keeps_approval_blocked() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(
+            row.status_detail, "/home/imi/.config/finance-sync/config.json",
+            "the blocked detail must identify the tool waiting at the approval UI"
+        );
+        assert_eq!(row.pending_tool_use_id, "tool-ext");
+        assert!(!db.is_idle("tori"));
+
+        // The repository-local sibling Read completes; the external read is
+        // still sitting at Claude's approval UI.
+        route_claude_json(&db, &ctx, HOOK_POST, repo_read_payload("tool-repo"));
+
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(
+            row.status, ST_BLOCKED,
+            "sibling completion must not clear an approval it does not own"
+        );
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(
+            row.status_detail,
+            "/home/imi/.config/finance-sync/config.json"
+        );
+        assert_eq!(row.pending_tool_use_id, "tool-ext");
+        assert!(!db.is_idle("tori"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_pending_approval_resolves_when_owning_tool_completes() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+        // A sibling completes first and is ignored, then the user approves the
+        // external read and its own PostToolUse arrives.
+        route_claude_json(&db, &ctx, HOOK_POST, repo_read_payload("tool-repo"));
+        route_claude_json(&db, &ctx, HOOK_POST, external_read_permission_request());
+
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "approved:Read");
+        assert_eq!(row.pending_tool_use_id, "");
+    }
+
+    #[test]
+    #[serial]
+    fn test_parallel_read_out_of_order_delivery_keeps_approval_visible() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        // Reversed delivery: the sibling completion lands before the
+        // permission request. While the row is still active the completion is
+        // a no-op, and the request then marks the real UI state.
+        route_claude_json(&db, &ctx, HOOK_POST, repo_read_payload("tool-repo"));
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "prompt");
+
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+
+        // A late-arriving sibling PreToolUse must not overwrite the blocked
+        // row either: the pending tool's own PreToolUse precedes its request.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PRE,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "tool_name": "Write",
+                "tool_use_id": "tool-write",
+                "tool_input": { "file_path": "/home/imi/Projects/hcom/notes.md", "content": "x" },
+            }),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-ext");
+    }
+
+    #[test]
+    #[serial]
+    fn test_sibling_posttooluse_failure_keeps_approval_blocked() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+        let mut failure = repo_read_payload("tool-repo");
+        failure["error"] = serde_json::json!("File content exceeded limit");
+        route_claude_json(&db, &ctx, HOOK_POST_FAILURE, failure);
+
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(
+            row.status, ST_BLOCKED,
+            "a sibling tool failure must not clear an approval it does not own"
+        );
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-ext");
+        assert!(!db.is_idle("tori"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_sibling_permission_denied_keeps_approval_then_owning_denial_resolves() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+
+        // A rule denial reported for the sibling read while the external read
+        // is still at the approval UI.
+        let mut sibling_denial = repo_read_payload("tool-repo");
+        sibling_denial["reason"] = serde_json::json!("path outside workspace");
+        route_claude_json(&db, &ctx, HOOK_PERMISSION_DENIED, sibling_denial);
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-ext");
+        assert!(!db.is_idle("tori"));
+
+        // The user then denies the external read itself.
+        let mut owning_denial = external_read_permission_request();
+        owning_denial["reason"] = serde_json::json!("User denied file read");
+        route_claude_json(&db, &ctx, HOOK_PERMISSION_DENIED, owning_denial);
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_LISTENING);
+        assert_eq!(row.status_context, "denied:Read");
+        assert_eq!(row.status_detail, "User denied file read");
+        assert_eq!(row.pending_tool_use_id, "");
+        assert!(db.is_idle("tori"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_approval_without_tool_use_id_falls_back_to_detail_match() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        // Older payloads may open the approval without a tool_use_id.
+        let mut request = external_read_permission_request();
+        request.as_object_mut().unwrap().remove("tool_use_id");
+        route_claude_json(&db, &ctx, HOOK_PERMISSION_REQUEST, request.clone());
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.pending_tool_use_id, "");
+
+        // Sibling with a different detail keeps the approval blocked...
+        route_claude_json(&db, &ctx, HOOK_POST, repo_read_payload("tool-repo"));
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+
+        // ...while the approving tool's own completion still resolves it.
+        route_claude_json(&db, &ctx, HOOK_POST, request);
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "approved:Read");
+        assert_eq!(row.pending_tool_use_id, "");
+    }
+
+    #[test]
+    #[serial]
+    fn test_replaced_approval_survives_stale_terminal_hook_snapshot() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        // Approval A opens; route fetches its snapshot (owner tool-ext).
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+        let stale = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(stale.pending_tool_use_id, "tool-ext");
+
+        // A replacement PermissionRequest lands before A's terminal hook
+        // runs: a different tool now owns the approval UI.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "tool_name": "Bash",
+                "tool_use_id": "tool-z",
+                "tool_input": { "command": "cargo test" },
+            }),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.pending_tool_use_id, "tool-z");
+
+        // The db-level guard refuses the stale approval identity outright
+        // (owner AND generation tokens from the pre-replacement snapshot).
+        assert!(
+            !db.resolve_owned_approval(
+                "tori",
+                &crate::db::ApprovalToken::from_row(&stale),
+                "active",
+                "approved:Read",
+                Some("")
+            )
+            .unwrap()
+        );
+
+        // A's PostToolUse arrives carrying route's pre-replacement snapshot.
+        // Ownership passes against the snapshot, but the guarded update must
+        // refuse and leave the replacement approval intact.
+        let payload = HookPayload::from_claude(external_read_permission_request());
+        let updates = serde_json::Map::new();
+        let _ = handle_posttooluse(&db, &ctx, &payload, "tori", &stale, &updates);
+
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(
+            row.status, ST_BLOCKED,
+            "a stale completion must not clear the replacement approval"
+        );
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.status_detail, "cargo test");
+        assert_eq!(row.pending_tool_use_id, "tool-z");
+        assert!(!db.is_idle("tori"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_recorded_owner_fails_closed_without_incoming_tool_use_id() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+
+        // A completion for the same file but WITHOUT a tool_use_id: the
+        // matching detail must not resolve a recorded owner. Fail closed.
+        let mut no_id = external_read_permission_request();
+        no_id.as_object_mut().unwrap().remove("tool_use_id");
+        route_claude_json(&db, &ctx, HOOK_POST, no_id.clone());
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.pending_tool_use_id, "tool-ext");
+
+        // Same for a denial without an id.
+        let mut no_id_denial = no_id;
+        no_id_denial["reason"] = serde_json::json!("User denied file read");
+        route_claude_json(&db, &ctx, HOOK_PERMISSION_DENIED, no_id_denial);
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-ext");
+
+        // The id-carrying completion of the owning tool still resolves it.
+        route_claude_json(&db, &ctx, HOOK_POST, external_read_permission_request());
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "approved:Read");
+        assert_eq!(row.pending_tool_use_id, "");
+    }
+
+    #[test]
+    #[serial]
+    fn test_sibling_hooks_keep_pty_approval_blocked() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+        db.conn()
+            .execute(
+                "UPDATE instances
+                 SET status = 'blocked', status_context = 'pty:approval',
+                     status_detail = 'Bash: cargo test'
+                 WHERE name = ?1",
+                ["tori"],
+            )
+            .unwrap();
+
+        // A sibling Bash completing while the PTY-detected approval prompt is
+        // still on screen must not clear the blocked state.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_POST,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "tool_name": "Bash",
+                "tool_use_id": "tool-b",
+                "tool_input": { "command": "ls -la" },
+            }),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "pty:approval");
+
+        // Neither may a late-arriving sibling PreToolUse overwrite it.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PRE,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "tool_name": "Write",
+                "tool_use_id": "tool-w",
+                "tool_input": { "file_path": "/home/imi/Projects/hcom/notes.md", "content": "x" },
+            }),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "pty:approval");
+        assert!(!db.is_idle("tori"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_legacy_permission_notification_preserves_hook_owned_approval() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+
+        // A legacy free-text permission notification arriving while the
+        // hook-owned approval is current must not clobber its owner/detail.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_NOTIFY,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "message": "Claude needs your permission to use Bash",
+            }),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-ext");
+        assert_eq!(
+            row.status_detail,
+            "/home/imi/.config/finance-sync/config.json"
+        );
+
+        // Once no approval is current, the legacy path still applies.
+        route_claude_json(&db, &ctx, HOOK_POST, external_read_permission_request());
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_NOTIFY,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "message": "Claude needs your permission to use Bash",
+            }),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "");
+    }
+
+    #[test]
+    #[serial]
+    fn test_lifecycle_transitions_off_approval_clear_pending_owner() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        // idle_prompt notification leaves the approval and drops the owner.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_NOTIFY,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "notification_type": "idle_prompt",
+            }),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_LISTENING);
+        assert_eq!(row.pending_tool_use_id, "");
+
+        // A user prompt submit leaves the approval and drops the owner.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_USERPROMPTSUBMIT,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "prompt": "continue",
+            }),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "prompt");
+        assert_eq!(row.pending_tool_use_id, "");
+
+        // Stop/session-end/stale paths all land in set_status: leaving the
+        // approval through it also drops the owner.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+        lifecycle::set_status(&db, "tori", ST_INACTIVE, "exit:timeout", Default::default());
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_INACTIVE);
+        assert_eq!(row.pending_tool_use_id, "");
+
+        // Staying inside the approval contexts (a replacement
+        // PermissionRequest) must NOT clear the fresh owner.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "tool_name": "Bash",
+                "tool_use_id": "tool-z",
+                "tool_input": { "command": "cargo test" },
+            }),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-z");
+    }
+
+    #[test]
+    #[serial]
+    fn test_pretooluse_status_write_guarded_at_db_time() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        // With no approval current the guarded tool-status write applies.
+        assert!(
+            db.set_status_if_no_approval("tori", "active", "tool:Bash", "ls -la")
+                .unwrap()
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status_context, "tool:Bash");
+
+        // This is the row state a PermissionRequest produces when it lands
+        // after a PreToolUse snapshot but before its write: the write is
+        // refused at DB time and the approval survives.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+        assert!(
+            !db.set_status_if_no_approval("tori", "active", "tool:Bash", "ls -la")
+                .unwrap()
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-ext");
+
+        // Handler-level: the Task PreToolUse branch uses the same guard.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PRE,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "tool_name": "Task",
+                "tool_use_id": "tool-t",
+                "tool_input": { "prompt": "delegate the chore" },
+            }),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-ext");
+    }
+
+    #[test]
+    #[serial]
+    fn test_leave_approval_transition_guarded_by_generation() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        // Approval X opens; a generic lifecycle transition snapshots it.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            external_read_permission_request(),
+        );
+        let stale = db.get_instance_full("tori").unwrap().unwrap();
+
+        // A replacement PermissionRequest Z lands after that snapshot.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "tool_name": "Bash",
+                "tool_use_id": "tool-z",
+                "tool_input": { "command": "cargo test" },
+            }),
+        );
+
+        // A generic leave carrying X's snapshotted identity (the deterministic
+        // mid-race state of idle_prompt/user-prompt/stop reading X, then Z
+        // landing, then writing) must be refused at DB write time: Z's blocked
+        // state, owner, detail, and generation stamp all survive.
+        assert!(
+            !db.resolve_owned_approval(
+                "tori",
+                &crate::db::ApprovalToken::from_row(&stale),
+                "listening",
+                "",
+                Some("")
+            )
+            .unwrap()
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-z");
+        assert_eq!(row.status_detail, "cargo test");
+
+        // When the snapshot genuinely sees the current approval (Z landed
+        // before the read), the same generic leave resolves it legitimately.
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_NOTIFY,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "notification_type": "idle_prompt",
+            }),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_LISTENING);
+        assert_eq!(row.pending_tool_use_id, "");
+    }
+
+    #[test]
+    #[serial]
+    fn test_permission_request_records_approval_atomically() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+
+        // One statement records blocked status, context, detail, generation
+        // stamp, and the owning tool_use_id together — there is no readable
+        // intermediate state where owner and blocked status disagree.
+        db.record_pending_approval("tori", "tool-x", "Read /etc/config.json")
+            .unwrap();
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.status_detail, "Read /etc/config.json");
+        assert_eq!(row.pending_tool_use_id, "tool-x");
+        assert!(row.status_time > 0);
+
+        // Handler-level: the routed PermissionRequest produces the same row
+        // plus the paired status event carrying the owning tool_use_id.
+        // (Same isolated env: a second concurrent isolated_test_env would
+        // deadlock the process-wide env guard.)
+        db.conn()
+            .execute(
+                "UPDATE instances
+                 SET status = 'active', status_context = 'prompt', status_detail = '',
+                     pending_tool_use_id = '' WHERE name = 'tori'",
+                [],
+            )
+            .unwrap();
+        let ctx = make_ctx();
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_PERMISSION_REQUEST,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "tool_name": "Read",
+                "tool_use_id": "tool-r",
+                "tool_input": { "file_path": "/home/imi/.config/app.cfg" },
+            }),
+        );
+        let events: Vec<String> = db
+            .conn()
+            .prepare(
+                "SELECT data FROM events WHERE type = 'status' AND instance = 'tori' ORDER BY id DESC",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(!events.is_empty());
+        let event: Value = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(event["status"], ST_BLOCKED);
+        assert_eq!(event["context"], "approval");
+        assert_eq!(event["old_status"], ST_ACTIVE);
+        assert_eq!(event["tool_use_id"], "tool-r");
+    }
+
+    #[test]
+    #[serial]
+    fn test_legacy_notification_write_time_guard() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+
+        // With no approval current, the conditional legacy write applies.
+        assert!(db.record_legacy_pending_approval("tori").unwrap());
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "");
+
+        // With a hook-owned approval current — the write-time state of a
+        // PermissionRequest arriving concurrently with the legacy read — the
+        // write is refused and the hook-owned approval is untouched.
+        db.record_pending_approval("tori", "tool-z", "Bash: cargo test")
+            .unwrap();
+        assert!(!db.record_legacy_pending_approval("tori").unwrap());
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-z");
+        assert_eq!(row.status_detail, "Bash: cargo test");
+    }
+
+    #[test]
+    #[serial]
+    fn test_set_status_leave_approval_db_error_skips_transition() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+
+        db.record_pending_approval("tori", "tool-ext", "/etc/config.json")
+            .unwrap();
+
+        // Inject a write failure that only affects approval resolutions: the
+        // trigger aborts any UPDATE moving this row off blocked:approval.
+        db.conn()
+            .execute(
+                "CREATE TRIGGER fail_approval_resolve BEFORE UPDATE ON instances
+                 WHEN OLD.status = 'blocked' AND OLD.status_context = 'approval'
+                      AND NEW.status != 'blocked'
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+                [],
+            )
+            .unwrap();
+
+        // The guarded leave fails at the DB, not as a CAS refusal: the
+        // transition is skipped (logged distinctly), the row is untouched,
+        // and no crash escapes set_status.
+        lifecycle::set_status(&db, "tori", ST_LISTENING, "", Default::default());
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-ext");
+
+        db.conn()
+            .execute("DROP TRIGGER fail_approval_resolve", [])
+            .unwrap();
+        lifecycle::set_status(&db, "tori", ST_LISTENING, "", Default::default());
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_LISTENING);
+        assert_eq!(row.pending_tool_use_id, "");
+    }
+
+    #[test]
+    #[serial]
+    fn test_late_approval_survives_non_approval_restore() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'blocked', status_context = 'elicitation',
+                     status_detail = 'pick one', pending_tool_use_id = ''
+                 WHERE name = 'tori'",
+                [],
+            )
+            .unwrap();
+
+        // Route's snapshot sees the non-approval (elicitation) block; an
+        // approval lands after the snapshot but before the restore write.
+        let stale = db.get_instance_full("tori").unwrap().unwrap();
+        db.record_pending_approval("tori", "tool-z", "Bash: cargo test")
+            .unwrap();
+
+        let payload = HookPayload::from_claude(repo_read_payload("tool-b"));
+        let updates = serde_json::Map::new();
+        let _ = handle_posttooluse(&db, &ctx, &payload, "tori", &stale, &updates);
+
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(
+            row.status, ST_BLOCKED,
+            "an approval that landed after the snapshot must survive the sibling completion"
+        );
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-z");
+
+        // Without a landed approval, the same restore applies and emits the
+        // paired event from the snapshot.
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'blocked', status_context = 'elicitation',
+                     status_detail = 'pick one', pending_tool_use_id = ''
+                 WHERE name = 'tori'",
+                [],
+            )
+            .unwrap();
+        let snapshot = db.get_instance_full("tori").unwrap().unwrap();
+        let _ = handle_posttooluse(&db, &ctx, &payload, "tori", &snapshot, &updates);
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "approved:Read");
+    }
+
+    #[test]
+    #[serial]
+    fn test_late_approval_survives_stop_and_tool_failure_restores() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        insert_active_claude_instance(&db, "tori");
+        let ctx = make_ctx();
+
+        // A stop-hook failure must not clear a standing approval.
+        db.record_pending_approval("tori", "tool-z", "Bash: cargo test")
+            .unwrap();
+        route_claude_json(
+            &db,
+            &ctx,
+            HOOK_STOP_FAILURE,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "error": "boom",
+                "error_details": "stop hook exited 1",
+            }),
+        );
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-z");
+
+        // A sibling tool failure while an elicitation block stands, with the
+        // approval landing before the handler's read, is skipped as a
+        // sibling; and without any approval the failure restore applies.
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'blocked', status_context = 'elicitation',
+                     status_detail = 'pick one', pending_tool_use_id = ''
+                 WHERE name = 'tori'",
+                [],
+            )
+            .unwrap();
+        let mut failure = repo_read_payload("tool-b");
+        failure["error"] = serde_json::json!("File content exceeded limit");
+        route_claude_json(&db, &ctx, HOOK_POST_FAILURE, failure.clone());
+        let row = db.get_instance_full("tori").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "tool_failed:Read");
     }
 }

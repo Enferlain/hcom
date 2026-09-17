@@ -4,7 +4,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::db::{HcomDb, InstanceRow};
+use crate::db::{ApprovalToken, HcomDb, InstanceRow};
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
 use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LAUNCHING, ST_LISTENING};
 
@@ -576,13 +576,57 @@ pub fn set_status(
         updates.insert("last_stop".into(), serde_json::json!(now));
     }
 
+    // Leaving an interactive approval (any transition off blocked:approval /
+    // pty:approval — idle_prompt, user prompt, stop, session end, stale
+    // cleanup) must drop the recorded owner so no later terminal hook can
+    // claim a stale tool_use_id against a future approval — and must do so
+    // as a write-time guarded transition: if a replacement PermissionRequest
+    // landed after the snapshot above, the guard refuses, no stale event or
+    // wake is emitted, and the newer approval stays intact. Staying inside
+    // the approval contexts keeps the plain write (a replacement
+    // PermissionRequest already recorded its owner atomically).
+    let leaves_approval = current_data.as_ref().is_some_and(|d| {
+        d.status == ST_BLOCKED
+            && matches!(d.status_context.as_str(), "approval" | "pty:approval")
+            && !(status == ST_BLOCKED && matches!(context, "approval" | "pty:approval"))
+    });
+
     let old_status = current_data.as_ref().map(|d| d.status.as_str());
     let status_changed = old_status != Some(status);
     let status_event_changed = current_data.as_ref().is_none_or(|d| {
         d.status != status || d.status_context != context || d.status_detail != detail
     });
 
-    crate::instances::update_instance_position(db, instance_name, &updates);
+    let applied = if leaves_approval {
+        let snapshot = current_data
+            .as_ref()
+            .expect("leaves_approval implies a row");
+        match db.resolve_owned_approval(
+            instance_name,
+            &ApprovalToken::from_row(snapshot),
+            status,
+            context,
+            Some(detail),
+        ) {
+            Ok(applied) => applied,
+            Err(e) => {
+                // A DB failure is not a CAS refusal: log it distinctly (the
+                // refusal path is silent by design — losing the race is
+                // normal), skip the transition entirely, and leave the row
+                // for the next writer.
+                eprintln!(
+                    "[hcom] warn: set_status leave-approval DB write failed for {instance_name}: {e}"
+                );
+                return;
+            }
+        }
+    } else {
+        crate::instances::update_instance_position(db, instance_name, &updates);
+        true
+    };
+    if !applied {
+        return;
+    }
 
     if status_changed {
         crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
@@ -601,7 +645,36 @@ pub fn set_status(
         return;
     }
 
-    let position = current_data.as_ref().map(|d| d.last_event_id).unwrap_or(0);
+    emit_status_event(
+        db,
+        instance_name,
+        current_data.as_ref(),
+        status,
+        context,
+        detail,
+        msg_ts,
+        tool_name,
+        tool_use_id,
+        writer,
+    );
+}
+
+/// Log the paired status event for a transition, using `current_data` as the
+/// pre-transition snapshot for the old_* fields.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_status_event(
+    db: &HcomDb,
+    instance_name: &str,
+    current_data: Option<&InstanceRow>,
+    status: &str,
+    context: &str,
+    detail: &str,
+    msg_ts: &str,
+    tool_name: &str,
+    tool_use_id: &str,
+    writer: &std::panic::Location<'_>,
+) {
+    let position = current_data.map(|d| d.last_event_id).unwrap_or(0);
     let mut data = serde_json::json!({
         "status": status,
         "context": context,
@@ -615,18 +688,17 @@ pub fn set_status(
     }
     // old_* differs from the prior status event when set_gate_status() touched
     // the row without logging (tui:* gate context churns silently).
-    data["old_status"] = serde_json::json!(old_status);
-    data["old_context"] =
-        serde_json::json!(current_data.as_ref().map(|d| d.status_context.as_str()));
-    data["old_detail"] = serde_json::json!(current_data.as_ref().map(|d| d.status_detail.as_str()));
+    data["old_status"] = serde_json::json!(current_data.map(|d| d.status.as_str()));
+    data["old_context"] = serde_json::json!(current_data.map(|d| d.status_context.as_str()));
+    data["old_detail"] = serde_json::json!(current_data.map(|d| d.status_detail.as_str()));
     data["new_status"] = serde_json::json!(status);
     data["new_context"] = serde_json::json!(context);
     data["new_detail"] = serde_json::json!(detail);
     data["writer"] = serde_json::json!(format!("{}:{}", writer.file(), writer.line()));
-    if let Some(session_id) = current_data.as_ref().and_then(|d| d.session_id.as_deref()) {
+    if let Some(session_id) = current_data.and_then(|d| d.session_id.as_deref()) {
         data["session"] = serde_json::json!(session_id);
     }
-    if let Some(agent_id) = current_data.as_ref().and_then(|d| d.agent_id.as_deref()) {
+    if let Some(agent_id) = current_data.and_then(|d| d.agent_id.as_deref()) {
         data["agent_id"] = serde_json::json!(agent_id);
     }
     if !tool_name.is_empty() {
@@ -636,6 +708,116 @@ pub fn set_status(
         data["tool_use_id"] = serde_json::json!(tool_use_id);
     }
     let _ = db.log_event("status", instance_name, &data);
+}
+
+/// Resolve a pending interactive approval under an atomic ownership guard.
+///
+/// Snapshot-then-write (plain `set_status`) would let a terminal hook for
+/// approval X clear a replacement approval Z that landed between the read
+/// and the write. The guarded UPDATE re-verifies the snapshotted approval
+/// identity (`snapshot`'s owner, status_time, and detail — the caller's own
+/// view, not a fresh read) at write time and also clears the owner; the
+/// paired status event is emitted from that same snapshot only when the
+/// transition actually applied. Returns false when the guard refused
+/// (approval replaced, already resolved, or DB error) — callers must leave
+/// the row untouched then.
+#[track_caller]
+pub fn resolve_approval_status(
+    db: &HcomDb,
+    snapshot: &InstanceRow,
+    status: &str,
+    context: &str,
+    upd: StatusUpdate<'_>,
+) -> bool {
+    let StatusUpdate {
+        detail,
+        msg_ts,
+        tool_name,
+        tool_use_id,
+    } = upd;
+    let writer = std::panic::Location::caller();
+    let instance_name = snapshot.name.as_str();
+
+    let applied = match db.resolve_owned_approval(
+        instance_name,
+        &ApprovalToken::from_row(snapshot),
+        status,
+        context,
+        Some(detail),
+    ) {
+        Ok(applied) => applied,
+        Err(e) => {
+            eprintln!(
+                "[hcom] warn: resolve_approval_status DB write failed for {instance_name}: {e}"
+            );
+            return false;
+        }
+    };
+    if !applied {
+        return false;
+    }
+    // The guard only matches a blocked approval row, so the status always
+    // changed; wake the delivery loops like set_status does.
+    crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+    emit_status_event(
+        db,
+        instance_name,
+        Some(snapshot),
+        status,
+        context,
+        detail,
+        msg_ts,
+        tool_name,
+        tool_use_id,
+        writer,
+    );
+    true
+}
+
+/// Record a PermissionRequest's approval atomically and log the paired
+/// status event.
+///
+/// `db.record_pending_approval` writes status, context, detail, status_time,
+/// and the owning tool_use_id in ONE statement — there is no intermediate
+/// state where the owner disagrees with the blocked status. A permission
+/// prompt currently showing is authoritative: it replaces any prior row
+/// state, including an older approval.
+#[track_caller]
+pub fn mark_pending_approval(
+    db: &HcomDb,
+    instance_name: &str,
+    detail: &str,
+    tool_name: &str,
+    tool_use_id: &str,
+) {
+    let writer = std::panic::Location::caller();
+
+    let current_data = match db.get_instance_full(instance_name) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("[hcom] warn: mark_pending_approval DB read failed for {instance_name}: {e}");
+            None
+        }
+    };
+    if let Err(e) = db.record_pending_approval(instance_name, tool_use_id, detail) {
+        eprintln!("[hcom] warn: mark_pending_approval DB write failed for {instance_name}: {e}");
+        return;
+    }
+    if current_data.as_ref().is_none_or(|d| d.status != ST_BLOCKED) {
+        crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+    }
+    emit_status_event(
+        db,
+        instance_name,
+        current_data.as_ref(),
+        ST_BLOCKED,
+        "approval",
+        detail,
+        "",
+        tool_name,
+        tool_use_id,
+        writer,
+    );
 }
 
 /// Delete placeholder instances that have been launching too long.
@@ -812,6 +994,7 @@ mod tests {
             launch_context: None,
             name_announced: 0,
             idle_since: None,
+            pending_tool_use_id: String::new(),
         }
     }
 

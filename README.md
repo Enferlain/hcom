@@ -303,8 +303,9 @@ hcom events --wait 1800 --after-id N --thread ID --result-from NAME
                                      # thread, attempt cursor, and recovery guidance
 hcom events sub [filters]           # Conversational subscription delivered as messages
 hcom events stream [filters]        # Generic live stream in durable-ID order
-hcom events stream --follow NAME --compact
-                                     # Model-safe typed worker progress observation
+hcom events stream --follow NAME --compact --heartbeat 15 --after-id N
+                                     # Model-safe typed worker progress observation;
+                                     # N is the exclusive cursor captured before launch
 hcom update                         # update hcom version
 ```
 

@@ -175,7 +175,7 @@ const EVENTS_HELP_2: &[HelpEntry] = &[
         "Generic stream: tail live events for peso",
     ),
     (
-        "  events stream --follow worker --compact",
+        "  events stream --follow worker --compact --after-id 42",
         "Compact observation: model-safe worker status",
     ),
     (

@@ -48,6 +48,34 @@ run `hcom --help` for full command syntax and flags.
 
 ---
 
+## ordinary interactive delegation
+
+Use the normal visible launch unless the user explicitly wants a background
+worker. `--headless` creates a background PTY and deliberately opens no
+terminal window.
+
+```bash
+cursor=$(hcom events --cursor)  # exclusive boundary; capture before launch
+hcom 1 claude --go --hcom-prompt "<non-empty bounded task>"
+```
+
+If progress observation is useful, keep one durable observer rather than
+repeatedly calling `list`, `events --last`, short waits, log tails, or terminal
+snapshots:
+
+```bash
+hcom events stream --follow <worker-name> --compact --heartbeat 15 --after-id "$cursor"
+```
+
+The stream can remain quiet between meaningful events; heartbeats show that a
+known live phase continues. Do not supervise a healthy worker merely because
+it has not emitted prose recently. After a plausible stall, inspect its
+terminal once, then resolve the surfaced blocker or stop the worker instead of
+polling repeatedly. Read `references/gotchas.md` when diagnosing a failed
+launch or observation workflow.
+
+---
+
 ## tool support
 
 | tool | delivery | connect |
@@ -153,7 +181,7 @@ Choose the appropriate mechanism for workflow synchronization and observation:
 | **One-shot wait** | `hcom events --wait SEC [filters]` | Blocks until first match, prints single event, exits 0 on match | Script synchronization, step boundaries (`--wait` never streams) |
 | **Conversational sub** | `hcom events sub [filters]` | Registers durable subscription in DB; notifies via `[hcom-events]` messages | Agent-driven reactive workflows, async file/status triggers |
 | **Generic stream** | `hcom events stream [filters]` | Continuous NDJSON live stream in durable-ID order | External logging, dashboard ingestion (can carry raw data/secrets) |
-| **Compact worker follow** | `hcom events stream --follow NAME --compact` | Bounded, typed progress NDJSON (`phase`, `file`, `command`, `heartbeat`) | Model-safe agent progress observation; stops at worker exit |
+| **Compact worker follow** | `hcom events stream --follow NAME --compact --heartbeat 15 --after-id <cursor>` | Bounded, typed progress NDJSON (`phase`, `file`, `command`, `heartbeat`) | Model-safe agent progress observation; stops at worker exit |
 
 ### agent topologies
 

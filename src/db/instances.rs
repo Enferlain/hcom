@@ -15,6 +15,26 @@ pub struct InstanceStatus {
     pub last_event_id: i64,
 }
 
+/// The write-time identity of a snapshotted interactive approval: the
+/// recorded owner plus the generation fields stamped when it was recorded.
+/// Guarded transitions apply only while the row still matches all of it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ApprovalToken {
+    pub owner: String,
+    pub status_time: i64,
+    pub detail: String,
+}
+
+impl ApprovalToken {
+    pub fn from_row(row: &InstanceRow) -> Self {
+        Self {
+            owner: row.pending_tool_use_id.clone(),
+            status_time: row.status_time,
+            detail: row.status_detail.clone(),
+        }
+    }
+}
+
 /// Full instance row from the instances table.
 #[derive(Debug, Clone)]
 pub struct InstanceRow {
@@ -49,6 +69,9 @@ pub struct InstanceRow {
     pub launch_context: Option<String>,
     pub name_announced: i64,
     pub idle_since: Option<String>,
+    /// Tool use id that owns the current `blocked:approval` state, when the
+    /// provider's approval payload carried one. Empty when unknown.
+    pub pending_tool_use_id: String,
 }
 
 impl InstanceRow {
@@ -119,6 +142,9 @@ impl InstanceRow {
             launch_context: row
                 .get::<_, Option<String>>("launch_context")?
                 .filter(|s| !s.is_empty()),
+            pending_tool_use_id: row
+                .get::<_, Option<String>>("pending_tool_use_id")?
+                .unwrap_or_default(),
             name_announced: row.get::<_, Option<i64>>("name_announced")?.unwrap_or(0),
             idle_since: row
                 .get::<_, Option<String>>("idle_since")?
@@ -136,7 +162,7 @@ pub(super) const INSTANCE_COLUMNS: &str =
      background_log_file, name_announced, agent_id,
      origin_device_id, hints, subagent_timeout, tool, launch_args,
      terminal_preset_requested, terminal_preset_effective,
-     idle_since, pid, launch_context";
+     idle_since, pid, launch_context, pending_tool_use_id";
 
 impl HcomDb {
     /// Get instance status by name
@@ -184,6 +210,153 @@ impl HcomDb {
         }
 
         Ok(())
+    }
+
+    /// Atomically move an instance out of its interactive-approval block,
+    /// but only while the row still matches the snapshotted approval
+    /// identity in [`ApprovalToken`].
+    ///
+    /// The WHERE clause re-verifies status/context/owner/status_time/detail
+    /// at write time, so a PermissionRequest that replaced the approval
+    /// between the caller's snapshot and this write is left intact — a stale
+    /// terminal hook for the old tool cannot clear the new approval.
+    /// `new_detail` overwrites status_detail; `None` preserves it (the PTY
+    /// release keeps the gated-command preview). Returns true when exactly
+    /// this approval was resolved (one row affected).
+    pub fn resolve_owned_approval(
+        &self,
+        name: &str,
+        token: &ApprovalToken,
+        status: &str,
+        context: &str,
+        new_detail: Option<&str>,
+    ) -> Result<bool> {
+        let now = now_epoch_i64();
+        let applied = match new_detail {
+            Some(detail) => {
+                let sql = format!(
+                    "UPDATE instances
+                     SET status = ?1, status_context = ?2, status_detail = ?3,
+                         status_time = ?4, pending_tool_use_id = ''{last_stop}
+                     WHERE name = ?5 AND status = 'blocked'
+                       AND (status_context = 'approval' OR status_context = 'pty:approval')
+                       AND pending_tool_use_id = ?6 AND status_time = ?7
+                       AND status_detail = ?8",
+                    last_stop = if status == ST_LISTENING {
+                        ", last_stop = ?4"
+                    } else {
+                        ""
+                    }
+                );
+                self.conn.execute(
+                    sql.as_str(),
+                    params![
+                        status,
+                        context,
+                        detail,
+                        now,
+                        name,
+                        token.owner,
+                        token.status_time,
+                        token.detail
+                    ],
+                )?
+            }
+            None => {
+                let sql = format!(
+                    "UPDATE instances
+                     SET status = ?1, status_context = ?2,
+                         status_time = ?3, pending_tool_use_id = ''{last_stop}
+                     WHERE name = ?4 AND status = 'blocked'
+                       AND (status_context = 'approval' OR status_context = 'pty:approval')
+                       AND pending_tool_use_id = ?5 AND status_time = ?6
+                       AND status_detail = ?7",
+                    last_stop = if status == ST_LISTENING {
+                        ", last_stop = ?3"
+                    } else {
+                        ""
+                    }
+                );
+                self.conn.execute(
+                    sql.as_str(),
+                    params![
+                        status,
+                        context,
+                        now,
+                        name,
+                        token.owner,
+                        token.status_time,
+                        token.detail
+                    ],
+                )?
+            }
+        };
+        Ok(applied == 1)
+    }
+
+    /// Record a PermissionRequest's approval in ONE atomic write: status,
+    /// context, detail, status_time, and the owning tool_use_id land
+    /// together, so no reader can observe a half-recorded approval (owner
+    /// without blocked state, or vice versa). Unconditional by design — a
+    /// permission prompt currently showing is authoritative and replaces any
+    /// prior row state, including an older approval.
+    pub fn record_pending_approval(
+        &self,
+        name: &str,
+        tool_use_id: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let now = now_epoch_i64();
+        self.conn.execute(
+            "UPDATE instances
+             SET status = 'blocked', status_context = 'approval', status_detail = ?1,
+                 status_time = ?2, pending_tool_use_id = ?3
+             WHERE name = ?4",
+            params![detail, now, tool_use_id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Record the legacy free-text permission notification's approval in one
+    /// CONDITIONAL write: applies only while no interactive approval is
+    /// current at write time, so a hook-owned PermissionRequest arriving
+    /// concurrently cannot be clobbered. Returns true when applied.
+    pub fn record_legacy_pending_approval(&self, name: &str) -> Result<bool> {
+        let now = now_epoch_i64();
+        let applied = self.conn.execute(
+            "UPDATE instances
+             SET status = 'blocked', status_context = 'approval', status_detail = '',
+                 status_time = ?1, pending_tool_use_id = ''
+             WHERE name = ?2
+               AND NOT (status = 'blocked'
+                        AND (status_context = 'approval' OR status_context = 'pty:approval'))",
+            params![now, name],
+        )?;
+        Ok(applied == 1)
+    }
+
+    /// Write a status transition that must not overwrite a pending
+    /// interactive approval: the WHERE clause fails the update when one is
+    /// current at write time, so a PermissionRequest that lands between the
+    /// caller's snapshot and this write cannot be clobbered by a later
+    /// PreToolUse status write. Returns true when the write applied.
+    pub fn set_status_if_no_approval(
+        &self,
+        name: &str,
+        status: &str,
+        context: &str,
+        detail: &str,
+    ) -> Result<bool> {
+        let now = now_epoch_i64();
+        let applied = self.conn.execute(
+            "UPDATE instances
+             SET status = ?1, status_context = ?2, status_detail = ?3, status_time = ?4
+             WHERE name = ?5
+               AND NOT (status = 'blocked'
+                        AND (status_context = 'approval' OR status_context = 'pty:approval'))",
+            params![status, context, detail, now, name],
+        )?;
+        Ok(applied == 1)
     }
 
     /// Update gate blocking status WITHOUT logging a status event.
@@ -603,6 +776,7 @@ impl HcomDb {
             "idle_since": row.get::<_, String>(28).unwrap_or_default(),
             "pid": row.get::<_, Option<i64>>(29).unwrap_or(None),
             "launch_context": row.get::<_, String>(30).unwrap_or_default(),
+            "pending_tool_use_id": row.get::<_, String>(31).unwrap_or_default(),
         }))
     }
 
@@ -899,6 +1073,7 @@ impl HcomDb {
             "pid",
             "launch_args",
             "launch_context",
+            "pending_tool_use_id",
             "name_announced",
             "idle_since",
             "terminal_preset_requested",

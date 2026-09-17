@@ -632,6 +632,32 @@ pub(super) fn publish_survey_status(
     true
 }
 
+/// After a refused guarded release, mirror the actual row into the shared
+/// title status: a standing (possibly replaced) approval keeps the blocked
+/// title, while an approval another path already resolved must not be
+/// re-blocked.
+fn mirror_shared_status_after_refusal(
+    db: &HcomDb,
+    instance_name: &str,
+    current_status: &Arc<RwLock<String>>,
+) {
+    let still_blocked = db
+        .get_instance_full(instance_name)
+        .ok()
+        .flatten()
+        .is_some_and(|row| {
+            row.status == ST_BLOCKED
+                && matches!(row.status_context.as_str(), "approval" | "pty:approval")
+        });
+    if let Ok(mut shared_status) = current_status.write() {
+        *shared_status = if still_blocked {
+            ST_BLOCKED.to_string()
+        } else {
+            ST_LISTENING.to_string()
+        };
+    }
+}
+
 /// Publish PTY approval edges independently of the delivery queue.
 ///
 /// Approval is agent state: `hcom list` must report it even when no message
@@ -702,24 +728,75 @@ pub(super) fn publish_approval_status(
         return;
     };
 
-    // Write the instance row, then log a paired status event. The bare
-    // `set_status` leaves `status_detail` (the gated-command preview) intact,
-    // while the explicit event keeps the block/release visible to the events
-    // table, `events sub`, and the TUI — mirroring how the sibling
-    // launch_blocked path pairs a row write with its own emitted event.
-    // Without the event, the row updates silently and event consumers never
-    // see the approval gate (Codex's only PTY-driven block path).
-    if let Err(error) = db.set_status(&instance_name, status, context) {
-        log_warn(
-            "native",
-            "pty.approval_status_failed",
-            &format!(
-                "Failed to publish approval={} for {}: {}",
-                approval, instance_name, error
-            ),
-        );
-        return;
+    // A falling edge releases whatever approval the row held, including a
+    // hook-owned one — as ONE guarded transition that re-verifies the blocked
+    // approval state and its snapshotted identity (owner, status_time,
+    // detail) at write time. A PermissionRequest that landed after the
+    // snapshot above (or an approval another path already resolved) refuses
+    // the update: the newer approval survives, no owner is cleared, and no
+    // release event is emitted. The rising edge cannot destroy owner/detail,
+    // so it keeps the plain write.
+    if !approval {
+        let token = current
+            .as_ref()
+            .map(crate::db::ApprovalToken::from_row)
+            .unwrap_or_default();
+        match db.resolve_owned_approval(&instance_name, &token, status, context, None) {
+            Ok(true) => {}
+            Ok(false) => {
+                log_info(
+                    "native",
+                    "pty.approval_replaced_before_release",
+                    &format!(
+                        "instance={} expected_owner={} context={}",
+                        instance_name, token.owner, context
+                    ),
+                );
+                // Refusal has two causes with opposite titles: a replacement
+                // approval (row still blocked) keeps the blocked title, an
+                // approval another path already resolved releases it. Mirror
+                // the row instead of assuming either.
+                mirror_shared_status_after_refusal(&db, &instance_name, current_status);
+                return;
+            }
+            Err(error) => {
+                log_warn(
+                    "native",
+                    "pty.approval_status_failed",
+                    &format!(
+                        "Failed to publish approval={} for {}: {}",
+                        approval, instance_name, error
+                    ),
+                );
+                return;
+            }
+        }
+    } else {
+        // Rising edge: db.set_status conservatively re-stamps status_time.
+        // That is safe: this write cannot destroy owner or detail, and every
+        // guarded consumer takes its ApprovalToken from a fresh row read at
+        // arrival, so the new stamp only supersedes an older generation — a
+        // hook still holding a pre-stamp token refuses conservatively.
+        if let Err(error) = db.set_status(&instance_name, status, context) {
+            log_warn(
+                "native",
+                "pty.approval_status_failed",
+                &format!(
+                    "Failed to publish approval={} for {}: {}",
+                    approval, instance_name, error
+                ),
+            );
+            return;
+        }
     }
+
+    // Log a paired status event. The guarded release leaves
+    // `status_detail` (the gated-command preview) intact, while the explicit
+    // event keeps the block/release visible to the events table, `events
+    // sub`, and the TUI — mirroring how the sibling launch_blocked path
+    // pairs a row write with its own emitted event. Without the event, the
+    // row updates silently and event consumers never see the approval gate
+    // (Codex's only PTY-driven block path).
 
     let position = current.as_ref().map(|row| row.last_event_id).unwrap_or(0);
     let detail = current
@@ -2733,6 +2810,142 @@ mod tests {
         assert_eq!(cleared.status, ST_LISTENING);
         assert_eq!(cleared.status_context, "pty:approval_cleared");
         assert_eq!(cleared.status_detail, "bd show hcom-f6g.12");
+        assert_eq!(*shared_status.read().unwrap(), ST_LISTENING);
+    }
+
+    /// A PTY falling edge that releases a hook-owned approval must also drop
+    /// the recorded pending owner, so a later terminal hook carrying that
+    /// stale tool_use_id can never claim to resolve a newer approval.
+    #[test]
+    #[serial]
+    fn publish_approval_status_falling_edge_clears_hook_owned_approval_owner() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, pending_tool_use_id, status_time, created_at)
+                 VALUES ('hera', 'claude', 'blocked', 'approval', 'Read ~/.config/app.cfg', 'tool-x', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+        let shared_status = Arc::new(RwLock::new(crate::shared::ST_BLOCKED.to_string()));
+
+        publish_approval_status(false, Some("hera"), &shared_status);
+
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, ST_LISTENING);
+        assert_eq!(row.status_context, "denied:screen");
+        assert_eq!(
+            row.pending_tool_use_id, "",
+            "the falling edge must clear the hook-owned approval's recorded owner"
+        );
+        assert_eq!(*shared_status.read().unwrap(), ST_LISTENING);
+    }
+
+    /// The falling-edge release is one guarded transition: an approval whose
+    /// owner was replaced after the PTY snapshot (the deterministic state of
+    /// a PermissionRequest landing between the read and the write) survives,
+    /// and the matching release preserves the gated-command detail.
+    #[test]
+    #[serial]
+    fn publish_approval_status_release_refuses_replaced_approval() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, pending_tool_use_id, status_time, created_at)
+                 VALUES ('hera', 'claude', 'blocked', 'approval', 'Read ~/.config/app.cfg', 'tool-x', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        // The PTY snapshotted the row (owner tool-x); a replacement
+        // PermissionRequest then recorded owner tool-z atomically before the
+        // release write ran.
+        let snapshot = db.get_instance_full("hera").unwrap().unwrap();
+        db.record_pending_approval("hera", "tool-z", "Bash: cargo test")
+            .unwrap();
+        assert!(
+            !db.resolve_owned_approval(
+                "hera",
+                &crate::db::ApprovalToken::from_row(&snapshot),
+                ST_LISTENING,
+                "denied:screen",
+                None
+            )
+            .unwrap()
+        );
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-z");
+        assert_eq!(row.status_detail, "Bash: cargo test");
+
+        // The current identity releases atomically, preserving the detail and
+        // clearing the owner in the same statement.
+        let current = db.get_instance_full("hera").unwrap().unwrap();
+        assert!(
+            db.resolve_owned_approval(
+                "hera",
+                &crate::db::ApprovalToken::from_row(&current),
+                ST_LISTENING,
+                "denied:screen",
+                None
+            )
+            .unwrap()
+        );
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, ST_LISTENING);
+        assert_eq!(row.status_context, "denied:screen");
+        assert_eq!(row.pending_tool_use_id, "");
+        assert_eq!(
+            row.status_detail, "Bash: cargo test",
+            "the guarded release preserves the gated-command preview"
+        );
+    }
+
+    /// A refused guarded release mirrors the actual row into the shared title
+    /// status: a standing (possibly replaced) approval keeps the blocked
+    /// title, an approval another path already resolved releases it.
+    #[test]
+    #[serial]
+    fn mirror_shared_status_after_refusal_mirrors_the_row() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('hera', 'claude', 'listening', 'pty:approval_cleared', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+        let shared_status = Arc::new(RwLock::new(ST_LISTENING.to_string()));
+
+        // Outcome 1: the approval was replaced — row still blocked, title
+        // stays blocked.
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'blocked', status_context = 'approval',
+                     pending_tool_use_id = 'tool-z' WHERE name = 'hera'",
+                [],
+            )
+            .unwrap();
+        mirror_shared_status_after_refusal(&db, "hera", &shared_status);
+        assert_eq!(*shared_status.read().unwrap(), ST_BLOCKED);
+
+        // Outcome 2: the approval was already resolved by another path —
+        // row is off the approval block, title releases.
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening', status_context = 'denied:Read',
+                     pending_tool_use_id = '' WHERE name = 'hera'",
+                [],
+            )
+            .unwrap();
+        mirror_shared_status_after_refusal(&db, "hera", &shared_status);
         assert_eq!(*shared_status.read().unwrap(), ST_LISTENING);
     }
 }

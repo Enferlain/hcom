@@ -32,12 +32,12 @@ mod sessions;
 pub(crate) mod subscriptions;
 
 pub use events::Message;
-pub use instances::InstanceRow;
 #[allow(unused_imports)]
 pub use instances::InstanceStatus;
+pub use instances::{ApprovalToken, InstanceRow};
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 18;
+const SCHEMA_VERSION: i32 = 19;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -66,6 +66,10 @@ const MIGRATIONS: &[(i32, &str)] = &[
              ON claude_actor_capabilities(expires_at);
          CREATE INDEX IF NOT EXISTS idx_claude_actor_session
              ON claude_actor_capabilities(session_id);",
+    ),
+    (
+        19,
+        "ALTER TABLE instances ADD COLUMN pending_tool_use_id TEXT DEFAULT '';",
     ),
 ];
 
@@ -338,6 +342,7 @@ impl HcomDb {
                 idle_since TEXT DEFAULT '',
                 pid INTEGER DEFAULT NULL,
                 launch_context TEXT DEFAULT '',
+                pending_tool_use_id TEXT DEFAULT '',
                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
             );
 
@@ -644,6 +649,7 @@ impl HcomDb {
                     "terminal_preset_requested",
                     "terminal_preset_effective",
                     "last_seen",
+                    "pending_tool_use_id",
                 ];
                 Ok(required
                     .iter()
@@ -680,8 +686,11 @@ impl HcomDb {
             .unwrap_or_default();
 
         // (migration version, a column that migration introduces)
-        const COLUMN_MIGRATIONS: &[(i32, &str)] =
-            &[(17, "terminal_preset_requested"), (18, "last_seen")];
+        const COLUMN_MIGRATIONS: &[(i32, &str)] = &[
+            (17, "terminal_preset_requested"),
+            (18, "last_seen"),
+            (19, "pending_tool_use_id"),
+        ];
         for (migration, column) in COLUMN_MIGRATIONS {
             if !columns.contains(*column) {
                 return migration - 1;
@@ -1505,6 +1514,89 @@ pub(super) mod tests {
             )
             .unwrap();
         assert_eq!(last_seen, 123);
+
+        cleanup_test_db(db_path);
+    }
+
+    /// v18 DBs gain the pending-approval owner column in place, without
+    /// archiving, so live blocked rows survive the upgrade.
+    #[test]
+    fn test_ensure_schema_migrates_v18_to_v19_in_place() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(2850);
+
+        let temp_dir = std::env::temp_dir();
+        let test_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = temp_dir.join(format!(
+            "test_hcom_migrate_pending_approval_{}_{}.db",
+            std::process::id(),
+            test_id
+        ));
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, timestamp TEXT, type TEXT, instance TEXT, data TEXT);
+                 CREATE TABLE instances (
+                     name TEXT PRIMARY KEY,
+                     tool TEXT DEFAULT 'claude',
+                     status TEXT DEFAULT 'active',
+                     status_context TEXT DEFAULT '',
+                     status_detail TEXT DEFAULT '',
+                     status_time INTEGER DEFAULT 0,
+                     last_seen INTEGER DEFAULT 0,
+                     created_at REAL NOT NULL,
+                     launch_context TEXT DEFAULT '',
+                     terminal_preset_requested TEXT DEFAULT '',
+                     terminal_preset_effective TEXT DEFAULT ''
+                 );
+                 CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE notify_endpoints (instance TEXT, kind TEXT, port INTEGER, updated_at REAL, PRIMARY KEY(instance, kind));
+                 CREATE TABLE session_bindings (session_id TEXT PRIMARY KEY, instance_name TEXT NOT NULL, created_at REAL NOT NULL);
+                 CREATE TABLE claude_actor_capabilities (
+                     token TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL,
+                     tool_use_id TEXT NOT NULL,
+                     agent_id TEXT NOT NULL DEFAULT '',
+                     instance_name TEXT NOT NULL,
+                     created_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     last_seen INTEGER NOT NULL,
+                     UNIQUE(session_id, tool_use_id, agent_id)
+                 );
+                 PRAGMA user_version = 18;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO instances (name, tool, status, status_context, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["luna", "claude", "blocked", "approval", 1.0f64],
+            )
+            .unwrap();
+        }
+
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.ensure_schema().unwrap();
+
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // The blocked row survived the in-place migration and can now record
+        // its pending approval owner.
+        let (status, context, pending): (String, String, String) = db
+            .conn
+            .query_row(
+                "SELECT status, status_context, pending_tool_use_id FROM instances WHERE name = ?",
+                params!["luna"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "blocked");
+        assert_eq!(context, "approval");
+        assert_eq!(pending, "");
 
         cleanup_test_db(db_path);
     }

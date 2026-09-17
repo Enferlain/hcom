@@ -42,6 +42,7 @@ use crate::db::subscriptions::{
 };
 use crate::messages::sender_instance_key;
 use crate::shared::CommandContext;
+use crate::shared::time::now_iso;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResultCorrelation {
@@ -1885,6 +1886,7 @@ fn events_stream_to<W: Write>(
     // Compact records identify their exact worker generation, so the typed
     // projection exists only inside a generation follow.
     let mut compact_classifier = None;
+    let mut compact_bootstrap_pending = false;
     if let Some(config) = compact {
         let Some(follow) = generation_follow.as_ref() else {
             eprintln!("Error: compact mode requires generation following");
@@ -1894,6 +1896,7 @@ fn events_stream_to<W: Write>(
             follow.generation.instance_key.clone(),
             config,
         ));
+        compact_bootstrap_pending = true;
     }
 
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -1989,6 +1992,31 @@ fn events_stream_to<W: Write>(
             Err(e) => {
                 eprintln!("{}", sql_where_error(e));
                 return 2;
+            }
+        }
+
+        // If the caller attached after the worker's latest event, seed only
+        // the heartbeat state from the live row. Do this after the first
+        // drain so a real post-cursor status event always wins and is emitted
+        // normally. Seeding never serializes a synthetic event or replays
+        // anything at/before the exclusive cursor.
+        if compact_bootstrap_pending {
+            compact_bootstrap_pending = false;
+            if let (Some(classifier), Some(follow), Some(cursor)) = (
+                compact_classifier.as_mut(),
+                generation_follow.as_ref(),
+                after_id,
+            ) {
+                match db.get_instance_status(&follow.generation.exact_worker) {
+                    Ok(Some(status)) => {
+                        classifier.seed_live_status(cursor, &now_iso(), &status.status);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("Error: failed to read followed worker status: {error}");
+                        return 2;
+                    }
+                }
             }
         }
 
@@ -3564,6 +3592,79 @@ mod tests {
         );
         assert_eq!(lines[1]["cursor"], json!(phase_event));
         assert_eq!(lines[1]["generation"], "worker@1000.000000");
+    }
+
+    #[test]
+    fn compact_stream_bootstraps_heartbeat_for_already_running_worker() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let mut db = HcomDb::open_raw(&temp.path().join("compact-stream-bootstrap.db")).unwrap();
+        db.ensure_schema().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, status) VALUES ('worker', 1000.0, 'active')",
+                [],
+            )
+            .unwrap();
+        let cursor = db.get_last_event_id();
+        let generation = discover_worker_generation(&db, "--follow", "worker", cursor).unwrap();
+
+        // No worker event exists after the cursor. The live status snapshot
+        // seeds heartbeat state without replaying a synthetic phase record.
+        let clock_calls = Arc::new(std::sync::Mutex::new(0u32));
+        let clock: crate::core::compact::CompactClock = {
+            let calls = Arc::clone(&clock_calls);
+            let base = Instant::now();
+            Arc::new(move || {
+                let mut count = calls.lock().unwrap();
+                *count += 1;
+                if *count == 1 {
+                    base
+                } else {
+                    base + Duration::from_secs(3600)
+                }
+            })
+        };
+
+        let filters = HashMap::new();
+        let mut output = Vec::new();
+        let exit = events_stream_to(
+            &db,
+            "",
+            Some(1),
+            &mut output,
+            EventsStreamOptions {
+                after_id: Some(cursor),
+                full_output: false,
+                filters: &filters,
+                instance_name: None,
+                generation_follow: Some(WorkerGenerationFollow {
+                    generation,
+                    stopped: false,
+                }),
+                compact: Some(CompactStreamConfig {
+                    heartbeat: Some(Duration::from_secs(1)),
+                    clock,
+                }),
+            },
+        );
+        assert_eq!(exit, 0);
+
+        let text = String::from_utf8(output).unwrap();
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the seeded heartbeat is emitted: {text}"
+        );
+        assert_eq!(
+            lines[0]["activity"],
+            json!({"type": "heartbeat", "phase": "active"})
+        );
+        assert_eq!(lines[0]["cursor"], json!(cursor));
+        assert_eq!(lines[0]["generation"], "worker@1000.000000");
     }
 
     #[test]

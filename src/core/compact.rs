@@ -179,6 +179,30 @@ impl CompactClassifier {
         }
     }
 
+    /// Seed heartbeat state from a live worker snapshot without emitting or
+    /// replaying an event at or before the caller's exclusive cursor.
+    ///
+    /// A follower can attach to an already-running worker after its latest
+    /// status event. Without this snapshot, the classifier has no phase or
+    /// activity stamp and quiet heartbeats can never begin until another
+    /// durable event happens. Unknown statuses remain unseeded rather than
+    /// inventing a lifecycle phase.
+    pub(crate) fn seed_live_status(&mut self, cursor: i64, ts: &str, status: &str) -> bool {
+        if self.heartbeat.is_none() || self.last_activity.is_some() {
+            return false;
+        }
+        let Some(phase) = phase_from_status(Some(status)) else {
+            return false;
+        };
+        self.last_phase = Some(phase);
+        self.last_activity = Some(ActivityStamp {
+            ts: ts.to_string(),
+            cursor,
+            at: (self.clock)(),
+        });
+        true
+    }
+
     /// Project one accepted generation event into zero or more compact
     /// records.
     ///
@@ -1008,6 +1032,24 @@ mod tests {
             classifier.poll_heartbeat().is_some(),
             "the next heartbeat fires one full interval later"
         );
+    }
+
+    #[test]
+    fn live_status_seed_is_heartbeat_only_and_preserves_future_phase_output() {
+        let (_state, mut without_heartbeat) = classifier(None);
+        assert!(!without_heartbeat.seed_live_status(7, "2026-09-11T00:00:07Z", "active"));
+        let records = without_heartbeat.observe(&status_event(8, "active", "", ""));
+        assert_eq!(
+            records[0].activity,
+            ProgressActivity::Phase {
+                phase: LifecyclePhase::Active
+            },
+            "seeding must not suppress phase output when heartbeats are disabled"
+        );
+
+        let (_state, mut unknown) = classifier(Some(Duration::from_secs(10)));
+        assert!(!unknown.seed_live_status(7, "2026-09-11T00:00:07Z", "unknown"));
+        assert!(unknown.poll_heartbeat().is_none());
     }
 
     #[test]

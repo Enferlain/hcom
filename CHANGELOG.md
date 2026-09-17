@@ -11,6 +11,38 @@ Rules:
 - Keep proper track of days for where entries should go
 - Be concise but mention all changes without necessarily detailing each one
 
+## [2026-09-16]
+
+### Fixed
+
+- Compact worker followers attached after an already-running worker's latest
+  event now seed heartbeat state from the live worker status, avoiding a
+  permanently silent stream without replaying events at or before the
+  exclusive `--after-id` cursor.
+
+- Claude permission blockers stay dominant across parallel tool completion:
+  the instance row now records which tool use id opened an interactive
+  approval, so sibling `PostToolUse`, `PostToolUseFailure`,
+  `PermissionDenied`, or late-arriving `PreToolUse` hooks for other tools in
+  the same parallel batch can no longer clear the blocked state and hide an
+  unresolved prompt. Only the approving tool's own completion or denial
+  resolves it; approvals recorded without a tool use id fall back to
+  formatted tool-detail matching, and Claude `Read` approvals now surface the
+  file path as their status detail.
+
+### Changed
+
+- Delegation guidance now defines `--after-id` as an exclusive cursor that is
+  captured before launch, forbids short wait/list/log polling loops, and uses
+  visible interactive launches by default; `--headless` is reserved for
+  explicitly requested background workers.
+
+- Repository delegation guidance (AGENTS.md, CLAUDE.md, mirrored) and the
+  hcom-agent-messaging gotchas now require non-empty prompts, observe workers
+  through one durable cursor/stream rather than recreated short streams, and
+  act on surfaced blockers with at most one targeted terminal inspection
+  after a plausible stall.
+
 ## [2026-09-15]
 
 ### Fixed

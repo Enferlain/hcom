@@ -58,6 +58,45 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 <!-- END BEADS INTEGRATION -->
 
 
+## Delegating Work to hcom Workers
+
+When work on this repository is delegated to worker agents through hcom
+(spawning `hcom claude`, resuming, or messaging workers), keep the delegation
+contract intact:
+
+- **Construct the prompt directly and check it is non-empty.** Build
+  `--hcom-prompt` from literals or validated variables; never
+  `--hcom-prompt "$MAYBE_UNSET_VAR"` — an empty prompt starts a session that
+  idles at the UI and wastes a terminal slot for the whole run.
+- **Observe through one durable cursor/stream.** Capture
+  `hcom events --cursor` before launch and follow progress with a single
+  `hcom events stream --follow <name> --compact --heartbeat 15 --after-id
+  <cursor>` (or, for a workflow that already has an explicit thread, one
+  correlated `hcom events --wait <sec> --after-id <cursor> --thread
+  <thread-id> --result-from <name>`). `--after-id` is an exclusive
+  durable-event cursor: the observer ignores older events, so capture it
+  before launching the worker. Keep that one observer alive when observation
+  is useful; do not replace it with a loop of short timeouts, `list`, `--last`,
+  log tails, or terminal snapshots. A healthy worker needs no supervision
+  merely because it has not emitted prose recently.
+- **Act on blockers; do not poll them away.** A surfaced
+  `blocked:approval`/`pty:approval` (or unresolved `launch_blocked`) signal
+  means the worker needs a decision: resolve it or redirect the task. After a
+  plausible stall, make at most one targeted terminal inspection
+  (`hcom term <name>`), then either fix the cause or kill the worker — do not
+  loop inspections.
+
+Normal interactive launch, copyable (opens the worker terminal):
+
+```bash
+task="Run cargo test --workspace and report failures"
+[ -n "$task" ] || { echo "refusing to launch with an empty prompt" >&2; exit 1; }
+hcom 1 claude --tag worker --go --hcom-prompt "$task"
+```
+
+Pass `--headless` only when a background PTY with no visible terminal is
+explicitly wanted. It is not the normal interactive delegation path.
+
 ## Build & Test
 
 _Add your build and test commands here_
