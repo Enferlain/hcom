@@ -105,6 +105,15 @@ pub enum InitialPromptShape {
     Positional,
     /// `opencode --prompt <text>`, `agy --prompt-interactive <text>`.
     Flag(&'static str),
+    /// Prompt flag exists only under a subcommand: emit `<sub> <flag> PROMPT`
+    /// (appended last, after the caller's top-level args). `hermes chat -q
+    /// <text>` — top-level `hermes -q` is rejected with exit 2 because `-q`
+    /// exists only under the `chat` subcommand (verified on 0.21.3).
+    /// No-prompt launches are unaffected: nothing is appended.
+    SubcommandFlag {
+        sub: &'static str,
+        flag: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -312,6 +321,28 @@ const COPILOT_HOOKS: &[&str] = &[
     "copilot-subagentstart",
     "copilot-subagentstop",
     "copilot-sessionend",
+];
+
+// Hermes Agent: argv-based RPC subcommands invoked by the installed Python
+// plugin (`~/.hermes/plugins/hcom/`), mirroring the Pi/Omp plugin contract.
+const HERMES_HOOKS: &[&str] = &[
+    "hermes-sessionstart",
+    "hermes-status",
+    "hermes-read",
+    "hermes-beforetool",
+    "hermes-stop",
+];
+
+const HERMES_HELP_EXAMPLES: &[HelpEntry] = &[
+    (
+        "hcom 1 hermes --dir ~/Projects/myapp",
+        "launch Hermes in a project dir",
+    ),
+    (
+        "hcom 1 hermes --tag worker",
+        "launch a tagged Hermes worker",
+    ),
+    ("hcom r <name>", "resume a stopped Hermes session"),
 ];
 
 // ── Help examples / extra-env tables ────────────────────────────────────
@@ -1063,6 +1094,71 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static HERMES: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Hermes,
+    name: "hermes",
+    label: "Hermes Agent",
+    aliases: &[],
+    cli_binary: "hermes",
+    tui_prefix: "hrm ",
+    adhoc_icon: None,
+    released: true,
+    // Hermes's Ink TUI renders its input area with a "?" hint on startup
+    // (e.g. "? for shortcuts" variants). Left broad on purpose: readiness
+    // also flows from the plugin binding (launch_ready_on_plugin_bind).
+    ready_pattern: b"? ",
+    pty: PtySpec {
+        delivery_start_timeout_secs: 30,
+    },
+    // Hermes sessions are identified by their session store, not ambient
+    // instance-state env vars; nothing same-tool-instance specific to strip.
+    instance_state_env: &[],
+    hooks: HooksSpec {
+        names: HERMES_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::Argv,
+    },
+    // Plugin owns delivery after bootstrap (same as Pi/Omp).
+    gates: GatesSpec {
+        require_idle: false,
+        require_ready_prompt: false,
+        require_prompt_empty: false,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        launch_requires_ready: true,
+        launch_ready_on_plugin_bind: true,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_HERMES_ARGS"),
+        config_dir_env: Some("HERMES_HOME"),
+        // Seeded interactive sessions must go through the `chat` subcommand:
+        // `-q/--query` exists only there (top-level `hermes -q PROMPT` exits
+        // 2 on 0.21.3). No-prompt launches stay plain `hermes`.
+        initial_prompt: InitialPromptShape::SubcommandFlag {
+            sub: "chat",
+            flag: "-q",
+        },
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        fork: None,
+    }),
+    help: HelpSpec {
+        unique_examples: HERMES_HELP_EXAMPLES,
+        extra_env: &[],
+    },
+    // Hermes tool names: terminal (bash), write_file/apply_patch-family
+    // (file), delegate_task (delegation).
+    status_detail: StatusDetailSpec {
+        bash: &["terminal"],
+        file: &["write_file", "apply_patch", "edit"],
+        delegate: &["delegate_task"],
+    },
+};
+
 pub static ADHOC: IntegrationSpec = IntegrationSpec {
     tool: Tool::Adhoc,
     name: "adhoc",
@@ -1127,6 +1223,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &CURSOR,
     &KIMI,
     &COPILOT,
+    &HERMES,
     &ADHOC,
 ];
 
@@ -1145,6 +1242,7 @@ impl Tool {
             Tool::Cursor => &CURSOR,
             Tool::Kimi => &KIMI,
             Tool::Copilot => &COPILOT,
+            Tool::Hermes => &HERMES,
             Tool::Adhoc => &ADHOC,
         }
     }
@@ -1260,7 +1358,8 @@ mod tests {
         assert!(names.contains(&"kimi"));
         assert!(names.contains(&"copilot"));
         assert!(names.contains(&"omp"));
-        assert_eq!(names.len(), 11);
+        assert!(names.contains(&"hermes"));
+        assert_eq!(names.len(), 12);
     }
 
     #[test]

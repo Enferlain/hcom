@@ -903,6 +903,7 @@ impl ScreenTracker {
             Ok(Tool::Kilo) => None,     // Kilo shares OpenCode's plugin delivery model
             Ok(Tool::Pi) => None,       // Pi plugin handles delivery after bootstrap
             Ok(Tool::Omp) => None,      // Omp plugin handles delivery after bootstrap
+            Ok(Tool::Hermes) => None,   // Hermes plugin handles delivery after bootstrap
             Ok(Tool::Antigravity) => self.get_antigravity_input_text(),
             Ok(Tool::Cursor) => self.get_cursor_input_text(),
             Ok(Tool::Kimi) => self.get_kimi_input_text(),

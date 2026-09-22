@@ -1,4 +1,4 @@
-//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot).
+//! Shared hook infrastructure for all tools (Claude, Gemini, Codex, OpenCode, Kilo, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot, Hermes).
 
 pub mod antigravity;
 pub mod claude;
@@ -9,6 +9,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod family;
 pub mod gemini;
+pub mod hermes;
 pub mod kimi;
 pub mod opencode;
 pub mod pi;
@@ -54,6 +55,7 @@ pub mod test_helpers {
         saved_pi_config_dir: Option<String>,
         saved_omp_profile: Option<String>,
         saved_pi_profile: Option<String>,
+        saved_hermes_home: Option<String>,
         // Declared last so it drops AFTER Drop::drop restores env vars,
         // releasing the lock only once this test's env state is gone.
         _lock: MutexGuard<'static, ()>,
@@ -86,6 +88,7 @@ pub mod test_helpers {
                 saved_pi_config_dir: std::env::var("PI_CONFIG_DIR").ok(),
                 saved_omp_profile: std::env::var("OMP_PROFILE").ok(),
                 saved_pi_profile: std::env::var("PI_PROFILE").ok(),
+                saved_hermes_home: std::env::var("HERMES_HOME").ok(),
                 _lock: lock,
             }
         }
@@ -157,6 +160,10 @@ pub mod test_helpers {
                 match &self.saved_pi_profile {
                     Some(v) => std::env::set_var("PI_PROFILE", v),
                     None => std::env::remove_var("PI_PROFILE"),
+                }
+                match &self.saved_hermes_home {
+                    Some(v) => std::env::set_var("HERMES_HOME", v),
+                    None => std::env::remove_var("HERMES_HOME"),
                 }
             }
             crate::config::Config::reset();

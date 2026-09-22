@@ -131,6 +131,7 @@ ci *steps:
 
     step dist-check dist generate --check
     step typecheck  bash ./scripts/typecheck.sh
+    step hermes_plugin bash ./scripts/hermes_plugin_test.sh
     step fmt        cargo fmt --all -- --check
     step clippy     cargo clippy --all-targets --locked -- -D warnings
     step test       cargo test --locked

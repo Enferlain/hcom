@@ -8,3 +8,7 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Python bytecode (src/hermes_plugin)
+__pycache__/
+*.pyc

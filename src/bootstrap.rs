@@ -176,6 +176,25 @@ RIGHT: hcom listen --timeout [sec] (blocking)
 
 You are now registered with hcom."#;
 
+// Hermes: the plugin injects pending messages only when a turn is assembled
+// (pre_llm_call). The notify port cannot wake an idle session, so claiming
+// "instantly and automatically" would be false — teach `hcom listen` for the
+// idle case instead.
+const DELIVERY_HERMES: &str = r#"## DELIVERY
+
+Messages do NOT arrive instantly. The hcom plugin injects pending messages
+when your next turn is assembled (after a new prompt is submitted).
+- While you are in an active conversation, messages sent mid-turn arrive automatically at the start of your next turn — no action needed.
+- While the session sits idle, nothing is delivered: wait with `hcom listen [timeout]` instead.
+- Always substitute `sleep [timeout]` with `hcom listen [timeout]`
+- Your prompt may be a bare `<hcom>` line, or one carrying only routing metadata (`[intent #id] sender -> you`). That is a wake trigger, not a message: do not answer the envelope. The real messages are injected into the same turn by the plugin — respond to those, not to the trigger.
+
+## WAITING RULES
+
+1. Never use `sleep [sec]` — use `hcom listen [sec]`
+2. Expecting an hcom reply while idle → `hcom listen --timeout [sec]`
+3. Waiting for agent progress → `hcom events sub`, subscribe, end your turn"#;
+
 const CLAUDE_ONLY: &str = r#"## SUBAGENTS
 
 Subagents can join hcom:
@@ -492,6 +511,9 @@ pub fn get_bootstrap(
             && ctx.is_launched)
     {
         parts.push(DELIVERY_AUTO);
+    } else if tool == "hermes" && ctx.is_launched {
+        // Honest delivery: injection happens at turn assembly only.
+        parts.push(DELIVERY_HERMES);
     } else {
         parts.push(DELIVERY_ADHOC);
     }
@@ -936,6 +958,59 @@ mod tests {
         assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("HCOM MESSAGE"));
         assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("ACK alone does not complete"));
         assert!(ANTIGRAVITY_DELIVERY_ACTION.contains("no turn is auto-created"));
+    }
+
+    #[test]
+    fn test_hermes_bootstrap_does_not_claim_instant_delivery() {
+        // Hermes injection only happens at turn assembly (pre_llm_call); the
+        // bootstrap must not promise instant/idle delivery and must teach
+        // `hcom listen` for waiting agents.
+        let (tmp, db) = setup_test_db();
+        let result = get_bootstrap(
+            &db,
+            tmp.path(),
+            "luna",
+            "hermes",
+            false,
+            true,
+            "",
+            "",
+            false,
+            None,
+        );
+        assert!(result.contains("Messages do NOT arrive instantly"));
+        assert!(result.contains("hcom listen"));
+        assert!(
+            !result.contains("Messages instantly and automatically arrive"),
+            "hermes bootstrap must not inherit the instant-delivery claim"
+        );
+        assert!(
+            !result.contains("Messages do NOT arrive automatically"),
+            "hermes launched bootstrap must use the hermes section, not the adhoc one"
+        );
+    }
+
+    #[test]
+    fn test_hermes_bootstrap_explains_metadata_only_wake_triggers() {
+        // The delivery loop seeds the first turn by typing a metadata-only
+        // <hcom> line into the PTY; the bootstrap must keep the model from
+        // answering that envelope instead of the injected messages.
+        let (tmp, db) = setup_test_db();
+        let result = get_bootstrap(
+            &db,
+            tmp.path(),
+            "luna",
+            "hermes",
+            false,
+            true,
+            "",
+            "",
+            false,
+            None,
+        );
+        assert!(result.contains("wake trigger, not a message"));
+        assert!(result.contains("do not answer the envelope"));
+        assert!(result.contains("injected into the same turn"));
     }
 
     // REGRESSION (tracker item 19): bootstrap must not require model-generated

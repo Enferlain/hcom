@@ -1431,6 +1431,14 @@ fn resolve_instance_transcript(
             )
             .unwrap_or_else(|_| (detect_agent_type(&path).to_string(), None));
         return Some((name, path, tool, sid));
+    } else if let Ok((tool, sid)) = db.conn().query_row(
+        "SELECT tool, session_id FROM instances WHERE name = ?",
+        rusqlite::params![&name],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    ) && let Ok(t) = tool.parse::<Tool>()
+        && let Some(db_path) = transcript::database_search_path(t)
+    {
+        return Some((name, db_path.to_string_lossy().to_string(), tool, sid));
     }
 
     // Prefix match
@@ -1598,6 +1606,8 @@ mod tests {
             detect_agent_type("/home/user/.copilot/session-state/abc/events.jsonl"),
             "copilot"
         );
+        assert_eq!(detect_agent_type("/home/user/.hermes/state.db"), "hermes");
+        assert_eq!(detect_agent_type("/tmp/state.db"), "unknown");
     }
 
     #[test]
@@ -1629,6 +1639,7 @@ mod tests {
             ),
             ("/home/user/.pi/agent/sessions/x/20260603_abc.jsonl", "pi"),
             ("/home/user/.omp/agent/sessions/x/20260603_abc.jsonl", "omp"),
+            ("/home/user/.hermes/state.db", "hermes"),
         ];
         let expected: std::collections::HashSet<&str> =
             crate::integration_spec::released_tool_names()
@@ -1754,6 +1765,62 @@ mod tests {
         assert_eq!(
             correlated.get(&transcript_search_key("/tmp/opencode.db", Some("ses_b"))),
             Some(&"nova".to_string())
+        );
+    }
+
+    #[test]
+    fn test_correlate_paths_to_hcom_uses_session_id_for_hermes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE instances (
+                     name text,
+                     transcript_path text,
+                     session_id text
+                 );
+                 CREATE TABLE events (
+                     id integer PRIMARY KEY,
+                     type text,
+                     instance text,
+                     data text
+                 );",
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, transcript_path, session_id) VALUES (?, ?, ?)",
+                rusqlite::params!["herm_a", "/home/user/.hermes/state.db", "ses_herm_1"],
+            )
+            .unwrap();
+
+        let correlated = correlate_paths_to_hcom(
+            &db,
+            &[
+                (
+                    "/home/user/.hermes/state.db".to_string(),
+                    Some("ses_herm_1".to_string()),
+                ),
+                (
+                    "/home/user/.hermes/state.db".to_string(),
+                    Some("ses_herm_2".to_string()),
+                ),
+            ],
+        );
+
+        assert_eq!(
+            correlated.get(&transcript_search_key(
+                "/home/user/.hermes/state.db",
+                Some("ses_herm_1")
+            )),
+            Some(&"herm_a".to_string())
+        );
+        assert_eq!(
+            correlated.get(&transcript_search_key(
+                "/home/user/.hermes/state.db",
+                Some("ses_herm_2")
+            )),
+            None
         );
     }
 

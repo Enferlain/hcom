@@ -1984,11 +1984,16 @@ pub fn run_delivery_loop(
     // OpenCode: plugin handles delivery after session exists. The delivery thread
     // only injects the FIRST message via PTY to bootstrap the session in the TUI.
     // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
+    // Hermes joins this mode too: first message via PTY (injected at turn start
+    // via -q-seeded context), then the hcom plugin drains at each pre_llm_call.
+    // An idle hermes is NOT wakeable by the notify poke — delivery waits for
+    // the next turn — so HERMES bootstrap text teaches `hcom listen` for
+    // waiting agents.
     use crate::tool::Tool;
     use std::str::FromStr;
     if matches!(
         Tool::from_str(&config.tool),
-        Ok(Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp)
+        Ok(Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp | Tool::Hermes)
     ) {
         log_info(
             "native",

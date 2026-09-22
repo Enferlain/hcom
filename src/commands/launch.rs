@@ -544,6 +544,7 @@ pub(crate) fn merge_tool_args(
         LaunchTool::OpenCode => append_config_args(&config.opencode_args, cli_args),
         LaunchTool::Kilo => append_config_args(&config.kilo_args, cli_args),
         LaunchTool::Kimi => append_config_args(&config.kimi_args, cli_args),
+        LaunchTool::Hermes => append_config_args(&config.hermes_args, cli_args),
         LaunchTool::Antigravity => {
             // IntegrationSpec.launch.args_env is explicitly None: Antigravity
             // has no persisted *_args config to merge.
@@ -571,7 +572,8 @@ pub(crate) fn is_background_from_args(tool: &LaunchTool, args: &[String]) -> boo
         | LaunchTool::Cursor
         | LaunchTool::Kimi
         | LaunchTool::Copilot
-        | LaunchTool::Omp => false,
+        | LaunchTool::Omp
+        | LaunchTool::Hermes => false,
     }
 }
 

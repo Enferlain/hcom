@@ -91,6 +91,7 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
         Tool::Kilo => crate::hooks::opencode::dispatch_opencode_hook(hook, args),
         Tool::Pi => crate::hooks::pi::dispatch_pi_hook(hook, args),
         Tool::Omp => crate::hooks::omp::dispatch_omp_hook(hook, args),
+        Tool::Hermes => crate::hooks::hermes::dispatch_hermes_hook(hook, args),
         Tool::Antigravity => (
             crate::hooks::gemini::dispatch_gemini_hook(hook),
             String::new(),

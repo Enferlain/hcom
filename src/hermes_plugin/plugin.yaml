@@ -1,0 +1,12 @@
+name: hcom
+version: "0.2.0"
+description: "Bridge this Hermes session into an hcom agent mesh: bind identity, drain pending hcom messages into the model context at turn assembly (pre_llm_call), report tool and turn activity, and register a notify port for launch readiness and wake pings. Idle delivery is via `hcom listen`, not instant injection."
+author: "hcom"
+requires_hermes: ">=0.21"
+provides_hooks:
+  - on_session_start
+  - pre_llm_call
+  - post_llm_call
+  - post_tool_call
+  - on_session_end
+  - on_session_reset

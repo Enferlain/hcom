@@ -22,6 +22,7 @@ pub enum Tool {
     Copilot,
     Pi,
     Omp,
+    Hermes,
     Adhoc,
 }
 
@@ -105,6 +106,7 @@ impl Tool {
             }
             Tool::Pi => crate::hooks::pi::verify_pi_plugin_installed(),
             Tool::Omp => crate::hooks::omp::verify_omp_plugin_installed(),
+            Tool::Hermes => crate::hooks::hermes::verify_hermes_plugin_installed(),
             Tool::Adhoc => false,
         }
     }
@@ -149,6 +151,11 @@ impl Tool {
                 Ok(false) => Err(String::new()),
                 Err(e) => Err(e.to_string()),
             },
+            Tool::Hermes => match crate::hooks::hermes::install_hermes_plugin() {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(String::new()),
+                Err(e) => Err(e.to_string()),
+            },
             Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
         }
     }
@@ -177,6 +184,9 @@ impl Tool {
             Tool::Omp => crate::hooks::omp::remove_omp_plugin()
                 .map(|_| true)
                 .map_err(|e| e.to_string()),
+            Tool::Hermes => crate::hooks::hermes::remove_hermes_plugin()
+                .map(|_| true)
+                .map_err(|e| e.to_string()),
             Tool::Adhoc => Ok(false),
         }
     }
@@ -196,6 +206,7 @@ impl Tool {
             Tool::Copilot => crate::hooks::copilot::get_copilot_hooks_path(),
             Tool::Pi => crate::hooks::pi::get_pi_plugin_path(),
             Tool::Omp => crate::hooks::omp::get_omp_plugin_path(),
+            Tool::Hermes => crate::hooks::hermes::get_hermes_plugin_path(),
             Tool::Adhoc => return String::new(),
         };
         path_buf.to_string_lossy().to_string()

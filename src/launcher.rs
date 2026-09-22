@@ -45,6 +45,7 @@ pub enum LaunchTool {
     Kimi,
     Copilot,
     Omp,
+    Hermes,
 }
 
 impl LaunchTool {
@@ -63,6 +64,7 @@ impl LaunchTool {
             "cursor" | "cursor-agent" => Ok(LaunchTool::Cursor),
             "kimi" => Ok(LaunchTool::Kimi),
             "copilot" => Ok(LaunchTool::Copilot),
+            "hermes" => Ok(LaunchTool::Hermes),
             _ => bail!("Unknown tool: {}", s),
         }
     }
@@ -81,6 +83,7 @@ impl LaunchTool {
             LaunchTool::Cursor => "cursor",
             LaunchTool::Kimi => "kimi",
             LaunchTool::Copilot => "copilot",
+            LaunchTool::Hermes => "hermes",
         }
     }
 
@@ -101,6 +104,7 @@ impl LaunchTool {
             LaunchTool::Cursor => crate::tool::Tool::Cursor,
             LaunchTool::Kimi => crate::tool::Tool::Kimi,
             LaunchTool::Copilot => crate::tool::Tool::Copilot,
+            LaunchTool::Hermes => crate::tool::Tool::Hermes,
         }
     }
 
@@ -166,6 +170,7 @@ impl LaunchBackend {
             | LaunchTool::OpenCode
             | LaunchTool::Kilo
             | LaunchTool::Pi
+            | LaunchTool::Hermes
             | LaunchTool::Omp
             | LaunchTool::Antigravity
             | LaunchTool::Cursor
@@ -448,6 +453,7 @@ fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
         crate::tool::Tool::Cursor => ".cursor",
         crate::tool::Tool::Kimi => ".kimi",
         crate::tool::Tool::Copilot => ".copilot",
+        crate::tool::Tool::Hermes => ".hermes",
         crate::tool::Tool::OpenCode | crate::tool::Tool::Adhoc => return None,
     };
     Some(root.join(dirname))
@@ -693,6 +699,13 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             }
             let diag = install_diag_context(tool, &[]);
             bail!("Failed to setup Oh My Pi plugin. Run: hcom hooks add omp\n{diag}");
+        }
+        LaunchTool::Hermes => {
+            if crate::hooks::hermes::ensure_hermes_plugin_installed() {
+                return Ok(());
+            }
+            let diag = install_diag_context(tool, &[]);
+            bail!("Failed to setup Hermes plugin. Run: hcom hooks add hermes\n{diag}");
         }
         LaunchTool::Antigravity => {
             if crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions) {
@@ -1614,6 +1627,14 @@ fn append_initial_prompt_args(
             args.push(flag.to_string());
             args.push(prompt);
         }
+        // Subcommand-qualified prompt flag (hermes `chat -q`): the subcommand
+        // is appended after the caller's args, so env/stored args stay
+        // top-level and the subcommand's parser consumes `<flag> PROMPT`.
+        crate::integration_spec::InitialPromptShape::SubcommandFlag { sub, flag } => {
+            args.push(sub.to_string());
+            args.push(flag.to_string());
+            args.push(prompt);
+        }
     }
     Ok(())
 }
@@ -2288,6 +2309,34 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         inside_ai_tool,
                     )
                 }
+                LaunchTool::Hermes => {
+                    instances::update_instance_position(
+                        db,
+                        &instance_name,
+                        &serde_json::Map::from_iter([(
+                            "launch_args".to_string(),
+                            json!(&stored_launch_args),
+                        )]),
+                    );
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "hermes",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &params.args,
+                        &params,
+                        inside_ai_tool,
+                    )
+                }
+
                 LaunchTool::Cursor => {
                     instances::update_instance_position(
                         db,
@@ -2461,6 +2510,7 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
         LaunchTool::Kilo => validate_rejected_args("Kilo", "hcom kilo", args, KILO_REJECTED_ARGS),
         LaunchTool::Pi => validate_rejected_args("Pi", "hcom pi", args, PI_REJECTED_ARGS),
         LaunchTool::Omp => validate_rejected_args("Oh My Pi", "hcom omp", args, OMP_REJECTED_ARGS),
+        LaunchTool::Hermes => Vec::new(),
         LaunchTool::Antigravity => validate_rejected_args(
             "Antigravity",
             "hcom antigravity",
@@ -2665,6 +2715,31 @@ mod tests {
     }
 
     #[test]
+    fn hermes_seeded_prompt_uses_chat_subcommand_with_query_flag() {
+        // Top-level `hermes -q PROMPT` exits 2 (verified on 0.21.3): `-q` is
+        // defined only under the `chat` subcommand. The seeded launch must be
+        // `hermes <args...> chat -q PROMPT`; the complete appended argv is
+        // asserted below, including that caller args stay top-level (before
+        // the subcommand) rather than being consumed by it. No-prompt
+        // launches never reach this code path (the launcher injects only
+        // under `params.initial_prompt`), so they remain plain `hermes`.
+        let mut args: Vec<String> = vec!["--in".into(), "/work/proj".into(), "--yolo".into()];
+        append_initial_prompt_args(&LaunchTool::Hermes, &mut args, "fix the flaky test".into())
+            .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "--in",
+                "/work/proj",
+                "--yolo",
+                "chat",
+                "-q",
+                "fix the flaky test"
+            ]
+        );
+    }
+
+    #[test]
     fn hcom_prompt_alone_is_injected_for_every_shape() {
         for (tool, expected) in [
             (
@@ -2675,6 +2750,10 @@ mod tests {
             (
                 LaunchTool::Claude,
                 vec!["--".to_string(), "hcom".to_string()],
+            ),
+            (
+                LaunchTool::Hermes,
+                vec!["chat".to_string(), "-q".to_string(), "hcom".to_string()],
             ),
         ] {
             let mut args = Vec::new();

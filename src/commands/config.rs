@@ -115,6 +115,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
+        "HCOM_HERMES_ARGS",
+        "Default args for hermes on launch",
+        "string",
+    ),
+    (
         "HCOM_CODEX_SANDBOX_MODE",
         "Codex permission profile (workspace | untrusted | danger-full-access | none)",
         "string",
@@ -1596,7 +1601,7 @@ Example:
   # hcom send \"@$HCOM_NAME completed task\"
 
 Notes:
-  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/pi/omp/agy/cursor/kimi/copilot)
+  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/kilo/pi/omp/agy/cursor/kimi/copilot/hermes)
   - Variable name must be a valid shell identifier
   - Works alongside HCOM_PROCESS_ID (always set) for identity",
         ),
@@ -1647,6 +1652,16 @@ HCOM_KIMI_ARGS - Default args passed to kimi on launch
 
 Example: hcom config kimi_args \"--model kimi-k2.6\"
 Clear:   hcom config kimi_args \"\"
+
+Prepended to launch-time cli args.",
+        ),
+
+        "HCOM_HERMES_ARGS" => Some(
+            "\
+HCOM_HERMES_ARGS - Default args passed to hermes on launch
+
+Example: hcom config hermes_args \"--model <model-id>\"
+Clear:   hcom config hermes_args \"\"
 
 Prepended to launch-time cli args.",
         ),
