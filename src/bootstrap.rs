@@ -511,8 +511,12 @@ pub fn get_bootstrap(
             && ctx.is_launched)
     {
         parts.push(DELIVERY_AUTO);
-    } else if tool == "hermes" && ctx.is_launched {
-        // Honest delivery: injection happens at turn assembly only.
+    } else if tool == "hermes" {
+        // Honest delivery: injection happens at turn assembly only. Hermes
+        // delivery is plugin-managed in BOTH modes — an hcom-launched session
+        // and an ordinary plugin-enabled one receive messages through the same
+        // pre_llm_call injection — so is_launched must not downgrade an
+        // ordinary session to the adhoc/manual section.
         parts.push(DELIVERY_HERMES);
     } else {
         parts.push(DELIVERY_ADHOC);
@@ -1013,6 +1017,32 @@ mod tests {
         assert!(result.contains("injected into the same turn"));
     }
 
+    #[test]
+    fn test_hermes_bootstrap_plugin_managed_uses_hook_delivery() {
+        // An ordinary plugin-enabled Hermes session (is_launched=false) still
+        // delivers through the plugin's pre_llm_call injection; the adhoc
+        // section would teach the wrong delivery/waiting model.
+        let (tmp, db) = setup_test_db();
+        let result = get_bootstrap(
+            &db,
+            tmp.path(),
+            "luna",
+            "hermes",
+            false,
+            false,
+            "",
+            "",
+            false,
+            None,
+        );
+        assert!(result.contains("Messages do NOT arrive instantly"));
+        assert!(result.contains("hcom listen"));
+        assert!(
+            !result.contains("Messages do NOT arrive automatically"),
+            "plugin-managed hermes must not get the adhoc delivery section"
+        );
+    }
+
     // REGRESSION (tracker item 19): bootstrap must not require model-generated
     // task acknowledgements. Every get_bootstrap variant shares UNIVERSAL's
     // rules, so sweep the delivery/lifecycle variants plus the subagent template.
@@ -1025,6 +1055,7 @@ mod tests {
             ("gemini_adhoc", "gemini", false, false, None),
             ("cursor_launched", "cursor", false, true, None),
             ("antigravity_launched", "antigravity", false, true, None),
+            ("hermes_plugin_managed", "hermes", false, false, None),
             ("claude_headless", "claude", true, true, None),
             (
                 "claude_background",

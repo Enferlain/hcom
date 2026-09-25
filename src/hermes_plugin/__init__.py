@@ -153,13 +153,16 @@ def _start_notify_listener() -> Optional[int]:
 
 
 def _ensure_bound(session_id: str) -> Optional[str]:
-    """Bind this session to an hcom instance name (idempotent per session)."""
+    """Bind this session to an hcom instance name (idempotent per session).
+
+    Works for BOTH an hcom-launched session (HCOM_LAUNCHED set) and an
+    ordinarily started, plugin-enabled one: the backend `hermes-sessionstart`
+    RPC recovers the identity by Hermes session id or registers a fresh one —
+    no HCOM_LAUNCHED gate here, the session id is the identity key.
+    """
     with _LOCK:
         if _STATE.get("session_id") == session_id and _STATE.get("name"):
             return _STATE["name"]
-        if not os.environ.get("HCOM_LAUNCHED"):
-            # Not launched by hcom: joining would hijack an unrelated instance.
-            return None
         port = _start_notify_listener()
         args = ["hermes-sessionstart", "--session-id", session_id,
                 "--cwd", os.getcwd()]
@@ -282,7 +285,19 @@ def post_tool_call(**kwargs: Any) -> None:
 
 
 def on_session_end(**kwargs: Any) -> None:
-    """Finalize the hcom instance when the session ends."""
+    """Finalize the hcom instance when the session ends.
+
+    On long-lived platforms (desktop/gateway) on_session_end fires after
+    EVERY turn — each turn is a fresh agent run — so a hard stop here would
+    delete the instance row between turns and the rebind's cursor seed
+    would silently skip messages that arrived in the gap. post_llm_call
+    already reports `listening` at turn end (the correct idle state, same
+    semantic as Claude's Stop hook); real departures fall to hcom's
+    staleness marking, like any unmanaged agent.
+    """
+    platform = str(kwargs.get("platform") or "")
+    if platform in ("desktop", "gateway"):
+        return
     name = _STATE.get("name")
     _clear_state()
     if name:

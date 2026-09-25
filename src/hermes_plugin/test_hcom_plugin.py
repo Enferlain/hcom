@@ -146,11 +146,38 @@ class HcomPluginTest(unittest.TestCase):
         self.assertIsNone(hermes_plugin._STATE["name"])
         self.assertIsNone(hermes_plugin.pre_llm_call(session_id="ses-1"))
 
-    def test_unlaunched_session_never_binds(self):
+    def test_ordinary_session_binds_without_hcom_launched(self):
+        # A normally started, plugin-enabled session has no HCOM_LAUNCHED:
+        # the backend registers it as a vanilla identity (the session id is
+        # the identity key — same RPC, same bootstrap).
         del os.environ["HCOM_LAUNCHED"]
-        hermes_plugin.on_session_start(session_id="ses-1")
-        self.assertIsNone(hermes_plugin._STATE["name"])
-        self.assertEqual(self.calls(), [])
+        self.bind()
+        starts = [c for c in self.calls() if c and c[0] == "hermes-sessionstart"]
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0][starts[0].index("--session-id") + 1], "ses-1")
+
+    def test_ordinary_session_receives_bootstrap_via_pre_llm(self):
+        # The primer arrives through pre_llm_call injection (hook-delivery
+        # bootstrap), not the ad-hoc manual channel.
+        del os.environ["HCOM_LAUNCHED"]
+        self.bind()
+        first = hermes_plugin.pre_llm_call(session_id="ses-1")
+        self.assertIsNotNone(first)
+        self.assertIn("BOOTSTRAP-PRIMER", first["context"])
+
+    def test_rebind_after_reset_uses_new_session_identity(self):
+        # on_session_reset soft-finalizes; the next session start (fresh sid)
+        # must issue a second sessionstart and receive a fresh primer.
+        self.bind()
+        hermes_plugin.on_session_reset(session_id="ses-1")
+        hermes_plugin.on_session_start(session_id="ses-2")
+        self.assertEqual(hermes_plugin._STATE["session_id"], "ses-2")
+        self.assertEqual(hermes_plugin._STATE["name"], "luna")
+        starts = [c for c in self.calls() if c and c[0] == "hermes-sessionstart"]
+        self.assertEqual(len(starts), 2)
+        self.assertEqual(starts[1][starts[1].index("--session-id") + 1], "ses-2")
+        first = hermes_plugin.pre_llm_call(session_id="ses-2")
+        self.assertIn("BOOTSTRAP-PRIMER", first["context"])
 
     # ── delivered-batch-only ack ──────────────────────────────────────────
 
