@@ -75,6 +75,8 @@ class HcomPluginTest(unittest.TestCase):
         os.environ["HCOM_LAUNCHED"] = "1"
         os.environ["HCOM_TEST_CALLLOG"] = self.calllog
         hermes_plugin._clear_state()
+        hermes_plugin._CTX_REF = None
+        hermes_plugin._LAST_WAKE_MONOTONIC = 0.0
         self._close_notify()
 
     def tearDown(self):
@@ -282,6 +284,95 @@ class HcomPluginTest(unittest.TestCase):
     def test_hcom_rpc_missing_binary_returns_none(self):
         os.environ["HCOM_BIN"] = os.path.join(self.tmp.name, "does-not-exist")
         self.assertIsNone(hermes_plugin._hcom(["hermes-status", "--name", "luna"]))
+
+    # ── wake-on-message ────────────────────────────────────────────────────
+
+    def test_wake_ping_injects_when_unread(self):
+        class RecordingCtx(FakeCtx):
+            def __init__(self):
+                super().__init__()
+                self.injected = []
+
+            def inject_message(self, content, role="user", *, session_key=None):
+                self.injected.append((content, session_key))
+                return True
+
+        ctx = RecordingCtx()
+        hermes_plugin.register(ctx)
+        self.bind()
+        hermes_plugin._handle_wake_ping()
+        self.assertEqual(len(ctx.injected), 1)
+        content, key = ctx.injected[0]
+        self.assertEqual(content, "<hcom>")
+        self.assertEqual(key, "ses-1")
+        # The check ran before the inject (filter step).
+        check_calls = [
+            c for c in self.calls()
+            if c[:1] == ["hermes-read"] and "--check" in c
+        ]
+        self.assertEqual(len(check_calls), 1, f"calls: {self.calls()}")
+
+    def test_wake_ping_without_unread_injects_nothing(self):
+        class NoUnreadCtx(FakeCtx):
+            def __init__(self):
+                super().__init__()
+                self.injected = []
+
+            def inject_message(self, content, role="user", *, session_key=None):
+                self.injected.append((content, session_key))
+                return True
+
+        # Replace the stub with a --check:false variant for this test.
+        no_unread_stub = STUB.replace(
+            'elif mode == "hermes-read" and "--check" in argv:\n    print(json.dumps({"has_unread": True}))',
+            'elif mode == "hermes-read" and "--check" in argv:\n    print(json.dumps({"has_unread": False}))')
+        stub_path = os.path.join(self.tmp.name, "hcom-nounread.py")
+        with open(stub_path, "w") as f:
+            f.write(no_unread_stub)
+        os.chmod(stub_path, 0o755)
+        os.environ["HCOM_BIN"] = stub_path
+
+        ctx = NoUnreadCtx()
+        hermes_plugin.register(ctx)
+        self.bind()
+        hermes_plugin._handle_wake_ping()
+        self.assertEqual(ctx.injected, [])
+
+    def test_wake_ping_debounces(self):
+        class RecordingCtx(FakeCtx):
+            def __init__(self):
+                super().__init__()
+                self.injected = []
+
+            def inject_message(self, content, role="user", *, session_key=None):
+                self.injected.append((content, session_key))
+                return True
+
+        ctx = RecordingCtx()
+        hermes_plugin.register(ctx)
+        self.bind()
+        hermes_plugin._handle_wake_ping()
+        hermes_plugin._handle_wake_ping()
+        hermes_plugin._handle_wake_ping()
+        self.assertEqual(len(ctx.injected), 1, "second/third ping within interval must be dropped")
+
+    def test_wake_ping_without_binding_is_a_noop(self):
+        class ExplodingCtx(FakeCtx):
+            def inject_message(self, content, role="user", *, session_key=None):
+                raise AssertionError("inject must not run unbound")
+
+        ctx = ExplodingCtx()
+        hermes_plugin.register(ctx)
+        hermes_plugin._handle_wake_ping()  # must not raise
+
+    def test_wake_ping_unbound_ctx_is_a_noop(self):
+        self.bind()
+        hermes_plugin._handle_wake_ping()  # no ctx captured: must not raise
+
+    def test_register_captures_ctx_for_wake(self):
+        ctx = FakeCtx()
+        hermes_plugin.register(ctx)
+        self.assertIs(hermes_plugin._CTX_REF, ctx)
 
 
 if __name__ == "__main__":

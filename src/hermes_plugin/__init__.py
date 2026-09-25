@@ -46,6 +46,7 @@ import os
 import socket
 import subprocess
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,19 @@ _NOTIFY_PORT: Optional[int] = None
 _BOUND = threading.Event()
 
 _LOCK = threading.Lock()
+
+# Wake-on-message state. The notify ping fires on a plugin thread; the only
+# safe way back into the session is the official inject_message channel,
+# which the host queues onto the session (idle → starts a turn, busy → runs
+# after the current one). A wake is submitted only when a check confirms
+# unread messages for OUR name (pings also fire on unrelated mesh events),
+# and at most once per interval — the drain acks before the turn runs, so
+# healthy operation cannot loop, and the interval caps the blast radius of
+# any ack regression turning pings into runaway turns.
+_CTX_REF: Any = None
+_WAKE_MIN_INTERVAL_S = 30.0
+_LAST_WAKE_MONOTONIC: float = 0.0
+_WAKE_TEXT = "<hcom>"
 
 
 def _hcom_bin() -> str:
@@ -112,6 +126,37 @@ def _hcom(args: List[str], timeout: float = 10.0) -> Optional[Dict[str, Any]]:
     return parsed if isinstance(parsed, dict) else {"value": parsed}
 
 
+def _handle_wake_ping() -> None:
+    """A wake ping arrived: submit a session turn iff unread messages exist.
+
+    Pings are connect-drops with no payload and fire on many mesh events
+    (status changes, other agents' traffic), so the ping alone proves
+    nothing — confirm with `hermes-read --check` first. The injected text is
+    the documented wake envelope (a bare ``<hcom>`` line): the turn-start
+    drain delivers the real messages; the envelope itself is not a message.
+    Debounced: one submission per interval regardless of ping count.
+    """
+    global _LAST_WAKE_MONOTONIC
+    ctx = _CTX_REF
+    name = _STATE.get("name")
+    session_id = _STATE.get("session_id")
+    if ctx is None or not name or not session_id:
+        return
+    now = time.monotonic()
+    if now - _LAST_WAKE_MONOTONIC < _WAKE_MIN_INTERVAL_S:
+        return
+    check = _hcom(["hermes-read", "--name", name, "--check"], timeout=5.0)
+    if not isinstance(check, dict) or not check.get("has_unread"):
+        return
+    _LAST_WAKE_MONOTONIC = now
+    try:
+        accepted = ctx.inject_message(_WAKE_TEXT, session_key=session_id)
+    except Exception as exc:
+        _log("warning", "wake_inject_failed", name=name, error=str(exc))
+        return
+    _log("info", "wake_submitted", name=name, accepted=bool(accepted))
+
+
 def _start_notify_listener() -> Optional[int]:
     """Bind a localhost TCP port; hcom connect-drops it as a wake signal.
 
@@ -141,6 +186,7 @@ def _start_notify_listener() -> Optional[int]:
                     conn, _ = srv.accept()
                     with conn:
                         conn.recv(64)
+                    _handle_wake_ping()
                 except socket.timeout:
                     continue
                 except OSError:
@@ -315,6 +361,10 @@ def on_session_reset(**kwargs: Any) -> None:
 
 
 def register(ctx) -> None:
+    # Keep the context for wake-on-message: the notify listener needs
+    # ctx.inject_message to submit a turn into the live session.
+    global _CTX_REF
+    _CTX_REF = ctx
     ctx.register_hook("on_session_start", on_session_start)
     ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_hook("post_llm_call", post_llm_call)

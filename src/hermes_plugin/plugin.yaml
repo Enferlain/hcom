@@ -1,6 +1,6 @@
 name: hcom
 version: "0.2.0"
-description: "Bridge this Hermes session into an hcom agent mesh: bind identity, drain pending hcom messages into the model context at turn assembly (pre_llm_call), report tool and turn activity, and register a notify port for launch readiness and wake pings. Idle delivery is via `hcom listen`, not instant injection."
+description: "Bridge this Hermes session into an hcom agent mesh: bind identity, drain pending hcom messages into the model context at turn assembly (pre_llm_call), report tool and turn activity, and register a notify port for launch readiness and wake pings. A ping with unread messages submits a `<hcom>` wake envelope through inject_message so an idle session starts a turn and drains; delivery is still turn-assembly based, never a mid-turn push."
 author: "hcom"
 # requires_hermes intentionally omitted: upstream builds have shipped
 # broken version strings (nix 2026.9.24 build reports 0.0.0), which would
