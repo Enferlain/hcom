@@ -148,6 +148,13 @@ def _handle_wake_ping() -> None:
     check = _hcom(["hermes-read", "--name", name, "--check"], timeout=5.0)
     if not isinstance(check, dict) or not check.get("has_unread"):
         return
+    # Wake policy: only request-intent mail (a sender blocked on a reply)
+    # buys an autonomous LLM turn. Inform/broadcast pings stay badge-only —
+    # they deliver at the next natural turn via the ordinary drain.
+    # has_request missing (older hcom) degrades to wake-on-any-unread.
+    if not check.get("has_request", True):
+        _log("info", "wake_skipped_inform", name=name)
+        return
     _LAST_WAKE_MONOTONIC = now
     try:
         accepted = ctx.inject_message(_WAKE_TEXT, session_key=session_id)

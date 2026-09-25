@@ -40,7 +40,10 @@ elif mode == "hermes-read" and "--format" in argv:
 elif mode == "hermes-read" and "--ack" in argv:
     print(json.dumps({"acked_to": 7}))
 elif mode == "hermes-read" and "--check" in argv:
-    print(json.dumps({"has_unread": True}))
+    # request-intent by default; inform-only tests set HCOM_TEST_CHECK_REQUEST=0
+    import os as _os
+    print(json.dumps({"has_unread": True,
+                      "has_request": _os.environ.get("HCOM_TEST_CHECK_REQUEST", "1") == "1"}))
 elif mode == "hermes-status":
     print(json.dumps({"ok": True}))
 elif mode == "hermes-beforetool":
@@ -324,8 +327,8 @@ class HcomPluginTest(unittest.TestCase):
 
         # Replace the stub with a --check:false variant for this test.
         no_unread_stub = STUB.replace(
-            'elif mode == "hermes-read" and "--check" in argv:\n    print(json.dumps({"has_unread": True}))',
-            'elif mode == "hermes-read" and "--check" in argv:\n    print(json.dumps({"has_unread": False}))')
+            '"has_unread": True,',
+            '"has_unread": False,')
         stub_path = os.path.join(self.tmp.name, "hcom-nounread.py")
         with open(stub_path, "w") as f:
             f.write(no_unread_stub)
@@ -368,6 +371,26 @@ class HcomPluginTest(unittest.TestCase):
     def test_wake_ping_unbound_ctx_is_a_noop(self):
         self.bind()
         hermes_plugin._handle_wake_ping()  # no ctx captured: must not raise
+
+    def test_wake_skipped_for_inform_only_mail(self):
+        class RecordingCtx(FakeCtx):
+            def __init__(self):
+                super().__init__()
+                self.injected = []
+
+            def inject_message(self, content, role="user", *, session_key=None):
+                self.injected.append((content, session_key))
+                return True
+
+        os.environ["HCOM_TEST_CHECK_REQUEST"] = "0"  # inform-only inbox
+        try:
+            ctx = RecordingCtx()
+            hermes_plugin.register(ctx)
+            self.bind()
+            hermes_plugin._handle_wake_ping()
+            self.assertEqual(ctx.injected, [], "inform-only mail must not wake")
+        finally:
+            os.environ.pop("HCOM_TEST_CHECK_REQUEST", None)
 
     def test_register_captures_ctx_for_wake(self):
         ctx = FakeCtx()

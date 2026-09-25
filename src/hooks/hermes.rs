@@ -482,9 +482,20 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
         );
     }
     if check_mode {
+        // Wake-gating support: report not just whether mail waits, but
+        // whether any of it is request-intent (a sender blocked on a
+        // reply). Plugins use this to decide wake-vs-badge: requests
+        // justify an autonomous turn, inform/broadcast do not.
+        let has_request = messages
+            .iter()
+            .any(|m| m.get("intent").and_then(|v| v.as_str()) == Some("request"));
         return (
             0,
-            serde_json::json!({ "has_unread": !messages.is_empty() }).to_string(),
+            serde_json::json!({
+                "has_unread": !messages.is_empty(),
+                "has_request": has_request,
+            })
+            .to_string(),
         );
     }
     (
@@ -1702,6 +1713,15 @@ mod tests {
         .unwrap()
     }
 
+    fn log_intent_message(db: &HcomDb, from: &str, text: &str, intent: &str) -> i64 {
+        db.log_event(
+            "message",
+            from,
+            &serde_json::json!({"from": from, "text": text, "scope": "broadcast", "intent": intent}),
+        )
+        .unwrap()
+    }
+
     fn argv_of(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
     }
@@ -1748,6 +1768,25 @@ mod tests {
         cleanup_db(&path);
         let doc: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(doc["has_unread"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn read_check_reports_request_intent_for_wake_gating() {
+        // Wake policy input: has_request must be true only when request-intent
+        // mail is pending. Inform-only mail reports has_unread without
+        // has_request — badge, not a turn.
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "luna");
+        log_intent_message(&db, "sol", "fyi only", "inform");
+        let (_, out) = handle_read(&db, &argv_of(&["--name", "luna", "--check"]));
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(doc["has_unread"].as_bool(), Some(true));
+        assert_eq!(doc["has_request"].as_bool(), Some(false));
+        log_intent_message(&db, "sol", "need this answered", "request");
+        let (_, out) = handle_read(&db, &argv_of(&["--name", "luna", "--check"]));
+        cleanup_db(&path);
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(doc["has_request"].as_bool(), Some(true));
     }
 
     #[test]
