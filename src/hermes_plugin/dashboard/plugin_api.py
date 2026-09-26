@@ -51,24 +51,110 @@ def _hcom_json(args: list[str], timeout: float = 5.0) -> dict | None:
 
 
 def _name_for_session(session_id: str) -> str | None:
-    """Map a Hermes session id to its hcom instance name.
+    """Map a Hermes session reference to its hcom instance name.
 
-    session_bindings is the live mapping (session_id → name). A missing row
-    means this session is not mesh-bound — the chip shows nothing.
+    Accepts the durable session key (e.g. 20260925_214123_0e89a3) or the
+    ephemeral UI session uuid: the instances table records the durable id,
+    and a UI id maps through the Hermes sessions registry if needed. Falls
+    back to the single active hermes-tool instance only when exactly one
+    exists (unambiguous); never guesses among several.
     """
     import sqlite3
 
-    if not session_id or not _HCOM_DB.exists():
+    if not _HCOM_DB.exists():
         return None
+
+    def _query(sql: str, args: tuple) -> str | None:
+        try:
+            conn = sqlite3.connect(f"file:{_HCOM_DB}?mode=ro", uri=True, timeout=3.0)
+        except sqlite3.Error:
+            return None
+        try:
+            row = conn.execute(sql, args).fetchone()
+            return row[0] if row else None
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
+    if session_id:
+        # 1. Direct binding by durable session id.
+        name = _query(
+            "SELECT instance_name FROM session_bindings WHERE session_id = ?",
+            (session_id,),
+        )
+        if name:
+            return name
+        # 2. UI uuid → durable key via the Hermes sessions registry.
+        durable = _ui_uuid_to_durable(session_id)
+        if durable and durable != session_id:
+            name = _query(
+                "SELECT instance_name FROM session_bindings WHERE session_id = ?",
+                (durable,),
+            )
+            if name:
+                return name
+
+    # 3. Fallback: newest-seen hermes instance. Two live rows is the NORM
+    #    after a session switch (old row stays listening until stale-marked),
+    #    so refusing on ambiguity hides the chip exactly when it matters.
+    #    last_seen breaks the tie toward the conversation actually in use.
     try:
         conn = sqlite3.connect(f"file:{_HCOM_DB}?mode=ro", uri=True, timeout=3.0)
     except sqlite3.Error:
         return None
     try:
+        # last_seen is not maintained for hermes-tool rows; last_stop (the
+        # last status transition timestamp) is the reliable recency signal.
         row = conn.execute(
-            "SELECT name FROM session_bindings WHERE session_id = ?", (session_id,)
+            "SELECT name FROM instances WHERE tool = 'hermes' "
+            "AND status IN ('listening', 'active') "
+            "ORDER BY last_stop DESC LIMIT 1"
         ).fetchone()
         return row[0] if row else None
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def _ui_uuid_to_durable(ui_id: str) -> str | None:
+    """Resolve an Electron UI session uuid to the durable session key.
+
+    The Hermes session registry (state.db sessions table) carries both; if
+    the uuid is unknown or already durable, returns None (caller falls
+    through).
+    """
+    import sqlite3
+
+    db = Path.home() / ".hermes" / "state.db"
+    if not db.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3.0)
+    except sqlite3.Error:
+        return None
+    try:
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "sessions" not in tables:
+            return None
+        cols = {
+            r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        # Look for a ui id ↔ durable key pairing among plausible columns.
+        for col in ("ui_session_id", "client_session_id", "electron_session_id"):
+            if col in cols:
+                row = conn.execute(
+                    f"SELECT session_key FROM sessions WHERE {col} = ?", (ui_id,)
+                ).fetchone()
+                if row and row[0]:
+                    return row[0]
+        return None
     except sqlite3.Error:
         return None
     finally:
@@ -101,9 +187,22 @@ class DrainRequest(BaseModel):
     session_id: str = ""
 
 
+_DEBUG_LOG = Path.home() / ".hcom" / "plugin_status_debug.log"
+
+
+def _dbg(line: str) -> None:
+    """Temporary instrumentation: append to a plain file I can read back."""
+    try:
+        with open(_DEBUG_LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
 @router.get("/status")
 def status(session_id: str = "") -> dict:
     name = _name_for_session(session_id)
+    _dbg(f"status session_id={session_id!r} -> name={name!r}")
     if not name:
         # Not mesh-bound (pre-bind window or plain session): no chip data.
         return {"bound": False}

@@ -2,10 +2,10 @@
  * hcom Mesh — Hermes Desktop plugin
  *
  * Statusbar chip after the llm-usage widget: unread mesh mail for THIS
- * session's hcom identity. Shows tower icon + count when mail waits,
- * nothing when clean. Popover on click: who's waiting and a "Drain now"
- * button that pokes the plugin's notify port — the same wake path a mesh
- * send uses (policy-gated inside the plugin: unread check, intent gate,
+ * session's hcom identity. Tower icon + count when mail waits, nothing
+ * when clean. Click: popover with who's waiting and a Drain-now button
+ * that pokes the plugin's notify port — the same wake path a mesh send
+ * uses (policy-gated inside the plugin: unread check, intent gate,
  * debounce; the button cannot bypass any of it).
  *
  * Data via the hcom plugin's Python backend at /api/plugins/hcom/
@@ -32,13 +32,17 @@ function useSessionId() {
   return useValue(host.state.activeSessionId)
 }
 
+function fetchStatus(rest, sessionId) {
+  return rest(`/status?session_id=${encodeURIComponent(sessionId)}`, {
+    timeoutMs: REST_TIMEOUT_MS,
+  })
+}
+
 function useMeshStatus(rest, sessionId) {
   return useQuery({
     queryKey: [...QUERY_KEY, sessionId],
     enabled: !!sessionId && !!rest,
-    queryFn: () => rest(`/status?session_id=${encodeURIComponent(sessionId)}`, {
-      timeoutMs: REST_TIMEOUT_MS,
-    }),
+    queryFn: () => fetchStatus(rest, sessionId),
     refetchInterval: POLL_MS,
     refetchIntervalInBackground: true,
     staleTime: 10_000,
@@ -53,50 +57,42 @@ function MeshChip({ rest }) {
   if (!sessionId || !q.data || !q.data.bound || !q.data.has_unread) return null
   const { count, latest_from, name } = q.data
 
-  return jsxs(
-    Popover,
-    {
-      children: [
-        jsxs(PopoverTrigger, {
-          asChild: true,
-          children: [
-            jsx('button', {
-              'data-testid': 'hcom-chip',
-              title: `hcom mesh: ${count} unread for ${name}${latest_from ? ` (latest: ${latest_from})` : ''} — click for actions`,
-              style: {
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: '4px',
-                padding: '0 6px',
-                border: 'none',
-                background: 'transparent',
-                cursor: 'pointer',
-                color: 'var(--ui-text-secondary)',
-                fontSize: '11px',
-              },
-              children: [
-                jsx(Codicon, { name: 'radio-tower', style: { fontSize: '13px' } }),
-                `hcom ${count}`,
-              ],
-            }),
-          ],
-        }),
-        jsx(PopoverContent, {
-          align: 'end',
-          children: jsx(MeshPaneBody, { rest, sessionId }),
-        }),
-      ],
+  const button = jsx('button', {
+    'data-testid': 'hcom-chip',
+    title: `hcom mesh: ${count} unread for ${name}${latest_from ? ` (latest: ${latest_from})` : ''} — click for actions`,
+    style: {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: '4px',
+      padding: '0 6px',
+      border: 'none',
+      background: 'transparent',
+      cursor: 'pointer',
+      color: 'var(--ui-text-secondary)',
+      fontSize: '11px',
     },
-  )
+    children: jsxs('span', {
+      style: { display: 'inline-flex', alignItems: 'center', gap: '4px' },
+      children: [
+        jsx(Codicon, { name: 'radio-tower', size: '0.8rem' }),
+        `hcom ${count}`,
+      ],
+    }),
+  })
+
+  return jsx(Popover, {
+    children: jsx(PopoverTrigger, {
+      asChild: true,
+      children: button,
+    }),
+  })
 }
 
 function MeshPaneBody({ rest, sessionId }) {
   const q = useQuery({
     queryKey: [...QUERY_KEY, sessionId],
     enabled: !!sessionId,
-    queryFn: () => rest(`/status?session_id=${encodeURIComponent(sessionId)}`, {
-      timeoutMs: REST_TIMEOUT_MS,
-    }),
+    queryFn: () => fetchStatus(rest, sessionId),
     staleTime: 0,
   })
   const refetch = q.refetch
@@ -132,7 +128,11 @@ function MeshPaneBody({ rest, sessionId }) {
         size: 'sm',
         disabled: count === 0,
         onClick: async () => {
-          await rest('/drain', { method: 'POST', body: { session_id: sessionId } })
+          await rest('/drain', {
+            method: 'POST',
+            body: { session_id: sessionId },
+            timeoutMs: REST_TIMEOUT_MS,
+          })
           refetch()
         },
         children: 'Drain now',
