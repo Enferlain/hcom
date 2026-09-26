@@ -494,6 +494,14 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
             serde_json::json!({
                 "has_unread": !messages.is_empty(),
                 "has_request": has_request,
+                // Badge data: pending mail volume and newest sender, so a
+                // tray widget can hint at what waits without a turn.
+                "count": messages.len(),
+                "latest_from": messages
+                    .iter()
+                    .rev()
+                    .find_map(|m| m.get("from").and_then(|v| v.as_str()))
+                    .unwrap_or(""),
             })
             .to_string(),
         );
