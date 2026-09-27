@@ -118,6 +118,34 @@ def _name_for_session(session_id: str) -> str | None:
         conn.close()
 
 
+def _session_title(session_id: str) -> str:
+    """The human-named session title from the Hermes registry, if resolvable.
+
+    Mesh names (tapa/keno) are opaque to the user; the session title is the
+    label they actually know ("ComfyUI workflow creation..."). Empty string
+    when unknown.
+    """
+    import sqlite3
+
+    db = Path.home() / ".hermes" / "state.db"
+    if not session_id or not db.exists():
+        return ""
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=3.0)
+    except sqlite3.Error:
+        return ""
+    try:
+        row = conn.execute(
+            "SELECT title FROM sessions WHERE id = ? AND title IS NOT NULL",
+            (session_id,),
+        ).fetchone()
+        return str(row[0]) if row else ""
+    except sqlite3.Error:
+        return ""
+    finally:
+        conn.close()
+
+
 def _ui_uuid_to_durable(ui_id: str) -> str | None:
     """Resolve an Electron UI session uuid to the durable session key.
 
@@ -207,9 +235,11 @@ def status(session_id: str = "") -> dict:
         # Not mesh-bound (pre-bind window or plain session): no chip data.
         return {"bound": False}
     check = _hcom_json(["hermes-read", "--name", name, "--check"]) or {}
+    title = _session_title(session_id)
     return {
         "bound": True,
         "name": name,
+        "session_title": title,
         "has_unread": bool(check.get("has_unread")),
         "has_request": bool(check.get("has_request")),
         "count": int(check.get("count") or 0),
