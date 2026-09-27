@@ -91,7 +91,8 @@ function MeshChip({ rest, onToggle, open }) {
   })
 }
 
-function MeshPanelBody({ rest, sessionId }) {
+function MeshPanelBody({ rest }) {
+  const sessionId = useSessionId()
   const q = useQuery({
     queryKey: [...QUERY_KEY, sessionId],
     enabled: !!sessionId,
@@ -177,7 +178,7 @@ export default {
           disposePane = host.openWorkspace('hcom-mesh', {
             dock: { pane: 'workspace', pos: 'right' },
             title: 'hcom Mesh',
-            render: () => jsx(MeshPanelBody, { rest: ctx.rest, sessionId: null }),
+            render: () => jsx(MeshPanelBody, { rest: ctx.rest }),
             onClose: () => {
               disposePane = null
               open = false
