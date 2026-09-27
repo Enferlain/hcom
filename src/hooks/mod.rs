@@ -50,8 +50,6 @@ pub mod test_helpers {
         saved_kimi_code_home: Option<String>,
         saved_copilot_home: Option<String>,
         saved_test_codex_cli_version: Option<String>,
-        saved_test_hermes_bin: Option<String>,
-        saved_test_hermes_cli_timeout_ms: Option<String>,
         saved_pi_coding_agent_dir: Option<String>,
         saved_pi_coding_agent_session_dir: Option<String>,
         saved_pi_config_dir: Option<String>,
@@ -84,9 +82,6 @@ pub mod test_helpers {
                 saved_kimi_code_home: std::env::var("KIMI_CODE_HOME").ok(),
                 saved_copilot_home: std::env::var("COPILOT_HOME").ok(),
                 saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
-                saved_test_hermes_bin: std::env::var("HCOM_TEST_HERMES_BIN").ok(),
-                saved_test_hermes_cli_timeout_ms: std::env::var("HCOM_TEST_HERMES_CLI_TIMEOUT_MS")
-                    .ok(),
                 saved_pi_coding_agent_dir: std::env::var("PI_CODING_AGENT_DIR").ok(),
                 saved_pi_coding_agent_session_dir: std::env::var("PI_CODING_AGENT_SESSION_DIR")
                     .ok(),
@@ -145,14 +140,6 @@ pub mod test_helpers {
                 match &self.saved_test_codex_cli_version {
                     Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),
                     None => std::env::remove_var("HCOM_TEST_CODEX_CLI_VERSION"),
-                }
-                match &self.saved_test_hermes_bin {
-                    Some(v) => std::env::set_var("HCOM_TEST_HERMES_BIN", v),
-                    None => std::env::remove_var("HCOM_TEST_HERMES_BIN"),
-                }
-                match &self.saved_test_hermes_cli_timeout_ms {
-                    Some(v) => std::env::set_var("HCOM_TEST_HERMES_CLI_TIMEOUT_MS", v),
-                    None => std::env::remove_var("HCOM_TEST_HERMES_CLI_TIMEOUT_MS"),
                 }
                 match &self.saved_pi_coding_agent_dir {
                     Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),

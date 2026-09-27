@@ -719,7 +719,10 @@ fn start_bare(
     // bare `hcom start` aligned with `hcom hooks add` as integrations evolve.
     if !has_valid_identity && ctx.detect_vanilla_tool().is_some() {
         let vanilla_tool = ctx.tool;
-        if !vanilla_tool.hooks().is_empty() && !vanilla_tool.verify_hooks_installed(false) {
+        if vanilla_tool != crate::tool::Tool::Hermes
+            && !vanilla_tool.hooks().is_empty()
+            && !vanilla_tool.verify_hooks_installed(false)
+        {
             println!("Installing {} hooks...", vanilla_tool.as_str());
             let include_perms = crate::config::load_config_snapshot().core.auto_approve;
             match vanilla_tool.try_setup_hooks(include_perms) {

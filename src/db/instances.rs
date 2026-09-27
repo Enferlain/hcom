@@ -727,35 +727,6 @@ impl HcomDb {
     /// session_id. life.stopped events are the source of truth: they persist
     /// across the `session_bindings` cascade, so they're the right thing to
     /// consult when reclaiming hcom identity by UUID after stop/kill.
-    /// Fetch the most recent `life.stopped` snapshot data for a session id.
-    ///
-    /// Companion to [`Self::find_stopped_instance_by_session_id`]: recovery
-    /// paths need not only the name but the snapshot payload (tool, cursor,
-    /// transcript, tag) to reconstruct the instance row when no launch
-    /// placeholder exists (vanilla adoption: ordinary plugin-enabled sessions
-    /// have no placeholder row at all).
-    pub fn stopped_snapshot_by_session_id(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<(String, serde_json::Value)>> {
-        self.conn
-            .query_row(
-                "SELECT instance, data FROM events
-                 WHERE type = 'life'
-                   AND json_extract(data, '$.action') = 'stopped'
-                   AND json_extract(data, '$.snapshot.session_id') = ?
-                 ORDER BY id DESC LIMIT 1",
-                params![session_id],
-                |row| {
-                    let data: String = row.get(1)?;
-                    let parsed: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
-                    Ok((row.get::<_, String>(0)?, parsed))
-                },
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
     pub fn find_stopped_instance_by_session_id(&self, session_id: &str) -> Result<Option<String>> {
         self.conn
             .query_row(

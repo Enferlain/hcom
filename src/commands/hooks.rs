@@ -18,12 +18,12 @@ pub struct HooksArgs {
 
 /// Released hook-bearing tools, derived from the integration registry.
 ///
-/// Keeping this as a function (rather than a parallel constant) means adding a
-/// released integration with hooks automatically exposes it to status/add/remove.
+/// Hermes uses an externally managed plugin, so this list only includes
+/// integrations whose hooks hcom owns and can install/remove.
 pub(crate) fn hook_tools() -> Vec<Tool> {
     crate::integration_spec::ALL
         .iter()
-        .filter(|spec| spec.released && !spec.hooks.names.is_empty())
+        .filter(|spec| spec.released && !spec.hooks.names.is_empty() && spec.tool != Tool::Hermes)
         .map(|spec| spec.tool)
         .collect()
 }
@@ -94,6 +94,12 @@ fn cmd_hooks_status() -> i32 {
 
 /// Add hooks for specified tool(s).
 fn cmd_hooks_add(argv: &[String]) -> i32 {
+    if argv.first().is_some_and(|tool| tool == "hermes") {
+        eprintln!(
+            "Hermes plugins are managed outside hcom; install and enable the Hermes-side plugin with Hermes."
+        );
+        return 1;
+    }
     // Get auto_approve from config
     let include_permissions = crate::config::load_config_snapshot().core.auto_approve;
 
@@ -176,6 +182,10 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
 
 /// Remove hooks for specified tool(s). Called from both `hcom hooks remove` and `hcom reset hooks`.
 pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
+    if argv.first().is_some_and(|tool| tool == "hermes") {
+        eprintln!("Hermes plugins are managed outside hcom; disable or remove them with Hermes.");
+        return 1;
+    }
     // Determine which tools to remove.
     let tools: Vec<Tool> = if argv.is_empty() || (argv.len() == 1 && argv[0] == "all") {
         hook_tools()
@@ -283,7 +293,7 @@ mod tests {
             .parse::<Tool>()
             .expect("detected tool must be canonical");
         assert!(
-            parsed == Tool::Adhoc || hook_tools().contains(&parsed),
+            parsed == Tool::Adhoc || parsed == Tool::Hermes || hook_tools().contains(&parsed),
             "unexpected tool: {tool}"
         );
     }

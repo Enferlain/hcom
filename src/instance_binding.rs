@@ -399,61 +399,6 @@ fn recreate_instance_from_placeholder(
     );
 }
 
-/// Rebuild an instance row from a `life.stopped` snapshot payload.
-///
-/// Path 2 fallback for vanilla adoption: no launch placeholder exists, so the
-/// snapshot (tool, cursor, transcript, tag, directory) is the only surviving
-/// identity data. Only recreates when the row is still absent.
-fn recreate_instance_from_snapshot(
-    db: &HcomDb,
-    target_name: &str,
-    session_id: &str,
-    snapshot: &serde_json::Value,
-) {
-    if db.get_instance_full(target_name).ok().flatten().is_some() {
-        return;
-    }
-    let g = |key: &str| {
-        snapshot
-            .get(key)
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-    };
-    let transcript = g("transcript_path");
-    let tool = g("tool").unwrap_or("hermes");
-    let directory = g("directory");
-    let tag = g("tag");
-    let last_event_id = snapshot
-        .get("last_event_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let background = snapshot
-        .get("background")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    initialize_instance_in_position_file(
-        db,
-        target_name,
-        Some(session_id),
-        None,
-        None,
-        None,
-        transcript,
-        Some(tool),
-        background != 0,
-        tag,
-        None,
-        None,
-        None,
-        directory,
-    );
-    if last_event_id > 0 {
-        let mut updates = serde_json::Map::new();
-        updates.insert("last_event_id".into(), serde_json::json!(last_event_id));
-        update_instance_position(db, target_name, &updates);
-    }
-}
-
 /// Bind session_id to canonical instance for process_id.
 /// Handles 4 paths: canonical exists (with placeholder merge/switch), placeholder bind,
 /// and two no-op paths.
@@ -611,26 +556,12 @@ pub fn bind_session_to_process(
             "bind_session_to_process.restore_stopped",
             &format!("stopped_name={stopped_name}, session_id={session_id}"),
         );
-        // Row recreation: prefer the launch placeholder (live relaunch), but
-        // a vanilla-adoption rebind has no placeholder — reconstruct from the
-        // stopped snapshot itself so status writes and @mentions resolve.
-        // Without this, every later UPDATE on the recovered name is a silent
-        // zero-row no-op and the instance is unaddressable.
-        if db.get_instance_full(&stopped_name).ok().flatten().is_none() {
-            let recreated = placeholder_data.is_some();
-            recreate_instance_from_placeholder(
-                db,
-                &stopped_name,
-                session_id,
-                placeholder_data.as_ref(),
-            );
-            if !recreated
-                && let Ok(Some((_, snap))) = db.stopped_snapshot_by_session_id(session_id)
-                && let Some(snapshot) = snap.get("snapshot").cloned()
-            {
-                recreate_instance_from_snapshot(db, &stopped_name, session_id, &snapshot);
-            }
-        }
+        recreate_instance_from_placeholder(
+            db,
+            &stopped_name,
+            session_id,
+            placeholder_data.as_ref(),
+        );
 
         if let Err(e) = db.clear_session_id_from_other_instances(session_id, &stopped_name) {
             crate::log::log_error("binding", "restore_stopped.clear_session", &format!("{e}"));

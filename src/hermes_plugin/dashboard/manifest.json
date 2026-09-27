@@ -1,8 +1,0 @@
-{
-  "name": "hcom",
-  "label": "hcom Mesh",
-  "description": "Unread hcom mesh mail badge and manual drain for this session's mesh identity",
-  "icon": "Radio",
-  "version": "0.1.0",
-  "api": "plugin_api.py"
-}

@@ -701,11 +701,13 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             bail!("Failed to setup Oh My Pi plugin. Run: hcom hooks add omp\n{diag}");
         }
         LaunchTool::Hermes => {
-            if let Err(e) = crate::hooks::hermes::ensure_hermes_plugin_installed() {
+            if !crate::hooks::hermes::verify_hermes_plugin_installed() {
                 let diag = install_diag_context(tool, &[]);
-                // Surface the installer's own error (files-installed path,
-                // CLI failure detail) before the generic rerun hint.
-                bail!("Failed to setup Hermes plugin: {e}\nRun: hcom hooks add hermes\n{diag}");
+                let path = crate::hooks::hermes::get_hermes_plugin_path();
+                bail!(
+                    "Hermes plugin is managed outside hcom and was not found at {}. Install and enable it with Hermes.\n{diag}",
+                    path.display()
+                );
             }
             Ok(())
         }

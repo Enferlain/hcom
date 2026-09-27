@@ -151,11 +151,7 @@ impl Tool {
                 Ok(false) => Err(String::new()),
                 Err(e) => Err(e.to_string()),
             },
-            Tool::Hermes => match crate::hooks::hermes::install_hermes_plugin() {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(String::new()),
-                Err(e) => Err(e.to_string()),
-            },
+            Tool::Hermes => Err("Hermes plugins are managed outside hcom".to_string()),
             Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
         }
     }
@@ -184,9 +180,7 @@ impl Tool {
             Tool::Omp => crate::hooks::omp::remove_omp_plugin()
                 .map(|_| true)
                 .map_err(|e| e.to_string()),
-            Tool::Hermes => crate::hooks::hermes::remove_hermes_plugin()
-                .map(|_| true)
-                .map_err(|e| e.to_string()),
+            Tool::Hermes => Err("Hermes plugins are managed outside hcom".to_string()),
             Tool::Adhoc => Ok(false),
         }
     }

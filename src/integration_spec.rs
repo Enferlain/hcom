@@ -1103,44 +1103,16 @@ pub static HERMES: IntegrationSpec = IntegrationSpec {
     tui_prefix: "hrm ",
     adhoc_icon: None,
     released: true,
-    // Hermes's Ink TUI input prompt is the U+276F "heavy right-pointing
-    // angle quotation mark" (❯), rendered in the banner/status line on
-    // startup. Byte sequence: E2 9D AF. The old b"? " never matched the
-    // 0.21.x TUI, so readiness depended solely on plugin binding.
-    ready_pattern: b"\xe2\x9d\xaf",
+    // Hermes's Ink TUI renders its input area with a "?" hint on startup
+    // (e.g. "? for shortcuts" variants). Left broad on purpose: readiness
+    // also flows from the plugin binding (launch_ready_on_plugin_bind).
+    ready_pattern: b"? ",
     pty: PtySpec {
         delivery_start_timeout_secs: 30,
     },
-    // Hermes sessions are identified by their session store. But a hcom
-    // launch usually happens FROM a running Hermes (the desktop gateway):
-    // its per-session/gateway env (HERMES_SESSION_*, HERMES_GATEWAY_*,
-    // _HERMES_GATEWAY, HERMES_INTERACTIVE, HERMES_CRON_SESSION,
-    // HERMES_UI_SESSION_ID) would leak into the child CLI and corrupt its
-    // session attribution — the documented instance-state leak trap. These
-    // are stripped before inheritance. User config vars (HERMES_HOME,
-    // HERMES_BIN, HERMES_PYTHON, HERMES_TUI_DIR) forward normally.
-    instance_state_env: &[
-        "HERMES_SESSION_ID",
-        "HERMES_SESSION_KEY",
-        "HERMES_SESSION_CHAT_ID",
-        "HERMES_SESSION_PARENT_CHAT_ID",
-        "HERMES_SESSION_THREAD_ID",
-        "HERMES_SESSION_USER_ID",
-        "HERMES_SESSION_USER_ID_ALT",
-        "HERMES_SESSION_USER_NAME",
-        "HERMES_SESSION_CHAT_NAME",
-        "HERMES_SESSION_CHAT_TYPE",
-        "HERMES_SESSION_SOURCE",
-        "HERMES_SESSION_SCOPE_ID",
-        "HERMES_SESSION_PLATFORM",
-        "HERMES_SESSION_MESSAGE_ID",
-        "HERMES_GATEWAY_SESSION",
-        "HERMES_GATEWAY_BUSY_INPUT_MODE",
-        "HERMES_INTERACTIVE",
-        "HERMES_CRON_SESSION",
-        "HERMES_UI_SESSION_ID",
-        "_HERMES_GATEWAY",
-    ],
+    // Hermes sessions are identified by their session store, not ambient
+    // instance-state env vars; nothing same-tool-instance specific to strip.
+    instance_state_env: &[],
     hooks: HooksSpec {
         names: HERMES_HOOKS,
         shared_hooks_with: None,
@@ -1746,56 +1718,6 @@ mod tests {
                     spec.name
                 );
             }
-        }
-    }
-
-    #[test]
-    fn hermes_ready_pattern_matches_tui_prompt_bytes() {
-        // The Hermes 0.21 Ink TUI renders its input prompt as U+276F "❯"
-        // (E2 9D AF). The old b"? " never matched, so every launch fell to
-        // the plugin-binding readiness fallback or timed out with
-        // "readiness was never observed". Pin the exact bytes.
-        assert_eq!(
-            crate::tool::Tool::Hermes.ready_pattern(),
-            b"\xe2\x9d\xaf",
-            "hermes ready_pattern must be the ❯ (U+276F) byte sequence"
-        );
-        // And it must actually match a realistic TUI status line fragment.
-        let screen = "─── \r\n ☤ glm-5.3 │ 40K/1M ❯ msg=interrupt · /queue\r\n";
-        assert!(screen.as_bytes().windows(3).any(|w| w == b"\xe2\x9d\xaf"));
-    }
-
-    #[test]
-    fn hermes_strips_session_state_but_preserves_config_env() {
-        let spec = crate::tool::Tool::Hermes.spec();
-        // Parent-gateway session attribution must not leak into a child CLI
-        // launch (bind failures observed when HERMES_SESSION_ID etc. were
-        // inherited from the launching Hermes desktop session).
-        for var in [
-            "HERMES_SESSION_ID",
-            "HERMES_SESSION_KEY",
-            "HERMES_GATEWAY_SESSION",
-            "HERMES_INTERACTIVE",
-            "HERMES_UI_SESSION_ID",
-            "_HERMES_GATEWAY",
-        ] {
-            assert!(
-                spec.instance_state_env.contains(&var),
-                "hermes instance_state_env must strip {var}"
-            );
-        }
-        // User configuration pointers are NOT instance state — they must
-        // forward so the child uses the same install/home as the parent.
-        for var in [
-            "HERMES_HOME",
-            "HERMES_BIN",
-            "HERMES_PYTHON",
-            "HERMES_TUI_DIR",
-        ] {
-            assert!(
-                !spec.instance_state_env.contains(&var),
-                "hermes instance_state_env must NOT strip config var {var}"
-            );
         }
     }
 }
