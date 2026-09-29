@@ -266,6 +266,49 @@ pub fn resolve_from_name(db: &HcomDb, name: &str) -> Result<SenderIdentity, Hcom
     )))
 }
 
+/// Resolve an ordinary Hermes terminal command's identity from the
+/// `HERMES_SESSION_ID` its host exports into every terminal subprocess.
+///
+/// Strictly a lookup — the Hermes counterpart of the wrapperless-Codex path
+/// below: the session id must already be bound (by the plugin's
+/// `hermes-sessionstart`) to an existing, hermes-owned instance row. Stale
+/// or unknown ids, deleted rows, rows owned by other tools, and DB errors
+/// all return `None` so callers fail safe with no identity. This never
+/// adopts, binds, or creates anything.
+pub fn resolve_hermes_session_identity(db: &HcomDb, session_id: &str) -> Option<SenderIdentity> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let name = db.get_session_binding(session_id).ok().flatten()?;
+    let instance_data = db.get_instance(&name).ok().flatten()?;
+    if instance_data.get("tool").and_then(|v| v.as_str()) != Some("hermes") {
+        // A Hermes session id resolving to another tool's row is a binding
+        // collision (or a foreign id) — not ours to act on. The prefix is
+        // char-based: a byte slice could land mid-UTF-8-char and panic.
+        crate::log::log_warn(
+            "identity",
+            "resolve.hermes_session_foreign_row",
+            &format!(
+                "session_id={}, name={}",
+                session_id.chars().take(8).collect::<String>(),
+                name
+            ),
+        );
+        return None;
+    }
+    crate::log::log_info(
+        "identity",
+        "resolve",
+        &format!("method=hermes_session_id, name={name}"),
+    );
+    Some(SenderIdentity {
+        kind: SenderKind::Instance,
+        name,
+        session_id: Some(session_id.to_string()),
+        instance_data: Some(instance_data),
+    })
+}
+
 /// Resolve sender identity for CLI commands and hook handlers.
 ///
 /// # Arguments
@@ -570,12 +613,22 @@ mod tests {
     }
 
     fn insert_instance(db: &HcomDb, name: &str, session_id: Option<&str>, tag: Option<&str>) {
+        insert_tool_instance(db, name, session_id, tag, "claude");
+    }
+
+    fn insert_tool_instance(
+        db: &HcomDb,
+        name: &str,
+        session_id: Option<&str>,
+        tag: Option<&str>,
+        tool: &str,
+    ) {
         let now = chrono::Utc::now().timestamp() as f64;
         db.conn()
             .execute(
                 "INSERT INTO instances (name, session_id, tag, status, created_at, tool)
-             VALUES (?1, ?2, ?3, 'active', ?4, 'claude')",
-                rusqlite::params![name, session_id, tag, now],
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5)",
+                rusqlite::params![name, session_id, tag, now, tool],
             )
             .unwrap();
     }
@@ -967,6 +1020,88 @@ mod tests {
 
         assert_eq!(identity.name, "luna");
         assert_eq!(identity.session_id.as_deref(), Some("thread-same"));
+    }
+
+    // ── Hermes session attribution tests ───────────────────────────────
+
+    #[test]
+    fn test_resolve_hermes_session_identity_bound_row() {
+        let (db, _dir) = make_test_db();
+        insert_tool_instance(&db, "tapa", Some("hermes-ses-1"), None, "hermes");
+        insert_session_binding(&db, "hermes-ses-1", "tapa");
+
+        let identity = resolve_hermes_session_identity(&db, "hermes-ses-1").unwrap();
+        assert!(matches!(identity.kind, SenderKind::Instance));
+        assert_eq!(identity.name, "tapa");
+        assert_eq!(identity.session_id.as_deref(), Some("hermes-ses-1"));
+        assert_eq!(
+            identity
+                .instance_data
+                .as_ref()
+                .and_then(|d| d.get("tool"))
+                .and_then(|v| v.as_str()),
+            Some("hermes")
+        );
+    }
+
+    #[test]
+    fn test_resolve_hermes_session_identity_stale_or_unknown_fails_safe() {
+        let (db, _dir) = make_test_db();
+        // Unknown id: no binding at all.
+        assert!(resolve_hermes_session_identity(&db, "hermes-unknown").is_none());
+        // Empty id (host leak guard) is not a session.
+        assert!(resolve_hermes_session_identity(&db, "").is_none());
+        // Stale id: binding survived but the instance row is gone (hard stop).
+        insert_tool_instance(&db, "gone", Some("hermes-stale"), None, "hermes");
+        insert_session_binding(&db, "hermes-stale", "gone");
+        db.conn()
+            .execute("DELETE FROM instances WHERE name = 'gone'", [])
+            .unwrap();
+        assert!(resolve_hermes_session_identity(&db, "hermes-stale").is_none());
+    }
+
+    #[test]
+    fn test_resolve_hermes_session_identity_refuses_foreign_rows() {
+        let (db, _dir) = make_test_db();
+        // A session bound to another tool's row is not the Hermes plugin's
+        // identity to claim.
+        insert_instance(&db, "luna", Some("claude-ses"), None);
+        insert_session_binding(&db, "claude-ses", "luna");
+        assert!(resolve_hermes_session_identity(&db, "claude-ses").is_none());
+    }
+
+    #[test]
+    fn test_resolve_hermes_session_identity_multibyte_foreign_prefix_safe() {
+        let (db, _dir) = make_test_db();
+        // Every char here is 3 bytes wide, so a byte-slice prefix at 8 would
+        // land mid-char and panic inside the foreign-row warn path; the
+        // prefix must stay UTF-8-safe and the lookup must still refuse.
+        let sid = "会話セッション識別子";
+        insert_instance(&db, "luna", Some(sid), None);
+        insert_session_binding(&db, sid, "luna");
+        assert!(resolve_hermes_session_identity(&db, sid).is_none());
+    }
+
+    #[test]
+    fn test_resolve_hermes_session_identity_never_binds_or_adopts() {
+        let (db, _dir) = make_test_db();
+        insert_tool_instance(&db, "tapa", Some("hermes-ses-1"), None, "hermes");
+        insert_session_binding(&db, "hermes-ses-1", "tapa");
+
+        // Resolution is read-only: an unknown id creates no binding/row and
+        // a known id rewrites nothing.
+        assert!(resolve_hermes_session_identity(&db, "hermes-other").is_none());
+        assert!(db.get_session_binding("hermes-other").unwrap().is_none());
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM instances", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(resolve_hermes_session_identity(&db, "hermes-ses-1").is_some());
+        assert_eq!(
+            db.get_session_binding("hermes-ses-1").unwrap().as_deref(),
+            Some("tapa")
+        );
     }
 
     // ── Display-name resolution tests ──────────────────────────────────

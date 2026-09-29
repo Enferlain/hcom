@@ -701,12 +701,15 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             bail!("Failed to setup Oh My Pi plugin. Run: hcom hooks add omp\n{diag}");
         }
         LaunchTool::Hermes => {
-            if !crate::hooks::hermes::verify_hermes_plugin_installed() {
+            // One evaluation carries BOTH the verdict and the diagnostic:
+            // re-probing for the message could race a timeout and
+            // contradict the gate's own answer.
+            let readiness = crate::hooks::hermes::evaluate_hermes_plugin_readiness();
+            if !readiness.ready {
                 let diag = install_diag_context(tool, &[]);
-                let path = crate::hooks::hermes::get_hermes_plugin_path();
                 bail!(
-                    "Hermes plugin is managed outside hcom and was not found at {}. Install and enable it with Hermes.\n{diag}",
-                    path.display()
+                    "Hermes plugin is not ready (files present is not enough — Hermes config must enable it). {}\n{diag}",
+                    readiness.diagnostic
                 );
             }
             Ok(())
@@ -2850,6 +2853,7 @@ mod tests {
         assert_eq!(LaunchTool::Gemini.as_str(), "gemini");
         assert_eq!(LaunchTool::Antigravity.as_str(), "antigravity");
         assert_eq!(LaunchTool::Copilot.as_str(), "copilot");
+        assert_eq!(LaunchTool::Hermes.as_str(), "hermes");
     }
 
     #[test]
@@ -2859,6 +2863,7 @@ mod tests {
         assert_eq!(LaunchTool::Codex.base_tool(), "codex");
         assert_eq!(LaunchTool::Antigravity.base_tool(), "antigravity");
         assert_eq!(LaunchTool::Copilot.base_tool(), "copilot");
+        assert_eq!(LaunchTool::Hermes.base_tool(), "hermes");
     }
 
     #[test]
@@ -2870,6 +2875,7 @@ mod tests {
         assert!(LaunchTool::OpenCode.uses_pty());
         assert!(LaunchTool::Kilo.uses_pty());
         assert!(LaunchTool::Copilot.uses_pty());
+        assert!(LaunchTool::Hermes.uses_pty());
     }
 
     #[test]
@@ -2884,6 +2890,7 @@ mod tests {
             LaunchTool::Kilo,
             LaunchTool::Antigravity,
             LaunchTool::Copilot,
+            LaunchTool::Hermes,
         ] {
             assert_eq!(
                 LaunchBackend::resolve(&tool, false),
@@ -2924,6 +2931,7 @@ mod tests {
             LaunchTool::Kilo,
             LaunchTool::Antigravity,
             LaunchTool::Copilot,
+            LaunchTool::Hermes,
         ] {
             assert_eq!(
                 LaunchBackend::resolve(&tool, true),
@@ -3454,6 +3462,67 @@ mod tests {
         std::fs::remove_file(env_file).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_create_runner_script_hermes_strips_instance_state_from_sidecar_and_unsets() {
+        let env = HashMap::from([
+            (
+                "HERMES_SESSION_ID".to_string(),
+                "parent_session_abc".to_string(),
+            ),
+            ("HERMES_SESSION_KEY".to_string(), "key_parent".to_string()),
+            ("HERMES_CRON_SESSION".to_string(), "1".to_string()),
+            ("HERMES_HOME".to_string(), "/custom/hermes/home".to_string()),
+            ("HERMES_API_KEY".to_string(), "secret-key".to_string()),
+        ]);
+
+        let script =
+            create_runner_script("hermes", "/tmp", "test-hermes", &env, &[], false).unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+
+        // HERMES per-session vars must be included in the bash unset line
+        assert!(
+            content.contains("HERMES_SESSION_ID"),
+            "HERMES_SESSION_ID should appear in unset"
+        );
+        assert!(
+            content.contains("HERMES_SESSION_KEY"),
+            "HERMES_SESSION_KEY should appear in unset"
+        );
+        assert!(
+            content.contains("HERMES_CRON_SESSION"),
+            "HERMES_CRON_SESSION should appear in unset"
+        );
+
+        let env_file = content
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(". "))
+            .map(|path| path.trim_matches('\'').to_string())
+            .expect("runner script should source a sidecar env file");
+        let sidecar = std::fs::read_to_string(&env_file).unwrap();
+
+        // Sidecar must NOT contain per-session state
+        assert!(
+            !sidecar.contains("HERMES_SESSION_ID"),
+            "sidecar must not leak parent HERMES_SESSION_ID"
+        );
+        assert!(
+            !sidecar.contains("HERMES_SESSION_KEY"),
+            "sidecar must not leak parent HERMES_SESSION_KEY"
+        );
+        assert!(
+            !sidecar.contains("HERMES_CRON_SESSION"),
+            "sidecar must not leak parent HERMES_CRON_SESSION"
+        );
+
+        // But non-instance-state env like HERMES_HOME and HERMES_API_KEY must be preserved
+        assert!(sidecar.contains("HERMES_HOME"));
+        assert!(sidecar.contains("HERMES_API_KEY"));
+
+        std::fs::remove_file(&script).ok();
+        std::fs::remove_file(env_file).ok();
+    }
+
     // create_runner_script_windows() isn't cfg(windows)-gated (only its call
     // site is, via a runtime cfg!(windows) check), so this runs on any host.
     #[test]
@@ -3586,6 +3655,97 @@ mod tests {
 
         unsafe { std::env::remove_var("GEMINI_PTY_INFO") }
         unsafe { std::env::remove_var("GEMINI_API_KEY") }
+    }
+
+    #[test]
+    #[serial]
+    fn test_hermes_nesting_strips_instance_state() {
+        unsafe { std::env::set_var("HERMES_SESSION_ID", "parent_session_123") }
+        unsafe { std::env::set_var("HERMES_SESSION_KEY", "parent_key_abc") }
+        unsafe { std::env::set_var("HERMES_CRON_SESSION", "1") }
+        unsafe { std::env::set_var("HERMES_HOME", "/custom/hermes/home") }
+
+        let config = crate::config::HcomConfig::default();
+        let mut env = build_launch_env(&config, LaunchEnvRegime::HumanShell);
+
+        let hermes_spec: &'static crate::integration_spec::IntegrationSpec =
+            crate::tool::Tool::Hermes.spec();
+        for var in hermes_spec.instance_state_env {
+            env.remove(*var);
+        }
+
+        assert!(!env.contains_key("HERMES_SESSION_ID"));
+        assert!(!env.contains_key("HERMES_SESSION_KEY"));
+        assert!(!env.contains_key("HERMES_CRON_SESSION"));
+        assert_eq!(
+            env.get("HERMES_HOME").map(String::as_str),
+            Some("/custom/hermes/home")
+        );
+
+        unsafe { std::env::remove_var("HERMES_SESSION_ID") }
+        unsafe { std::env::remove_var("HERMES_SESSION_KEY") }
+        unsafe { std::env::remove_var("HERMES_CRON_SESSION") }
+        unsafe { std::env::remove_var("HERMES_HOME") }
+    }
+
+    #[test]
+    fn test_create_runner_script_windows_hermes_strips_instance_state() {
+        let env = HashMap::from([
+            (
+                "HERMES_SESSION_ID".to_string(),
+                "parent_session_win".to_string(),
+            ),
+            (
+                "HERMES_SESSION_KEY".to_string(),
+                "parent_key_win".to_string(),
+            ),
+            ("HERMES_CRON_SESSION".to_string(), "1".to_string()),
+            ("HERMES_HOME".to_string(), r"C:\custom\hermes".to_string()),
+            ("HERMES_API_KEY".to_string(), "secret-win-key".to_string()),
+        ]);
+
+        let script =
+            create_runner_script_windows("hermes", "/tmp", "test-hermes-win", &env, &[], false)
+                .unwrap();
+        let content = std::fs::read_to_string(&script).unwrap();
+
+        assert!(
+            content.contains("Env:HERMES_SESSION_ID"),
+            "PowerShell script must scrub Env:HERMES_SESSION_ID"
+        );
+        assert!(
+            content.contains("Env:HERMES_SESSION_KEY"),
+            "PowerShell script must scrub Env:HERMES_SESSION_KEY"
+        );
+        assert!(
+            content.contains("Env:HERMES_CRON_SESSION"),
+            "PowerShell script must scrub Env:HERMES_CRON_SESSION"
+        );
+
+        let sidecar_path = content
+            .split("Test-Path '")
+            .nth(1)
+            .and_then(|s| s.split('\'').next())
+            .expect("PowerShell runner script should dot-source a sidecar env file");
+        let sidecar = std::fs::read_to_string(sidecar_path).unwrap();
+
+        assert!(
+            !sidecar.contains("HERMES_SESSION_ID"),
+            "Windows sidecar must not leak HERMES_SESSION_ID"
+        );
+        assert!(
+            !sidecar.contains("HERMES_SESSION_KEY"),
+            "Windows sidecar must not leak HERMES_SESSION_KEY"
+        );
+        assert!(
+            !sidecar.contains("HERMES_CRON_SESSION"),
+            "Windows sidecar must not leak HERMES_CRON_SESSION"
+        );
+        assert!(sidecar.contains("HERMES_HOME"));
+        assert!(sidecar.contains("HERMES_API_KEY"));
+
+        std::fs::remove_file(&script).ok();
+        std::fs::remove_file(sidecar_path).ok();
     }
 
     #[test]

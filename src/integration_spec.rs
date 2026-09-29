@@ -345,6 +345,40 @@ const HERMES_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom r <name>", "resume a stopped Hermes session"),
 ];
 
+// Hermes child processes inherit per-session ContextVar state from terminal
+// command injection (tools/environments/local.py _inject_session_context_env
+// and gateway/session_context.py _VAR_MAP). Strip all per-session markers so
+// same-tool children start with clean session state, while preserving
+// HERMES_HOME, credentials, and persistent configuration.
+const HERMES_INSTANCE_STATE_ENV: &[&str] = &[
+    "HERMES_SESSION_ID",
+    "HERMES_SESSION_KEY",
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_SOURCE",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_CHAT_TYPE",
+    "HERMES_SESSION_CHAT_NAME",
+    "HERMES_SESSION_THREAD_ID",
+    "HERMES_SESSION_USER_ID",
+    "HERMES_SESSION_USER_ID_ALT",
+    "HERMES_SESSION_USER_NAME",
+    "HERMES_SESSION_SCOPE_ID",
+    "HERMES_UI_SESSION_ID",
+    "HERMES_SESSION_MESSAGE_ID",
+    "HERMES_SESSION_PROFILE",
+    "HERMES_SESSION_PARENT_CHAT_ID",
+    "HERMES_SESSION_ASYNC_DELIVERY",
+    "HERMES_SESSION_HISTORY_DELIVERY",
+    "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+    "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+    "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+    "HERMES_CRON_SESSION",
+    "HERMES_KANBAN_TASK",
+    "HERMES_DELEGATED_CHILD_CONTEXT",
+    "HERMES_BROWSER_CONTROL_PRINCIPAL",
+    "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY",
+];
+
 // ── Help examples / extra-env tables ────────────────────────────────────
 
 const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[
@@ -1103,16 +1137,20 @@ pub static HERMES: IntegrationSpec = IntegrationSpec {
     tui_prefix: "hrm ",
     adhoc_icon: None,
     released: true,
-    // Hermes's Ink TUI renders its input area with a "?" hint on startup
-    // (e.g. "? for shortcuts" variants). Left broad on purpose: readiness
-    // also flows from the plugin binding (launch_ready_on_plugin_bind).
-    ready_pattern: b"? ",
+    // Hermes renders its prompt with a "❯ " glyph (\u{276f} ) on startup in
+    // both its modern Ink TUI and classic prompt_toolkit REPL (or "> " in
+    // termux mode). Readiness also flows from the plugin binding
+    // (launch_ready_on_plugin_bind).
+    ready_pattern: "\u{276f} ".as_bytes(),
     pty: PtySpec {
         delivery_start_timeout_secs: 30,
     },
-    // Hermes sessions are identified by their session store, not ambient
-    // instance-state env vars; nothing same-tool-instance specific to strip.
-    instance_state_env: &[],
+    // Hermes child processes inherit per-session ContextVar state from terminal
+    // command injection (tools/environments/local.py _inject_session_context_env
+    // and gateway/session_context.py _VAR_MAP). Strip all per-session markers so
+    // same-tool children start with clean session state, while preserving
+    // HERMES_HOME, credentials, and persistent configuration.
+    instance_state_env: HERMES_INSTANCE_STATE_ENV,
     hooks: HooksSpec {
         names: HERMES_HOOKS,
         shared_hooks_with: None,
@@ -1292,11 +1330,34 @@ mod tests {
             Tool::Copilot,
             Tool::Pi,
             Tool::Omp,
+            Tool::Hermes,
             Tool::Adhoc,
         ] {
             let spec = tool.spec();
             assert_eq!(spec.tool, tool, "spec.tool mismatch for {tool:?}");
         }
+    }
+
+    #[test]
+    fn hermes_spec_launch_parity() {
+        assert_eq!(HERMES.tool, Tool::Hermes);
+        assert_eq!(HERMES.name, "hermes");
+        assert_eq!(HERMES.cli_binary, "hermes");
+        assert_eq!(HERMES.ready_pattern, "\u{276f} ".as_bytes());
+        assert_eq!(HERMES.instance_state_env, HERMES_INSTANCE_STATE_ENV);
+        assert!(HERMES.instance_state_env.contains(&"HERMES_SESSION_ID"));
+        assert!(HERMES.instance_state_env.contains(&"HERMES_SESSION_KEY"));
+        assert_eq!(HERMES.launch.config_dir_env, Some("HERMES_HOME"));
+        assert_eq!(HERMES.launch.args_env, Some("HCOM_HERMES_ARGS"));
+        assert!(HERMES.launch.uses_pty_default);
+        assert!(HERMES.gates.launch_ready_on_plugin_bind);
+        assert!(matches!(
+            HERMES.launch.initial_prompt,
+            InitialPromptShape::SubcommandFlag {
+                sub: "chat",
+                flag: "-q"
+            }
+        ));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::shared::ansi::{BOLD, DIM, FG_CYAN, RESET};
 use crate::shared::{
     CommandContext, HcomError, ST_ACTIVE, ST_INACTIVE, SenderKind, status_fg, status_icon,
 };
+use crate::tool::Tool;
 
 /// Commands that should NOT trigger hookless status update.
 /// Handled internally or are lifecycle commands.
@@ -31,6 +32,7 @@ const STATUS_SKIP_COMMANDS: &[&str] = &["listen", "start", "stop", "kill", "rese
 /// Returns `Err` when an explicit `--name` fails to resolve — the error
 /// propagates to the caller (printed + exit 1).
 /// Without explicit name, resolution errors are swallowed (best-effort).
+#[allow(clippy::too_many_arguments)]
 pub fn build_ctx_for_command(
     db: &HcomDb,
     cmd: Option<&str>,
@@ -38,6 +40,8 @@ pub fn build_ctx_for_command(
     go: bool,
     process_id: Option<&str>,
     codex_thread_id: Option<&str>,
+    hermes_session_id: Option<&str>,
+    detected_tool: Tool,
 ) -> Result<CommandContext, HcomError> {
     let verified_actor = claude_actor::resolve_env_actor(db)?;
     if let (Some(actor), Some(name)) = (verified_actor.as_ref(), explicit_name) {
@@ -63,7 +67,29 @@ pub fn build_ctx_for_command(
         }
     } else {
         // No explicit name: best-effort, swallow errors
-        identity::resolve_identity(db, None, None, None, process_id, codex_thread_id, None).ok()
+        identity::resolve_identity(db, None, None, None, process_id, codex_thread_id, None)
+            .ok()
+            // Ordinary Hermes attribution: Hermes exports HERMES_SESSION_ID
+            // into terminal subprocesses. Applied only as the LAST resort —
+            // explicit --name and HCOM_PROCESS_ID keep precedence (a present
+            // process id owns resolution entirely, including its expiry
+            // error), and never for `start`, which rebinds and deletes the
+            // identity it sees. Gated on the env-detected tool being Hermes
+            // so a foreign tool nested inside a Hermes terminal (which
+            // inherits the marker) can never be misattributed to the parent
+            // Hermes session. The lookup itself is read-only: it resolves
+            // only an existing hermes-owned binding and adopts nothing.
+            .or_else(|| {
+                if cmd == Some("start")
+                    || process_id.is_some_and(|p| !p.is_empty())
+                    || detected_tool != Tool::Hermes
+                {
+                    return None;
+                }
+                hermes_session_id
+                    .filter(|s| !s.is_empty())
+                    .and_then(|sid| identity::resolve_hermes_session_identity(db, sid))
+            })
     };
 
     Ok(CommandContext {
@@ -558,12 +584,32 @@ mod tests {
             .unwrap();
     }
 
+    fn insert_session_binding(db: &HcomDb, session_id: &str, instance_name: &str) {
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO session_bindings (session_id, instance_name, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![session_id, instance_name, now],
+            )
+            .unwrap();
+    }
+
     // ── build_ctx_for_command tests ──
 
     #[test]
     fn test_build_ctx_no_identity() {
         let (db, _dir) = make_test_db();
-        let ctx = build_ctx_for_command(&db, Some("list"), None, false, None, None).unwrap();
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("list"),
+            None,
+            false,
+            None,
+            None,
+            None,
+            Tool::Adhoc,
+        )
+        .unwrap();
         assert!(ctx.identity.is_none());
         assert!(ctx.explicit_name.is_none());
         assert!(!ctx.go);
@@ -573,8 +619,17 @@ mod tests {
     fn test_build_ctx_with_name() {
         let (db, _dir) = make_test_db();
         insert_instance(&db, "luna", "claude");
-        let ctx =
-            build_ctx_for_command(&db, Some("send"), Some("luna"), false, None, None).unwrap();
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some("luna"),
+            false,
+            None,
+            None,
+            None,
+            Tool::Adhoc,
+        )
+        .unwrap();
         assert!(ctx.identity.is_some());
         assert_eq!(ctx.identity.as_ref().unwrap().name, "luna");
         assert_eq!(ctx.explicit_name.as_deref(), Some("luna"));
@@ -584,8 +639,17 @@ mod tests {
     fn test_build_ctx_start_skips_name_resolution() {
         let (db, _dir) = make_test_db();
         insert_instance(&db, "luna", "claude");
-        let ctx =
-            build_ctx_for_command(&db, Some("start"), Some("luna"), false, None, None).unwrap();
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("start"),
+            Some("luna"),
+            false,
+            None,
+            None,
+            None,
+            Tool::Adhoc,
+        )
+        .unwrap();
         // start skips name resolution
         assert!(ctx.identity.is_none());
         assert_eq!(ctx.explicit_name.as_deref(), Some("luna"));
@@ -596,8 +660,17 @@ mod tests {
         let (db, _dir) = make_test_db();
         insert_instance(&db, "luna", "claude");
         insert_process_binding(&db, "pid-1", "luna");
-        let ctx =
-            build_ctx_for_command(&db, Some("send"), None, false, Some("pid-1"), None).unwrap();
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            None,
+            false,
+            Some("pid-1"),
+            None,
+            None,
+            Tool::Adhoc,
+        )
+        .unwrap();
         assert!(ctx.identity.is_some());
         assert_eq!(ctx.identity.as_ref().unwrap().name, "luna");
     }
@@ -605,7 +678,9 @@ mod tests {
     #[test]
     fn test_build_ctx_go_flag() {
         let (db, _dir) = make_test_db();
-        let ctx = build_ctx_for_command(&db, Some("stop"), None, true, None, None).unwrap();
+        let ctx =
+            build_ctx_for_command(&db, Some("stop"), None, true, None, None, None, Tool::Adhoc)
+                .unwrap();
         assert!(ctx.go);
     }
 
@@ -613,7 +688,16 @@ mod tests {
     fn test_build_ctx_invalid_name_returns_error() {
         let (db, _dir) = make_test_db();
         // "garbage" doesn't exist — explicit --name must propagate error
-        let result = build_ctx_for_command(&db, Some("send"), Some("garbage"), false, None, None);
+        let result = build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some("garbage"),
+            false,
+            None,
+            None,
+            None,
+            Tool::Adhoc,
+        );
         assert!(result.is_err());
     }
 
@@ -621,9 +705,231 @@ mod tests {
     fn test_build_ctx_invalid_name_not_swallowed_by_gate() {
         let (db, _dir) = make_test_db();
         // Explicit --name that fails resolution → error before gate is reached
-        let result = build_ctx_for_command(&db, Some("send"), Some("garbage"), false, None, None);
+        let result = build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some("garbage"),
+            false,
+            None,
+            None,
+            None,
+            Tool::Adhoc,
+        );
         assert!(result.is_err());
         // Gate should never see this case because build_ctx_for_command fails first
+    }
+
+    // ── ordinary Hermes attribution tests ──
+
+    fn insert_hermes(db: &HcomDb, name: &str, session_id: &str) {
+        insert_instance(db, name, "hermes");
+        insert_session_binding(db, session_id, name);
+    }
+
+    #[test]
+    fn test_build_ctx_hermes_session_resolves_identity() {
+        let (db, _dir) = make_test_db();
+        insert_hermes(&db, "tapa", "hermes-ses-1");
+
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            None,
+            false,
+            None,
+            None,
+            Some("hermes-ses-1"),
+            Tool::Hermes,
+        )
+        .unwrap();
+        let identity = ctx.identity.as_ref().expect("hermes session attributed");
+        assert_eq!(identity.name, "tapa");
+        assert_eq!(identity.session_id.as_deref(), Some("hermes-ses-1"));
+        // A hermes row is a participant: the identity gate must pass.
+        assert!(check_identity_gate("send", &ctx, false, true).is_ok());
+    }
+
+    #[test]
+    fn test_build_ctx_hermes_session_stale_fails_safe() {
+        let (db, _dir) = make_test_db();
+        insert_hermes(&db, "tapa", "hermes-ses-1");
+
+        // Unknown and empty session ids resolve no identity (no panic, no row).
+        for sid in ["hermes-unknown", ""] {
+            let ctx = build_ctx_for_command(
+                &db,
+                Some("send"),
+                None,
+                false,
+                None,
+                None,
+                Some(sid),
+                Tool::Hermes,
+            )
+            .unwrap();
+            assert!(ctx.identity.is_none(), "sid {sid:?} must not resolve");
+        }
+    }
+
+    #[test]
+    fn test_build_ctx_hermes_session_refuses_foreign_rows() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "luna", "claude");
+        insert_session_binding(&db, "claude-ses", "luna");
+
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            None,
+            false,
+            None,
+            None,
+            Some("claude-ses"),
+            Tool::Adhoc,
+        )
+        .unwrap();
+        assert!(ctx.identity.is_none(), "another tool's row is not ours");
+    }
+
+    #[test]
+    fn test_build_ctx_explicit_name_beats_hermes_session() {
+        let (db, _dir) = make_test_db();
+        insert_hermes(&db, "tapa", "hermes-ses-1");
+        insert_instance(&db, "luna", "claude");
+
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some("luna"),
+            false,
+            None,
+            None,
+            Some("hermes-ses-1"),
+            Tool::Hermes,
+        )
+        .unwrap();
+        assert_eq!(ctx.identity.as_ref().unwrap().name, "luna");
+    }
+
+    #[test]
+    fn test_build_ctx_process_binding_beats_hermes_session() {
+        let (db, _dir) = make_test_db();
+        insert_hermes(&db, "tapa", "hermes-ses-1");
+        insert_instance(&db, "luna", "claude");
+        insert_process_binding(&db, "pid-1", "luna");
+
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            None,
+            false,
+            Some("pid-1"),
+            None,
+            Some("hermes-ses-1"),
+            Tool::Hermes,
+        )
+        .unwrap();
+        assert_eq!(ctx.identity.as_ref().unwrap().name, "luna");
+    }
+
+    #[test]
+    fn test_build_ctx_expired_process_id_blocks_hermes_fallback() {
+        let (db, _dir) = make_test_db();
+        insert_hermes(&db, "tapa", "hermes-ses-1");
+
+        // A present-but-unbound process id keeps precedence INCLUDING its
+        // failure: the hermes env must not silently take over resolution.
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            None,
+            false,
+            Some("pid-expired"),
+            None,
+            Some("hermes-ses-1"),
+            Tool::Hermes,
+        )
+        .unwrap();
+        assert!(ctx.identity.is_none());
+        assert!(check_identity_gate("send", &ctx, false, true).is_err());
+    }
+
+    #[test]
+    fn test_build_ctx_start_never_uses_hermes_session() {
+        let (db, _dir) = make_test_db();
+        insert_hermes(&db, "tapa", "hermes-ses-1");
+
+        // `start` rebinds and deletes the identity it resolves; the hermes
+        // env must never feed it (the bound row must survive untouched).
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("start"),
+            None,
+            false,
+            None,
+            None,
+            Some("hermes-ses-1"),
+            Tool::Hermes,
+        )
+        .unwrap();
+        assert!(ctx.identity.is_none());
+        assert_eq!(
+            db.get_session_binding("hermes-ses-1").unwrap().as_deref(),
+            Some("tapa")
+        );
+    }
+
+    #[test]
+    fn test_build_ctx_nested_foreign_tool_never_attributed_to_hermes() {
+        let (db, _dir) = make_test_db();
+        insert_hermes(&db, "tapa", "hermes-ses-1");
+
+        // A Codex/Claude nested inside a Hermes terminal inherits
+        // HERMES_SESSION_ID but carries its own stronger marker: its
+        // commands must not be attributed to the parent Hermes session,
+        // even when the nested tool's own identity has not resolved.
+        for tool_str in ["codex", "claude"] {
+            let tool: Tool = tool_str.parse().unwrap();
+            let ctx = build_ctx_for_command(
+                &db,
+                Some("send"),
+                None,
+                false,
+                None,
+                None,
+                Some("hermes-ses-1"),
+                tool,
+            )
+            .unwrap();
+            assert!(
+                ctx.identity.is_none(),
+                "{tool_str} nested in hermes must not inherit the hermes identity"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hermes_identity_is_not_hookless() {
+        let (db, _dir) = make_test_db();
+        insert_hermes(&db, "tapa", "hermes-ses-1");
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            None,
+            false,
+            None,
+            None,
+            Some("hermes-ses-1"),
+            Tool::Hermes,
+        )
+        .unwrap();
+
+        // The plugin owns hermes status via hermes-status; a CLI command
+        // must not churn it.
+        set_hookless_command_status(&db, "send", &ctx);
+        let row = db.get_instance_full("tapa").unwrap().unwrap();
+        assert_eq!(row.status, "active", "status untouched (INSERT value)");
+        assert_eq!(row.status_context, "");
     }
 
     // ── check_identity_gate tests ──

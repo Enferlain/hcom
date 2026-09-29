@@ -106,7 +106,7 @@ impl Tool {
             }
             Tool::Pi => crate::hooks::pi::verify_pi_plugin_installed(),
             Tool::Omp => crate::hooks::omp::verify_omp_plugin_installed(),
-            Tool::Hermes => crate::hooks::hermes::verify_hermes_plugin_installed(),
+            Tool::Hermes => crate::hooks::hermes::verify_hermes_plugin_ready(),
             Tool::Adhoc => false,
         }
     }

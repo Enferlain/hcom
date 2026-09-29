@@ -12,9 +12,19 @@
 //!   DELIVERED batch — the batch is capped, so it can lag the newest
 //!   unread event), `--check` (`{"has_unread": bool}`), and
 //!   `--ack [--up-to ID]` (`{"acked_to": id}` / `{"acked": n}`; acks are
-//!   monotonic — the cursor never moves backwards).
+//!   monotonic — the cursor never moves backwards, and acking the
+//!   empty-inbox cursor 0 is a no-op, not an error).
 //! - `hermes-beforetool` — record tool activity into the event stream.
 //! - `hermes-stop` — finalize (or `--soft`-finalize) the instance.
+//!
+//! Every write RPC (`hermes-status`, `hermes-read` in ack mode,
+//! `hermes-stop`) requires `--name` to resolve to an existing hermes-owned
+//! instance row and answers a JSON error otherwise: an unknown name must not
+//! emit status events for a nonexistent instance or claim an ack that no row
+//! recorded, and a row owned by another tool is not the Hermes plugin's to
+//! touch. Reads of an unknown name stay permissive (empty inbox);
+//! `hermes-beforetool` always allows — it only skips bookkeeping for names
+//! that are not hers.
 
 use std::time::Instant;
 
@@ -77,6 +87,18 @@ fn instance_name_from_env(ctx: &HcomContext) -> Option<String> {
         .get("HCOM_INSTANCE_NAME")
         .filter(|s| !s.is_empty())
         .cloned()
+}
+
+/// The argv RPCs are the Hermes plugin's private channel: a `--name` must
+/// resolve to an existing hermes-owned row before any write. `set_status`
+/// still emits a status event when its UPDATE touches no row, so an unknown
+/// name would otherwise log ghost events into the shared stream, and a name
+/// owned by another tool would let the plugin overwrite or finalize it.
+fn is_hermes_instance(db: &HcomDb, name: &str) -> bool {
+    db.get_instance_full(name)
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.tool == "hermes")
 }
 
 fn bootstrap_for(ctx: &HcomContext, db: &HcomDb, instance_name: &str) -> String {
@@ -206,13 +228,29 @@ fn adopt_ordinary_hermes_instance(
 fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String) {
     // Plugin RPC returns JSON errors on exit 0 so the plugin can handle
     // setup failures without Hermes treating the subprocess as failed.
-    let session_id = match parse_flag(argv, "--session-id") {
+    let session_id = match parse_flag(argv, "--session-id").filter(|s| !s.is_empty()) {
         Some(sid) => sid,
         None => return (0, r#"{"error":"Missing --session-id"}"#.to_string()),
     };
-    let transcript_path = parse_flag(argv, "--transcript-path");
+    let transcript_path = parse_flag(argv, "--transcript-path")
+        .filter(|p| !p.is_empty())
+        .or_else(|| {
+            crate::transcript::hermes::resolve_hermes_db_path_from_env(&ctx.raw_env)
+                .map(|p| p.to_string_lossy().to_string())
+        });
     let cwd = parse_flag(argv, "--cwd");
-    let notify_port: Option<u16> = parse_flag(argv, "--notify-port").and_then(|s| s.parse().ok());
+    let notify_port: Option<u16> =
+        parse_flag(argv, "--notify-port").and_then(|raw| match raw.parse::<u16>() {
+            Ok(port) => Some(port),
+            Err(_) => {
+                log_warn(
+                    "hooks",
+                    "hermes-sessionstart.invalid_notify_port",
+                    &format!("ignoring unparseable --notify-port {raw:?}"),
+                );
+                None
+            }
+        });
 
     let instance_name = if let Some(process_id) = ctx.process_id.as_deref() {
         instance_binding::bind_session_to_process(db, &session_id, Some(process_id)).or_else(|| {
@@ -303,6 +341,12 @@ fn handle_status(db: &HcomDb, argv: &[String]) -> (i32, String) {
     };
     let context = parse_flag(argv, "--context").unwrap_or_default();
     let detail = parse_flag(argv, "--detail").unwrap_or_default();
+    if !is_hermes_instance(db, &name) {
+        return (
+            0,
+            serde_json::json!({"error": format!("Unknown Hermes instance: {name}")}).to_string(),
+        );
+    }
     let was_listening = db
         .get_instance_full(&name)
         .ok()
@@ -333,6 +377,23 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
     let format_mode = has_flag(argv, "--format");
     let check_mode = has_flag(argv, "--check");
     let ack_mode = has_flag(argv, "--ack");
+
+    // An existing row that is not a hermes instance is another tool's
+    // mailbox: refuse every mode rather than read or ack it. A missing row
+    // stays permissive for reads (documented empty inbox), but acks below
+    // additionally require a real row — `update_instance_fields` is
+    // UPDATE-only, so acking a missing row would claim a cursor no row kept.
+    if db
+        .get_instance_full(&name)
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.tool != "hermes")
+    {
+        return (
+            0,
+            serde_json::json!({"error": format!("Not a Hermes instance: {name}")}).to_string(),
+        );
+    }
 
     let raw_messages = db.get_unread_messages(&name);
     let messages: Vec<Value> = raw_messages.iter().map(common::message_to_value).collect();
@@ -365,6 +426,15 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
         );
     }
     if ack_mode {
+        // Acks write a cursor: require a real hermes row. Without one the
+        // UPDATE below would touch nothing while the reply claimed success.
+        if !is_hermes_instance(db, &name) {
+            return (
+                0,
+                serde_json::json!({"error": format!("Unknown Hermes instance: {name}")})
+                    .to_string(),
+            );
+        }
         if let Some(up_to) = parse_flag(argv, "--up-to") {
             let Ok(ack_id) = up_to.parse::<i64>() else {
                 return (
@@ -372,14 +442,15 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
                     serde_json::json!({"error": format!("Invalid --up-to: {up_to}")}).to_string(),
                 );
             };
-            if ack_id <= 0 {
+            if ack_id < 0 {
                 return (
                     0,
                     serde_json::json!({"error": format!("Invalid --up-to: {up_to}")}).to_string(),
                 );
             }
             // Monotonic: the cursor never moves backwards, so a late/duplicate
-            // ack for an older batch cannot re-mark newer messages unread.
+            // ack for an older batch cannot re-mark newer messages unread —
+            // including the empty-inbox cursor 0 that `--format` reports.
             let current = db
                 .get_instance_full(&name)
                 .ok()
@@ -447,7 +518,9 @@ fn handle_beforetool(db: &HcomDb, argv: &[String]) -> (i32, String) {
     let input = parse_flag(argv, "--input-json")
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .unwrap_or_else(|| serde_json::json!({}));
-    if !tool_name.is_empty() {
+    // The allow decision is unconditional; bookkeeping is skipped for names
+    // that are not ours so a stray --name cannot ghost-log tool events.
+    if !tool_name.is_empty() && is_hermes_instance(db, &name) {
         common::update_tool_status(db, &name, "hermes", &tool_name, &input);
     }
     (0, r#"{"decision":"allow"}"#.to_string())
@@ -459,6 +532,12 @@ fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
         None => return (0, r#"{"error":"Missing --name"}"#.to_string()),
     };
     let reason = parse_flag(argv, "--reason").unwrap_or_else(|| "unknown".to_string());
+    if !is_hermes_instance(db, &name) {
+        return (
+            0,
+            serde_json::json!({"error": format!("Unknown Hermes instance: {name}")}).to_string(),
+        );
+    }
     if has_flag(argv, "--soft") {
         common::soft_finalize_session(db, &name, &reason, None, true);
         (0, r#"{"ok":true,"soft":true}"#.to_string())
@@ -540,23 +619,34 @@ fn current_home_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
 }
 
-/// User plugins live at `<hermes home>/plugins` (hermes_cli/plugins_discovery).
-/// `HERMES_HOME` IS the hermes home itself (like `~/.hermes`), not its parent —
-/// honor it verbatim so installs never duplicate `.hermes` inside a custom
-/// home. Without it, fall back to the default home, isolating under the tool
-/// config root when hcom runs against an isolated workspace (mirroring the
-/// launcher's `isolated_tool_config_dir` choice of `<root>/.hermes`).
-fn hermes_plugin_root() -> std::path::PathBuf {
+/// The hermes home itself (like `~/.hermes`). `HERMES_HOME` IS the home, not
+/// its parent — honor it verbatim so a custom home never duplicates `.hermes`
+/// inside itself. Without it, fall back to the default home, isolating under
+/// the tool config root when hcom runs against an isolated workspace
+/// (mirroring the launcher's `isolated_tool_config_dir` choice of
+/// `<root>/.hermes`). Hermes resolves `<home>/config.yaml` and
+/// `<home>/plugins` from the same root (hermes_cli config.get_config_path /
+/// plugins_discovery).
+fn hermes_home_dir() -> std::path::PathBuf {
     if let Some(home) = std::env::var("HERMES_HOME").ok().filter(|s| !s.is_empty()) {
-        return std::path::PathBuf::from(home).join("plugins");
+        return std::path::PathBuf::from(home);
     }
     let tool_root = crate::runtime_env::tool_config_root();
     let home = current_home_dir();
     if tool_root == home {
-        home.join(".hermes").join("plugins")
+        home.join(".hermes")
     } else {
-        tool_root.join(".hermes").join("plugins")
+        tool_root.join(".hermes")
     }
+}
+
+/// User plugins live at `<hermes home>/plugins` (hermes_cli/plugins_discovery).
+fn hermes_plugin_root() -> std::path::PathBuf {
+    hermes_home_dir().join("plugins")
+}
+
+fn hermes_config_path() -> std::path::PathBuf {
+    hermes_home_dir().join("config.yaml")
 }
 
 pub fn get_hermes_plugin_path() -> std::path::PathBuf {
@@ -565,9 +655,331 @@ pub fn get_hermes_plugin_path() -> std::path::PathBuf {
         .join("plugin.yaml")
 }
 
+/// External plugin files present under `<hermes home>/plugins/hcom`.
 pub fn verify_hermes_plugin_installed() -> bool {
     let dir = hermes_plugin_root().join(PLUGIN_DIR_NAME);
     dir.join("__init__.py").is_file() && dir.join("plugin.yaml").is_file()
+}
+
+/// Hermes `HERMES_SAFE_MODE` truthy values — exactly hermes_cli's
+/// `utils.TRUTHY_STRINGS` ({"1", "true", "yes", "on"}, stripped + lowercased,
+/// per `env_var_enabled`/`is_truthy_value`); when active Hermes suppresses
+/// ALL plugin loading.
+fn hermes_safe_mode_active() -> bool {
+    std::env::var("HERMES_SAFE_MODE")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Extract the plugin name sets from the top-level `plugins:` block of a
+/// Hermes config.yaml.
+///
+/// Deliberately a subset parser, not a YAML implementation: the installed
+/// Hermes CLI answers authoritatively via `hermes plugins list --enabled
+/// --user --json` (~1.2s, see the probe below), so this parser only serves
+/// as the fallback when the CLI cannot answer (no binary, version skew,
+/// timeout) — hcom carries no YAML dependency for that niche. Hermes itself
+/// writes this file via yaml dump, so the supported forms are the ones its
+/// dumper emits (and the parser accepts both styles):
+/// - block lists with items one level deeper than the key (observed config)
+///   or at the key's own indent (PyYAML default style);
+/// - inline flow lists (`enabled: [a, 'b']`) incl. quoted entries;
+/// - comments and nested subblocks (e.g. `plugins.entries.*`) are skipped.
+///
+/// Unsupported YAML (aliases, multiline scalars) can only ever yield a name
+/// that differs from `hcom`, so it cannot false-positive "enabled". Returns
+/// None when the block or the lists are missing/malformed — Hermes treats a
+/// missing allow-list as "nothing enabled" (opt-in default), so callers fail
+/// safe to not-ready, and the suggested remediation
+/// (`hermes plugins enable hcom`) is idempotent.
+fn parse_hermes_plugin_lists(config_text: &str) -> Option<(Vec<String>, Vec<String>)> {
+    fn unquote(item: &str) -> String {
+        let item = item.trim();
+        let stripped = item.strip_prefix(['"', '\'']).unwrap_or(item);
+        stripped
+            .strip_suffix(['"', '\''])
+            .unwrap_or(stripped)
+            .to_string()
+    }
+    fn flow_list(rest: &str) -> Option<Vec<String>> {
+        let inner = rest.strip_prefix('[')?.strip_suffix(']')?;
+        Some(
+            inner
+                .split(',')
+                .map(unquote)
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    enum List {
+        Enabled,
+        Disabled,
+    }
+
+    let mut enabled: Option<Vec<String>> = None;
+    let mut disabled: Option<Vec<String>> = None;
+    let mut in_plugins = false;
+    let mut key_indent: Option<usize> = None;
+    let mut collecting: Option<List> = None;
+
+    for raw in config_text.lines() {
+        if raw.trim().is_empty() || raw.trim_start().starts_with('#') {
+            continue;
+        }
+        let indent = raw.len() - raw.trim_start().len();
+        let body = raw.trim_start();
+
+        if !in_plugins {
+            if indent == 0 && body == "plugins:" {
+                in_plugins = true;
+            }
+            continue;
+        }
+        // Leaving the plugins block (a new top-level key).
+        if indent == 0 {
+            in_plugins = false;
+            collecting = None;
+            continue;
+        }
+        // First key inside the block fixes the child indentation level.
+        let key_level = *key_indent.get_or_insert(indent);
+        if indent < key_level {
+            // Deeper-nested subblock (e.g. plugins.entries.hcom) — skip.
+            continue;
+        }
+        // List items may sit at the key's indent (PyYAML default block
+        // style) or one level deeper (Hermes's indented dumps).
+        if let Some(item) = body.strip_prefix("- ") {
+            if let Some(which) = collecting {
+                let list = match which {
+                    List::Enabled => &mut enabled,
+                    List::Disabled => &mut disabled,
+                };
+                list.get_or_insert_with(Vec::new).push(unquote(item));
+            }
+            continue;
+        }
+        if indent > key_level {
+            // A deeper NON-item line turns the enclosing key into a mapping,
+            // not a name list (e.g. `enabled:` holding `nested: [- hcom]`).
+            // Stop collecting so items under a sub-key can never leak in as
+            // allow-list names — Hermes itself treats a non-list `enabled`
+            // as "nothing enabled".
+            collecting = None;
+            continue;
+        }
+        // Key line at child level: ends any list being collected.
+        collecting = None;
+        let (key, rest) = body.split_once(':')?;
+        let rest = rest.trim();
+        match key.trim() {
+            "enabled" => {
+                if rest.is_empty() {
+                    collecting = Some(List::Enabled);
+                } else {
+                    enabled = flow_list(rest);
+                }
+            }
+            "disabled" => {
+                if rest.is_empty() {
+                    collecting = Some(List::Disabled);
+                } else {
+                    disabled = flow_list(rest);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // A malformed/missing enabled allow-list loads nothing in Hermes.
+    let enabled = enabled?;
+    let disabled = disabled.unwrap_or_default();
+    Some((enabled, disabled))
+}
+
+/// One evaluated readiness verdict with its diagnostic, produced by a
+/// single pass so a gate prints exactly what it checked: re-probing after
+/// a failed verdict could race a timeout and contradict the first answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HermesPluginReadiness {
+    pub ready: bool,
+    /// Empty when ready; otherwise an actionable, state-accurate message.
+    pub diagnostic: String,
+}
+
+fn not_ready(diagnostic: String) -> HermesPluginReadiness {
+    HermesPluginReadiness {
+        ready: false,
+        diagnostic,
+    }
+}
+
+/// Evaluate the full Hermes integration readiness ONCE: the external plugin
+/// files exist AND Hermes actually enables the plugin. Files alone are NOT
+/// ready — a present-but-disabled plugin never loads into Hermes.
+///
+/// Enabled-state mirrors hermes_cli/plugins.py loader semantics:
+/// `plugins.enabled` is an opt-in allow-list, `plugins.disabled` vetoes
+/// even when enabled, a missing or malformed allow-list loads nothing, and
+/// `HERMES_SAFE_MODE` suppresses all plugin loading. The installed Hermes
+/// CLI is the source of truth when available (it parses the real config
+/// with a real YAML loader and applies the loader's own semantics, so
+/// neither subset-parse false positives nor false negatives can flip the
+/// launch gate). The config.yaml subset parse is only a fallback for when
+/// the CLI cannot answer — no binary, version skew (no `--json`), or a
+/// hung command.
+pub fn evaluate_hermes_plugin_readiness() -> HermesPluginReadiness {
+    if hermes_safe_mode_active() {
+        return not_ready(
+            "HERMES_SAFE_MODE is set — Hermes suppresses all plugin loading. Unset it, then ensure the plugin is enabled: hermes plugins enable hcom"
+                .to_string(),
+        );
+    }
+    if !verify_hermes_plugin_installed() {
+        return not_ready(format!(
+            "Hermes plugin files are missing at {}. The plugin is managed outside hcom — install it with Hermes, then run: hermes plugins enable hcom",
+            get_hermes_plugin_path().display()
+        ));
+    }
+    match hermes_cli_reports_plugin_enabled() {
+        Some(true) => HermesPluginReadiness {
+            ready: true,
+            diagnostic: String::new(),
+        },
+        // The CLI answered: ground the text in its verdict (the reason may
+        // be the allow-list, a broken manifest, or anything else the loader
+        // itself weighs).
+        Some(false) => not_ready(
+            "Hermes does not report the hcom plugin as enabled (`hermes plugins list --enabled --user`). Run `hermes plugins enable hcom`, then restart Hermes."
+                .to_string(),
+        ),
+        // CLI unavailable (no binary / version skew / timeout): ground the
+        // verdict in the config fallback instead.
+        None => {
+            let parsed = std::fs::read_to_string(hermes_config_path())
+                .ok()
+                .and_then(|text| parse_hermes_plugin_lists(&text));
+            match parsed {
+                // Explicit deny-list entry is a positive extraction —
+                // trustworthy.
+                Some((_, disabled)) if disabled.iter().any(|n| n == PLUGIN_DIR_NAME) => not_ready(format!(
+                    "Hermes config has the hcom plugin explicitly disabled (plugins.disabled) in {}. Run `hermes plugins enable hcom`, then restart Hermes.",
+                    hermes_config_path().display()
+                )),
+                Some((enabled, _)) if enabled.iter().any(|n| n == PLUGIN_DIR_NAME) => {
+                    HermesPluginReadiness {
+                        ready: true,
+                        diagnostic: String::new(),
+                    }
+                }
+                Some(_) => not_ready(format!(
+                    "Hermes config has the hcom plugin not in the plugins.enabled allow-list in {}. Run `hermes plugins enable hcom`, then restart Hermes.",
+                    hermes_config_path().display()
+                )),
+                None => not_ready(format!(
+                    "Hermes config has the hcom plugin not enabled (no parsable plugins.enabled allow-list) in {}. Run `hermes plugins enable hcom`, then restart Hermes.",
+                    hermes_config_path().display()
+                )),
+            }
+        }
+    }
+}
+
+/// Full Hermes integration readiness as a plain bool (status tables and
+/// hook-state checks). Callers that need the diagnostic on failure must use
+/// [`evaluate_hermes_plugin_readiness`] so the verdict and the text come
+/// from ONE evaluation.
+pub fn verify_hermes_plugin_ready() -> bool {
+    evaluate_hermes_plugin_readiness().ready
+}
+
+/// Run `hermes plugins list --enabled --user --json` and capture stdout,
+/// killing the child after `timeout` (a hung CLI must never hang an hcom
+/// launch). Returns None on spawn failure, non-zero exit, timeout, or read
+/// error.
+fn run_hermes_json_probe(hermes_bin: &str, timeout: std::time::Duration) -> Option<String> {
+    use std::io::Read;
+    // Pin the child to the SAME home our config fallback reads: when
+    // HERMES_HOME is unset and hcom runs against an isolated workspace,
+    // hermes_home_dir() resolves to <root>/.hermes while a bare `hermes`
+    // would default to the real ~/.hermes and answer about a different
+    // config. (When HERMES_HOME is set, this re-sets the identical value.)
+    let home = hermes_home_dir();
+    let mut child = std::process::Command::new(hermes_bin)
+        .args(["plugins", "list", "--enabled", "--user", "--json"])
+        .env("HERMES_HOME", &home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Read concurrently: a JSON payload larger than the pipe buffer would
+    // otherwise deadlock against the poll loop below.
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        stdout.read_to_string(&mut buf).map(|_| buf).ok()
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return reader.join().ok().flatten(),
+            Ok(Some(_)) => return None,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Does the CLI's `plugins list` JSON report the hcom plugin as enabled?
+/// Pure so the schema expectations are unit-testable.
+fn hermes_plugin_listed_enabled(items: &[Value]) -> bool {
+    items.iter().any(|item| {
+        item.get("name").and_then(|v| v.as_str()) == Some(PLUGIN_DIR_NAME)
+            && item
+                .get("removed")
+                .is_none_or(|r| r.is_null() || r == &Value::Bool(false))
+            && item
+                .get("status")
+                .and_then(|v| v.as_str())
+                .is_none_or(|s| s == "enabled")
+    })
+}
+
+/// Authoritative enabled-check via the installed Hermes CLI (~1.2s Python
+/// startup; only reached after the plugin files exist, from human-paced
+/// paths — status display and launch gating). Returns None when the CLI
+/// cannot answer (no binary, non-zero exit, timeout, non-JSON stdout) so
+/// the caller falls back to the config parse. Version skew (a Hermes
+/// without `--json`) surfaces here and degrades gracefully.
+fn hermes_cli_reports_plugin_enabled() -> Option<bool> {
+    if cfg!(test) {
+        // Unit tests pin the config-parse fallback deterministically; the
+        // live probe depends on this machine's real Hermes state and is
+        // covered by end-to-end verification instead.
+        return None;
+    }
+    // Use the resolved binary path (Windows shim / non-PATH installs)
+    // rather than a bare name.
+    let hermes_bin = crate::terminal::which_bin("hermes")?;
+    let json = run_hermes_json_probe(&hermes_bin, std::time::Duration::from_secs(3))?;
+    let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&json) else {
+        return None;
+    };
+    Some(hermes_plugin_listed_enabled(&items))
 }
 
 #[cfg(test)]
@@ -705,9 +1117,13 @@ mod tests {
     }
 
     fn save_hermes_instance(db: &HcomDb, name: &str) {
+        save_instance_with_tool(db, name, "hermes");
+    }
+
+    fn save_instance_with_tool(db: &HcomDb, name: &str, tool: &str) {
         let mut row = serde_json::Map::new();
         row.insert("name".into(), serde_json::json!(name));
-        row.insert("tool".into(), serde_json::json!("hermes"));
+        row.insert("tool".into(), serde_json::json!(tool));
         row.insert("status".into(), serde_json::json!(ST_LISTENING));
         row.insert("status_context".into(), serde_json::json!(""));
         row.insert("status_detail".into(), serde_json::json!(""));
@@ -854,6 +1270,355 @@ mod tests {
         );
     }
 
+    // ── Write-path gating / cursor truthfulness tests ────────────────────
+
+    #[test]
+    fn write_paths_refuse_unknown_names_without_emitting_events() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "luna");
+        log_broadcast(&db, "sol", "seed");
+        let before = db.get_last_event_id();
+        assert!(before > 0, "baseline event exists");
+
+        let (_, out) = handle_status(
+            &db,
+            &argv_of(&["--name", "ghost", "--status", "active", "--context", "work"]),
+        );
+        assert!(
+            serde_json::from_str::<Value>(&out)
+                .unwrap()
+                .get("error")
+                .is_some(),
+            "status refuses an unknown name: {out}"
+        );
+        for args in [vec!["--name", "ghost"], vec!["--name", "ghost", "--soft"]] {
+            let (_, out) = handle_stop(&db, &argv_of(&args));
+            assert!(
+                serde_json::from_str::<Value>(&out)
+                    .unwrap()
+                    .get("error")
+                    .is_some(),
+                "stop refuses an unknown name: {out}"
+            );
+        }
+        let (_, out) = handle_read(&db, &argv_of(&["--name", "ghost", "--ack", "--up-to", "9"]));
+        assert!(
+            serde_json::from_str::<Value>(&out)
+                .unwrap()
+                .get("error")
+                .is_some(),
+            "ack refuses an unknown name instead of claiming success: {out}"
+        );
+        assert!(db.get_instance_full("ghost").unwrap().is_none());
+
+        // beforetool never blocks a tool, but a stray name logs nothing.
+        let (_, out) = handle_beforetool(
+            &db,
+            &argv_of(&["--name", "ghost", "--tool", "Bash", "--input-json", "{}"]),
+        );
+        assert_eq!(out, r#"{"decision":"allow"}"#);
+
+        // Reads of an unknown name stay permissive (documented empty inbox).
+        let (_, out) = handle_read(&db, &argv_of(&["--name", "ghost", "--check"]));
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["has_unread"].as_bool(),
+            Some(false)
+        );
+
+        assert_eq!(
+            db.get_last_event_id(),
+            before,
+            "no ghost status/life events may be emitted for unknown names"
+        );
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn write_paths_refuse_names_owned_by_other_tools() {
+        let (db, path) = setup_test_db();
+        save_instance_with_tool(&db, "other", "claude");
+        let e1 = log_broadcast(&db, "sol", "for other");
+
+        let (_, out) = handle_status(&db, &argv_of(&["--name", "other", "--status", "active"]));
+        assert!(
+            serde_json::from_str::<Value>(&out)
+                .unwrap()
+                .get("error")
+                .is_some(),
+            "status refuses a foreign-owned name: {out}"
+        );
+        let row = db.get_instance_full("other").unwrap().unwrap();
+        assert_eq!(row.status, ST_LISTENING, "foreign status untouched");
+        assert_eq!(row.status_context, "");
+
+        for args in [vec!["--name", "other"], vec!["--name", "other", "--soft"]] {
+            let (_, out) = handle_stop(&db, &argv_of(&args));
+            assert!(
+                serde_json::from_str::<Value>(&out)
+                    .unwrap()
+                    .get("error")
+                    .is_some(),
+                "stop refuses a foreign-owned name: {out}"
+            );
+        }
+        assert!(
+            db.get_instance_full("other").unwrap().is_some(),
+            "foreign row must not be finalized by the Hermes RPC"
+        );
+
+        // Another tool's mailbox is not readable or ackable either.
+        let up_to = e1.to_string();
+        for args in [
+            vec!["--name", "other", "--format"],
+            vec!["--name", "other", "--check"],
+            vec!["--name", "other", "--ack"],
+            vec!["--name", "other", "--ack", "--up-to", up_to.as_str()],
+        ] {
+            let (_, out) = handle_read(&db, &argv_of(&args));
+            assert!(
+                serde_json::from_str::<Value>(&out)
+                    .unwrap()
+                    .get("error")
+                    .is_some(),
+                "read/ack refuses a foreign-owned name: {out}"
+            );
+        }
+        assert_eq!(
+            db.get_instance_full("other")
+                .unwrap()
+                .unwrap()
+                .last_event_id,
+            0,
+            "foreign cursor untouched"
+        );
+
+        let (_, out) = handle_beforetool(&db, &argv_of(&["--name", "other", "--tool", "Bash"]));
+        assert_eq!(out, r#"{"decision":"allow"}"#);
+        assert_eq!(
+            db.get_instance_full("other").unwrap().unwrap().status,
+            ST_LISTENING,
+            "beforetool skips bookkeeping on foreign names"
+        );
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn status_transition_updates_row_and_emits_one_event() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "luna");
+        let before = db.get_last_event_id();
+        let (_, out) = handle_status(
+            &db,
+            &argv_of(&[
+                "--name",
+                "luna",
+                "--status",
+                "active",
+                "--context",
+                "tool:Bash",
+                "--detail",
+                "running",
+            ]),
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["ok"].as_bool(),
+            Some(true)
+        );
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.status, "active");
+        assert_eq!(row.status_context, "tool:Bash");
+        assert_eq!(row.status_detail, "running");
+        assert_eq!(
+            db.get_last_event_id(),
+            before + 1,
+            "exactly one status event"
+        );
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn ack_up_to_zero_is_monotonic_noop_not_error() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "luna");
+        // --format reports up_to 0 for an empty inbox; acking that cursor
+        // must be a clean no-op, not an error a plugin sees every idle read.
+        let (_, out) = handle_read(&db, &argv_of(&["--name", "luna", "--ack", "--up-to", "0"]));
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            doc.get("error").is_none(),
+            "zero cursor is not an error: {out}"
+        );
+        assert_eq!(doc["noop"].as_bool(), Some(true));
+
+        let _ = log_broadcast(&db, "sol", "one");
+        let e2 = log_broadcast(&db, "sol", "two");
+        let (_, out) = handle_read(
+            &db,
+            &argv_of(&["--name", "luna", "--ack", "--up-to", &e2.to_string()]),
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["acked_to"].as_i64(),
+            Some(e2)
+        );
+        // A late ack of the empty cursor cannot regress the advanced one.
+        let (_, out) = handle_read(&db, &argv_of(&["--name", "luna", "--ack", "--up-to", "0"]));
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        assert!(doc.get("error").is_none());
+        assert_eq!(doc["acked_to"].as_i64(), Some(e2));
+        assert_eq!(
+            db.get_instance_full("luna").unwrap().unwrap().last_event_id,
+            e2,
+            "cursor never regresses"
+        );
+        // Negative cursors stay invalid.
+        let (_, out) = handle_read(&db, &argv_of(&["--name", "luna", "--ack", "--up-to", "-3"]));
+        assert!(
+            serde_json::from_str::<Value>(&out)
+                .unwrap()
+                .get("error")
+                .is_some()
+        );
+        cleanup_db(&path);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn start_rejects_empty_session_id() {
+        use crate::hooks::test_helpers::isolated_test_env;
+        use std::collections::HashMap;
+
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let ctx = HcomContext::from_env(&HashMap::new(), home);
+        let (_, out) = handle_start(&ctx, &db, &argv_of(&["--session-id", ""]));
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["error"].as_str(),
+            Some("Missing --session-id")
+        );
+        assert_eq!(db.iter_instances_full().unwrap().len(), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ordinary_session_hard_stop_restart_creates_fresh_instance() {
+        use crate::hooks::test_helpers::isolated_test_env;
+        use std::collections::HashMap;
+
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let ctx = HcomContext::from_env(&HashMap::new(), home);
+        let argv = argv_of(&["--session-id", "ses-hard"]);
+        let (_, first) = handle_start(&ctx, &db, &argv);
+        let name1 = serde_json::from_str::<Value>(&first).unwrap()["name"]
+            .as_str()
+            .expect("ordinary session bound")
+            .to_string();
+
+        let (_, out) = handle_stop(&db, &argv_of(&["--name", &name1, "--reason", "done"]));
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap()["ok"].as_bool(),
+            Some(true)
+        );
+        assert!(
+            db.get_instance_full(&name1).unwrap().is_none(),
+            "hard stop deletes the row"
+        );
+        assert!(db.get_session_binding("ses-hard").unwrap().is_none());
+
+        // The stopped snapshot lives on in life events, but the adopt path
+        // must not resurrect a deleted row: a restart gets a fresh instance.
+        let (_, second) = handle_start(&ctx, &db, &argv);
+        let name2 = serde_json::from_str::<Value>(&second).unwrap()["name"]
+            .as_str()
+            .expect("session rebound")
+            .to_string();
+        assert_ne!(name2, name1);
+        assert_eq!(db.iter_instances_full().unwrap().len(), 1);
+        assert_eq!(
+            db.get_session_binding("ses-hard").unwrap().as_deref(),
+            Some(name2.as_str())
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn start_persists_transcript_path_and_directory() {
+        use crate::hooks::test_helpers::isolated_test_env;
+        use std::collections::HashMap;
+
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let db = HcomDb::open().unwrap();
+        let ctx = HcomContext::from_env(&HashMap::new(), workspace.clone());
+        let transcript = home.join("transcript.jsonl");
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&[
+                "--session-id",
+                "ses-meta",
+                "--transcript-path",
+                transcript.to_str().unwrap(),
+                "--cwd",
+                workspace.to_str().unwrap(),
+            ]),
+        );
+        let name = serde_json::from_str::<Value>(&out).unwrap()["name"]
+            .as_str()
+            .expect("ordinary session bound")
+            .to_string();
+        let row = db.get_instance_full(&name).unwrap().unwrap();
+        assert_eq!(row.tool, "hermes");
+        assert_eq!(row.session_id.as_deref(), Some("ses-meta"));
+        assert_eq!(row.transcript_path, transcript.to_str().unwrap());
+        assert_eq!(row.directory, workspace.to_str().unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn start_derives_transcript_path_from_hermes_home_when_unspecified() {
+        use crate::hooks::test_helpers::isolated_test_env;
+        use std::collections::HashMap;
+
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let profile_dir = home.join("custom_profile");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let state_db = profile_dir.join("state.db");
+        std::fs::write(&state_db, b"").unwrap();
+
+        let mut env = HashMap::new();
+        env.insert(
+            "HERMES_HOME".to_string(),
+            profile_dir.to_str().unwrap().to_string(),
+        );
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let db = HcomDb::open().unwrap();
+        let ctx = HcomContext::from_env(&env, workspace.clone());
+
+        // Call handle_start without --transcript-path
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&[
+                "--session-id",
+                "ses-derived",
+                "--cwd",
+                workspace.to_str().unwrap(),
+            ]),
+        );
+        let name = serde_json::from_str::<Value>(&out).unwrap()["name"]
+            .as_str()
+            .expect("ordinary session bound")
+            .to_string();
+        let row = db.get_instance_full(&name).unwrap().unwrap();
+        assert_eq!(row.tool, "hermes");
+        assert_eq!(row.session_id.as_deref(), Some("ses-derived"));
+        assert_eq!(row.transcript_path, state_db.to_str().unwrap());
+    }
+
     // ── Plugin root / HERMES_HOME tests ──────────────────────────────────
 
     #[test]
@@ -897,5 +1662,224 @@ mod tests {
             std::env::remove_var("HCOM_DIR");
         }
         assert_eq!(root, iso.join(".hermes").join("plugins"));
+    }
+
+    // ── Plugin readiness / config-enable tests ──────────────────────────
+
+    fn install_fake_hermes_plugin(home: &std::path::Path) {
+        let dir = home.join("plugins").join(PLUGIN_DIR_NAME);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("__init__.py"), "# test plugin\n").unwrap();
+        std::fs::write(dir.join("plugin.yaml"), "name: hcom\nversion: \"0.2.0\"\n").unwrap();
+    }
+
+    fn write_hermes_config(home: &std::path::Path, body: &str) {
+        std::fs::write(home.join("config.yaml"), body).unwrap();
+    }
+
+    /// Point the hermes home at `home` (custom-home coverage) and clear
+    /// safe mode. EnvGuard restores HERMES_HOME on drop.
+    fn hermes_home_guard(home: &std::path::Path) -> crate::hooks::test_helpers::EnvGuard {
+        let guard = crate::hooks::test_helpers::EnvGuard::new();
+        unsafe {
+            std::env::set_var("HERMES_HOME", home);
+            std::env::remove_var("HERMES_SAFE_MODE");
+        }
+        guard
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_ready_when_enabled_in_config() {
+        let temp = tempfile::tempdir().unwrap();
+        install_fake_hermes_plugin(temp.path());
+        write_hermes_config(
+            temp.path(),
+            "model:\n  default: glm\nplugins:\n  disabled: []\n  enabled:\n    - current-time\n    - hcom\nagent:\n  max_turns: 60\n",
+        );
+        let _guard = hermes_home_guard(temp.path());
+        assert!(verify_hermes_plugin_installed());
+        assert!(evaluate_hermes_plugin_readiness().ready);
+        assert!(verify_hermes_plugin_ready());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_not_ready_when_present_but_absent_from_allow_list() {
+        let temp = tempfile::tempdir().unwrap();
+        install_fake_hermes_plugin(temp.path());
+        write_hermes_config(
+            temp.path(),
+            "plugins:\n  disabled: []\n  enabled:\n    - current-time\n",
+        );
+        let _guard = hermes_home_guard(temp.path());
+        // Hermes plugins are opt-in: present files are NOT ready.
+        assert!(verify_hermes_plugin_installed());
+        let readiness = evaluate_hermes_plugin_readiness();
+        assert!(!readiness.ready);
+        assert!(!verify_hermes_plugin_ready());
+        let diag = readiness.diagnostic;
+        assert!(diag.contains("hermes plugins enable hcom"), "{diag}");
+        assert!(
+            diag.contains(temp.path().join("config.yaml").to_str().unwrap()),
+            "{diag}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_disabled_veto_beats_enabled_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        install_fake_hermes_plugin(temp.path());
+        write_hermes_config(
+            temp.path(),
+            "plugins:\n  disabled:\n    - hcom\n  enabled:\n    - hcom\n",
+        );
+        let _guard = hermes_home_guard(temp.path());
+        let readiness = evaluate_hermes_plugin_readiness();
+        assert!(!readiness.ready && !verify_hermes_plugin_ready());
+        assert!(readiness.diagnostic.contains("disabled"), "{readiness:?}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_not_ready_when_config_missing_or_without_plugins_block() {
+        let temp = tempfile::tempdir().unwrap();
+        install_fake_hermes_plugin(temp.path());
+        let _guard = hermes_home_guard(temp.path());
+        // No config.yaml at all.
+        assert!(!evaluate_hermes_plugin_readiness().ready);
+        assert!(!verify_hermes_plugin_ready());
+
+        // Config exists but has no plugins block: nothing is enabled.
+        write_hermes_config(temp.path(), "model:\n  default: glm\n");
+        let readiness = evaluate_hermes_plugin_readiness();
+        assert!(!readiness.ready);
+        assert!(
+            readiness.diagnostic.contains("hermes plugins enable hcom"),
+            "{readiness:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_not_ready_when_files_missing_even_if_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        write_hermes_config(temp.path(), "plugins:\n  enabled:\n    - hcom\n");
+        let _guard = hermes_home_guard(temp.path());
+        assert!(!verify_hermes_plugin_installed());
+        // The config itself would enable hcom; only the files gate fails.
+        let (enabled, _) = parse_hermes_plugin_lists(
+            &std::fs::read_to_string(temp.path().join("config.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert!(enabled.iter().any(|n| n == "hcom"));
+        let readiness = evaluate_hermes_plugin_readiness();
+        assert!(!readiness.ready);
+        let diag = readiness.diagnostic;
+        assert!(
+            diag.contains(
+                temp.path()
+                    .join("plugins")
+                    .join("hcom")
+                    .join("plugin.yaml")
+                    .to_str()
+                    .unwrap()
+            ),
+            "diagnostic names the missing plugin path: {diag}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn plugin_safe_mode_suppresses_even_when_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        install_fake_hermes_plugin(temp.path());
+        write_hermes_config(temp.path(), "plugins:\n  enabled:\n    - hcom\n");
+        let _guard = hermes_home_guard(temp.path());
+        unsafe { std::env::set_var("HERMES_SAFE_MODE", "1") };
+        let readiness = evaluate_hermes_plugin_readiness();
+        assert!(!readiness.ready && !verify_hermes_plugin_ready());
+        assert!(readiness.diagnostic.contains("HERMES_SAFE_MODE"));
+        unsafe { std::env::remove_var("HERMES_SAFE_MODE") };
+        assert!(verify_hermes_plugin_ready());
+    }
+
+    #[test]
+    fn plugin_list_parser_handles_yaml_shapes() {
+        // Hermes's indented dump (as seen in real config.yaml).
+        let (enabled, disabled) = parse_hermes_plugin_lists(
+            "plugins:\n  disabled: []\n  enabled:\n    - current-time\n    - hcom\n  entries:\n    hcom:\n      allow_tool_override: false\n",
+        )
+        .unwrap();
+        assert!(enabled.contains(&"hcom".to_string()));
+        assert!(disabled.is_empty());
+
+        // PyYAML default style: items at the key's own indent.
+        let (enabled, _) = parse_hermes_plugin_lists("plugins:\n  enabled:\n  - hcom\n").unwrap();
+        assert_eq!(enabled, vec!["hcom".to_string()]);
+
+        // Flow lists and quoted entries.
+        let (enabled, disabled) = parse_hermes_plugin_lists(
+            "plugins:\n  enabled: ['hcom', llm-usage]\n  disabled: [\"current-time\"]\n",
+        )
+        .unwrap();
+        assert_eq!(enabled, vec!["hcom".to_string(), "llm-usage".to_string()]);
+        assert_eq!(disabled, vec!["current-time".to_string()]);
+
+        // Equal-indent items must not be mistaken for keys; later top-level
+        // keys end the block.
+        let (enabled, _) = parse_hermes_plugin_lists(
+            "other:\n  enabled: noise\nplugins:\n  disabled:\n  - x\n  enabled:\n  - hcom\nknown_plugin_toolsets:\n  cli:\n    - spotify\n",
+        )
+        .unwrap();
+        assert_eq!(enabled, vec!["hcom".to_string()]);
+
+        // Missing block / non-list enabled value: nothing enabled (opt-in).
+        assert!(parse_hermes_plugin_lists("model:\n  default: glm\n").is_none());
+        assert!(parse_hermes_plugin_lists("plugins:\n  enabled: yes\n").is_none());
+
+        // A nested mapping under `enabled` is NOT a name list: its items
+        // must never leak into the allow-list (Hermes treats a non-list
+        // enabled as "nothing enabled").
+        assert!(
+            parse_hermes_plugin_lists("plugins:\n  enabled:\n    nested:\n      - hcom\n")
+                .is_none()
+        );
+        // Symmetric on the veto list: a nested disabled mapping is no veto,
+        // so a plainly-enabled hcom stays enabled.
+        let (enabled, disabled) = parse_hermes_plugin_lists(
+            "plugins:\n  enabled:\n    - hcom\n  disabled:\n    nested:\n      - hcom\n",
+        )
+        .unwrap();
+        assert!(enabled.iter().any(|n| n == "hcom"));
+        assert!(disabled.is_empty());
+    }
+
+    #[test]
+    fn plugin_list_json_matcher_reports_hcom_enabled() {
+        let items = vec![
+            serde_json::json!({"name": "current-time", "status": "enabled"}),
+            serde_json::json!({"name": "hcom", "status": "enabled", "removed": null}),
+        ];
+        assert!(hermes_plugin_listed_enabled(&items));
+        // Missing status is accepted: the probe pre-filters with --enabled.
+        assert!(hermes_plugin_listed_enabled(&[
+            serde_json::json!({"name": "hcom"})
+        ]));
+    }
+
+    #[test]
+    fn plugin_list_json_matcher_rejects_other_states() {
+        // Wrong name, disabled status, or a removal flag never report ready.
+        assert!(!hermes_plugin_listed_enabled(&[serde_json::json!({
+            "name": "other", "status": "enabled"
+        })]));
+        assert!(!hermes_plugin_listed_enabled(&[serde_json::json!({
+            "name": "hcom", "status": "disabled"
+        })]));
+        assert!(!hermes_plugin_listed_enabled(&[serde_json::json!({
+            "name": "hcom", "status": "enabled", "removed": true
+        })]));
     }
 }

@@ -63,15 +63,64 @@ fn is_error_content(content: &str) -> bool {
 /// workspace sandbox otherwise, so transcript lookup and plugin install always
 /// agree on one hermes home.
 pub(crate) fn get_hermes_db_path() -> Option<PathBuf> {
-    let base = match std::env::var("HERMES_HOME").ok().filter(|s| !s.is_empty()) {
-        Some(home) => PathBuf::from(home),
+    let explicit = std::env::var("HERMES_HOME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let base = match explicit {
+        Some(home) => home,
         None => crate::runtime_env::tool_config_root().join(".hermes"),
     };
-    let direct = base.join("state.db");
+    let direct = if base.file_name().and_then(|n| n.to_str()) == Some("state.db") {
+        base
+    } else {
+        base.join("state.db")
+    };
     if direct.exists() {
         return Some(direct);
     }
     None
+}
+
+/// Resolve Hermes SQLite state DB path from an explicit environment map,
+/// falling back to process environment and the default tool config root.
+///
+/// If `HERMES_HOME` is present in `raw_env` or process environment, the DB sits
+/// at `$HERMES_HOME/state.db` (or `$HERMES_HOME` directly if it names the DB file).
+/// When `HERMES_HOME` is explicitly specified, the resulting path is returned
+/// even if the DB file has not been created yet. When falling back to the default
+/// hermes home (`<tool_config_root()>/.hermes`), the path is only returned if
+/// `state.db` exists.
+pub(crate) fn resolve_hermes_db_path_from_env(
+    raw_env: &HashMap<String, String>,
+) -> Option<PathBuf> {
+    let explicit = raw_env
+        .get("HERMES_HOME")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HERMES_HOME")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        });
+    let base = match explicit {
+        Some(ref home) => home.clone(),
+        None => crate::runtime_env::tool_config_root().join(".hermes"),
+    };
+    let direct = if base.file_name().and_then(|n| n.to_str()) == Some("state.db") {
+        base
+    } else {
+        base.join("state.db")
+    };
+    if explicit.is_some() || direct.exists() {
+        Some(direct)
+    } else {
+        None
+    }
 }
 
 /// Search Hermes sessions in the state database for a pattern.
@@ -101,10 +150,7 @@ pub(crate) fn search_hermes_sessions(
         .map_err(|e| format!("Query error: {e}"))?;
 
     for row in rows {
-        let (session_id, content) = match row {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let (session_id, content) = row.map_err(|e| format!("Query error: {e}"))?;
         if session_id.is_empty() || content.is_empty() || !re.is_match(&content) {
             continue;
         }
@@ -129,6 +175,60 @@ pub(crate) fn search_hermes_sessions(
         .filter_map(|session_id| by_session.remove(&session_id))
         .take(limit)
         .collect())
+}
+
+/// Search a specific Hermes session in the state database for a pattern.
+pub(crate) fn search_hermes_session(
+    db_path: &Path,
+    session_id: &str,
+    pattern: &str,
+) -> Result<Option<TranscriptSearchMatch>, String> {
+    if session_id.trim().is_empty() {
+        return Ok(None);
+    }
+    let re = Regex::new(pattern).map_err(|e| format!("Invalid regex: {e}"))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("Cannot open Hermes state DB: {e}"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT content FROM messages WHERE session_id = ? AND active IS NOT 0 ORDER BY id ASC",
+        )
+        .map_err(|e| format!("Query error: {e}"))?;
+
+    let mut result: Option<TranscriptSearchMatch> = None;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok(row.get::<_, String>(0).unwrap_or_default())
+        })
+        .map_err(|e| format!("Query error: {e}"))?;
+
+    for row in rows {
+        let content = row.map_err(|e| format!("Query error: {e}"))?;
+        if content.is_empty() || !re.is_match(&content) {
+            continue;
+        }
+
+        match result {
+            None => {
+                result = Some(TranscriptSearchMatch {
+                    path: db_path.to_string_lossy().to_string(),
+                    agent: "hermes".to_string(),
+                    line: 0,
+                    text: truncate_str(&content.replace('\n', " "), 100).to_string(),
+                    matches: 1,
+                    session_id: Some(session_id.to_string()),
+                    label: None,
+                });
+            }
+            Some(ref mut m) => {
+                m.matches += 1;
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 pub(crate) fn parse_hermes_sqlite(
@@ -703,5 +803,80 @@ mod tests {
             "NULL active must be treated as active by parse"
         );
         assert!(null_exchanges[1].action.contains("unique_null_active"));
+    }
+
+    #[test]
+    fn test_search_hermes_session_filters_by_session_id() {
+        let (_dir, db_path) = create_test_db();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, active, timestamp) \
+             VALUES ('ses_one', 'user', 'common_term in session one', 1, 1700000000.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, active, timestamp) \
+             VALUES ('ses_one', 'assistant', 'common_term second match in session one', 1, 1700000001.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, active, timestamp) \
+             VALUES ('ses_two', 'user', 'common_term in session two', 1, 1700000002.0)",
+            [],
+        )
+        .unwrap();
+
+        // Search specific session ses_one
+        let match_one = search_hermes_session(&db_path, "ses_one", "common_term").unwrap();
+        assert!(match_one.is_some());
+        let m = match_one.unwrap();
+        assert_eq!(m.matches, 2);
+        assert_eq!(m.session_id.as_deref(), Some("ses_one"));
+        assert!(m.text.contains("session one"));
+
+        // Search specific session ses_two
+        let match_two = search_hermes_session(&db_path, "ses_two", "common_term").unwrap();
+        assert!(match_two.is_some());
+        let m2 = match_two.unwrap();
+        assert_eq!(m2.matches, 1);
+        assert_eq!(m2.session_id.as_deref(), Some("ses_two"));
+
+        // Search non-existent session returns None
+        let match_none = search_hermes_session(&db_path, "ses_missing", "common_term").unwrap();
+        assert!(match_none.is_none());
+
+        // Empty session ID returns None
+        let match_empty = search_hermes_session(&db_path, "", "common_term").unwrap();
+        assert!(match_empty.is_none());
+        let match_whitespace = search_hermes_session(&db_path, "   ", "common_term").unwrap();
+        assert!(match_whitespace.is_none());
+
+        // Invalid regex returns Err
+        let err_regex = search_hermes_session(&db_path, "ses_one", "[invalid").unwrap_err();
+        assert!(err_regex.contains("Invalid regex"));
+
+        // Corrupt/invalid DB file returns Err
+        let corrupt_path = _dir.path().join("corrupt.db");
+        std::fs::write(&corrupt_path, b"not a valid sqlite database").unwrap();
+        let err_db = search_hermes_session(&corrupt_path, "ses_one", "common_term").unwrap_err();
+        assert!(err_db.contains("Cannot open Hermes state DB") || err_db.contains("Query error"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_get_hermes_db_path_explicit_state_db_file() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("state.db");
+        std::fs::write(&db_file, b"").unwrap();
+
+        unsafe {
+            std::env::set_var("HERMES_HOME", &db_file);
+        }
+        let resolved = get_hermes_db_path();
+        assert_eq!(resolved, Some(db_file));
     }
 }

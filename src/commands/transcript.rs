@@ -422,24 +422,17 @@ fn correlate_paths_to_hcom(
     result
 }
 
-/// Search across transcripts: `hcom transcript search "pattern" [--live] [--all] [--limit N] [--exclude-self]`
-fn cmd_transcript_search(
+/// Collect transcript search results across files and databases.
+pub(crate) fn collect_transcript_search_results(
     db: &HcomDb,
     args: &TranscriptSearchArgs,
     ctx: Option<&CommandContext>,
-) -> i32 {
+) -> Result<Vec<Value>, String> {
     let live_mode = args.live;
     let all_mode = args.all;
-    let json_mode = args.json;
     let limit = args.limit;
     let agent_filter = match args.agent.as_deref() {
-        Some(value) => match transcript::parse_tool_filter(value) {
-            Ok(tool) => Some(tool),
-            Err(error) => {
-                eprintln!("Error: {error}");
-                return 1;
-            }
-        },
+        Some(value) => Some(transcript::parse_tool_filter(value)?),
         None => None,
     };
 
@@ -454,8 +447,8 @@ fn cmd_transcript_search(
 
     let pattern = &args.pattern;
 
-    // Collect transcript paths: (name, path, agent)
-    let mut paths: Vec<(String, String, String)> = Vec::new();
+    // Collect transcript paths: (name, path, agent, session_id)
+    let mut paths: Vec<(String, String, String, Option<String>)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
     if all_mode {
@@ -481,14 +474,41 @@ fn cmd_transcript_search(
                 }
             }
         }
-        let database_sources: Vec<(Tool, PathBuf)> = selected_tools
+        let mut database_sources: Vec<(Tool, PathBuf)> = selected_tools
             .iter()
             .filter_map(|tool| transcript::database_search_path(*tool).map(|path| (*tool, path)))
             .collect();
 
+        // Also search distinct profile databases of tracked Hermes instances
+        // so profiles outside the caller's ambient HERMES_HOME are included and correlated.
+        if selected_tools.contains(&Tool::Hermes)
+            && let Ok(mut stmt) = db.conn().prepare(
+                "SELECT DISTINCT transcript_path FROM instances WHERE lower(tool) = 'hermes' AND transcript_path IS NOT NULL AND transcript_path != '' \
+                 UNION \
+                 SELECT DISTINCT json_extract(data, '$.snapshot.transcript_path') \
+                 FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' \
+                 AND lower(json_extract(data, '$.snapshot.tool')) = 'hermes' \
+                 AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL AND json_extract(data, '$.snapshot.transcript_path') != ''",
+            )
+            && let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0))
+        {
+            for path_str in rows.flatten() {
+                let p = PathBuf::from(path_str);
+                let canon_p = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+                if p.exists()
+                    && !database_sources.iter().any(|(_, existing)| {
+                        existing == &p
+                            || std::fs::canonicalize(existing).unwrap_or_else(|_| existing.clone())
+                                == canon_p
+                    })
+                {
+                    database_sources.push((Tool::Hermes, p));
+                }
+            }
+        }
+
         if search_dirs.is_empty() && database_sources.is_empty() {
-            println!("No transcript directories or databases found on disk.");
-            return 0;
+            return Ok(Vec::new());
         }
 
         // Phase 1: find matching files with rg -l (recursive, *.jsonl/*.json).
@@ -510,19 +530,18 @@ fn cmd_transcript_search(
                     .collect(),
                 Ok(out) if out.status.code() == Some(1) => Vec::new(),
                 Ok(out) => {
-                    eprintln!(
-                        "Error: ripgrep failed: {}",
+                    return Err(format!(
+                        "ripgrep failed: {}",
                         String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                    return 1;
+                    ));
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!("Error: transcript search --all requires `rg` (ripgrep) on PATH");
-                    return 1;
+                    return Err(
+                        "transcript search --all requires `rg` (ripgrep) on PATH".to_string()
+                    );
                 }
                 Err(err) => {
-                    eprintln!("Error: could not run `rg`: {err}");
-                    return 1;
+                    return Err(format!("could not run `rg`: {err}"));
                 }
             }
         };
@@ -540,19 +559,13 @@ fn cmd_transcript_search(
             ) {
                 Ok(matches) => database_matches.extend(matches),
                 Err(err) => {
-                    eprintln!("Error: {err}");
-                    return 1;
+                    return Err(err);
                 }
             }
         }
 
         if matching_files.is_empty() && database_matches.is_empty() {
-            if json_mode {
-                println!("{}", json!({"count": 0, "results": [], "scope": "all"}));
-            } else {
-                println!("No matches for \"{pattern}\"");
-            }
-            return 0;
+            return Ok(Vec::new());
         }
 
         // Correlate transcript paths/session IDs to hcom names via DB.
@@ -587,7 +600,7 @@ fn cmd_transcript_search(
 
             let remaining = limit - results.len();
             let max_count = remaining.to_string();
-            let out = match run_search_tool(
+            let out = run_search_tool(
                 "rg",
                 &[
                     "-n",
@@ -597,13 +610,7 @@ fn cmd_transcript_search(
                     pattern,
                     file_path,
                 ],
-            ) {
-                Ok(output) => output,
-                Err(err) => {
-                    eprintln!("Error: {err}");
-                    return 1;
-                }
-            };
+            )?;
             if let Some(out) = out {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let lines: Vec<&str> = stdout.lines().collect();
@@ -646,69 +653,21 @@ fn cmd_transcript_search(
             }));
         }
 
-        if json_mode {
-            println!(
-                "{}",
-                json!({"count": results.len(), "results": results, "scope": "all"})
-            );
-        } else if results.is_empty() {
-            println!("No matches for \"{pattern}\"");
-        } else {
-            println!(
-                "Found matches in {} transcripts (all on disk):",
-                results.len()
-            );
-            for r in &results {
-                let path = r["path"].as_str().unwrap_or("");
-                let agent = r["agent"].as_str().unwrap_or("?");
-                let line = r["line"].as_u64().unwrap_or(0);
-                let matches = r["matches"].as_u64().unwrap_or(0);
-                let snippet = r["text"].as_str().unwrap_or("");
-                let label = r["label"].as_str().unwrap_or("");
-                let session_id = r["session_id"].as_str().unwrap_or("");
-                let short_path = path
-                    .split('/')
-                    .rev()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("/");
-                let name_part = r["hcom_name"]
-                    .as_str()
-                    .map(|n| format!(" ({n})"))
-                    .unwrap_or_default();
-                println!("  [{agent}]{name_part} .../{short_path}:{line}  ({matches} matches)");
-                if !label.is_empty() || !session_id.is_empty() {
-                    let mut details = Vec::new();
-                    if !label.is_empty() {
-                        details.push(label.to_string());
-                    }
-                    if !session_id.is_empty() {
-                        details.push(session_id.to_string());
-                    }
-                    println!("    {}", details.join(" | "));
-                }
-                if !snippet.is_empty() {
-                    println!("    {snippet}");
-                }
-            }
-        }
-        return 0;
+        return Ok(results);
     } else {
         // Active instances
         if let Ok(mut stmt) = db.conn().prepare(
-            "SELECT name, transcript_path, tool FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''"
+            "SELECT name, transcript_path, tool, session_id FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''"
         )
             && let Ok(rows) = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             }) {
-                for (name, path, tool) in rows.flatten() {
+                for (name, path, tool, session_id) in rows.flatten() {
                     if let Some(filter_tool) = agent_filter
                         && transcript::tool_from_agent_or_path(&tool, &path).ok() != Some(filter_tool)
                     {
@@ -716,23 +675,27 @@ fn cmd_transcript_search(
                     }
                     if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
                     seen.insert(name.clone());
-                    paths.push((name, path, tool));
+                    paths.push((name, path, tool, session_id));
                 }
             }
 
         // Stopped instances from life event snapshots (C2/C3 fix)
         if !live_mode
             && let Ok(mut stmt) = db.conn().prepare(
-                "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL"
+                "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool'), json_extract(data, '$.snapshot.session_id') \
+                 FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' \
+                 AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL \
+                 ORDER BY id DESC"
             )
                 && let Ok(rows) = stmt.query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 }) {
-                    for (name, path, tool) in rows.flatten() {
+                    for (name, path, tool, session_id) in rows.flatten() {
                         if seen.contains(&name) { continue; }
                         if let Some(filter_tool) = agent_filter
                             && transcript::tool_from_agent_or_path(&tool, &path).ok() != Some(filter_tool)
@@ -741,14 +704,14 @@ fn cmd_transcript_search(
                         }
                         if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
                         seen.insert(name.clone());
-                        paths.push((name, path, tool));
+                        paths.push((name, path, tool, session_id));
                     }
                 }
     }
 
     // Search using ripgrep (with line-level matches + snippets) — hcom-tracked/live paths
     let mut results = Vec::new();
-    for (name, path, agent) in &paths {
+    for (name, path, agent, session_id) in &paths {
         if !Path::new(path).exists() {
             continue;
         }
@@ -757,6 +720,32 @@ fn cmd_transcript_search(
         // match offset so the snippet can be centered on the hit; the grep
         // fallback has no column, so parse_match_line locates the pattern itself.
         let remaining = limit - results.len();
+        let resolved_tool = agent
+            .parse::<Tool>()
+            .ok()
+            .or_else(|| transcript::detect_tool_from_path(path));
+
+        if resolved_tool == Some(Tool::Hermes) {
+            let Some(sid) = session_id.as_deref().filter(|s| !s.trim().is_empty()) else {
+                continue;
+            };
+            let search_match =
+                transcript::hermes::search_hermes_session(Path::new(path), sid, pattern)?;
+            if let Some(m) = search_match {
+                results.push(json!({
+                    "hcom_name": name,
+                    "agent": agent,
+                    "path": path,
+                    "line": 0,
+                    "text": m.text,
+                    "matches": m.matches,
+                }));
+            }
+            if results.len() >= limit {
+                break;
+            }
+            continue;
+        }
         let max_count = remaining.to_string();
         let mut has_column = true;
         let output = match run_search_tool(
@@ -777,13 +766,7 @@ fn cmd_transcript_search(
             Err(err) => Err(err),
         };
 
-        let output = match output {
-            Ok(output) => output,
-            Err(err) => {
-                eprintln!("Error: {err}");
-                return 1;
-            }
-        };
+        let output = output?;
 
         if let Some(out) = output {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -808,24 +791,122 @@ fn cmd_transcript_search(
         }
     }
 
-    let scope_label = if live_mode {
-        " (live agents)"
-    } else if all_mode {
-        ""
-    } else {
-        " (hcom-tracked)"
+    Ok(results)
+}
+
+/// Search across transcripts: `hcom transcript search "pattern" [--live] [--all] [--limit N] [--exclude-self]`
+fn cmd_transcript_search(
+    db: &HcomDb,
+    args: &TranscriptSearchArgs,
+    ctx: Option<&CommandContext>,
+) -> i32 {
+    let live_mode = args.live;
+    let all_mode = args.all;
+    let json_mode = args.json;
+    let limit = args.limit;
+    let pattern = &args.pattern;
+
+    let results = match collect_transcript_search_results(db, args, ctx) {
+        Ok(results) => results,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            return 1;
+        }
     };
+
+    if all_mode && results.is_empty() {
+        let selected_tools = args
+            .agent
+            .as_deref()
+            .and_then(|a| transcript::parse_tool_filter(a).ok())
+            .map(|t| vec![t])
+            .unwrap_or_else(transcript::transcript_tools);
+        let has_dirs = selected_tools.iter().any(|t| {
+            transcript::disk_search_roots(*t)
+                .into_iter()
+                .any(|p| p.exists())
+        });
+        let has_dbs = selected_tools
+            .iter()
+            .any(|t| transcript::database_search_path(*t).is_some());
+        let has_tracked_dbs = if selected_tools.contains(&Tool::Hermes)
+            && let Ok(mut stmt) = db.conn().prepare(
+                "SELECT 1 FROM instances WHERE lower(tool) = 'hermes' AND transcript_path IS NOT NULL AND transcript_path != '' \
+                 UNION \
+                 SELECT 1 FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' \
+                 AND lower(json_extract(data, '$.snapshot.tool')) = 'hermes' \
+                 AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL AND json_extract(data, '$.snapshot.transcript_path') != '' LIMIT 1",
+            ) {
+                stmt.exists([]).unwrap_or(false)
+            } else {
+                false
+            };
+        if !has_dirs && !has_dbs && !has_tracked_dbs {
+            println!("No transcript directories or databases found on disk.");
+            return 0;
+        }
+    }
 
     if json_mode {
         println!(
             "{}",
             json!({"count": results.len(), "results": results, "scope": if live_mode {"live"} else if all_mode {"all"} else {"hcom"}})
         );
-    } else {
-        if results.is_empty() {
-            println!("No matches for \"{pattern}\"");
-            return 0;
+        return 0;
+    }
+
+    if results.is_empty() {
+        println!("No matches for \"{pattern}\"");
+        return 0;
+    }
+
+    if all_mode {
+        println!(
+            "Found matches in {} transcripts (all on disk):",
+            results.len()
+        );
+        for r in &results {
+            let path = r["path"].as_str().unwrap_or("");
+            let agent = r["agent"].as_str().unwrap_or("?");
+            let line = r["line"].as_u64().unwrap_or(0);
+            let matches = r["matches"].as_u64().unwrap_or(0);
+            let snippet = r["text"].as_str().unwrap_or("");
+            let label = r["label"].as_str().unwrap_or("");
+            let session_id = r["session_id"].as_str().unwrap_or("");
+            let short_path = path
+                .split('/')
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("/");
+            let name_part = r["hcom_name"]
+                .as_str()
+                .map(|n| format!(" ({n})"))
+                .unwrap_or_default();
+            println!("  [{agent}]{name_part} .../{short_path}:{line}  ({matches} matches)");
+            if !label.is_empty() || !session_id.is_empty() {
+                let mut details = Vec::new();
+                if !label.is_empty() {
+                    details.push(label.to_string());
+                }
+                if !session_id.is_empty() {
+                    details.push(session_id.to_string());
+                }
+                println!("    {}", details.join(" | "));
+            }
+            if !snippet.is_empty() {
+                println!("    {snippet}");
+            }
         }
+    } else {
+        let scope_label = if live_mode {
+            " (live agents)"
+        } else {
+            " (hcom-tracked)"
+        };
         let limit_hit = results.len() >= limit;
         if limit_hit {
             println!(
@@ -1436,6 +1517,7 @@ fn resolve_instance_transcript(
         rusqlite::params![&name],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
     ) && let Ok(t) = tool.parse::<Tool>()
+        && t != Tool::Hermes
         && let Some(db_path) = transcript::database_search_path(t)
     {
         return Some((name, db_path.to_string_lossy().to_string(), tool, sid));
@@ -1450,13 +1532,13 @@ fn resolve_instance_transcript(
         return Some((matched_name, path, tool, sid));
     }
 
-    // Check stopped events (session_id from snapshot)
-    if let Ok((path, sid)) = db.conn().query_row(
-        "SELECT json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped' ORDER BY id DESC LIMIT 1",
+    // Check stopped events (session_id and tool from snapshot)
+    if let Ok((path, sid, tool)) = db.conn().query_row(
+        "SELECT json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.session_id'), json_extract(data, '$.snapshot.tool') FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped' ORDER BY id DESC LIMIT 1",
         rusqlite::params![&name],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)),
     ) {
-        let agent = detect_agent_type(&path).to_string();
+        let agent = tool.unwrap_or_else(|| detect_agent_type(&path).to_string());
         return Some((name, path, agent, sid));
     }
 
@@ -2292,5 +2374,712 @@ mod tests {
             err.contains("could not run") && !err.contains("was not found on PATH"),
             "expected permission error for explicit path, got: {err}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_hermes_two_profiles_transcript_resolution_from_unrelated_caller() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("hcom.db");
+        let db = HcomDb::open_raw(&db_file).unwrap();
+        db.init_db().unwrap();
+
+        let profile1_dir = temp.path().join("profile1");
+        let profile2_dir = temp.path().join("profile2");
+        let unrelated_dir = temp.path().join("unrelated");
+        std::fs::create_dir_all(&profile1_dir).unwrap();
+        std::fs::create_dir_all(&profile2_dir).unwrap();
+        std::fs::create_dir_all(&unrelated_dir).unwrap();
+
+        let p1_db = profile1_dir.join("state.db");
+        let p2_db = profile2_dir.join("state.db");
+        let unrel_db = unrelated_dir.join("state.db");
+
+        let make_db = |path: &Path, sid: &str, user: &str, assistant: &str| {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    tool_call_id TEXT DEFAULT '',
+                    tool_calls TEXT DEFAULT '',
+                    tool_name TEXT DEFAULT '',
+                    timestamp REAL DEFAULT 0.0,
+                    token_count INTEGER DEFAULT 0,
+                    active INTEGER DEFAULT 1
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', ?, 1700000000.0)",
+                rusqlite::params![sid, user],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'assistant', ?, 1700000001.0)",
+                rusqlite::params![sid, assistant],
+            )
+            .unwrap();
+        };
+
+        make_db(&p1_db, "ses_p1", "Profile 1 question", "Profile 1 answer");
+        make_db(&p2_db, "ses_p2", "Profile 2 question", "Profile 2 answer");
+        make_db(&unrel_db, "ses_unrel", "Ambient question", "Ambient answer");
+
+        // Record two Hermes instances backed by different profile DBs
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES (?, 'hermes', ?, ?, 'active', 1000.0)",
+                rusqlite::params!["herm_a", "ses_p1", p1_db.to_str().unwrap()],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES (?, 'hermes', ?, ?, 'active', 1000.0)",
+                rusqlite::params!["herm_b", "ses_p2", p2_db.to_str().unwrap()],
+            )
+            .unwrap();
+
+        // Caller runs in an unrelated ambient environment pointing to unrelated_dir
+        unsafe {
+            std::env::set_var("HERMES_HOME", &unrelated_dir);
+        }
+
+        // Resolving herm_a must read profile1, never ambient or profile2
+        let rendered_a =
+            render_instance_transcript_with_options(&db, "herm_a", None, 10, false, false, false)
+                .unwrap();
+        assert!(rendered_a.contains("Profile 1 question"));
+        assert!(rendered_a.contains("Profile 1 answer"));
+        assert!(!rendered_a.contains("Profile 2"));
+        assert!(!rendered_a.contains("Ambient"));
+
+        // Resolving herm_b must read profile2, never ambient or profile1
+        let rendered_b =
+            render_instance_transcript_with_options(&db, "herm_b", None, 10, false, false, false)
+                .unwrap();
+        assert!(rendered_b.contains("Profile 2 question"));
+        assert!(rendered_b.contains("Profile 2 answer"));
+        assert!(!rendered_b.contains("Profile 1"));
+        assert!(!rendered_b.contains("Ambient"));
+
+        // Missing transcript path fails safely with error, never falling back to ambient
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES (?, 'hermes', ?, ?, 'active', 1000.0)",
+                rusqlite::params!["herm_missing", "ses_missing", "/nonexistent/hermes/state.db"],
+            )
+            .unwrap();
+        let err_missing = render_instance_transcript_with_options(
+            &db,
+            "herm_missing",
+            None,
+            10,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err_missing.contains("Transcript not found") || err_missing.contains("not found"));
+        assert!(!err_missing.contains("Ambient"));
+
+        // Empty transcript path fails safely with no-transcript error, never falling back to ambient
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES (?, 'hermes', ?, '', 'active', 1000.0)",
+                rusqlite::params!["herm_empty", "ses_empty"],
+            )
+            .unwrap();
+        let err_empty = render_instance_transcript_with_options(
+            &db,
+            "herm_empty",
+            None,
+            10,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err_empty.contains("no transcript yet"));
+        assert!(!err_empty.contains("Ambient"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_hermes_search_isolation_across_profiles() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("hcom.db");
+        let db = HcomDb::open_raw(&db_file).unwrap();
+        db.init_db().unwrap();
+
+        let profile1_dir = temp.path().join("prof1");
+        let profile2_dir = temp.path().join("prof2");
+        let absent_ambient_dir = temp.path().join("nonexistent_ambient");
+        std::fs::create_dir_all(&profile1_dir).unwrap();
+        std::fs::create_dir_all(&profile2_dir).unwrap();
+
+        let p1_db = profile1_dir.join("state.db");
+        let p2_db = profile2_dir.join("state.db");
+
+        let make_hermes_db = |path: &Path, messages: &[(&str, &str)]| {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    tool_call_id TEXT DEFAULT '',
+                    tool_calls TEXT DEFAULT '',
+                    tool_name TEXT DEFAULT '',
+                    timestamp REAL DEFAULT 0.0,
+                    token_count INTEGER DEFAULT 0,
+                    active INTEGER DEFAULT 1
+                );",
+            )
+            .unwrap();
+            for (sid, text) in messages {
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', ?, 1700000000.0)",
+                    rusqlite::params![sid, text],
+                )
+                .unwrap();
+            }
+        };
+
+        make_hermes_db(&p1_db, &[("ses_1", "unique_keyword_alpha in profile one")]);
+        make_hermes_db(&p2_db, &[("ses_2", "unique_keyword_beta in profile two")]);
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES (?, 'hermes', ?, ?, 'active', 1000.0)",
+                rusqlite::params!["inst_alpha", "ses_1", p1_db.to_str().unwrap()],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES (?, 'hermes', ?, ?, 'active', 1000.0)",
+                rusqlite::params!["inst_beta", "ses_2", p2_db.to_str().unwrap()],
+            )
+            .unwrap();
+
+        // Caller runs with absent ambient HERMES_HOME (pointing to non-existent directory)
+        unsafe {
+            std::env::set_var("HERMES_HOME", &absent_ambient_dir);
+        }
+        assert!(transcript::database_search_path(Tool::Hermes).is_none());
+
+        // Tracked search for alpha matches only inst_alpha
+        let args_alpha = TranscriptSearchArgs {
+            pattern: "unique_keyword_alpha".to_string(),
+            live: false,
+            all: false,
+            limit: 10,
+            json: true,
+            agent: Some("hermes".to_string()),
+            exclude_self: false,
+        };
+        let results_alpha = collect_transcript_search_results(&db, &args_alpha, None).unwrap();
+        assert_eq!(results_alpha.len(), 1);
+        assert_eq!(results_alpha[0]["hcom_name"], "inst_alpha");
+        assert!(
+            results_alpha[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unique_keyword_alpha")
+        );
+
+        // Tracked search for beta matches only inst_beta
+        let args_beta = TranscriptSearchArgs {
+            pattern: "unique_keyword_beta".to_string(),
+            live: false,
+            all: false,
+            limit: 10,
+            json: true,
+            agent: Some("hermes".to_string()),
+            exclude_self: false,
+        };
+        let results_beta = collect_transcript_search_results(&db, &args_beta, None).unwrap();
+        assert_eq!(results_beta.len(), 1);
+        assert_eq!(results_beta[0]["hcom_name"], "inst_beta");
+        assert!(
+            results_beta[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unique_keyword_beta")
+        );
+
+        // --all search with absent ambient DB still includes and correlates both profile DBs
+        let args_all = TranscriptSearchArgs {
+            pattern: "unique_keyword".to_string(),
+            live: false,
+            all: true,
+            limit: 10,
+            json: true,
+            agent: Some("hermes".to_string()),
+            exclude_self: false,
+        };
+        let results_all = collect_transcript_search_results(&db, &args_all, None).unwrap();
+        assert_eq!(results_all.len(), 2);
+        let names: Vec<&str> = results_all
+            .iter()
+            .filter_map(|r| r["hcom_name"].as_str())
+            .collect();
+        assert!(names.contains(&"inst_alpha"));
+        assert!(names.contains(&"inst_beta"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_hermes_search_multiple_sessions_in_one_profile_and_low_limit() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("hcom.db");
+        let db = HcomDb::open_raw(&db_file).unwrap();
+        db.init_db().unwrap();
+
+        let profile_dir = temp.path().join("profile");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let shared_db = profile_dir.join("state.db");
+
+        let conn = rusqlite::Connection::open(&shared_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tool_call_id TEXT DEFAULT '',
+                tool_calls TEXT DEFAULT '',
+                tool_name TEXT DEFAULT '',
+                timestamp REAL DEFAULT 0.0,
+                token_count INTEGER DEFAULT 0,
+                active INTEGER DEFAULT 1
+            );",
+        )
+        .unwrap();
+
+        // ses_first is inserted first (lower ID) with the matching keyword
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('ses_first', 'user', 'matched_keyword in first session', 1700000000.0)",
+            [],
+        )
+        .unwrap();
+        // ses_second is inserted second with the matching keyword
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('ses_second', 'user', 'matched_keyword in second session', 1700000001.0)",
+            [],
+        )
+        .unwrap();
+
+        // Instance herm_target is bound to ses_second (not ses_first)
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES (?, 'hermes', ?, ?, 'active', 1000.0)",
+                rusqlite::params!["herm_target", "ses_second", shared_db.to_str().unwrap()],
+            )
+            .unwrap();
+
+        // Instance herm_no_sid has no session ID (empty or null)
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES (?, 'hermes', '', ?, 'active', 1000.0)",
+                rusqlite::params!["herm_no_sid", shared_db.to_str().unwrap()],
+            )
+            .unwrap();
+
+        // Ambient HERMES_HOME points to non-existent directory
+        unsafe {
+            std::env::set_var("HERMES_HOME", temp.path().join("absent_ambient"));
+        }
+
+        // Search with limit 1: Must find herm_target for ses_second despite ses_first preceding it in SQLite
+        let args = TranscriptSearchArgs {
+            pattern: "matched_keyword".to_string(),
+            live: false,
+            all: false,
+            limit: 1,
+            json: true,
+            agent: Some("hermes".to_string()),
+            exclude_self: false,
+        };
+        let results = collect_transcript_search_results(&db, &args, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["hcom_name"], "herm_target");
+        assert!(
+            results[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("second session")
+        );
+
+        // Search with limit 10: herm_no_sid must be safely skipped, never misattributed
+        let args_all_limit = TranscriptSearchArgs {
+            pattern: "matched_keyword".to_string(),
+            live: false,
+            all: false,
+            limit: 10,
+            json: true,
+            agent: Some("hermes".to_string()),
+            exclude_self: false,
+        };
+        let results_all = collect_transcript_search_results(&db, &args_all_limit, None).unwrap();
+        assert_eq!(results_all.len(), 1);
+        assert_eq!(results_all[0]["hcom_name"], "herm_target");
+        assert!(!results_all.iter().any(|r| r["hcom_name"] == "herm_no_sid"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_hermes_search_stopped_snapshot_session_isolation() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("hcom.db");
+        let db = HcomDb::open_raw(&db_file).unwrap();
+        db.init_db().unwrap();
+
+        let profile_dir = temp.path().join("prof_stopped");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let stopped_db = profile_dir.join("state.db");
+
+        let conn = rusqlite::Connection::open(&stopped_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tool_call_id TEXT DEFAULT '',
+                tool_calls TEXT DEFAULT '',
+                tool_name TEXT DEFAULT '',
+                timestamp REAL DEFAULT 0.0,
+                token_count INTEGER DEFAULT 0,
+                active INTEGER DEFAULT 1
+            );",
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('ses_stopped', 'user', 'unique_stopped_phrase from stopped agent', 1700000000.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('ses_other', 'user', 'unique_stopped_phrase from other agent', 1700000001.0)",
+            [],
+        )
+        .unwrap();
+
+        // Stopped instance with snapshot.session_id
+        let data_valid = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "transcript_path": stopped_db.to_str().unwrap(),
+                "session_id": "ses_stopped",
+                "tool": "hermes"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (1700000000.0, 'life', 'inst_stopped', ?)",
+                rusqlite::params![data_valid.to_string()],
+            )
+            .unwrap();
+
+        // Stopped instance with snapshot but no session_id
+        let data_no_sid = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "transcript_path": stopped_db.to_str().unwrap(),
+                "tool": "hermes"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (1700000001.0, 'life', 'inst_stopped_no_sid', ?)",
+                rusqlite::params![data_no_sid.to_string()],
+            )
+            .unwrap();
+
+        unsafe {
+            std::env::set_var("HERMES_HOME", temp.path().join("absent_ambient"));
+        }
+
+        // Tracked search with live=false: inst_stopped matches ses_stopped, inst_stopped_no_sid is safely skipped
+        let args = TranscriptSearchArgs {
+            pattern: "unique_stopped_phrase".to_string(),
+            live: false,
+            all: false,
+            limit: 10,
+            json: true,
+            agent: Some("hermes".to_string()),
+            exclude_self: false,
+        };
+        let results = collect_transcript_search_results(&db, &args, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["hcom_name"], "inst_stopped");
+        assert!(
+            results[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("from stopped agent")
+        );
+
+        // Live search with live=true: stopped instance is ignored
+        let args_live = TranscriptSearchArgs {
+            pattern: "unique_stopped_phrase".to_string(),
+            live: true,
+            all: false,
+            limit: 10,
+            json: true,
+            agent: Some("hermes".to_string()),
+            exclude_self: false,
+        };
+        let results_live = collect_transcript_search_results(&db, &args_live, None).unwrap();
+        assert!(results_live.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_hermes_tracked_search_propagates_invalid_regex_error() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("hcom.db");
+        let db = HcomDb::open_raw(&db_file).unwrap();
+        db.init_db().unwrap();
+
+        let profile_dir = temp.path().join("profile");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let hermes_db = profile_dir.join("state.db");
+        let conn = rusqlite::Connection::open(&hermes_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                active INTEGER DEFAULT 1
+            );",
+        )
+        .unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES ('herm_inst', 'hermes', 'ses_test', ?, 'active', 1000.0)",
+                rusqlite::params![hermes_db.to_str().unwrap()],
+            )
+            .unwrap();
+
+        // Tracked search with invalid regex must propagate error, not return Ok(empty)
+        let args = TranscriptSearchArgs {
+            pattern: "[invalid_regex".to_string(),
+            live: false,
+            all: false,
+            limit: 10,
+            json: true,
+            agent: Some("hermes".to_string()),
+            exclude_self: false,
+        };
+        let err = collect_transcript_search_results(&db, &args, None).unwrap_err();
+        assert!(
+            err.contains("Invalid regex"),
+            "tracked search error must propagate invalid regex: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_hermes_tracked_search_propagates_db_failure_error() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("hcom.db");
+        let db = HcomDb::open_raw(&db_file).unwrap();
+        db.init_db().unwrap();
+
+        let corrupt_db = temp.path().join("corrupt_state.db");
+        std::fs::write(&corrupt_db, b"not a valid sqlite file").unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES ('herm_corrupt', 'hermes', 'ses_test', ?, 'active', 1000.0)",
+                rusqlite::params![corrupt_db.to_str().unwrap()],
+            )
+            .unwrap();
+
+        let args = TranscriptSearchArgs {
+            pattern: "some_pattern".to_string(),
+            live: false,
+            all: false,
+            limit: 10,
+            json: true,
+            agent: Some("hermes".to_string()),
+            exclude_self: false,
+        };
+        let err = collect_transcript_search_results(&db, &args, None).unwrap_err();
+        assert!(
+            err.contains("Cannot open Hermes state DB") || err.contains("Query error"),
+            "tracked search error must propagate DB failure: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_hermes_all_search_propagates_invalid_regex_error() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("hcom.db");
+        let db = HcomDb::open_raw(&db_file).unwrap();
+        db.init_db().unwrap();
+
+        let profile_dir = temp.path().join("profile");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let hermes_db = profile_dir.join("state.db");
+        let conn = rusqlite::Connection::open(&hermes_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                active INTEGER DEFAULT 1
+            );",
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("HERMES_HOME", &profile_dir);
+        }
+
+        let args = TranscriptSearchArgs {
+            pattern: "[invalid_regex".to_string(),
+            live: false,
+            all: true,
+            limit: 10,
+            json: true,
+            agent: Some("hermes".to_string()),
+            exclude_self: false,
+        };
+        let err = collect_transcript_search_results(&db, &args, None).unwrap_err();
+        assert!(
+            err.contains("Invalid regex"),
+            "--all search error must propagate invalid regex: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_tracked_search_non_hermes_retains_pre_change_behavior() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("hcom.db");
+        let db = HcomDb::open_raw(&db_file).unwrap();
+        db.init_db().unwrap();
+
+        let transcript_file = temp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript_file,
+            "{\"type\":\"message\",\"content\":\"opencode unique pattern match\"}\n",
+        )
+        .unwrap();
+
+        // Instance with tool 'opencode' pointing to a flat file
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES ('open_inst', 'opencode', 'ses_oc', ?, 'active', 1000.0)",
+                rusqlite::params![transcript_file.to_str().unwrap()],
+            )
+            .unwrap();
+
+        // Tracked search for non-Hermes must use ripgrep on the file, retaining pre-change behavior
+        let args = TranscriptSearchArgs {
+            pattern: "opencode unique pattern".to_string(),
+            live: false,
+            all: false,
+            limit: 10,
+            json: true,
+            agent: Some("opencode".to_string()),
+            exclude_self: false,
+        };
+        let results = collect_transcript_search_results(&db, &args, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["hcom_name"], "open_inst");
+        assert!(
+            results[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("opencode unique pattern")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_hermes_all_search_deduplicates_symlink_or_equivalent_paths() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("hcom.db");
+        let db = HcomDb::open_raw(&db_file).unwrap();
+        db.init_db().unwrap();
+
+        let profile_dir = temp.path().join("profile");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let original_db = profile_dir.join("state.db");
+        let conn = rusqlite::Connection::open(&original_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                active INTEGER DEFAULT 1
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content) VALUES ('ses_sym', 'user', 'dedup test message')",
+            [],
+        )
+        .unwrap();
+
+        // Create symlink to state.db in another directory
+        let symlink_dir = temp.path().join("symlink_dir");
+        std::fs::create_dir_all(&symlink_dir).unwrap();
+        let symlinked_db = symlink_dir.join("state.db");
+        std::os::unix::fs::symlink(&original_db, &symlinked_db).unwrap();
+
+        // Instance A points to original_db with ses_orig, Instance B points to symlinked_db with ses_sym
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES ('inst_orig', 'hermes', 'ses_orig', ?, 'active', 1000.0)",
+                rusqlite::params![original_db.to_str().unwrap()],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) VALUES ('inst_sym', 'hermes', 'ses_sym', ?, 'active', 1001.0)",
+                rusqlite::params![symlinked_db.to_str().unwrap()],
+            )
+            .unwrap();
+
+        // Set ambient HERMES_HOME to original profile_dir
+        unsafe {
+            std::env::set_var("HERMES_HOME", &profile_dir);
+        }
+
+        let args = TranscriptSearchArgs {
+            pattern: "dedup test message".to_string(),
+            live: false,
+            all: true,
+            limit: 10,
+            json: true,
+            agent: Some("hermes".to_string()),
+            exclude_self: false,
+        };
+        let results = collect_transcript_search_results(&db, &args, None).unwrap();
+        // The DB must be searched once, not duplicated across the symlink
+        assert_eq!(results.len(), 1);
     }
 }

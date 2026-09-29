@@ -742,6 +742,17 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     let codex_thread_id = std::env::var("CODEX_THREAD_ID")
         .ok()
         .filter(|s| !s.is_empty());
+    // Ordinary Hermes exports HERMES_SESSION_ID into terminal subprocesses
+    // (tools/environments/local.py); downstream this is a pure session-
+    // binding lookup that only accepts existing hermes-owned rows. Passed
+    // only when the detected tool is Hermes so a foreign tool nested inside
+    // a Hermes terminal (which inherits the marker) keeps its own identity
+    // path instead of being misattributed to the parent Hermes session.
+    let detected_tool = crate::shared::tool_detection::detect_tool(&std::env::vars().collect());
+    let hermes_session_id = std::env::var("HERMES_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .filter(|_| detected_tool == Tool::Hermes);
     let has_from_flag = cmd_argv.iter().any(|a| a == "--from" || a == "-b");
     let is_inside_ai = crate::shared::is_inside_ai_tool();
     let ctx = match build_ctx_for_command(
@@ -751,6 +762,8 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         flags.go,
         process_id.as_deref(),
         codex_thread_id.as_deref(),
+        hermes_session_id.as_deref(),
+        detected_tool,
     ) {
         Ok(ctx) => ctx,
         Err(e) => {
