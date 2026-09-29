@@ -732,6 +732,9 @@ pub(crate) fn collect_transcript_search_results(
             let search_match =
                 transcript::hermes::search_hermes_session(Path::new(path), sid, pattern)?;
             if let Some(m) = search_match {
+                // Same shape as the --all database matches: session_id and
+                // label are always present so consumers can correlate Hermes
+                // results across tracked and --all scopes uniformly.
                 results.push(json!({
                     "hcom_name": name,
                     "agent": agent,
@@ -739,6 +742,8 @@ pub(crate) fn collect_transcript_search_results(
                     "line": 0,
                     "text": m.text,
                     "matches": m.matches,
+                    "session_id": m.session_id,
+                    "label": m.label,
                 }));
             }
             if results.len() >= limit {
@@ -2374,6 +2379,78 @@ mod tests {
             err.contains("could not run") && !err.contains("was not found on PATH"),
             "expected permission error for explicit path, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_tracked_hermes_search_json_includes_session_id_and_label() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&temp.path().join("hcom.db")).unwrap();
+        db.init_db().unwrap();
+
+        let profile_dir = temp.path().join("profile1");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let state_db = profile_dir.join("state.db");
+        let conn = rusqlite::Connection::open(&state_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                tool_call_id TEXT DEFAULT '',
+                tool_calls TEXT DEFAULT '',
+                tool_name TEXT DEFAULT '',
+                timestamp REAL DEFAULT 0.0,
+                token_count INTEGER DEFAULT 0,
+                active INTEGER DEFAULT 1
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) \
+             VALUES ('ses_p1', 'user', 'needle question in profile one', 1700000000.0)",
+            [],
+        )
+        .unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, session_id, transcript_path, status, created_at) \
+                 VALUES ('herm_a', 'hermes', 'ses_p1', ?, 'active', 1000.0)",
+                rusqlite::params![state_db.to_str().unwrap()],
+            )
+            .unwrap();
+
+        let args = TranscriptSearchArgs {
+            pattern: "needle".to_string(),
+            live: false,
+            all: false,
+            json: true,
+            exclude_self: false,
+            limit: 10,
+            agent: None,
+        };
+        let results = collect_transcript_search_results(&db, &args, None).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "tracked Hermes match expected: {results:?}"
+        );
+        let entry = &results[0];
+        assert_eq!(entry["hcom_name"].as_str(), Some("herm_a"));
+        assert_eq!(entry["agent"].as_str(), Some("hermes"));
+        // The tracked JSON carries session_id/label like the --all database
+        // matches, so consumers can correlate both scopes uniformly.
+        assert_eq!(entry["session_id"].as_str(), Some("ses_p1"));
+        assert!(
+            entry.get("label").is_some(),
+            "label key must be present (null) like --all database matches"
+        );
+        assert!(
+            entry["label"].is_null(),
+            "a present label must be null, matching --all database matches"
+        );
+        assert!(entry["text"].as_str().unwrap().contains("needle"));
     }
 
     #[test]

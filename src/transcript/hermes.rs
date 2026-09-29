@@ -56,8 +56,10 @@ fn is_error_content(content: &str) -> bool {
 }
 
 /// Resolve existing Hermes SQLite state DB path.
-/// `HERMES_HOME` IS the hermes home itself (like `~/.hermes`), so the DB sits
-/// directly at `$HERMES_HOME/state.db`. Without it, mirror the plugin root
+/// `HERMES_HOME` IS the hermes home itself (like `~/.hermes`) and is always
+/// treated as a directory — even when its basename is `state.db`, Hermes
+/// itself reads `$HERMES_HOME/state.db` — so the DB sits directly at
+/// `$HERMES_HOME/state.db`. Without it, mirror the plugin root
 /// (`hermes_plugin_root`): `<tool_config_root()>/.hermes` — which collapses to
 /// `~/.hermes` whenever the hcom dir resolves under HOME and follows the
 /// workspace sandbox otherwise, so transcript lookup and plugin install always
@@ -72,11 +74,7 @@ pub(crate) fn get_hermes_db_path() -> Option<PathBuf> {
         Some(home) => home,
         None => crate::runtime_env::tool_config_root().join(".hermes"),
     };
-    let direct = if base.file_name().and_then(|n| n.to_str()) == Some("state.db") {
-        base
-    } else {
-        base.join("state.db")
-    };
+    let direct = base.join("state.db");
     if direct.exists() {
         return Some(direct);
     }
@@ -86,12 +84,13 @@ pub(crate) fn get_hermes_db_path() -> Option<PathBuf> {
 /// Resolve Hermes SQLite state DB path from an explicit environment map,
 /// falling back to process environment and the default tool config root.
 ///
-/// If `HERMES_HOME` is present in `raw_env` or process environment, the DB sits
-/// at `$HERMES_HOME/state.db` (or `$HERMES_HOME` directly if it names the DB file).
-/// When `HERMES_HOME` is explicitly specified, the resulting path is returned
-/// even if the DB file has not been created yet. When falling back to the default
-/// hermes home (`<tool_config_root()>/.hermes`), the path is only returned if
-/// `state.db` exists.
+/// If `HERMES_HOME` is present in `raw_env` or process environment, the DB
+/// sits at `$HERMES_HOME/state.db` — `HERMES_HOME` is always a directory,
+/// never the DB file itself. When `HERMES_HOME` is explicitly specified, the
+/// resulting path is returned even if the DB file has not been created yet.
+/// When falling back to the default hermes home
+/// (`<tool_config_root()>/.hermes`), the path is only returned if `state.db`
+/// exists.
 pub(crate) fn resolve_hermes_db_path_from_env(
     raw_env: &HashMap<String, String>,
 ) -> Option<PathBuf> {
@@ -111,11 +110,7 @@ pub(crate) fn resolve_hermes_db_path_from_env(
         Some(ref home) => home.clone(),
         None => crate::runtime_env::tool_config_root().join(".hermes"),
     };
-    let direct = if base.file_name().and_then(|n| n.to_str()) == Some("state.db") {
-        base
-    } else {
-        base.join("state.db")
-    };
+    let direct = base.join("state.db");
     if explicit.is_some() || direct.exists() {
         Some(direct)
     } else {
@@ -867,16 +862,44 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_get_hermes_db_path_explicit_state_db_file() {
+    fn hermes_home_is_always_a_directory_even_when_named_state_db() {
         let _guard = crate::hooks::test_helpers::EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
-        let db_file = temp.path().join("state.db");
+        // A hermes home whose basename happens to be state.db is still a
+        // directory: the DB sits at $HERMES_HOME/state.db.
+        let home = temp.path().join("state.db");
+        std::fs::create_dir_all(&home).unwrap();
+        let db_file = home.join("state.db");
         std::fs::write(&db_file, b"").unwrap();
 
         unsafe {
-            std::env::set_var("HERMES_HOME", &db_file);
+            std::env::set_var("HERMES_HOME", &home);
         }
-        let resolved = get_hermes_db_path();
-        assert_eq!(resolved, Some(db_file));
+        assert_eq!(get_hermes_db_path(), Some(db_file));
+
+        let mut raw_env = HashMap::new();
+        raw_env.insert(
+            "HERMES_HOME".to_string(),
+            home.to_string_lossy().to_string(),
+        );
+        assert_eq!(
+            resolve_hermes_db_path_from_env(&raw_env),
+            Some(home.join("state.db"))
+        );
+
+        // HERMES_HOME naming an actual state.db FILE is not special-cased as
+        // the DB either: it is treated as a directory, so the resolution nests
+        // state.db under it rather than returning the file.
+        let file_home = temp.path().join("file_home.db");
+        std::fs::write(&file_home, b"").unwrap();
+        let mut raw_env = HashMap::new();
+        raw_env.insert(
+            "HERMES_HOME".to_string(),
+            file_home.to_string_lossy().to_string(),
+        );
+        assert_eq!(
+            resolve_hermes_db_path_from_env(&raw_env),
+            Some(file_home.join("state.db"))
+        );
     }
 }
