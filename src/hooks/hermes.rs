@@ -4,7 +4,21 @@
 //! here. Their installation and lifecycle are owned outside hcom:
 //!
 //! - `hermes-sessionstart` — bind session→process, set listening, return
-//!   `{name, session_id, bootstrap}`.
+//!   `{name, session_id, bootstrap}`. With `--existing-only` (the backend
+//!   extension's enrollment route) nothing is ever created: an existing
+//!   hermes-owned binding is reused, an explicitly stopped hermes row is
+//!   recovered by session id only while the live row is still attributed to
+//!   that session (the stopped snapshot is history, not ownership — a row
+//!   since rebound to another session is not recoverable, or the old session
+//!   would steal the identity and delete the new binding), and the
+//!   hcom-launched process placeholder may bind only while no other session
+//!   already owns it, the enrolling session carries no stopped-snapshot
+//!   history (the fallback must never restore or recreate through that
+//!   snapshot), and any stale session binding to a missing row could not be
+//!   healed by recovery (the fallback would otherwise mint the missing row
+//!   back and retire the placeholder) — hermes serve hosts several sessions
+//!   per process; a second must not steal the first's identity. An
+//!   unenrolled session answers `{"name": null}` — expected, not an error.
 //! - `hermes-status` — set active/listening with context/detail.
 //! - `hermes-read` — every mode prints one JSON document on stdout:
 //!   raw unread list (default, `[message, …]`), `--format`
@@ -14,6 +28,10 @@
 //!   `--ack [--up-to ID]` (`{"acked_to": id}` / `{"acked": n}`; acks are
 //!   monotonic — the cursor never moves backwards, and acking the
 //!   empty-inbox cursor 0 is a no-op, not an error).
+//!   `--session-id <sid>` (without `--name`) is a read-only resolve mode:
+//!   `{"name": <enrolled name or null>, "session_id"}` — no binding,
+//!   recovery, or creation; used by the backend extension's post-tool-call
+//!   discovery for sessions that ran `hcom start` mid-session.
 //! - `hermes-beforetool` — record tool activity into the event stream.
 //! - `hermes-stop` — finalize (or `--soft`-finalize) the instance.
 //!
@@ -22,7 +40,11 @@
 //! instance row and answers a JSON error otherwise: an unknown name must not
 //! emit status events for a nonexistent instance or claim an ack that no row
 //! recorded, and a row owned by another tool is not the Hermes plugin's to
-//! touch. Reads of an unknown name stay permissive (empty inbox);
+//! touch. Writes also accept an optional `--session-id` claim: when present,
+//! the row must still be attributed to that session (stale-callback guard —
+//! a per-session callback must not status/ack/finalize a name that has since
+//! been rebound to a different session). Absent, the legacy contract holds.
+//! Reads of an unknown name stay permissive (empty inbox);
 //! `hermes-beforetool` always allows — it only skips bookkeeping for names
 //! that are not hers.
 
@@ -101,6 +123,33 @@ fn is_hermes_instance(db: &HcomDb, name: &str) -> bool {
         .is_some_and(|row| row.tool == "hermes")
 }
 
+/// Stale-callback guard for write RPCs: a caller that carries its Hermes
+/// session id (`--session-id`) may only touch a row CURRENTLY attributed to
+/// that session. A session whose identity was since rebound elsewhere (serve
+/// rebind, `hcom start --as`) must not have its old name statused, acked, or
+/// finalized through a stale per-session callback. Absent/empty session id
+/// is the legacy contract: no claim, nothing to validate.
+fn session_attribution_matches(db: &HcomDb, name: &str, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return true;
+    }
+    db.get_instance_full(name)
+        .ok()
+        .flatten()
+        .is_some_and(|row| row.session_id.as_deref() == Some(session_id))
+}
+
+/// Refusal JSON for a stale-attribution write RPC.
+fn stale_attribution_error(name: &str, session_id: &str) -> String {
+    serde_json::json!({
+        "error": format!(
+            "Hermes instance '{name}' is no longer attributed to session {session_id}; \
+             refusing the stale-callback write"
+        )
+    })
+    .to_string()
+}
+
 fn bootstrap_for(ctx: &HcomContext, db: &HcomDb, instance_name: &str) -> String {
     let tag = db
         .get_instance_full(instance_name)
@@ -140,21 +189,7 @@ fn adopt_ordinary_hermes_instance(
     if session_id.is_empty() {
         return None;
     }
-    let lock_dir = db.path().parent()?.join(".tmp");
-    if let Err(error) = std::fs::create_dir_all(&lock_dir) {
-        log_warn("hooks", "hermes.adopt.lock_dir_failed", &error.to_string());
-        return None;
-    }
-    let lock_file = std::fs::File::options()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_dir.join("hermes_adopt.lock"))
-        .ok()?;
-    if let Err(error) = crate::sys::fs::lock_exclusive(&lock_file) {
-        log_warn("hooks", "hermes.adopt.lock_failed", &error.to_string());
-        return None;
-    }
+    let _adopt_lock = acquire_hermes_adopt_lock(db)?;
     // Do not use the shared stopped-snapshot restore path here: without a
     // launch placeholder it can return a name whose instance row is gone.
     if let Ok(Some(name)) = db.get_session_binding(session_id) {
@@ -166,15 +201,10 @@ fn adopt_ordinary_hermes_instance(
         }
     }
     // A soft reset retains the row but drops the binding. Recover it locally
-    // without changing the shared bind_session_to_process behavior.
-    if let Ok(Some(name)) = db.find_stopped_instance_by_session_id(session_id)
-        && db
-            .get_instance_full(&name)
-            .ok()
-            .flatten()
-            .is_some_and(|row| row.tool == "hermes")
-        && db.rebind_instance_session(&name, session_id).is_ok()
-    {
+    // without changing the shared bind_session_to_process behavior. Legacy
+    // adopt stays error-tolerant: an unreadable snapshot simply means no
+    // recovery here (a fresh identity is minted below), as it always did.
+    if let Ok(Some(name)) = recover_stopped_hermes_row(db, session_id) {
         return Some(name);
     }
     let name = crate::instance_names::generate_unique_name(db).ok()?;
@@ -225,6 +255,87 @@ fn adopt_ordinary_hermes_instance(
     Some(name)
 }
 
+/// Safely recover an explicitly stopped hermes row by session id: the
+/// stopped-snapshot evidence plus a live hermes-owned row, rebound in place
+/// (the row keeps its cursor and history; rebind_instance_session also heals
+/// a stale binding naming the session). `Ok(None)` is a decided "not
+/// recoverable"; `Err` means the state was unreadable and no decision was
+/// made — callers that must fail closed treat it as a hard stop.
+///
+/// Fail-closed live ownership guard: the stopped snapshot is immutable
+/// life-event history, so it still names a row long after that row was
+/// rebound to a different session — and `rebind_instance_session` deletes the
+/// row's CURRENT binding. Recovering through a stale snapshot would strip the
+/// new session's binding and attribution (the old session stealing the
+/// identity). Only a live row that is unattributed or still attributed to
+/// this session is recoverable; a row owned by another session is not ours.
+fn recover_stopped_hermes_row(db: &HcomDb, session_id: &str) -> anyhow::Result<Option<String>> {
+    let Some(name) = db.find_stopped_instance_by_session_id(session_id)? else {
+        return Ok(None);
+    };
+    let Some(row) = db.get_instance_full(&name)? else {
+        return Ok(None);
+    };
+    if row.tool != "hermes" {
+        return Ok(None);
+    }
+    if let Some(owner) = row
+        .session_id
+        .as_deref()
+        .filter(|sid| !sid.is_empty() && *sid != session_id)
+    {
+        log_warn(
+            "hooks",
+            "hermes.recover_stopped.refused_row_rebound",
+            &format!("instance={name} stopped_session={session_id} live_owner={owner}"),
+        );
+        return Ok(None);
+    }
+    db.rebind_instance_session(&name, session_id)?;
+    Ok(Some(name))
+}
+
+/// Take the cross-process adopt/enroll serialization lock. Session→identity
+/// transitions (adopt, stopped-row recovery, placeholder bind) resolve a row
+/// and its bindings then rebind them; two of them racing can interleave their
+/// reads and rebinds so one session claims an identity out from under the
+/// other. Holders serialize on `<db dir>/.tmp/hermes_adopt.lock`; the guard
+/// file keeps the lock held until it is dropped.
+fn acquire_hermes_adopt_lock(db: &HcomDb) -> Option<std::fs::File> {
+    let lock_dir = db.path().parent()?.join(".tmp");
+    if let Err(error) = std::fs::create_dir_all(&lock_dir) {
+        log_warn("hooks", "hermes.adopt.lock_dir_failed", &error.to_string());
+        return None;
+    }
+    let lock_file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_dir.join("hermes_adopt.lock"))
+        .ok()?;
+    if let Err(error) = crate::sys::fs::lock_exclusive(&lock_file) {
+        log_warn("hooks", "hermes.adopt.lock_failed", &error.to_string());
+        return None;
+    }
+    Some(lock_file)
+}
+
+fn is_hcom_launched_interactive_cli(ctx: &HcomContext, row: &crate::db::InstanceRow) -> bool {
+    if !ctx.is_launched {
+        return false;
+    }
+    if row.tool != "hermes" {
+        return false;
+    }
+    let Some(ref raw_args) = row.launch_args else {
+        return false;
+    };
+    let Ok(args) = serde_json::from_str::<Vec<String>>(raw_args) else {
+        return false;
+    };
+    !args.iter().any(|a| a == "serve")
+}
+
 fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String) {
     // Plugin RPC returns JSON errors on exit 0 so the plugin can handle
     // setup failures without Hermes treating the subprocess as failed.
@@ -252,7 +363,232 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
             }
         });
 
-    let instance_name = if let Some(process_id) = ctx.process_id.as_deref() {
+    let existing_only = has_flag(argv, "--existing-only");
+    // The enrollment lock spans the whole enrollment critical section: name
+    // resolution below (binding, stopped-row recovery, placeholder fallback)
+    // AND the attribution and notify-endpoint writes further down — a rebind
+    // landing between them would be clobbered by enrollment's own
+    // session_id/port writes. Released before the bootstrap/relay side
+    // effects, which write no per-name session state.
+    let mut enroll_lock: Option<std::fs::File> = None;
+    let instance_name = if existing_only {
+        // Backend-extension enrollment: existing identities only, never a
+        // mint (adopt_ordinary_hermes_instance stays on the legacy route).
+        // A binding naming a live non-hermes row is a collision, not ours.
+        // Enrollment resolves a row and rebinds its bindings exactly like an
+        // adopt, so it serializes on the same adopt lock; when the lock
+        // cannot be taken, refuse rather than resolve unsynchronized.
+        enroll_lock = acquire_hermes_adopt_lock(db);
+        if enroll_lock.is_none() {
+            return (
+                0,
+                serde_json::json!({
+                    "error": "Hermes enrollment lock unavailable; refusing unsynchronized enrollment"
+                })
+                .to_string(),
+            );
+        }
+        // Guard reads fail CLOSED on DB errors: a swallowed Err would look
+        // exactly like "no binding / no snapshot" and let the placeholder
+        // fallback proceed even though a retry could reveal a stale binding
+        // or stopped-snapshot history. Each guard read below (binding,
+        // bound row, recovery, snapshot gate) answers a JSON error on Err
+        // instead of guessing. The placeholder lookup after the guards is
+        // optional resolution, not a guard: its read failures fail closed to
+        // a null name with no mutation, which is safe but not an error.
+        let binding = match db.get_session_binding(&session_id) {
+            Ok(binding) => binding,
+            Err(error) => {
+                log_warn(
+                    "hooks",
+                    "hermes-sessionstart.enroll_binding_read_failed",
+                    &error.to_string(),
+                );
+                return (
+                    0,
+                    serde_json::json!({
+                        "error": format!(
+                            "Hermes enrollment read failed for session {session_id}: {error}"
+                        )
+                    })
+                    .to_string(),
+                );
+            }
+        };
+        let mut canonical: Option<String> = None;
+        let mut stale_binding = false;
+        if let Some(bound) = binding {
+            let bound_row = match db.get_instance_full(&bound) {
+                Ok(row) => row,
+                Err(error) => {
+                    log_warn(
+                        "hooks",
+                        "hermes-sessionstart.enroll_bound_row_read_failed",
+                        &error.to_string(),
+                    );
+                    return (
+                        0,
+                        serde_json::json!({
+                            "error": format!(
+                                "Hermes enrollment read failed for instance {bound}: {error}"
+                            )
+                        })
+                        .to_string(),
+                    );
+                }
+            };
+            match bound_row {
+                Some(row) if row.tool == "hermes" => {
+                    if row.session_id.as_deref() != Some(session_id.as_str()) {
+                        return (
+                            0,
+                            serde_json::json!({
+                                "error": format!(
+                                    "Hermes session {session_id} is bound to '{bound}', which is attributed to session {}",
+                                    row.session_id.as_deref().unwrap_or("none")
+                                )
+                            })
+                            .to_string(),
+                        );
+                    }
+                    canonical = Some(bound);
+                }
+                Some(_) => {
+                    return (
+                        0,
+                        serde_json::json!({
+                            "error": format!(
+                                "Hermes session {session_id} is bound to '{bound}', which is not a Hermes instance"
+                            )
+                        })
+                        .to_string(),
+                    );
+                }
+                // Stale binding: the stopped-row recovery below rebinds
+                // through it, healing the binding to name the recovered row.
+                None => stale_binding = true,
+            }
+        }
+        let recovered = match canonical
+            .map(|name| Ok(Some(name)))
+            .unwrap_or_else(|| recover_stopped_hermes_row(db, &session_id))
+        {
+            Ok(name) => name,
+            Err(error) => {
+                log_warn(
+                    "hooks",
+                    "hermes-sessionstart.enroll_recovery_read_failed",
+                    &error.to_string(),
+                );
+                return (
+                    0,
+                    serde_json::json!({
+                        "error": format!(
+                            "Hermes enrollment read failed for session {session_id}: {error}"
+                        )
+                    })
+                    .to_string(),
+                );
+            }
+        };
+        match recovered {
+            Some(name) => Some(name),
+            // Stale-binding gate: bind_session_to_process re-reads the
+            // session binding and would treat the stale name as a live
+            // canonical (its canonical-exists path) — recreating the
+            // deleted row (a mint) and retiring the live placeholder as a
+            // session switch. If recovery could not heal the binding,
+            // existing-only fails closed instead.
+            None if stale_binding => {
+                log_info(
+                    "hooks",
+                    "hermes-sessionstart.enroll_fallback_stale_binding_refused",
+                    &format!("session={session_id}"),
+                );
+                None
+            }
+            // Snapshot-history gate: the guarded recovery above is the
+            // ONLY route by which a session's stopped snapshot may be
+            // consumed by enrollment. bind_session_to_process would
+            // consult the same immutable snapshot too (its
+            // restore-stopped path runs before the placeholder bind) —
+            // recreating a deleted row (violating existing-only's
+            // never-creates guarantee) or rebinding a row now owned by
+            // another session (the stale-snapshot steal the recovery
+            // guard refuses). A session with stopped-snapshot history
+            // does not enroll through the process placeholder — and an
+            // unreadable snapshot cannot prove the session has none.
+            None => match db.find_stopped_instance_by_session_id(&session_id) {
+                Ok(Some(_)) => {
+                    log_info(
+                        "hooks",
+                        "hermes-sessionstart.enroll_fallback_snapshot_refused",
+                        &format!("session={session_id}"),
+                    );
+                    None
+                }
+                Err(error) => {
+                    log_warn(
+                        "hooks",
+                        "hermes-sessionstart.enroll_snapshot_read_failed",
+                        &error.to_string(),
+                    );
+                    return (
+                        0,
+                        serde_json::json!({
+                            "error": format!(
+                                "Hermes enrollment read failed for session {session_id}: {error}"
+                            )
+                        })
+                        .to_string(),
+                    );
+                }
+                // The hcom-launched interactive CLI placeholder may bind —
+                // but hermes serve hosts several sessions in one process, and
+                // must never auto-enroll sessions into a serve process placeholder.
+                // Furthermore, process-placeholder fallback must be limited to
+                // demonstrably hcom-launched interactive CLI.
+                Ok(None) => ctx.process_id.as_deref().and_then(|process_id| {
+                    let (bound_session, placeholder_name) =
+                        db.get_process_binding_full(process_id).ok()??;
+                    let row = db.get_instance_full(&placeholder_name).ok()??;
+                    if row.tool != "hermes" {
+                        return None;
+                    }
+                    if let Some(other) = row
+                        .session_id
+                        .as_deref()
+                        .filter(|sid| !sid.is_empty() && *sid != session_id.as_str())
+                    {
+                        log_warn(
+                            "hooks",
+                            "hermes-sessionstart.placeholder_double_attribution",
+                            &format!(
+                                "placeholder={placeholder_name} owned_session={other} \
+                                 requested_session={session_id}"
+                            ),
+                        );
+                        return None;
+                    }
+                    let already_owning = row.session_id.as_deref() == Some(session_id.as_str())
+                        || bound_session.as_deref() == Some(session_id.as_str());
+                    if !already_owning && !is_hcom_launched_interactive_cli(ctx, &row) {
+                        log_info(
+                            "hooks",
+                            "hermes-sessionstart.placeholder_fallback_skipped",
+                            &format!(
+                                "placeholder={placeholder_name} session={session_id} \
+                                 is_launched={} launch_args={:?}",
+                                ctx.is_launched, row.launch_args
+                            ),
+                        );
+                        return None;
+                    }
+                    instance_binding::bind_session_to_process(db, &session_id, Some(process_id))
+                }),
+            },
+        }
+    } else if let Some(process_id) = ctx.process_id.as_deref() {
         instance_binding::bind_session_to_process(db, &session_id, Some(process_id)).or_else(|| {
             instance_name_from_env(ctx).and_then(|name| {
                 instance_binding::recover_process_binding_for_instance(
@@ -282,6 +618,15 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
             })
     };
     let Some(instance_name) = instance_name else {
+        if existing_only {
+            // Unenrolled is the expected state for an ordinary session that
+            // never ran `hcom start`: a null name, not an error, so the
+            // backend extension can stay silent without error noise.
+            return (
+                0,
+                serde_json::json!({"name": null, "session_id": session_id}).to_string(),
+            );
+        }
         return (
             0,
             r#"{"error":"No Hermes instance could be bound"}"#.to_string(),
@@ -313,8 +658,15 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     }
     instances::update_instance_position(db, &instance_name, &updates);
     if let Some(port) = notify_port {
+        // Inside the enrollment critical section: the notify port is routing
+        // state for the name — a rebind landing before this upsert would let
+        // this enrollment misroute the new owner's mail.
         upsert_plugin_notify_endpoint(db, &instance_name, port);
     }
+    // The enrollment critical section ends here: identity, binding,
+    // attribution, and the notify endpoint are consistent, and the remaining
+    // bootstrap/relay side effects write no per-name session state.
+    drop(enroll_lock);
     log_info(
         "hooks",
         "hermes-sessionstart.bind",
@@ -347,6 +699,10 @@ fn handle_status(db: &HcomDb, argv: &[String]) -> (i32, String) {
             serde_json::json!({"error": format!("Unknown Hermes instance: {name}")}).to_string(),
         );
     }
+    let claimed_session = parse_flag(argv, "--session-id").unwrap_or_default();
+    if !session_attribution_matches(db, &name, &claimed_session) {
+        return (0, stale_attribution_error(&name, &claimed_session));
+    }
     let was_listening = db
         .get_instance_full(&name)
         .ok()
@@ -370,6 +726,46 @@ fn handle_status(db: &HcomDb, argv: &[String]) -> (i32, String) {
 }
 
 fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
+    // Read-only resolve mode: map a Hermes session id to its enrolled hcom
+    // name without binding, recovering, or creating anything. The backend
+    // extension's post-tool-call discovery uses this for sessions that ran
+    // `hcom start` mid-session, where a full sessionstart would be too heavy
+    // to run per tool call. `--name` keeps its mailbox semantics and takes
+    // precedence when both are given.
+    if parse_flag(argv, "--name").is_none()
+        && let Some(session_id) = parse_flag(argv, "--session-id").filter(|s| !s.is_empty())
+    {
+        if has_flag(argv, "--ack") || has_flag(argv, "--format") || has_flag(argv, "--check") {
+            return (
+                0,
+                serde_json::json!({
+                    "error": "Cannot use --ack, --format, or --check in session resolve mode without --name"
+                })
+                .to_string(),
+            );
+        }
+        let name = db
+            .get_session_binding(&session_id)
+            .ok()
+            .flatten()
+            .filter(|name| {
+                db.get_instance_full(name)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|row| {
+                        row.tool == "hermes"
+                            && row.session_id.as_deref() == Some(session_id.as_str())
+                    })
+            });
+        return (
+            0,
+            serde_json::json!({
+                "name": name,
+                "session_id": session_id,
+            })
+            .to_string(),
+        );
+    }
     let name = match parse_flag(argv, "--name") {
         Some(n) => n,
         None => return (0, r#"{"error":"Missing --name"}"#.to_string()),
@@ -393,6 +789,11 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
             0,
             serde_json::json!({"error": format!("Not a Hermes instance: {name}")}).to_string(),
         );
+    }
+
+    let claimed_session = parse_flag(argv, "--session-id").unwrap_or_default();
+    if format_mode && !session_attribution_matches(db, &name, &claimed_session) {
+        return (0, stale_attribution_error(&name, &claimed_session));
     }
 
     let raw_messages = db.get_unread_messages(&name);
@@ -434,6 +835,12 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
                 serde_json::json!({"error": format!("Unknown Hermes instance: {name}")})
                     .to_string(),
             );
+        }
+        // And an ack is a write: a stale per-session callback must not
+        // advance the cursor of a name since rebound to another session.
+        let claimed_session = parse_flag(argv, "--session-id").unwrap_or_default();
+        if !session_attribution_matches(db, &name, &claimed_session) {
+            return (0, stale_attribution_error(&name, &claimed_session));
         }
         if let Some(up_to) = parse_flag(argv, "--up-to") {
             let Ok(ack_id) = up_to.parse::<i64>() else {
@@ -537,6 +944,12 @@ fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
             0,
             serde_json::json!({"error": format!("Unknown Hermes instance: {name}")}).to_string(),
         );
+    }
+    // Finalizing is the strongest write: a stale per-session callback must
+    // not stop a name that has since been rebound to a different session.
+    let claimed_session = parse_flag(argv, "--session-id").unwrap_or_default();
+    if !session_attribution_matches(db, &name, &claimed_session) {
+        return (0, stale_attribution_error(&name, &claimed_session));
     }
     if has_flag(argv, "--soft") {
         common::soft_finalize_session(db, &name, &reason, None, true);
@@ -1142,6 +1555,962 @@ mod tests {
 
     fn argv_of(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ── Existing-only enrollment / resolve / stale-attribution tests ──────
+
+    fn ctx_without_process(cwd: &str) -> HcomContext {
+        HcomContext::from_env(
+            &std::collections::HashMap::new(),
+            std::path::PathBuf::from(cwd),
+        )
+    }
+
+    fn ctx_with_process(process_id: &str, cwd: &str) -> HcomContext {
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), process_id.to_string());
+        HcomContext::from_env(&env, std::path::PathBuf::from(cwd))
+    }
+
+    fn set_row_session(db: &HcomDb, name: &str, session_id: &str) {
+        let mut updates = serde_json::Map::new();
+        updates.insert("session_id".into(), serde_json::json!(session_id));
+        db.update_instance_fields(name, &updates).unwrap();
+    }
+
+    fn hermes_row_count(db: &HcomDb) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM instances WHERE tool = 'hermes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn json_out(out: &str) -> Value {
+        serde_json::from_str(out).expect("handler output must be one JSON document")
+    }
+
+    #[test]
+    fn existing_only_enrolls_existing_identity_and_never_mints() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        set_row_session(&db, "vega", "ses-eo-1");
+        db.set_session_binding("ses-eo-1", "vega").unwrap();
+
+        let ctx = ctx_without_process("/tmp/project");
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-eo-1"]),
+        );
+        let doc = json_out(&out);
+        assert_eq!(
+            doc["name"].as_str(),
+            Some("vega"),
+            "an enrolled session resolves to its existing identity"
+        );
+        assert_eq!(hermes_row_count(&db), 1);
+
+        // Unknown session: a null name — expected unenrolled state, and no
+        // identity may be minted for it.
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-unknown"]),
+        );
+        let doc = json_out(&out);
+        assert!(doc["name"].is_null(), "unenrolled must answer null: {doc}");
+        assert!(doc.get("error").is_none());
+        assert_eq!(
+            hermes_row_count(&db),
+            1,
+            "existing-only must never mint an identity"
+        );
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn existing_only_recovers_explicitly_stopped_row() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        set_row_session(&db, "vega", "ses-eo-2");
+        db.set_session_binding("ses-eo-2", "vega").unwrap();
+        crate::hooks::common::soft_finalize_session(&db, "vega", "session end", None, true);
+        assert!(
+            db.get_session_binding("ses-eo-2").unwrap().is_none(),
+            "fixture: soft finalize drops the binding, keeps the row"
+        );
+
+        let ctx = ctx_without_process("/tmp/project");
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-eo-2"]),
+        );
+        let doc = json_out(&out);
+        assert_eq!(
+            doc["name"].as_str(),
+            Some("vega"),
+            "an explicitly stopped row is recovered by session id"
+        );
+        assert_eq!(
+            db.get_session_binding("ses-eo-2").unwrap().as_deref(),
+            Some("vega")
+        );
+        assert_eq!(hermes_row_count(&db), 1, "recovered, not re-minted");
+        cleanup_db(&path);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn stale_session_cannot_steal_rebound_row_on_legacy_start() {
+        use crate::hooks::test_helpers::isolated_test_env;
+
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        save_hermes_instance(&db, "vega");
+        set_row_session(&db, "vega", "ses-a");
+        db.set_session_binding("ses-a", "vega").unwrap();
+        // vega stops while attributed to ses-a: the snapshot persists, the
+        // binding drops, the row survives still naming ses-a.
+        crate::hooks::common::soft_finalize_session(&db, "vega", "session end", None, true);
+        // vega has since been rebound to ses-b (e.g. `hcom start --as vega`).
+        set_row_session(&db, "vega", "ses-b");
+        db.set_session_binding("ses-b", "vega").unwrap();
+
+        // A late callback still speaking for ses-a must not reclaim vega: the
+        // stopped snapshot is history, not ownership.
+        let ctx = HcomContext::from_env(&std::collections::HashMap::new(), home);
+        let (_, out) = handle_start(&ctx, &db, &argv_of(&["--session-id", "ses-a"]));
+        let doc = json_out(&out);
+        let fresh = doc["name"]
+            .as_str()
+            .expect("legacy start mints a fresh identity");
+        assert_ne!(
+            fresh, "vega",
+            "a stale session must not reclaim vega: {doc}"
+        );
+        assert_eq!(
+            db.get_instance_full("vega").unwrap().unwrap().session_id,
+            Some("ses-b".to_string()),
+            "vega keeps its current owner's attribution"
+        );
+        assert_eq!(
+            db.get_session_binding("ses-b").unwrap().as_deref(),
+            Some("vega"),
+            "the current owner's binding is not deleted"
+        );
+        assert_eq!(
+            db.get_session_binding("ses-a").unwrap().as_deref(),
+            Some(fresh),
+            "the stale session is answered by its fresh identity"
+        );
+
+        // The current owner can still write through vega; the stale one can't.
+        let (_, out) = handle_status(
+            &db,
+            &argv_of(&[
+                "--name",
+                "vega",
+                "--status",
+                "active",
+                "--session-id",
+                "ses-b",
+            ]),
+        );
+        assert!(
+            json_out(&out).get("error").is_none(),
+            "the current owner's write still lands: {out}"
+        );
+        let (_, out) = handle_status(
+            &db,
+            &argv_of(&[
+                "--name",
+                "vega",
+                "--status",
+                "active",
+                "--session-id",
+                "ses-a",
+            ]),
+        );
+        assert!(
+            json_out(&out)["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no longer attributed"),
+            "the stale session's write through vega is refused: {out}"
+        );
+    }
+
+    #[test]
+    fn existing_only_stale_session_cannot_steal_rebound_row() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        set_row_session(&db, "vega", "ses-a");
+        db.set_session_binding("ses-a", "vega").unwrap();
+        crate::hooks::common::soft_finalize_session(&db, "vega", "session end", None, true);
+        set_row_session(&db, "vega", "ses-b");
+        db.set_session_binding("ses-b", "vega").unwrap();
+
+        let ctx = ctx_without_process("/tmp/project");
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-a"]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["name"].is_null(),
+            "a stale session must not re-enroll into vega: {doc}"
+        );
+        assert_eq!(
+            db.get_instance_full("vega").unwrap().unwrap().session_id,
+            Some("ses-b".to_string()),
+            "vega's attribution is not overwritten"
+        );
+        assert_eq!(
+            db.get_session_binding("ses-b").unwrap().as_deref(),
+            Some("vega"),
+            "vega's live binding is not deleted"
+        );
+        assert!(db.get_session_binding("ses-a").unwrap().is_none());
+        assert_eq!(hermes_row_count(&db), 1, "nothing was minted");
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn existing_only_fallback_refuses_placeholder_for_rebound_snapshot_row() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        set_row_session(&db, "vega", "ses-a");
+        db.set_session_binding("ses-a", "vega").unwrap();
+        crate::hooks::common::soft_finalize_session(&db, "vega", "session end", None, true);
+        set_row_session(&db, "vega", "ses-b");
+        db.set_session_binding("ses-b", "vega").unwrap();
+
+        // A separate hcom-launched interactive CLI placeholder in whose
+        // process the stale callback fires: without the snapshot gate,
+        // bind_session_to_process would restore the stale snapshot (stealing
+        // vega's attribution) before ever binding the placeholder.
+        save_hermes_instance(&db, "ph");
+        let mut updates = serde_json::Map::new();
+        updates.insert("launch_args".into(), serde_json::json!(["chat"]));
+        db.update_instance_fields("ph", &updates).unwrap();
+        db.set_process_binding("pid-cli", "", "ph").unwrap();
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "pid-cli".to_string());
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp/project"));
+
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-a"]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["name"].is_null(),
+            "placeholder fallback must not restore through a stale snapshot: {doc}"
+        );
+        assert_eq!(
+            db.get_instance_full("vega").unwrap().unwrap().session_id,
+            Some("ses-b".to_string()),
+            "vega's attribution is not overwritten"
+        );
+        assert_eq!(
+            db.get_session_binding("ses-b").unwrap().as_deref(),
+            Some("vega"),
+            "vega's live binding is not deleted"
+        );
+        assert!(
+            db.get_instance_full("ph")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .is_none(),
+            "the placeholder stays unattributed"
+        );
+        assert!(db.get_session_binding("ses-a").unwrap().is_none());
+        assert_eq!(hermes_row_count(&db), 2);
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn existing_only_stale_binding_to_missing_row_never_mints_or_retires() {
+        let (db, path) = setup_test_db();
+        // A stale session binding naming a row that no longer exists, with
+        // NO stopped snapshot: nothing legitimizes re-creating that row or
+        // re-attributing anything to this session. Built the way production
+        // gets it — the row vanished without its binding cleanup (the FK
+        // blocks constructing it any other way).
+        save_hermes_instance(&db, "gone");
+        db.set_session_binding("ses-a", "gone").unwrap();
+        db.conn()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF; DELETE FROM instances WHERE name='gone'; \
+                 PRAGMA foreign_keys=ON;",
+            )
+            .unwrap();
+        assert!(db.get_instance_full("gone").unwrap().is_none());
+        assert_eq!(
+            db.get_session_binding("ses-a").unwrap().as_deref(),
+            Some("gone"),
+            "fixture: binding outlived its row"
+        );
+
+        // A live, unattributed hcom-launched interactive CLI placeholder:
+        // without the stale-binding gate, bind_session_to_process would treat
+        // 'gone' as a live canonical — minting it back from the placeholder
+        // and retiring the placeholder as a session switch.
+        save_hermes_instance(&db, "ph");
+        let mut updates = serde_json::Map::new();
+        updates.insert("launch_args".into(), serde_json::json!(["chat"]));
+        db.update_instance_fields("ph", &updates).unwrap();
+        db.set_process_binding("pid-cli", "", "ph").unwrap();
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "pid-cli".to_string());
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp/project"));
+
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-a"]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["name"].is_null(),
+            "a stale binding must not enroll through the placeholder: {doc}"
+        );
+        assert!(
+            db.get_instance_full("gone").unwrap().is_none(),
+            "the missing row is not recreated"
+        );
+        let ph = db.get_instance_full("ph").unwrap().unwrap();
+        assert_eq!(
+            ph.status, "listening",
+            "the live placeholder is not retired"
+        );
+        assert!(
+            ph.session_id.is_none(),
+            "the placeholder is not attributed to the stale session"
+        );
+        assert!(
+            db.get_session_binding("ses-a").unwrap().is_none()
+                || db.get_session_binding("ses-a").unwrap().as_deref() == Some("gone"),
+            "the stale binding is not silently rewritten to another row"
+        );
+        assert_eq!(hermes_row_count(&db), 1, "nothing was minted");
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn existing_only_fails_closed_when_guard_reads_error() {
+        // A placeholder whose every policy guard would pass: only the
+        // injected read errors stand between the fallback and a bind.
+        let placeholder_fixture = |db: &HcomDb| {
+            save_hermes_instance(db, "ph");
+            let mut updates = serde_json::Map::new();
+            updates.insert("launch_args".into(), serde_json::json!(["chat"]));
+            db.update_instance_fields("ph", &updates).unwrap();
+            db.set_process_binding("pid-cli", "", "ph").unwrap();
+        };
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "pid-cli".to_string());
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+
+        // 1. The session binding read errors: an unreadable binding must not
+        //    masquerade as an absent one and let enrollment proceed.
+        let (db, path) = setup_test_db();
+        placeholder_fixture(&db);
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp/project"));
+        db.conn()
+            .execute_batch("DROP TABLE session_bindings")
+            .unwrap();
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-a"]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("enrollment read failed"),
+            "an unreadable binding must fail closed with an error: {doc}"
+        );
+        assert!(
+            db.get_instance_full("ph")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .is_none(),
+            "no bind may happen on a failed guard read"
+        );
+        cleanup_db(&path);
+
+        // 2. The stopped-snapshot read errors mid-recovery (life events
+        //    unreadable): with every other guard green, the placeholder
+        //    fallback must still not run.
+        let (db, path) = setup_test_db();
+        placeholder_fixture(&db);
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp/project"));
+        db.conn().execute_batch("DROP TABLE events").unwrap();
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-a"]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("enrollment read failed"),
+            "an unreadable snapshot must fail closed with an error: {doc}"
+        );
+        let ph = db.get_instance_full("ph").unwrap().unwrap();
+        assert_eq!(ph.status, "listening", "the placeholder is not touched");
+        assert!(
+            ph.session_id.is_none(),
+            "the placeholder is not bound to the session"
+        );
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn existing_only_fallback_never_recreates_deleted_row_from_snapshot() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "oldid");
+        set_row_session(&db, "oldid", "ses-a");
+        db.set_session_binding("ses-a", "oldid").unwrap();
+        // Hard stop: the row is deleted, but the stopped snapshot naming
+        // oldid persists in life events.
+        let (_, out) = handle_stop(&db, &argv_of(&["--name", "oldid", "--reason", "done"]));
+        assert!(json_out(&out).get("ok").is_some());
+        assert!(db.get_instance_full("oldid").unwrap().is_none());
+
+        // A demonstrably hcom-launched interactive CLI placeholder: without
+        // the snapshot gate, bind_session_to_process would RECREATE oldid
+        // from the snapshot before binding the placeholder — a mint.
+        save_hermes_instance(&db, "ph");
+        let mut updates = serde_json::Map::new();
+        updates.insert("launch_args".into(), serde_json::json!(["chat"]));
+        db.update_instance_fields("ph", &updates).unwrap();
+        db.set_process_binding("pid-cli", "", "ph").unwrap();
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "pid-cli".to_string());
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp/project"));
+
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-a"]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["name"].is_null(),
+            "existing-only must never recreate a deleted identity: {doc}"
+        );
+        assert!(
+            db.get_instance_full("oldid").unwrap().is_none(),
+            "the deleted row stays deleted"
+        );
+        assert!(db.get_session_binding("ses-a").unwrap().is_none());
+        assert_eq!(hermes_row_count(&db), 1, "only the placeholder row exists");
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn recovery_allows_stopped_row_now_unattributed() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        set_row_session(&db, "vega", "ses-a");
+        db.set_session_binding("ses-a", "vega").unwrap();
+        crate::hooks::common::soft_finalize_session(&db, "vega", "session end", None, true);
+        // Attribution since cleared (a later rebind of ses-a elsewhere strips
+        // it): vega itself is unowned, so recovery may still heal it.
+        let mut clear = serde_json::Map::new();
+        clear.insert("session_id".into(), serde_json::Value::Null);
+        db.update_instance_fields("vega", &clear).unwrap();
+
+        let ctx = ctx_without_process("/tmp/project");
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-a"]),
+        );
+        let doc = json_out(&out);
+        assert_eq!(
+            doc["name"].as_str(),
+            Some("vega"),
+            "an unowned stopped row is still recoverable: {doc}"
+        );
+        assert_eq!(
+            db.get_session_binding("ses-a").unwrap().as_deref(),
+            Some("vega")
+        );
+        assert_eq!(hermes_row_count(&db), 1, "recovered, not re-minted");
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn hermes_adopt_lock_acquires_and_releases_on_drop() {
+        let (db, path) = setup_test_db();
+        {
+            let lock = acquire_hermes_adopt_lock(&db);
+            assert!(lock.is_some(), "lock acquires against a fresh db dir");
+        }
+        // The dropped guard released the lock: a sequential re-acquisition
+        // (the serialization adopt and enrollment both rely on) succeeds.
+        assert!(acquire_hermes_adopt_lock(&db).is_some());
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn existing_only_refuses_foreign_session_binding() {
+        let (db, path) = setup_test_db();
+        save_instance_with_tool(&db, "luna", "claude");
+        set_row_session(&db, "luna", "ses-eo-3");
+        db.set_session_binding("ses-eo-3", "luna").unwrap();
+
+        let ctx = ctx_without_process("/tmp/project");
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-eo-3"]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not a Hermes instance"),
+            "a foreign binding must be refused, not adopted: {doc}"
+        );
+        assert_eq!(
+            db.get_session_binding("ses-eo-3").unwrap().as_deref(),
+            Some("luna"),
+            "the foreign binding is left exactly as it was"
+        );
+        assert_eq!(hermes_row_count(&db), 0);
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn existing_only_never_binds_two_serve_sessions_to_one_placeholder() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        set_row_session(&db, "vega", "ses-a");
+        db.set_process_binding("pid-1", "ses-a", "vega").unwrap();
+
+        let ctx = ctx_with_process("pid-1", "/tmp/project");
+        // The owning session re-binds idempotently through its placeholder.
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-a"]),
+        );
+        let doc = json_out(&out);
+        assert_eq!(doc["name"].as_str(), Some("vega"));
+
+        // A second serve session in the same process: no attribution, and the
+        // placeholder keeps its owning session.
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-b"]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["name"].is_null(),
+            "a second serve session must not claim the placeholder: {doc}"
+        );
+        assert_eq!(
+            db.get_instance_full("vega")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("ses-a"),
+            "the placeholder keeps its owning session"
+        );
+        assert!(db.get_session_binding("ses-b").unwrap().is_none());
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn read_resolve_mode_maps_session_to_name_read_only() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        set_row_session(&db, "vega", "ses-r");
+        db.set_session_binding("ses-r", "vega").unwrap();
+        save_instance_with_tool(&db, "luna", "claude");
+        set_row_session(&db, "luna", "ses-x");
+        db.set_session_binding("ses-x", "luna").unwrap();
+
+        let (_, out) = handle_read(&db, &argv_of(&["--session-id", "ses-r"]));
+        let doc = json_out(&out);
+        assert_eq!(doc["name"].as_str(), Some("vega"));
+
+        // A foreign binding resolves to null, an unknown session to null.
+        let (_, out) = handle_read(&db, &argv_of(&["--session-id", "ses-x"]));
+        assert!(json_out(&out)["name"].is_null());
+        let (_, out) = handle_read(&db, &argv_of(&["--session-id", "ses-none"]));
+        assert!(json_out(&out)["name"].is_null());
+
+        // Read-only: nothing was created, recovered, or rebound.
+        assert_eq!(hermes_row_count(&db), 1);
+        assert_eq!(
+            db.get_session_binding("ses-x").unwrap().as_deref(),
+            Some("luna")
+        );
+        assert_eq!(
+            db.get_session_binding("ses-r").unwrap().as_deref(),
+            Some("vega")
+        );
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn read_resolve_mode_refuses_ack_format_and_check_without_name() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        set_row_session(&db, "vega", "ses-r");
+        db.set_session_binding("ses-r", "vega").unwrap();
+
+        for flag in ["--ack", "--format", "--check"] {
+            let (_, out) = handle_read(&db, &argv_of(&["--session-id", "ses-r", flag]));
+            let doc = json_out(&out);
+            assert!(
+                doc.get("error").is_some(),
+                "resolve mode must refuse {flag} without --name: {out}"
+            );
+        }
+
+        // Clean resolve without --ack/--format/--check still works
+        let (_, out) = handle_read(&db, &argv_of(&["--session-id", "ses-r"]));
+        let doc = json_out(&out);
+        assert_eq!(doc["name"].as_str(), Some("vega"));
+        assert!(doc.get("error").is_none());
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn write_rpcs_refuse_stale_session_attribution() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        // vega has since been rebound to ses-new; a stale callback still
+        // speaking for ses-old must not write through it.
+        set_row_session(&db, "vega", "ses-new");
+
+        let (_, out) = handle_status(
+            &db,
+            &argv_of(&[
+                "--name",
+                "vega",
+                "--status",
+                "active",
+                "--session-id",
+                "ses-old",
+            ]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no longer attributed"),
+            "stale status must be refused: {doc}"
+        );
+        assert_eq!(
+            db.get_instance_full("vega").unwrap().unwrap().status,
+            "listening",
+            "refused status must not mutate the row"
+        );
+        let (_, out) = handle_status(
+            &db,
+            &argv_of(&[
+                "--name",
+                "vega",
+                "--status",
+                "active",
+                "--session-id",
+                "ses-new",
+            ]),
+        );
+        assert!(json_out(&out).get("error").is_none());
+
+        // Ack: stale claim refused (cursor untouched), current claim advances.
+        let e1 = log_broadcast(&db, "sol", "first");
+        let e2 = log_broadcast(&db, "sol", "second");
+        let (_, out) = handle_read(
+            &db,
+            &argv_of(&[
+                "--name",
+                "vega",
+                "--ack",
+                "--up-to",
+                &e2.to_string(),
+                "--session-id",
+                "ses-old",
+            ]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no longer attributed"),
+            "stale ack must be refused: {doc}"
+        );
+        assert_eq!(
+            db.get_instance_full("vega").unwrap().unwrap().last_event_id,
+            0,
+            "refused ack must not advance the cursor"
+        );
+        let (_, out) = handle_read(
+            &db,
+            &argv_of(&[
+                "--name",
+                "vega",
+                "--ack",
+                "--up-to",
+                &e2.to_string(),
+                "--session-id",
+                "ses-new",
+            ]),
+        );
+        assert_eq!(json_out(&out)["acked_to"].as_i64(), Some(e2));
+        let _ = e1;
+
+        // Read format: stale claim refused BEFORE reading messages.
+        let (_, out) = handle_read(
+            &db,
+            &argv_of(&["--name", "vega", "--format", "--session-id", "ses-old"]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no longer attributed"),
+            "stale read format must be refused: {doc}"
+        );
+
+        // Read format with current claim succeeds.
+        let (_, out) = handle_read(
+            &db,
+            &argv_of(&["--name", "vega", "--format", "--session-id", "ses-new"]),
+        );
+        assert!(json_out(&out).get("error").is_none());
+
+        // Stop: stale claim refused, current claim soft-stops.
+        let (_, out) = handle_stop(
+            &db,
+            &argv_of(&[
+                "--name",
+                "vega",
+                "--reason",
+                "stale test",
+                "--session-id",
+                "ses-old",
+            ]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no longer attributed"),
+            "stale stop must be refused: {doc}"
+        );
+        assert!(
+            db.get_instance_full("vega").unwrap().is_some(),
+            "refused stop must not finalize the row"
+        );
+        let (_, out) = handle_stop(
+            &db,
+            &argv_of(&[
+                "--name",
+                "vega",
+                "--reason",
+                "session finalize",
+                "--soft",
+                "--session-id",
+                "ses-new",
+            ]),
+        );
+        assert!(json_out(&out).get("error").is_none());
+        assert!(db.get_instance_full("vega").unwrap().is_some());
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn existing_only_refuses_bound_row_with_different_session_id() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        set_row_session(&db, "vega", "ses-other");
+        db.set_session_binding("ses-req", "vega").unwrap();
+
+        let ctx = ctx_without_process("/tmp/project");
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-req"]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("attributed to session"),
+            "mismatched bound session must be refused: {doc}"
+        );
+        assert_eq!(
+            db.get_instance_full("vega")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("ses-other"),
+            "row session_id is not overwritten"
+        );
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn existing_only_never_auto_enrolls_first_session_of_serve() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        // Fresh serve placeholder: no session_id yet, launch_args = ["serve"]
+        let mut updates = serde_json::Map::new();
+        updates.insert("launch_args".into(), serde_json::json!(["serve"]));
+        db.update_instance_fields("vega", &updates).unwrap();
+        db.set_process_binding("pid-srv", "", "vega").unwrap();
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "pid-srv".to_string());
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp/project"));
+
+        let (_, out) = handle_start(
+            &ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-first-serve"]),
+        );
+        let doc = json_out(&out);
+        assert!(
+            doc["name"].is_null(),
+            "first session of serve must never auto-enroll: {doc}"
+        );
+        assert!(
+            db.get_instance_full("vega")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .is_none(),
+            "placeholder keeps empty session_id"
+        );
+        assert!(db.get_session_binding("ses-first-serve").unwrap().is_none());
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn existing_only_placeholder_fallback_requires_demonstrably_hcom_launched_interactive_cli() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        let mut updates = serde_json::Map::new();
+        updates.insert("launch_args".into(), serde_json::json!(["chat"]));
+        db.update_instance_fields("vega", &updates).unwrap();
+        db.set_process_binding("pid-cli", "", "vega").unwrap();
+
+        // 1. Not launched by hcom: ctx.is_launched is false -> refuses fallback
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), "pid-cli".to_string());
+        let unlaunched_ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp/project"));
+        let (_, out) = handle_start(
+            &unlaunched_ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-cli"]),
+        );
+        assert!(json_out(&out)["name"].is_null());
+
+        // 2. Launched by hcom, but launch_args is missing (None) -> fails closed
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+        let launched_ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp/project"));
+        let mut clear_args = serde_json::Map::new();
+        clear_args.insert("launch_args".into(), serde_json::Value::Null);
+        db.update_instance_fields("vega", &clear_args).unwrap();
+        let (_, out) = handle_start(
+            &launched_ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-cli"]),
+        );
+        assert!(
+            json_out(&out)["name"].is_null(),
+            "missing launch_args must fail closed"
+        );
+
+        // 3. Launched by hcom, but launch_args is malformed JSON -> fails closed
+        let mut malformed_args = serde_json::Map::new();
+        malformed_args.insert("launch_args".into(), serde_json::json!("{not valid json"));
+        db.update_instance_fields("vega", &malformed_args).unwrap();
+        let (_, out) = handle_start(
+            &launched_ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-cli"]),
+        );
+        assert!(
+            json_out(&out)["name"].is_null(),
+            "malformed launch_args must fail closed"
+        );
+
+        // 4. Launched by hcom, but launch_args contains serve subcommand -> refuses
+        let mut serve_args = serde_json::Map::new();
+        serve_args.insert(
+            "launch_args".into(),
+            serde_json::json!(["serve", "--port", "8000"]),
+        );
+        db.update_instance_fields("vega", &serve_args).unwrap();
+        let (_, out) = handle_start(
+            &launched_ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-cli"]),
+        );
+        assert!(
+            json_out(&out)["name"].is_null(),
+            "serve launch_args must be refused"
+        );
+
+        // 5. Demonstrably launched by hcom interactive CLI: binds successfully
+        let mut clean_args = serde_json::Map::new();
+        clean_args.insert("launch_args".into(), serde_json::json!(["chat"]));
+        db.update_instance_fields("vega", &clean_args).unwrap();
+        let (_, out) = handle_start(
+            &launched_ctx,
+            &db,
+            &argv_of(&["--existing-only", "--session-id", "ses-cli"]),
+        );
+        let doc = json_out(&out);
+        assert_eq!(doc["name"].as_str(), Some("vega"));
+        assert_eq!(
+            db.get_instance_full("vega")
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("ses-cli")
+        );
+        assert_eq!(
+            db.get_session_binding("ses-cli").unwrap().as_deref(),
+            Some("vega")
+        );
+        cleanup_db(&path);
     }
 
     #[test]

@@ -1,0 +1,9 @@
+name: hcom
+version: 0.1.0
+description: "hcom backend extension: existing-only identity enrollment, per-session mail delivery as visible Hermes user turns, and lifecycle sync for Hermes sessions."
+author: "hcom"
+provides_hooks:
+  - on_session_start
+  - on_session_finalize
+  - on_session_reset
+  - post_tool_call
