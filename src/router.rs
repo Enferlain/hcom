@@ -937,9 +937,7 @@ mod tests {
         let actual = crate::commands::hooks::hook_tools();
         let expected: Vec<Tool> = crate::integration_spec::ALL
             .iter()
-            .filter(|spec| {
-                spec.released && !spec.hooks.names.is_empty() && spec.tool != Tool::Hermes
-            })
+            .filter(|spec| spec.released && !spec.hooks.names.is_empty())
             .map(|spec| spec.tool)
             .collect();
         assert_eq!(actual, expected);

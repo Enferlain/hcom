@@ -106,7 +106,11 @@ impl Tool {
             }
             Tool::Pi => crate::hooks::pi::verify_pi_plugin_installed(),
             Tool::Omp => crate::hooks::omp::verify_omp_plugin_installed(),
-            Tool::Hermes => crate::hooks::hermes::verify_hermes_plugin_ready(),
+            // Full backend readiness: plugin loads (owned, present,
+            // enabled) AND the gateway-injection grant is in place —
+            // otherwise hooks-add would say "already installed" and launch
+            // would skip setup over a missing grant.
+            Tool::Hermes => crate::hooks::hermes::verify_hermes_backend_ready(),
             Tool::Adhoc => false,
         }
     }
@@ -151,7 +155,10 @@ impl Tool {
                 Ok(false) => Err(String::new()),
                 Err(e) => Err(e.to_string()),
             },
-            Tool::Hermes => Err("Hermes plugins are managed outside hcom".to_string()),
+            // The hcom-owned backend extension: files + config enablement
+            // (see hooks::hermes installer). Hermes has no permission block;
+            // `include_permissions` does not apply.
+            Tool::Hermes => crate::hooks::hermes::try_setup_hermes_backend(),
             Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
         }
     }
@@ -180,7 +187,7 @@ impl Tool {
             Tool::Omp => crate::hooks::omp::remove_omp_plugin()
                 .map(|_| true)
                 .map_err(|e| e.to_string()),
-            Tool::Hermes => Err("Hermes plugins are managed outside hcom".to_string()),
+            Tool::Hermes => crate::hooks::hermes::remove_hermes_backend().map(|_| true),
             Tool::Adhoc => Ok(false),
         }
     }

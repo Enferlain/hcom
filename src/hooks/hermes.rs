@@ -1,7 +1,7 @@
 //! Hermes Agent hook handlers — argv-based lifecycle plus Python plugin.
 //!
-//! Hermes-side plugins may use the argv-based RPC subcommands dispatched
-//! here. Their installation and lifecycle are owned outside hcom:
+//! The hcom-owned Hermes backend extension uses the argv-based RPC
+//! subcommands dispatched here:
 //!
 //! - `hermes-sessionstart` — bind session→process, set listening, return
 //!   `{name, session_id, bootstrap}`. With `--existing-only` (the backend
@@ -1291,8 +1291,8 @@ fn not_ready(diagnostic: String) -> HermesPluginReadiness {
     }
 }
 
-/// Evaluate the full Hermes integration readiness ONCE: the external plugin
-/// files exist AND Hermes actually enables the plugin. Files alone are NOT
+/// Evaluate Hermes plugin readiness ONCE: the hcom-owned backend files exist
+/// AND Hermes actually enables the plugin. Files alone are NOT
 /// ready — a present-but-disabled plugin never loads into Hermes.
 ///
 /// Enabled-state mirrors hermes_cli/plugins.py loader semantics:
@@ -1314,9 +1314,24 @@ pub fn evaluate_hermes_plugin_readiness() -> HermesPluginReadiness {
     }
     if !verify_hermes_plugin_installed() {
         return not_ready(format!(
-            "Hermes plugin files are missing at {}. The plugin is managed outside hcom — install it with Hermes, then run: hermes plugins enable hcom",
+            "Hermes backend files are missing at {}. Run: hcom hooks add hermes",
             get_hermes_plugin_path().display()
         ));
+    }
+    // hcom owns the backend extension and must never load someone else's
+    // plugin in its place: an unmanaged/foreign copy at the plugin path is
+    // not ready even when it is enabled — and hcom will not auto-overwrite
+    // it. Tell the user exactly how to migrate by hand.
+    match backend_ownership() {
+        Ok(BackendOwnership::Ours) => {}
+        _ => {
+            return not_ready(format!(
+                "A plugin that is not hcom-managed is installed at {}. hcom will not overwrite \
+                 it. Back it up if needed, remove it (e.g. hermes plugins remove hcom), then \
+                 run: hcom hooks add hermes",
+                backend_plugin_dir().display()
+            ));
+        }
     }
     match hermes_cli_reports_plugin_enabled() {
         Some(true) => HermesPluginReadiness {
@@ -1368,6 +1383,666 @@ pub fn evaluate_hermes_plugin_readiness() -> HermesPluginReadiness {
 /// from ONE evaluation.
 pub fn verify_hermes_plugin_ready() -> bool {
     evaluate_hermes_plugin_readiness().ready
+}
+
+/// Full BACKEND readiness for hook-install and launch gating: the plugin
+/// loads (owned, present, enabled — [`evaluate_hermes_plugin_readiness`])
+/// AND the gateway-injection grant is in place. Without the grant the
+/// extension cannot inject visible user turns into `hermes serve` /
+/// non-CLI sessions, so hooks-add must not report "already installed" and
+/// launch must not skip setup over a missing grant.
+pub fn evaluate_hermes_backend_readiness() -> HermesPluginReadiness {
+    let plugin = evaluate_hermes_plugin_readiness();
+    if !plugin.ready {
+        return plugin;
+    }
+    match hermes_gateway_injection_enabled() {
+        Some(true) => plugin,
+        Some(false) => not_ready(
+            "Gateway injection is denied for the hcom plugin entry \
+             (plugins.entries.hcom.allow_gateway_injection: false); non-CLI/serve sessions \
+             cannot receive injected turns. Run: hcom hooks add hermes"
+                .to_string(),
+        ),
+        None => not_ready(
+            "Gateway injection is not granted (plugins.entries.hcom.allow_gateway_injection); \
+             non-CLI/serve sessions cannot receive injected turns. Run: hcom hooks add hermes"
+                .to_string(),
+        ),
+    }
+}
+
+/// Backend readiness as a plain bool — the Hermes arm of the hooks surface
+/// (`Tool::verify_hooks_installed`) and the launch gate.
+pub fn verify_hermes_backend_ready() -> bool {
+    evaluate_hermes_backend_readiness().ready
+}
+
+// ── Backend extension installer ──────────────────────────────────────────
+//
+// hcom owns the Hermes backend extension (`src/hermes_backend/hcom`): it is
+// the delivery surface for both hcom-launched CLI sessions and `hermes
+// serve`. `hcom hooks add hermes` copies it into `<hermes home>/plugins/hcom`
+// and enables it through Hermes config; nothing else is installed — no
+// Desktop/UI plugin, no other package, path, manifest, or migration.
+
+/// Embedded sources of the hcom-owned backend extension. Only these two
+/// files are ever installed (never the test module or pycache).
+const BACKEND_INIT_SOURCE: &str = include_str!("../hermes_backend/hcom/__init__.py");
+const BACKEND_MANIFEST_SOURCE: &str = include_str!("../hermes_backend/hcom/plugin.yaml");
+
+/// Marker file our installer writes inside the plugin directory. Only its
+/// own writes ever create it, so its presence is the sentinel that a
+/// (possibly drifted) copy is hcom-managed and may be updated in place.
+/// Without it, only a byte-exact copy of the current sources counts as ours
+/// — anything else at the plugin path is foreign and never touched.
+const BACKEND_MANAGED_MARKER: &str = ".hcom-managed";
+const BACKEND_MARKER_CONTENT: &str = "hcom-managed backend extension (hcom hooks add hermes)\n";
+
+fn backend_plugin_dir() -> std::path::PathBuf {
+    hermes_plugin_root().join(PLUGIN_DIR_NAME)
+}
+
+/// A plugin path redirected outside its visible directory is never ours to
+/// update or remove. On Windows, junctions are reparse points but are not
+/// reported by `Path::is_symlink()`.
+fn backend_path_is_indirect(path: &std::path::Path) -> bool {
+    if path.is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0);
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// Ownership state of whatever sits at the backend plugin path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendOwnership {
+    /// Nothing installed there.
+    Absent,
+    /// hcom-managed: our marker is present, or the files are a byte-exact
+    /// copy of the current embedded sources (adoption of a fresh copy).
+    Ours,
+    /// Someone else's plugin (or unknown/unexpected content, incl. symlinked
+    /// paths): hcom must never write through or delete it.
+    Foreign,
+}
+
+/// Decide ownership of the plugin directory. A symlinked directory or a
+/// symlinked file inside it is Foreign by definition — hcom does not follow
+/// or rewrite symlinks into user-managed locations.
+fn backend_ownership() -> Result<BackendOwnership, String> {
+    let dir = backend_plugin_dir();
+    if backend_path_is_indirect(&dir) {
+        return Ok(BackendOwnership::Foreign);
+    }
+    if !dir.exists() {
+        return Ok(BackendOwnership::Absent);
+    }
+    let manifest = dir.join("plugin.yaml");
+    let init = dir.join("__init__.py");
+    if backend_path_is_indirect(&manifest) || backend_path_is_indirect(&init) {
+        return Ok(BackendOwnership::Foreign);
+    }
+    // The marker must be a REGULAR file with our exact content: a symlinked
+    // or edited marker must never make someone else's directory look
+    // hcom-managed. A valid marker also lets us repair a first install that
+    // was interrupted before either runtime file was written.
+    let marker = dir.join(BACKEND_MANAGED_MARKER);
+    if backend_path_is_indirect(&marker) {
+        return Ok(BackendOwnership::Foreign);
+    }
+    if marker.exists() {
+        return Ok(
+            if std::fs::read_to_string(&marker)
+                .is_ok_and(|content| content == BACKEND_MARKER_CONTENT)
+            {
+                BackendOwnership::Ours
+            } else {
+                BackendOwnership::Foreign
+            },
+        );
+    }
+    if !manifest.exists() && !init.exists() {
+        // An interrupted first install may have created only an empty
+        // directory. Nothing there can be someone else's plugin, so a retry
+        // may safely adopt it. Any unknown content remains foreign.
+        return Ok(
+            if std::fs::read_dir(&dir)
+                .map_err(|e| e.to_string())?
+                .next()
+                .is_none()
+            {
+                BackendOwnership::Absent
+            } else {
+                BackendOwnership::Foreign
+            },
+        );
+    }
+    let manifest_exact =
+        std::fs::read_to_string(&manifest).is_ok_and(|c| c == BACKEND_MANIFEST_SOURCE);
+    let init_exact = std::fs::read_to_string(&init).is_ok_and(|c| c == BACKEND_INIT_SOURCE);
+    if manifest_exact && init_exact {
+        return Ok(BackendOwnership::Ours);
+    }
+    Ok(BackendOwnership::Foreign)
+}
+
+/// Public ownership probe for status reporting.
+pub fn backend_ownership_pub() -> Result<BackendOwnership, String> {
+    backend_ownership()
+}
+
+fn foreign_plugin_error() -> String {
+    format!(
+        "a plugin that is not hcom-managed exists at {}; hcom will not overwrite or remove it — \
+         back it up and remove it (e.g. hermes plugins remove hcom), then run: hcom hooks add hermes",
+        backend_plugin_dir().display()
+    )
+}
+
+/// Install (or update) the backend extension files. Refuses to touch a
+/// foreign plugin at the same path. `Ok(true)` when files were written,
+/// `Ok(false)` when already current.
+pub fn install_hermes_backend_files() -> Result<bool, String> {
+    if backend_ownership()? == BackendOwnership::Foreign {
+        return Err(foreign_plugin_error());
+    }
+    let dir = backend_plugin_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let manifest_current = std::fs::read_to_string(dir.join("plugin.yaml"))
+        .map(|c| c == BACKEND_MANIFEST_SOURCE)
+        .unwrap_or(false);
+    let init_current = std::fs::read_to_string(dir.join("__init__.py"))
+        .map(|c| c == BACKEND_INIT_SOURCE)
+        .unwrap_or(false);
+    let marker_present = dir.join(BACKEND_MANAGED_MARKER).exists();
+    if manifest_current && init_current && marker_present {
+        return Ok(false);
+    }
+    // Claim ownership before changing either runtime file. Each replacement
+    // is staged outside the plugin directory and renamed into place, so an
+    // interrupted update cannot leave a torn, discoverable Python module.
+    // Write the manifest last because Hermes discovers a directory plugin
+    // through plugin.yaml.
+    if !marker_present {
+        atomic_write_backend_file(&dir, BACKEND_MANAGED_MARKER, BACKEND_MARKER_CONTENT)?;
+    }
+    if !init_current {
+        atomic_write_backend_file(&dir, "__init__.py", BACKEND_INIT_SOURCE)?;
+    }
+    if !manifest_current {
+        atomic_write_backend_file(&dir, "plugin.yaml", BACKEND_MANIFEST_SOURCE)?;
+    }
+    Ok(true)
+}
+
+fn atomic_write_backend_file(dir: &std::path::Path, name: &str, body: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    // Keep temporary files outside the plugin directory: an interrupted
+    // write must not become part of the discovered plugin or its removal.
+    let parent = dir
+        .parent()
+        .ok_or("backend plugin directory has no parent")?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".hcom-backend-")
+        .tempfile_in(parent)
+        .map_err(|e| e.to_string())?;
+    staged
+        .write_all(body.as_bytes())
+        .and_then(|_| staged.as_file().sync_all())
+        .map_err(|e| e.to_string())?;
+    staged.persist(dir.join(name)).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The first file inside the plugin directory that is not one of our known
+/// files (`plugin.yaml`, `__init__.py`, the managed marker, and Python's
+/// own compiled `__init__` cache), if any. Unreadable entries fail closed.
+fn backend_unexpected_file(dir: &std::path::Path) -> Result<Option<String>, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == "__pycache__" {
+            if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+                return Ok(Some(name.to_string()));
+            }
+            for cached in std::fs::read_dir(entry.path()).map_err(|e| e.to_string())? {
+                let cached = cached.map_err(|e| e.to_string())?;
+                let cached_name = cached.file_name();
+                let cached_name = cached_name.to_string_lossy();
+                let compiled_init = cached_name.starts_with("__init__.cpython-")
+                    && cached_name.ends_with(".pyc")
+                    && cached.file_type().map_err(|e| e.to_string())?.is_file();
+                if !compiled_init {
+                    return Ok(Some(format!("__pycache__/{cached_name}")));
+                }
+            }
+        } else if name != BACKEND_MANAGED_MARKER
+            && !matches!(name.as_ref(), "plugin.yaml" | "__init__.py")
+        {
+            return Ok(Some(name.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn unexpected_file_error(dir: &std::path::Path, name: &str) -> String {
+    format!(
+        "unexpected file '{}' inside {}; hcom will not delete the directory — \
+         inspect and remove it manually, then retry",
+        name,
+        dir.display()
+    )
+}
+
+/// Remove the backend extension files. Refuses to remove a foreign plugin,
+/// and refuses to delete a directory holding anything beyond our known
+/// files. `Ok(true)` when the directory was removed, `Ok(false)` when
+/// absent.
+pub fn remove_hermes_backend_files() -> Result<bool, String> {
+    if backend_ownership()? == BackendOwnership::Foreign {
+        return Err(foreign_plugin_error());
+    }
+    let dir = backend_plugin_dir();
+    if !dir.exists() {
+        return Ok(false);
+    }
+    if let Some(name) = backend_unexpected_file(&dir)? {
+        return Err(unexpected_file_error(&dir, &name));
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+/// Files present AND byte-current with the embedded sources (drives the
+/// "update available" nuance in status output).
+pub fn hermes_backend_files_current() -> bool {
+    let dir = backend_plugin_dir();
+    let manifest = std::fs::read_to_string(dir.join("plugin.yaml"))
+        .map(|c| c == BACKEND_MANIFEST_SOURCE)
+        .unwrap_or(false);
+    let init = std::fs::read_to_string(dir.join("__init__.py"))
+        .map(|c| c == BACKEND_INIT_SOURCE)
+        .unwrap_or(false);
+    manifest && init
+}
+
+/// Run `hermes <args...>` against OUR resolved hermes home. Returns
+/// `(success, stdout, stderr)` — callers classify "not set" style non-zero
+/// replies themselves (that notice arrives on stderr).
+fn run_hermes_cli_raw(args: &[&str]) -> Result<(bool, String, String), String> {
+    let hermes_bin = crate::terminal::which_bin("hermes")
+        .ok_or_else(|| "the hermes CLI was not found on PATH; install Hermes first".to_string())?;
+    run_hermes_command(&hermes_bin, args, std::time::Duration::from_secs(10))
+}
+
+/// Capture both output pipes concurrently and bound the entire CLI call.
+/// Config reads/writes run on launch and status paths, so a wedged Hermes
+/// binary must not hang hcom indefinitely.
+fn run_hermes_command(
+    hermes_bin: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<(bool, String, String), String> {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    let home = hermes_home_dir();
+    let mut child = std::process::Command::new(hermes_bin)
+        .args(args)
+        .env("HERMES_HOME", &home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run hermes {}: {e}", args.join(" ")))?;
+    let mut stdout = child.stdout.take().ok_or("missing Hermes stdout pipe")?;
+    let mut stderr = child.stderr.take().ok_or("missing Hermes stderr pipe")?;
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = stdout_tx.send(result);
+    });
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stderr.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = stderr_tx.send(result);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("hermes {} timed out", args.join(" ")));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "failed to wait for hermes {}: {error}",
+                    args.join(" ")
+                ));
+            }
+        }
+    };
+    // A child process inheriting a pipe must not turn a completed Hermes
+    // command into an unbounded wait on the reader threads.
+    let read_timeout = deadline.saturating_duration_since(std::time::Instant::now())
+        + std::time::Duration::from_millis(200);
+    let stdout = stdout_rx
+        .recv_timeout(read_timeout)
+        .map_err(|e| format!("failed to read hermes stdout: {e}"))?
+        .map_err(|e| format!("failed to read hermes stdout: {e}"))?;
+    let stderr = stderr_rx
+        .recv_timeout(read_timeout)
+        .map_err(|e| format!("failed to read hermes stderr: {e}"))?
+        .map_err(|e| format!("failed to read hermes stderr: {e}"))?;
+    Ok((
+        status.success(),
+        String::from_utf8_lossy(&stdout).trim().to_string(),
+        String::from_utf8_lossy(&stderr).trim().to_string(),
+    ))
+}
+
+/// Run `hermes <args...>` requiring success. Returns `Err(message)` when
+/// the CLI is missing or fails — config writes must not be guessed at when
+/// the authoritative writer cannot run.
+pub fn run_hermes_cli(args: &[&str]) -> Result<String, String> {
+    let (success, stdout, stderr) = run_hermes_cli_raw(args)?;
+    if !success {
+        let detail = if stderr.is_empty() { &stdout } else { &stderr };
+        return Err(format!("hermes {} failed: {detail}", args.join(" ")));
+    }
+    Ok(stdout)
+}
+
+/// JSON-array literal for a `hermes config set <list-key> <value>` value
+/// (JSON is a YAML subset; the CLI's own dumper emits the block form).
+fn config_list_value(items: &[String]) -> String {
+    serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// The last line of `hermes config get <key> --json` output, parsed as a
+/// JSON string array. The CLI prints its value last; anything else in the
+/// output is warnings.
+fn json_list_from_get_output(stdout: &str) -> Option<Vec<String>> {
+    let last = stdout.lines().last()?.trim();
+    serde_json::from_str::<Vec<String>>(last).ok()
+}
+
+/// Read the current plugin allow/veto lists through the installed CLI —
+/// the authoritative parser (handles every YAML shape, incl. flow style).
+/// `hermes config get` exits non-zero with "Config key not set" for an
+/// unset list, which means empty.
+fn plugin_lists_via_cli() -> Result<(Vec<String>, Vec<String>), String> {
+    let mut lists = Vec::new();
+    for key in ["plugins.enabled", "plugins.disabled"] {
+        let (success, stdout, stderr) = run_hermes_cli_raw(&["config", "get", key, "--json"])?;
+        let missing = format!("Config key not set: {key}");
+        if success && let Some(list) = json_list_from_get_output(&stdout) {
+            lists.push(list);
+        } else if !success
+            && (stdout.lines().last().map(str::trim) == Some(missing.as_str())
+                || stderr.lines().last().map(str::trim) == Some(missing.as_str()))
+        {
+            lists.push(Vec::new());
+        } else {
+            let detail = if stderr.is_empty() { &stdout } else { &stderr };
+            return Err(format!("hermes config get {key}: {detail}"));
+        }
+    }
+    Ok((lists.remove(0), lists.remove(0)))
+}
+
+/// Current `plugins.enabled`/`plugins.disabled` lists for list-rewriting.
+/// CLI-first (authoritative); without the CLI, the conservative text parser
+/// — and a present-but-unparsable config FAILS CLOSED rather than letting a
+/// rewrite drop other plugins' allow-list entries. A missing config file is
+/// a fresh home (empty lists).
+fn current_plugin_lists() -> Result<(Vec<String>, Vec<String>), String> {
+    if !cfg!(test) && crate::terminal::which_bin("hermes").is_some() {
+        return plugin_lists_via_cli();
+    }
+    match std::fs::read_to_string(hermes_config_path()) {
+        Err(_) => Ok((Vec::new(), Vec::new())),
+        Ok(text) => parse_hermes_plugin_lists(&text).ok_or_else(|| {
+            format!(
+                "cannot safely parse the plugins block in {}; refusing to rewrite the plugin \
+                 allow-lists — fix the config (hermes config check) or make the hermes CLI \
+                 available, then retry",
+                hermes_config_path().display()
+            )
+        }),
+    }
+}
+
+/// Enable the backend extension through Hermes config, preserving every
+/// other plugin and setting (the CLI's comment-preserving writer is the only
+/// thing that touches config.yaml):
+/// - add `hcom` to `plugins.enabled` (keeping all other entries, order kept)
+/// - drop `hcom` from `plugins.disabled` if present (the loader vetoes it)
+/// - grant `plugins.entries.hcom.allow_gateway_injection: true` — required
+///   for the extension to inject visible user turns into `hermes serve` /
+///   non-CLI sessions (hermes_cli PluginContext.inject_message gates non-CLI
+///   injection on exactly this entry).
+///
+/// The `run` closure executes each `hermes config …` operation (injected so
+/// tests assert the exact operations without the live CLI).
+pub fn enable_hermes_backend_config(
+    run: &dyn Fn(&[&str]) -> Result<(), String>,
+) -> Result<(), String> {
+    let (enabled, disabled) = current_plugin_lists()?;
+    if !enabled.iter().any(|n| n == PLUGIN_DIR_NAME) {
+        let mut desired = enabled.clone();
+        desired.push(PLUGIN_DIR_NAME.to_string());
+        run(&[
+            "config",
+            "set",
+            "plugins.enabled",
+            &config_list_value(&desired),
+        ])?;
+    }
+    if disabled.iter().any(|n| n == PLUGIN_DIR_NAME) {
+        let desired: Vec<String> = disabled
+            .iter()
+            .filter(|n| n.as_str() != PLUGIN_DIR_NAME)
+            .cloned()
+            .collect();
+        run(&[
+            "config",
+            "set",
+            "plugins.disabled",
+            &config_list_value(&desired),
+        ])?;
+    }
+    run(&[
+        "config",
+        "set",
+        "plugins.entries.hcom.allow_gateway_injection",
+        "true",
+    ])?;
+    Ok(())
+}
+
+/// Undo the config side of the install: remove `hcom` from
+/// `plugins.enabled` and drop `plugins.entries.hcom` (a foreign `entries`
+/// key is never touched — only ours). `plugins.disabled` is left alone: a
+/// user's explicit disable choice survives a reinstall.
+pub fn disable_hermes_backend_config(
+    run: &dyn Fn(&[&str]) -> Result<(), String>,
+) -> Result<(), String> {
+    let (enabled, _disabled) = current_plugin_lists()?;
+    if enabled.iter().any(|n| n == PLUGIN_DIR_NAME) {
+        let desired: Vec<String> = enabled
+            .iter()
+            .filter(|n| n.as_str() != PLUGIN_DIR_NAME)
+            .cloned()
+            .collect();
+        run(&[
+            "config",
+            "set",
+            "plugins.enabled",
+            &config_list_value(&desired),
+        ])?;
+    }
+    // `hermes config unset` exits non-zero with "Config key not set" when
+    // the key is already absent — an idempotent no-op, not a failure.
+    if let Err(error) = run(&["config", "unset", "plugins.entries.hcom"])
+        && !error.ends_with("Config key not set: plugins.entries.hcom")
+    {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Full install used by the hooks surface: files, then config enablement.
+/// Idempotent — already-current files and already-enabled config are no-ops.
+pub fn try_setup_hermes_backend() -> Result<(), String> {
+    if crate::terminal::which_bin("hermes").is_none() {
+        return Err("the hermes CLI was not found on PATH; install Hermes first".to_string());
+    }
+    // Fail before writing plugin files when the existing allow-lists cannot
+    // be read safely. A broken or absent Hermes CLI must not leave an
+    // unconfigured extension behind.
+    current_plugin_lists()?;
+    install_hermes_backend_files()?;
+    let run = |args: &[&str]| run_hermes_cli(args).map(|_| ());
+    enable_hermes_backend_config(&run)
+}
+
+/// Full removal used by the hooks surface. An absent backend is a no-op that
+/// leaves Hermes config untouched and does not require the Hermes CLI.
+/// Ownership AND directory contents are validated FIRST: a foreign plugin
+/// is never disabled or deleted, and unexpected files are refused. Config
+/// cleanup must succeed before removing files so a failed CLI call leaves
+/// an installed backend that can be retried, not stranded config.
+pub fn remove_hermes_backend() -> Result<bool, String> {
+    match backend_ownership()? {
+        BackendOwnership::Absent => {
+            // Nothing hcom-owned is installed. Do not touch a user's Hermes
+            // config or require the Hermes CLI just to report a no-op.
+            return Ok(false);
+        }
+        BackendOwnership::Foreign => return Err(foreign_plugin_error()),
+        BackendOwnership::Ours => {}
+    }
+    let dir = backend_plugin_dir();
+    if dir.exists()
+        && let Some(name) = backend_unexpected_file(&dir)?
+    {
+        return Err(unexpected_file_error(&dir, &name));
+    }
+    if crate::terminal::which_bin("hermes").is_some() {
+        let run = |args: &[&str]| run_hermes_cli(args).map(|_| ());
+        disable_hermes_backend_config(&run)
+            .map_err(|error| format!("Hermes config cleanup failed: {error}"))?;
+    } else if !config_proves_no_hcom_settings()? {
+        return Err(
+            "Hermes config cleanup needs the hermes CLI, but it was not found on PATH; \
+                    restore the CLI and retry (backend files were preserved)"
+                .to_string(),
+        );
+    }
+    remove_hermes_backend_files()
+}
+
+/// With no Hermes CLI, removal is safe only when no hcom config change is
+/// possible. Do not try to edit YAML ourselves. A readable config with no
+/// literal `hcom` and either no plugins block or a parseable one is a
+/// conservative proof; anything ambiguous waits for the CLI writer.
+fn config_proves_no_hcom_settings() -> Result<bool, String> {
+    match std::fs::read_to_string(hermes_config_path()) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!("cannot inspect Hermes config for removal: {error}")),
+        Ok(text) => Ok(!text.contains("hcom")
+            && (!text.contains("plugins:") || parse_hermes_plugin_lists(&text).is_some())),
+    }
+}
+
+/// Is gateway injection granted to our plugin entry? Authoritative answer
+/// from the CLI when available; a conservative block-shape text scan of
+/// config.yaml otherwise (only the block shape Hermes's own dumper emits).
+/// `None` = unset/unknown.
+pub fn hermes_gateway_injection_enabled() -> Option<bool> {
+    if !cfg!(test)
+        && let Ok(stdout) = run_hermes_cli(&[
+            "config",
+            "get",
+            "plugins.entries.hcom.allow_gateway_injection",
+        ])
+    {
+        match stdout.lines().last().map(str::trim) {
+            Some("true") => return Some(true),
+            Some("false") => return Some(false),
+            _ => {}
+        }
+    }
+    let text = std::fs::read_to_string(hermes_config_path()).ok()?;
+    gateway_injection_from_config_text(&text)
+}
+
+/// Text fallback: recognize `entries:` → `hcom:` → `allow_gateway_injection:
+/// true` in Hermes's block-shaped dump. Flow YAML is left to the authoritative
+/// CLI parser; this fallback must never infer permission from a different key.
+fn gateway_injection_from_config_text(text: &str) -> Option<bool> {
+    fn bool_value(rest: &str) -> Option<bool> {
+        let value = rest.trim();
+        if value == "true" {
+            Some(true)
+        } else if value == "false" {
+            Some(false)
+        } else {
+            None
+        }
+    }
+    // Only a direct plugins -> entries -> hcom child is authoritative. Keep
+    // the indentation path so a similarly named nested key cannot grant
+    // permission in the fallback scan.
+    let mut path: Vec<(usize, &str)> = Vec::new();
+    for raw in text.lines() {
+        if raw.trim().is_empty() || raw.trim_start().starts_with('#') {
+            continue;
+        }
+        let indent = raw.len() - raw.trim_start().len();
+        let body = raw.trim_start();
+        while path.last().is_some_and(|(level, _)| indent <= *level) {
+            path.pop();
+        }
+        let Some((key, rest)) = body.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        if path.len() == 3
+            && path[0].0 == 0
+            && path[0].1 == "plugins"
+            && path[1].1 == "entries"
+            && path[2].1 == "hcom"
+            && key == "allow_gateway_injection"
+        {
+            return bool_value(rest);
+        }
+        if rest.trim().is_empty() {
+            path.push((indent, key));
+        }
+    }
+    None
 }
 
 /// Run `hermes plugins list --enabled --user --json` and capture stdout,
@@ -2551,6 +3226,671 @@ mod tests {
         cleanup_db(&path);
     }
 
+    // ── Backend extension installer tests (isolated HERMES_HOME) ─────────
+
+    /// Isolated hermes home with an optional pre-existing config.yaml.
+    fn isolated_hermes_home(
+        config: Option<&str>,
+    ) -> (tempfile::TempDir, crate::hooks::test_helpers::EnvGuard) {
+        let temp = tempfile::tempdir().unwrap();
+        if let Some(body) = config {
+            std::fs::write(temp.path().join("config.yaml"), body).unwrap();
+        }
+        let guard = hermes_home_guard(temp.path());
+        (temp, guard)
+    }
+
+    type RecordedOps = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+    fn recorded_ops() -> (RecordedOps, impl Fn(&[&str]) -> Result<(), String>) {
+        let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&ops);
+        let run = move |args: &[&str]| -> Result<(), String> {
+            sink.lock()
+                .unwrap()
+                .push(args.iter().map(|s| s.to_string()).collect());
+            Ok(())
+        };
+        (ops, run)
+    }
+
+    fn expected_ops(groups: &[&[&str]]) -> Vec<Vec<String>> {
+        groups
+            .iter()
+            .map(|args| args.iter().map(|s| s.to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn hermes_config_runner_times_out_hung_cli() {
+        let (_tmp, _guard) = isolated_hermes_home(None);
+        let start = std::time::Instant::now();
+        let error = run_hermes_command(
+            "sh",
+            &["-c", "while :; do :; done"],
+            std::time::Duration::from_millis(80),
+        )
+        .expect_err("a hung CLI must be killed");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn backend_install_writes_then_updates_our_files() {
+        let (_tmp, _guard) = isolated_hermes_home(None);
+        assert!(!verify_hermes_plugin_installed());
+
+        // Fresh install: exactly our two files, byte-current.
+        assert_eq!(install_hermes_backend_files(), Ok(true));
+        assert!(verify_hermes_plugin_installed());
+        assert!(hermes_backend_files_current());
+        assert_eq!(
+            std::fs::read_to_string(backend_plugin_dir().join("plugin.yaml")).unwrap(),
+            BACKEND_MANIFEST_SOURCE
+        );
+        assert_eq!(
+            std::fs::read_to_string(backend_plugin_dir().join("__init__.py")).unwrap(),
+            BACKEND_INIT_SOURCE
+        );
+
+        // Idempotent: current files are a no-op.
+        assert_eq!(install_hermes_backend_files(), Ok(false));
+
+        // A drifted copy under the hcom-managed marker (written by the
+        // install above — an older hcom version's files) updates in place.
+        std::fs::write(
+            backend_plugin_dir().join("__init__.py"),
+            "# older hcom-managed copy\ndef register(ctx):\n    pass\n",
+        )
+        .unwrap();
+        assert!(!hermes_backend_files_current());
+        assert_eq!(install_hermes_backend_files(), Ok(true));
+        assert!(hermes_backend_files_current());
+        assert!(
+            std::fs::read_dir(hermes_plugin_root())
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() == PLUGIN_DIR_NAME),
+            "completed atomic writes leave no staging files"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn backend_ownership_requires_marker_or_exact_sources() {
+        // Absent when nothing is there.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(None);
+            assert_eq!(backend_ownership(), Ok(BackendOwnership::Absent));
+        }
+        // If an install stops immediately after mkdir, the empty directory
+        // is adoptable, but arbitrary content is still foreign.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(None);
+            let dir = backend_plugin_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            assert_eq!(backend_ownership(), Ok(BackendOwnership::Absent));
+            assert_eq!(install_hermes_backend_files(), Ok(true));
+            assert!(hermes_backend_files_current());
+        }
+        {
+            let (_tmp, _guard) = isolated_hermes_home(None);
+            let dir = backend_plugin_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("user-notes.txt"), "data").unwrap();
+            assert_eq!(backend_ownership(), Ok(BackendOwnership::Foreign));
+        }
+        // Byte-exact sources without the marker: adoption (an exact copy of
+        // OUR current files is definitionally ours) — install adds marker.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(None);
+            let dir = backend_plugin_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("plugin.yaml"), BACKEND_MANIFEST_SOURCE).unwrap();
+            std::fs::write(dir.join("__init__.py"), BACKEND_INIT_SOURCE).unwrap();
+            assert_eq!(backend_ownership(), Ok(BackendOwnership::Ours));
+            assert_eq!(install_hermes_backend_files(), Ok(true));
+            assert!(dir.join(BACKEND_MANAGED_MARKER).exists());
+        }
+        // A marker-only or marker-plus-init directory can be left by an
+        // interrupted first install; both remain safely recoverable.
+        for partial_init in [false, true] {
+            let (_tmp, _guard) = isolated_hermes_home(None);
+            let dir = backend_plugin_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(BACKEND_MANAGED_MARKER), BACKEND_MARKER_CONTENT).unwrap();
+            if partial_init {
+                std::fs::write(dir.join("__init__.py"), BACKEND_INIT_SOURCE).unwrap();
+            }
+            assert_eq!(backend_ownership(), Ok(BackendOwnership::Ours));
+            assert_eq!(install_hermes_backend_files(), Ok(true));
+            assert!(hermes_backend_files_current());
+        }
+        // Drifted copy carrying hcom-ish identity but NO marker and no exact
+        // match — e.g. the older externally managed plugin — is Foreign:
+        // never updated, never deleted.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(None);
+            let dir = backend_plugin_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("plugin.yaml"), "name: hcom\nversion: 0.0.1\n").unwrap();
+            std::fs::write(
+                dir.join("__init__.py"),
+                "import logging\nlogger = logging.getLogger(\"hermes.plugin.hcom\")\n",
+            )
+            .unwrap();
+            assert_eq!(backend_ownership(), Ok(BackendOwnership::Foreign));
+            let error = install_hermes_backend_files().expect_err("unmanaged drift refused");
+            assert!(error.contains("not hcom-managed"), "{error}");
+            assert!(remove_hermes_backend_files().is_err());
+            assert!(dir.join("plugin.yaml").exists(), "foreign files untouched");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn backend_ownership_rejects_symlinked_paths() {
+        // A symlinked plugin directory is user-managed wiring: Foreign.
+        {
+            let (tmp, _guard) = isolated_hermes_home(None);
+            let real = tmp.path().join("elsewhere");
+            std::fs::create_dir_all(&real).unwrap();
+            std::fs::write(real.join("plugin.yaml"), BACKEND_MANIFEST_SOURCE).unwrap();
+            std::fs::write(real.join("__init__.py"), BACKEND_INIT_SOURCE).unwrap();
+            std::fs::create_dir_all(hermes_plugin_root()).unwrap();
+            std::os::unix::fs::symlink(&real, backend_plugin_dir()).unwrap();
+            assert_eq!(backend_ownership(), Ok(BackendOwnership::Foreign));
+            assert!(install_hermes_backend_files().is_err());
+            assert!(remove_hermes_backend_files().is_err());
+            assert!(
+                real.join("plugin.yaml").exists(),
+                "symlink target untouched"
+            );
+        }
+        // A symlinked file inside a real directory is equally untouchable.
+        {
+            let (tmp, _guard) = isolated_hermes_home(None);
+            let dir = backend_plugin_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("__init__.py"), BACKEND_INIT_SOURCE).unwrap();
+            std::os::unix::fs::symlink(
+                tmp.path().join("elsewhere-manifest.yaml"),
+                dir.join("plugin.yaml"),
+            )
+            .unwrap();
+            assert_eq!(backend_ownership(), Ok(BackendOwnership::Foreign));
+            assert!(install_hermes_backend_files().is_err());
+        }
+        // A symlinked (or edited) managed marker must NEVER make someone
+        // else's directory look hcom-managed.
+        {
+            let (tmp, _guard) = isolated_hermes_home(None);
+            let dir = backend_plugin_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("plugin.yaml"), "name: someone-elses\n").unwrap();
+            std::fs::write(dir.join("__init__.py"), "# externally managed\n").unwrap();
+            std::fs::write(tmp.path().join("marker-elsewhere"), BACKEND_MARKER_CONTENT).unwrap();
+            std::os::unix::fs::symlink(
+                tmp.path().join("marker-elsewhere"),
+                dir.join(BACKEND_MANAGED_MARKER),
+            )
+            .unwrap();
+            assert_eq!(
+                backend_ownership(),
+                Ok(BackendOwnership::Foreign),
+                "a symlinked marker does not confer ownership"
+            );
+            assert!(install_hermes_backend_files().is_err());
+            assert!(remove_hermes_backend_files().is_err());
+            assert!(dir.join("plugin.yaml").exists());
+        }
+        // An EDITED marker (wrong content, regular file) is equally invalid.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(None);
+            let dir = backend_plugin_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("plugin.yaml"), "name: someone-elses\n").unwrap();
+            std::fs::write(dir.join("__init__.py"), "# externally managed\n").unwrap();
+            std::fs::write(dir.join(BACKEND_MANAGED_MARKER), "forged\n").unwrap();
+            assert_eq!(backend_ownership(), Ok(BackendOwnership::Foreign));
+        }
+        // Even byte-current sources cannot make a symlinked marker safe to
+        // write through on a later update.
+        {
+            let (tmp, _guard) = isolated_hermes_home(None);
+            let dir = backend_plugin_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("plugin.yaml"), BACKEND_MANIFEST_SOURCE).unwrap();
+            std::fs::write(dir.join("__init__.py"), BACKEND_INIT_SOURCE).unwrap();
+            std::fs::write(tmp.path().join("marker-elsewhere"), BACKEND_MARKER_CONTENT).unwrap();
+            std::os::unix::fs::symlink(
+                tmp.path().join("marker-elsewhere"),
+                dir.join(BACKEND_MANAGED_MARKER),
+            )
+            .unwrap();
+            assert_eq!(backend_ownership(), Ok(BackendOwnership::Foreign));
+            assert!(install_hermes_backend_files().is_err());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn backend_remove_absent_is_successful_noop() {
+        let (_tmp, _guard) = isolated_hermes_home(Some(
+            "plugins:\n  enabled:\n    - hcom\n  entries:\n    hcom:\n      allow_gateway_injection: true\n",
+        ));
+        let before = std::fs::read_to_string(hermes_config_path()).unwrap();
+        assert_eq!(remove_hermes_backend(), Ok(false));
+        assert_eq!(crate::tool::Tool::Hermes.remove_hooks(), Ok(true));
+        assert_eq!(
+            std::fs::read_to_string(hermes_config_path()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn backend_config_noop_proof_is_conservative() {
+        {
+            let (_tmp, _guard) = isolated_hermes_home(None);
+            assert_eq!(config_proves_no_hcom_settings(), Ok(true));
+        }
+        {
+            let (_tmp, _guard) = isolated_hermes_home(Some(
+                "plugins:\n  enabled:\n    - current-time\n  entries:\n    current-time:\n      allow_tool_override: false\n",
+            ));
+            assert_eq!(config_proves_no_hcom_settings(), Ok(true));
+        }
+        {
+            let (_tmp, _guard) = isolated_hermes_home(Some("model: some-model\n"));
+            assert_eq!(config_proves_no_hcom_settings(), Ok(true));
+        }
+        {
+            let (_tmp, _guard) = isolated_hermes_home(Some(
+                "plugins:\n  entries:\n    hcom:\n      allow_gateway_injection: true\n",
+            ));
+            assert_eq!(config_proves_no_hcom_settings(), Ok(false));
+        }
+        {
+            let (_tmp, _guard) = isolated_hermes_home(Some("plugins: [unclosed\n"));
+            assert_eq!(config_proves_no_hcom_settings(), Ok(false));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn backend_remove_refuses_unexpected_files_and_foreign_skips_config() {
+        // Unexpected file inside our directory: refuse to delete anything.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(None);
+            assert_eq!(install_hermes_backend_files(), Ok(true));
+            std::fs::write(backend_plugin_dir().join("user-notes.txt"), "data").unwrap();
+            let error = remove_hermes_backend_files().expect_err("unexpected file refused");
+            assert!(error.contains("user-notes.txt"), "{error}");
+            assert!(backend_plugin_dir().exists(), "directory is preserved");
+        }
+        // Python's own compiled init is expected runtime content, but an
+        // unrelated file inside the cache must not be deleted.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(None);
+            assert_eq!(install_hermes_backend_files(), Ok(true));
+            let cache = backend_plugin_dir().join("__pycache__");
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(cache.join("user-notes.txt"), "data").unwrap();
+            assert!(remove_hermes_backend_files().is_err());
+            assert!(cache.join("user-notes.txt").exists());
+            std::fs::remove_file(cache.join("user-notes.txt")).unwrap();
+            std::fs::write(cache.join("__init__.cpython-314.pyc"), "cached").unwrap();
+            assert_eq!(remove_hermes_backend_files(), Ok(true));
+        }
+        // A FOREIGN plugin: remove_hermes_backend refuses BEFORE any config
+        // mutation — the foreign plugin's enablement is not ours to change.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(Some(
+                "plugins:\n  enabled:\n    - hcom\n  entries:\n    hcom:\n      allow_gateway_injection: true\n",
+            ));
+            let dir = backend_plugin_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("plugin.yaml"), "name: hcom\nversion: 0.0.1\n").unwrap();
+            std::fs::write(dir.join("__init__.py"), "# externally managed\n").unwrap();
+            assert!(remove_hermes_backend().is_err());
+            assert!(dir.join("plugin.yaml").exists());
+            let config = std::fs::read_to_string(hermes_config_path()).unwrap();
+            assert!(
+                config.contains("- hcom") && config.contains("allow_gateway_injection: true"),
+                "config is untouched for a foreign plugin:\n{config}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn enable_config_fails_closed_on_unparsable_config() {
+        // A present-but-unparsable plugins block must NEVER be rewritten
+        // from an empty-list fallback — that would erase other plugins'
+        // allow-list entries.
+        let (_tmp, _guard) = isolated_hermes_home(Some("plugins: [unclosed\n  bad yaml :::\n"));
+        let (ops, run) = recorded_ops();
+        let error = enable_hermes_backend_config(&run).expect_err("must fail closed");
+        assert!(
+            error.contains("refusing to rewrite"),
+            "diagnostic must explain the refusal: {error}"
+        );
+        assert!(
+            ops.lock().unwrap().is_empty(),
+            "no config operations may run on an unreadable config"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn backend_readiness_requires_grant_and_ownership() {
+        // Owned + enabled + granted → ready.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(Some(
+                "plugins:\n  enabled:\n    - hcom\n  entries:\n    hcom:\n      allow_gateway_injection: true\n",
+            ));
+            assert_eq!(install_hermes_backend_files(), Ok(true));
+            assert!(evaluate_hermes_backend_readiness().ready);
+            assert!(verify_hermes_backend_ready());
+        }
+        // Owned + enabled but NO grant: the plugin loads, yet the backend is
+        // not ready — hooks-add must not say "already installed" here.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(Some("plugins:\n  enabled:\n    - hcom\n"));
+            assert_eq!(install_hermes_backend_files(), Ok(true));
+            let readiness = evaluate_hermes_backend_readiness();
+            assert!(!readiness.ready, "{readiness:?}");
+            assert!(
+                readiness
+                    .diagnostic
+                    .to_lowercase()
+                    .contains("gateway injection"),
+                "diagnostic must name the missing grant: {}",
+                readiness.diagnostic
+            );
+            assert!(!verify_hermes_backend_ready());
+        }
+        // Foreign plugin that IS enabled and granted: still not ready —
+        // launch must install ours, never load someone else's plugin.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(Some(
+                "plugins:\n  enabled:\n    - hcom\n  entries:\n    hcom:\n      allow_gateway_injection: true\n",
+            ));
+            let dir = backend_plugin_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("plugin.yaml"), "name: hcom\nversion: 0.0.1\n").unwrap();
+            std::fs::write(dir.join("__init__.py"), "# externally managed\n").unwrap();
+            let readiness = evaluate_hermes_plugin_readiness();
+            assert!(!readiness.ready, "{readiness:?}");
+            assert!(
+                readiness.diagnostic.contains("not hcom-managed"),
+                "migration diagnostic names the problem: {}",
+                readiness.diagnostic
+            );
+            assert!(!verify_hermes_backend_ready());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn backend_install_refuses_foreign_plugin_at_our_path() {
+        let (_tmp, _guard) = isolated_hermes_home(None);
+        let dir = backend_plugin_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.yaml"),
+            "name: someone-elses\nversion: 9.9\n",
+        )
+        .unwrap();
+        let foreign_manifest = std::fs::read_to_string(dir.join("plugin.yaml")).unwrap();
+
+        let error = install_hermes_backend_files().expect_err("foreign plugin must be refused");
+        assert!(error.contains("not hcom-managed"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("plugin.yaml")).unwrap(),
+            foreign_manifest,
+            "the foreign file is untouched"
+        );
+        assert!(
+            !dir.join("__init__.py").exists(),
+            "nothing else was written"
+        );
+
+        // Foreign __init__.py is refused the same way.
+        std::fs::write(dir.join("plugin.yaml"), BACKEND_MANIFEST_SOURCE).unwrap();
+        std::fs::write(dir.join("__init__.py"), "print('not ours')\n").unwrap();
+        assert!(install_hermes_backend_files().is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("__init__.py")).unwrap(),
+            "print('not ours')\n",
+            "the foreign module is untouched"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn backend_remove_removes_ours_and_refuses_foreign() {
+        let (_tmp, _guard) = isolated_hermes_home(None);
+        assert_eq!(
+            remove_hermes_backend_files(),
+            Ok(false),
+            "absent is a no-op"
+        );
+
+        assert_eq!(install_hermes_backend_files(), Ok(true));
+        assert_eq!(remove_hermes_backend_files(), Ok(true));
+        assert!(!backend_plugin_dir().exists());
+
+        // Foreign content at our path is never deleted.
+        let dir = backend_plugin_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("plugin.yaml"), "name: someone-elses\n").unwrap();
+        assert!(remove_hermes_backend_files().is_err());
+        assert!(dir.join("plugin.yaml").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn enable_config_preserves_foreign_lists_and_grants_injection() {
+        let (_tmp, _guard) = isolated_hermes_home(Some(
+            "# user comment\nmodel:\n  default: glm\nplugins:\n  disabled:\n    - hcom\n    - other\n  enabled:\n    - current-time\n  entries:\n    current-time:\n      allow_tool_override: false\nagent:\n  max_turns: 60\n",
+        ));
+        let (ops, run) = recorded_ops();
+        enable_hermes_backend_config(&run).unwrap();
+        let ops = ops.lock().unwrap().clone();
+        assert_eq!(
+            ops,
+            expected_ops(&[
+                &[
+                    "config",
+                    "set",
+                    "plugins.enabled",
+                    "[\"current-time\",\"hcom\"]"
+                ],
+                &["config", "set", "plugins.disabled", "[\"other\"]"],
+                &[
+                    "config",
+                    "set",
+                    "plugins.entries.hcom.allow_gateway_injection",
+                    "true"
+                ],
+            ]),
+            "foreign enabled/disabled entries survive; the veto is dropped; injection granted"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn enable_config_is_idempotent_and_boots_fresh_homes() {
+        // Already enabled, not vetoed: only the injection grant is ensured.
+        // (Each case in its own block: two live EnvGuards on the env lock in
+        // one thread would self-deadlock.)
+        {
+            let (_tmp, _guard) = isolated_hermes_home(Some(
+                "plugins:\n  disabled: []\n  enabled:\n    - current-time\n    - hcom\n",
+            ));
+            let (ops, run) = recorded_ops();
+            enable_hermes_backend_config(&run).unwrap();
+            assert_eq!(
+                ops.lock().unwrap().clone(),
+                expected_ops(&[&[
+                    "config",
+                    "set",
+                    "plugins.entries.hcom.allow_gateway_injection",
+                    "true"
+                ]])
+            );
+        }
+
+        // No config at all: enable seeds the allow-list with just hcom.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(None);
+            let (ops, run) = recorded_ops();
+            enable_hermes_backend_config(&run).unwrap();
+            assert_eq!(
+                ops.lock().unwrap().clone(),
+                expected_ops(&[
+                    &["config", "set", "plugins.enabled", "[\"hcom\"]"],
+                    &[
+                        "config",
+                        "set",
+                        "plugins.entries.hcom.allow_gateway_injection",
+                        "true"
+                    ],
+                ])
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn enable_config_propagates_cli_failure() {
+        let (_tmp, _guard) = isolated_hermes_home(None);
+        let run =
+            |_: &[&str]| -> Result<(), String> { Err("hermes config set failed".to_string()) };
+        assert!(
+            enable_hermes_backend_config(&run)
+                .unwrap_err()
+                .contains("hermes config set failed")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn disable_config_removes_only_our_entries() {
+        // (Each case in its own block: two live EnvGuards on the env lock
+        // in one thread would self-deadlock.)
+        {
+            let (_tmp, _guard) = isolated_hermes_home(Some(
+                "plugins:\n  enabled:\n    - current-time\n    - hcom\n  entries:\n    current-time:\n      allow_tool_override: false\n    hcom:\n      allow_gateway_injection: true\n",
+            ));
+            let (ops, run) = recorded_ops();
+            disable_hermes_backend_config(&run).unwrap();
+            assert_eq!(
+                ops.lock().unwrap().clone(),
+                expected_ops(&[
+                    &["config", "set", "plugins.enabled", "[\"current-time\"]"],
+                    &["config", "unset", "plugins.entries.hcom"],
+                ]),
+                "foreign enabled entries and foreign entries keys are preserved"
+            );
+        }
+
+        // Not enabled: only the entries cleanup runs — and an already-absent
+        // entries key ("Config key not set") is an idempotent no-op.
+        {
+            let (_tmp, _guard) = isolated_hermes_home(Some("plugins:\n  enabled: []\n"));
+            let ops = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+            let sink = std::sync::Arc::clone(&ops);
+            let run = move |args: &[&str]| -> Result<(), String> {
+                let mut guard = sink.lock().unwrap();
+                guard.push(args.iter().map(|s| s.to_string()).collect());
+                if args.first() == Some(&"unset") {
+                    return Err("hermes config unset plugins.entries.hcom failed: Config key not set: plugins.entries.hcom".to_string());
+                }
+                Ok(())
+            };
+            disable_hermes_backend_config(&run).unwrap();
+            assert_eq!(
+                ops.lock().unwrap().clone(),
+                expected_ops(&[&["config", "unset", "plugins.entries.hcom"]])
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_injection_text_fallback_only_trusts_exact_block_key() {
+        // Block shape (Hermes's own dumper output).
+        assert_eq!(
+            gateway_injection_from_config_text(
+                "plugins:\n  enabled:\n    - hcom\n  entries:\n    hcom:\n      allow_gateway_injection: true\n"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            gateway_injection_from_config_text(
+                "plugins:\n  entries:\n    other:\n      allow_gateway_injection: true\n    hcom:\n      allow_gateway_injection: false\n"
+            ),
+            Some(false)
+        );
+        // Flow shape is left to the Hermes CLI's YAML parser. A text scan
+        // must not mistake another plugin's similarly named key for hcom.
+        assert_eq!(
+            gateway_injection_from_config_text(
+                "plugins: {entries: {hcom: {allow_gateway_injection: true}}}\n"
+            ),
+            None
+        );
+        assert_eq!(
+            gateway_injection_from_config_text(
+                "plugins: {entries: {otherhcom: {allow_gateway_injection: true}}}\n"
+            ),
+            None
+        );
+        // Absent, or granted only to a foreign plugin: unknown/not set.
+        assert_eq!(
+            gateway_injection_from_config_text("plugins:\n  enabled:\n    - hcom\n"),
+            None
+        );
+        assert_eq!(
+            gateway_injection_from_config_text(
+                "plugins:\n  entries:\n    other:\n      allow_gateway_injection: true\n"
+            ),
+            None
+        );
+        // Only direct children count, not identically named keys nested in
+        // another plugin or beneath hcom's own unrelated setting.
+        for config in [
+            "plugins:\n  other:\n    entries:\n      hcom:\n        allow_gateway_injection: true\n",
+            "plugins:\n  entries:\n    other:\n      hcom:\n        allow_gateway_injection: true\n",
+            "plugins:\n  entries:\n    hcom:\n      other:\n        allow_gateway_injection: true\n",
+            "other:\n  plugins:\n    entries:\n      hcom:\n        allow_gateway_injection: true\n",
+        ] {
+            assert_eq!(gateway_injection_from_config_text(config), None, "{config}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn gateway_injection_enabled_reads_isolated_home() {
+        // (Each case in its own block: two live EnvGuards on the env lock
+        // in one thread would self-deadlock.)
+        {
+            let (_tmp, _guard) = isolated_hermes_home(Some(
+                "plugins:\n  enabled:\n    - hcom\n  entries:\n    hcom:\n      allow_gateway_injection: true\n",
+            ));
+            assert_eq!(hermes_gateway_injection_enabled(), Some(true));
+        }
+        {
+            let (_tmp, _guard) = isolated_hermes_home(None);
+            assert_eq!(hermes_gateway_injection_enabled(), None);
+        }
+    }
+
     #[test]
     fn existing_only_refuses_bound_row_with_different_session_id() {
         let (db, path) = setup_test_db();
@@ -3237,10 +4577,14 @@ mod tests {
     // ── Plugin readiness / config-enable tests ──────────────────────────
 
     fn install_fake_hermes_plugin(home: &std::path::Path) {
+        // Readiness rejects foreign plugins, so tests install exactly what
+        // `hcom hooks add hermes` writes: the embedded sources plus the
+        // hcom-managed marker.
         let dir = home.join("plugins").join(PLUGIN_DIR_NAME);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("__init__.py"), "# test plugin\n").unwrap();
-        std::fs::write(dir.join("plugin.yaml"), "name: hcom\nversion: \"0.2.0\"\n").unwrap();
+        std::fs::write(dir.join("__init__.py"), BACKEND_INIT_SOURCE).unwrap();
+        std::fs::write(dir.join("plugin.yaml"), BACKEND_MANIFEST_SOURCE).unwrap();
+        std::fs::write(dir.join(BACKEND_MANAGED_MARKER), BACKEND_MARKER_CONTENT).unwrap();
     }
 
     fn write_hermes_config(home: &std::path::Path, body: &str) {

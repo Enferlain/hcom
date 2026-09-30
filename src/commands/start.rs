@@ -1012,9 +1012,10 @@ fn start_bare(
         .is_some();
 
     // Vanilla tool detection: auto-install hooks for unmanaged AI tools.
-    // Identity is already canonical on HcomContext, so route every released
-    // hook-bearing integration through the typed Tool hook adapter. This keeps
-    // bare `hcom start` aligned with `hcom hooks add` as integrations evolve.
+    // Identity is already canonical on HcomContext, so route hook-bearing
+    // integrations through the typed Tool hook adapter. Hermes is deliberately
+    // excluded: an explicit `hcom start` works without the optional backend
+    // extension and must not silently install or enable it in Hermes config.
     if !has_valid_identity && ctx.detect_vanilla_tool().is_some() {
         let vanilla_tool = ctx.tool;
         if vanilla_tool != crate::tool::Tool::Hermes

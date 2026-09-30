@@ -18,12 +18,13 @@ pub struct HooksArgs {
 
 /// Released hook-bearing tools, derived from the integration registry.
 ///
-/// Hermes uses an externally managed plugin, so this list only includes
-/// integrations whose hooks hcom owns and can install/remove.
+/// Hermes's surface is the hcom-owned backend extension (installed into
+/// HERMES_HOME and enabled through Hermes config — see `hooks::hermes`),
+/// so it flows through the same adapter as every other tool.
 pub(crate) fn hook_tools() -> Vec<Tool> {
     crate::integration_spec::ALL
         .iter()
-        .filter(|spec| spec.released && !spec.hooks.names.is_empty() && spec.tool != Tool::Hermes)
+        .filter(|spec| spec.released && !spec.hooks.names.is_empty())
         .map(|spec| spec.tool)
         .collect()
 }
@@ -49,10 +50,15 @@ fn valid_hook_options() -> String {
 ///
 /// This is used after `auto_approve` changes. It intentionally skips tools
 /// without installed hooks so changing one preference does not install new
-/// integrations as a side effect.
+/// integrations as a side effect — and it skips Hermes entirely: the backend
+/// extension has no permission block, so an auto_approve toggle must never
+/// rerun its installer.
 pub(crate) fn refresh_installed_hook_permissions(enabled: bool) -> Vec<(&'static str, String)> {
     let mut failures = Vec::new();
     for tool in hook_tools() {
+        if tool == Tool::Hermes {
+            continue;
+        }
         if !tool.verify_hooks_installed(false) {
             continue;
         }
@@ -79,8 +85,12 @@ fn get_tool_status() -> Vec<(Tool, bool, String)> {
         .collect()
 }
 
-/// Show hook installation status for all tools.
-fn cmd_hooks_status() -> i32 {
+/// Show hook installation status for all tools. `hooks status hermes`
+/// prints the detailed backend-extension report instead of the one-liner.
+fn cmd_hooks_status(argv: &[String]) -> i32 {
+    if argv.first().is_some_and(|tool| tool == "hermes") {
+        return cmd_hermes_backend_status();
+    }
     let status = get_tool_status();
     for (tool, installed, path) in &status {
         if *installed {
@@ -92,14 +102,59 @@ fn cmd_hooks_status() -> i32 {
     0
 }
 
+/// Detailed readiness report for the hcom-owned Hermes backend extension:
+/// ownership, files, config enablement (via the normal readiness
+/// evaluation), and the gateway-injection grant the extension needs for
+/// non-CLI sessions.
+fn cmd_hermes_backend_status() -> i32 {
+    use crate::hooks::hermes;
+    println!("Hermes backend extension (hcom-owned):");
+    match hermes::backend_ownership_pub() {
+        Ok(hermes::BackendOwnership::Foreign) => {
+            println!(
+                "  files:      foreign — NOT hcom-managed; hcom will not touch it. Back it up, remove it, then run: hcom hooks add hermes"
+            );
+            return 0;
+        }
+        Ok(hermes::BackendOwnership::Absent) => {
+            println!("  files:      missing  (run: hcom hooks add hermes)");
+        }
+        Ok(hermes::BackendOwnership::Ours) => {
+            let current = hermes::hermes_backend_files_current();
+            println!(
+                "  files:      present (hcom-managed){}",
+                if current {
+                    String::new()
+                } else {
+                    ", but differ from this hcom's version (hcom hooks add hermes updates them)"
+                        .to_string()
+                }
+            );
+        }
+        Err(error) => println!("  files:      unreadable ({error})"),
+    }
+    let readiness = hermes::evaluate_hermes_plugin_readiness();
+    println!(
+        "  enabled:    {}",
+        if readiness.ready { "yes" } else { "no" }
+    );
+    if !readiness.ready {
+        println!("  readiness:  {}", readiness.diagnostic);
+    }
+    match hermes::hermes_gateway_injection_enabled() {
+        Some(true) => println!("  allow_gateway_injection: granted"),
+        Some(false) => println!(
+            "  allow_gateway_injection: denied — non-CLI/serve sessions cannot receive injected turns; hcom hooks add hermes grants it"
+        ),
+        None => println!(
+            "  allow_gateway_injection: not set — non-CLI/serve sessions cannot receive injected turns; hcom hooks add hermes grants it"
+        ),
+    }
+    0
+}
+
 /// Add hooks for specified tool(s).
 fn cmd_hooks_add(argv: &[String]) -> i32 {
-    if argv.first().is_some_and(|tool| tool == "hermes") {
-        eprintln!(
-            "Hermes plugins are managed outside hcom; install and enable the Hermes-side plugin with Hermes."
-        );
-        return 1;
-    }
     // Get auto_approve from config
     let include_permissions = crate::config::load_config_snapshot().core.auto_approve;
 
@@ -120,15 +175,27 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
     };
 
     // Install hooks — propagate error detail where available
-    // Outcome: "already" = was already installed, "added" = newly added, "failed" = error
+    // Outcome: "already" = installed, "added" = newly added, "skipped" =
+    // optional CLI absent during a bulk add, "failed" = error.
     enum AddResult {
         Already,
         Added,
+        SkippedUnavailable,
         Failed(Option<String>),
     }
     let mut results: Vec<(Tool, AddResult)> = Vec::new();
     for tool in &tools {
-        if tool.verify_hooks_installed(include_permissions) {
+        if *tool == Tool::Hermes
+            && tools.len() > 1
+            && crate::terminal::which_bin("hermes").is_none()
+        {
+            results.push((*tool, AddResult::SkippedUnavailable));
+            continue;
+        }
+        // A ready Hermes backend may still be an older hcom-owned copy.
+        // Explicit `hooks add hermes` is also its safe update path.
+        let current = *tool != Tool::Hermes || crate::hooks::hermes::hermes_backend_files_current();
+        if current && tool.verify_hooks_installed(include_permissions) {
             results.push((*tool, AddResult::Already));
             continue;
         }
@@ -157,6 +224,9 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
                 println!("Added {name} hooks  ({path})");
                 added_count += 1;
             }
+            AddResult::SkippedUnavailable => {
+                println!("Skipped {name} hooks (Hermes CLI not found on PATH)");
+            }
             AddResult::Failed(Some(e)) => {
                 eprintln!("Failed to add {name} hooks: {e}");
                 fail_count += 1;
@@ -182,10 +252,6 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
 
 /// Remove hooks for specified tool(s). Called from both `hcom hooks remove` and `hcom reset hooks`.
 pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
-    if argv.first().is_some_and(|tool| tool == "hermes") {
-        eprintln!("Hermes plugins are managed outside hcom; disable or remove them with Hermes.");
-        return 1;
-    }
     // Determine which tools to remove.
     let tools: Vec<Tool> = if argv.is_empty() || (argv.len() == 1 && argv[0] == "all") {
         hook_tools()
@@ -241,7 +307,7 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
     let argv = &args.args;
     if argv.is_empty() {
         // No args = show status
-        return cmd_hooks_status();
+        return cmd_hooks_status(&[]);
     }
 
     let first = argv[0].as_str();
@@ -269,7 +335,7 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
     let sub_argv = argv[1..].to_vec();
 
     match first {
-        "status" => cmd_hooks_status(),
+        "status" => cmd_hooks_status(&sub_argv),
         "add" | "install" => cmd_hooks_add(&sub_argv),
         "remove" | "uninstall" => cmd_hooks_remove(&sub_argv),
         _ => {

@@ -176,18 +176,22 @@ RIGHT: hcom listen --timeout [sec] (blocking)
 
 You are now registered with hcom."#;
 
-// Hermes: the plugin injects pending messages only when a turn is assembled
-// (pre_llm_call). The notify port cannot wake an idle session, so claiming
-// "instantly and automatically" would be false — teach `hcom listen` for the
-// idle case instead.
+// Hermes: the hcom-owned backend extension delivers mail as visible user
+// turns via inject_message. An attached CLI session is woken by the
+// extension's notify listener even while idle; hermes serve / non-CLI
+// sessions additionally require the allow_gateway_injection grant
+// (`hcom hooks add hermes` sets it). Delivery is not guaranteed in every
+// host state (a denied or absent injector leaves mail unread and retried),
+// so `hcom listen` stays the honest manual fallback.
 const DELIVERY_HERMES: &str = r#"## DELIVERY
 
-Messages do NOT arrive instantly. The hcom plugin injects pending messages
-when your next turn is assembled (after a new prompt is submitted).
-- While you are in an active conversation, messages sent mid-turn arrive automatically at the start of your next turn — no action needed.
-- While the session sits idle, nothing is delivered: wait with `hcom listen [timeout]` instead.
+Messages arrive as visible user turns delivered by the hcom backend
+extension (inject_message), not as instant system events.
+- While you are in an active conversation, messages sent mid-turn are injected into your next turn — no action needed.
+- While idle, the extension's notify listener wakes your session and injects waiting mail automatically.
+- If injection is unavailable in your host (denied or no live session), mail stays unread — check with `hcom listen [timeout]` instead of sleeping.
 - Always substitute `sleep [timeout]` with `hcom listen [timeout]`
-- Your prompt may be a bare `<hcom>` line, or one carrying only routing metadata (`[intent #id] sender -> you`). That is a wake trigger, not a message: do not answer the envelope. The real messages are injected into the same turn by the plugin — respond to those, not to the trigger.
+- Your prompt may be a bare `<hcom>` line, or one carrying only routing metadata (`[intent #id] sender -> you`). That is a wake trigger, not a message: do not answer the envelope. The real messages are injected into the same turn by the extension — respond to those, not to the trigger.
 
 ## WAITING RULES
 
@@ -512,11 +516,11 @@ pub fn get_bootstrap(
     {
         parts.push(DELIVERY_AUTO);
     } else if tool == "hermes" {
-        // Honest delivery: injection happens at turn assembly only. Hermes
-        // delivery is plugin-managed in BOTH modes — an hcom-launched session
-        // and an ordinary plugin-enabled one receive messages through the same
-        // pre_llm_call injection — so is_launched must not downgrade an
-        // ordinary session to the adhoc/manual section.
+        // Honest delivery: the backend extension injects visible user turns
+        // in BOTH modes — an hcom-launched session and an ordinary
+        // plugin-enabled one use the same inject_message path — so
+        // is_launched must not downgrade an ordinary session to the
+        // adhoc/manual section.
         parts.push(DELIVERY_HERMES);
     } else {
         parts.push(DELIVERY_ADHOC);
@@ -965,10 +969,9 @@ mod tests {
     }
 
     #[test]
-    fn test_hermes_bootstrap_does_not_claim_instant_delivery() {
-        // Hermes injection only happens at turn assembly (pre_llm_call); the
-        // bootstrap must not promise instant/idle delivery and must teach
-        // `hcom listen` for waiting agents.
+    fn test_hermes_bootstrap_describes_visible_turn_delivery() {
+        // The backend extension can wake an idle session with an injected
+        // user turn, but must retain hcom listen as the manual fallback.
         let (tmp, db) = setup_test_db();
         let result = get_bootstrap(
             &db,
@@ -982,7 +985,8 @@ mod tests {
             false,
             None,
         );
-        assert!(result.contains("Messages do NOT arrive instantly"));
+        assert!(result.contains("Messages arrive as visible user turns"));
+        assert!(result.contains("While idle, the extension's notify listener wakes your session"));
         assert!(result.contains("hcom listen"));
         assert!(
             !result.contains("Messages instantly and automatically arrive"),
@@ -1020,8 +1024,8 @@ mod tests {
     #[test]
     fn test_hermes_bootstrap_plugin_managed_uses_hook_delivery() {
         // An ordinary plugin-enabled Hermes session (is_launched=false) still
-        // delivers through the plugin's pre_llm_call injection; the adhoc
-        // section would teach the wrong delivery/waiting model.
+        // uses backend user-turn injection; the adhoc section would teach
+        // the wrong delivery/waiting model.
         let (tmp, db) = setup_test_db();
         let result = get_bootstrap(
             &db,
@@ -1035,7 +1039,7 @@ mod tests {
             false,
             None,
         );
-        assert!(result.contains("Messages do NOT arrive instantly"));
+        assert!(result.contains("Messages arrive as visible user turns"));
         assert!(result.contains("hcom listen"));
         assert!(
             !result.contains("Messages do NOT arrive automatically"),

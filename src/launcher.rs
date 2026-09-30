@@ -701,16 +701,30 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             bail!("Failed to setup Oh My Pi plugin. Run: hcom hooks add omp\n{diag}");
         }
         LaunchTool::Hermes => {
-            // One evaluation carries BOTH the verdict and the diagnostic:
-            // re-probing for the message could race a timeout and
-            // contradict the gate's own answer.
-            let readiness = crate::hooks::hermes::evaluate_hermes_plugin_readiness();
-            if !readiness.ready {
-                let diag = install_diag_context(tool, &[]);
-                bail!(
-                    "Hermes plugin is not ready (files present is not enough — Hermes config must enable it). {}\n{diag}",
-                    readiness.diagnostic
-                );
+            // Normal setup/readiness behavior, same as every other tool:
+            // verify first (full BACKEND readiness: owned files, enabled,
+            // and the gateway-injection grant), install or update the
+            // hcom-owned backend extension when needed, then re-evaluate ONCE — the
+            // second evaluation carries both the final verdict and its
+            // diagnostic, so a re-probe can never race a timeout and
+            // contradict the gate.
+            let readiness = crate::hooks::hermes::evaluate_hermes_backend_readiness();
+            if !readiness.ready || !crate::hooks::hermes::hermes_backend_files_current() {
+                if let Err(e) = crate::hooks::hermes::try_setup_hermes_backend() {
+                    let diag = install_diag_context(tool, &[]);
+                    bail!(
+                        "Failed to setup the Hermes backend extension: {e}\n\
+                         Run: hcom hooks add hermes\n{diag}"
+                    );
+                }
+                let readiness = crate::hooks::hermes::evaluate_hermes_backend_readiness();
+                if !readiness.ready {
+                    let diag = install_diag_context(tool, &[]);
+                    bail!(
+                        "Hermes backend is not ready (owned files + enablement + gateway injection are all required). {}\n{diag}",
+                        readiness.diagnostic
+                    );
+                }
             }
             Ok(())
         }
