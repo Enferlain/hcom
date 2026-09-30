@@ -844,6 +844,85 @@ class TestHermesBackendExtension(unittest.TestCase):
         self.assertFalse(state.retry_needed)
         self.assertEqual(state.backoff_until, 0.0)
 
+    def test_claimed_format_transient_db_error_preserves_session_and_recovers(self) -> None:
+        """Transient DB read error on claimed --format preserves active session/listener, sets backoff, and recovers without teardown."""
+        error_mode: Optional[str] = "db_error"
+        mail_items = [{"context": "recovered event", "up_to": 42, "count": 1}]
+
+        def runner(args: List[str]) -> tuple[int, Dict[str, Any]]:
+            self.command_log.append(list(args))
+            subcmd = args[0]
+            if subcmd == "hermes-sessionstart":
+                return 0, {"name": "vega", "session_id": "ses-db-retry"}
+            elif subcmd == "hermes-read" and "--format" in args:
+                if error_mode == "db_error":
+                    # Distinguishable retryable DB read failure from Rust backend
+                    return 0, {"error": "Failed to read events from database: disk I/O error"}
+                elif error_mode == "stale":
+                    return 0, {
+                        "error": "Hermes instance 'vega' is no longer attributed to session 'ses-db-retry' (current: ses-other)"
+                    }
+                elif mail_items:
+                    item = mail_items[-1]
+                    return 0, {"context": item["context"], "up_to": item["up_to"], "count": item["count"]}
+                return 0, {"context": "", "up_to": 0, "count": 0}
+            elif subcmd == "hermes-read" and "--ack" in args:
+                mail_items.clear()
+                up_to_val = int(args[args.index("--up-to") + 1]) if "--up-to" in args else 42
+                return 0, {"acked": 1, "acked_to": up_to_val}
+            return 0, {}
+
+        hcom_ext._runner_override = runner
+
+        # 1. Start session; initial drain encounters the distinguishable DB read error
+        now_before = time.time()
+        self.ctx.hooks["on_session_start"]("ses-db-retry")
+
+        with _sessions_lock:
+            self.assertIn("ses-db-retry", _sessions)
+            state = _sessions["ses-db-retry"]
+            # Active session, socket, and listener thread must remain intact!
+            self.assertTrue(state.active, "Session must remain active on transient DB error")
+            self.assertIsNotNone(state.server_sock)
+            self.assertNotEqual(state.server_sock.fileno(), -1)
+            self.assertIsNotNone(state.listener_thread)
+            self.assertTrue(state.listener_thread.is_alive())
+            # retry_needed and failure backoff floor >= 2s set
+            self.assertTrue(state.retry_needed)
+            self.assertGreaterEqual(state.backoff_until, now_before + 1.9)
+            self.assertGreaterEqual(state.backoff_delay, 4.0)
+
+        # No messages injected and no ack sent
+        self.assertEqual(len(self.ctx.injected_messages), 0)
+        acks = [c for c in self.command_log if c[0] == "hermes-read" and "--ack" in c]
+        self.assertEqual(len(acks), 0)
+
+        # 2. Transient DB failure clears; expired backoff retry succeeds
+        error_mode = None
+        state.backoff_until = time.time() - 0.01
+
+        _drain_messages(state, self.ctx)
+
+        # Mail is injected and acked
+        self.assertEqual(len(self.ctx.injected_messages), 1)
+        self.assertEqual(self.ctx.injected_messages[0]["content"], "recovered event")
+        self.assertEqual(self.ctx.injected_messages[0]["session_key"], "ses-db-retry")
+        self.assertFalse(state.retry_needed)
+        self.assertEqual(state.backoff_until, 0.0)
+
+        acks_after = [c for c in self.command_log if c[0] == "hermes-read" and "--ack" in c]
+        self.assertEqual(len(acks_after), 1)
+        self.assertIn("--session-id", acks_after[0])
+        self.assertEqual(acks_after[0][acks_after[0].index("--session-id") + 1], "ses-db-retry")
+
+        # 3. Contrast: verified stale attribution response STILL tears down state
+        error_mode = "stale"
+        _drain_messages(state, self.ctx)
+
+        self.assertFalse(state.active, "Stale attribution must tear down active session")
+        with _sessions_lock:
+            self.assertNotIn("ses-db-retry", _sessions)
+
     def test_stale_attribution_format_refusal_tears_down_state_and_allows_re_enrollment(self) -> None:
         """When hermes-read --format is refused due to stale attribution, old state is torn down and re-enrollment allowed."""
         stale = False

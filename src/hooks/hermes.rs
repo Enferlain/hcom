@@ -43,7 +43,11 @@
 //! touch. Writes also accept an optional `--session-id` claim: when present,
 //! the row must still be attributed to that session (stale-callback guard —
 //! a per-session callback must not status/ack/finalize a name that has since
-//! been rebound to a different session). Absent, the legacy contract holds.
+//! been rebound to a different session). A VERIFIED rebind answers the
+//! stale-attribution refusal; a transient read error answers a retryable
+//! error instead — the extension's listener teardown keys on the stale text,
+//! so an unreadable row must never pose as a verified rebind. Absent, the
+//! legacy contract holds.
 //! Reads of an unknown name stay permissive (empty inbox);
 //! `hermes-beforetool` always allows — it only skips bookkeeping for names
 //! that are not hers.
@@ -123,20 +127,65 @@ fn is_hermes_instance(db: &HcomDb, name: &str) -> bool {
         .is_some_and(|row| row.tool == "hermes")
 }
 
-/// Stale-callback guard for write RPCs: a caller that carries its Hermes
-/// session id (`--session-id`) may only touch a row CURRENTLY attributed to
-/// that session. A session whose identity was since rebound elsewhere (serve
-/// rebind, `hcom start --as`) must not have its old name statused, acked, or
-/// finalized through a stale per-session callback. Absent/empty session id
-/// is the legacy contract: no claim, nothing to validate.
-fn session_attribution_matches(db: &HcomDb, name: &str, session_id: &str) -> bool {
+/// Stale-callback claim check for write RPCs: a caller that carries its
+/// Hermes session id (`--session-id`) may only touch a row CURRENTLY
+/// attributed to that session. A session whose identity was since rebound
+/// elsewhere (serve rebind, `hcom start --as`, or the row's deletion) must
+/// not have its old name statused, acked, or finalized through a stale
+/// per-session callback. Absent/empty session id is the legacy contract: no
+/// claim, nothing to validate.
+///
+/// The three outcomes stay distinguishable because the backend extension
+/// keys permanent listener teardown off the stale-attribution refusal: a
+/// transient DB read error must NEVER surface as that text, or the plugin
+/// would tear down a still-valid listener over a retryable failure.
+enum SessionClaim {
+    /// Empty `--session-id`: the legacy no-claim contract.
+    Unclaimed,
+    /// The row was read; `matches` says whether it is still attributed to
+    /// the claiming session (a read of a MISSING row is verified, not an
+    /// error — the row's absence is itself the answer).
+    Verified { matches: bool },
+    /// The row could not be read: attribution is UNKNOWN. Not a verified
+    /// rebind — retryable, never a teardown signal.
+    Unreadable(anyhow::Error),
+}
+
+fn check_session_claim(db: &HcomDb, name: &str, session_id: &str) -> SessionClaim {
     if session_id.is_empty() {
-        return true;
+        return SessionClaim::Unclaimed;
     }
-    db.get_instance_full(name)
-        .ok()
-        .flatten()
-        .is_some_and(|row| row.session_id.as_deref() == Some(session_id))
+    match db.get_instance_full(name) {
+        Ok(Some(row)) => SessionClaim::Verified {
+            matches: row.session_id.as_deref() == Some(session_id),
+        },
+        Ok(None) => SessionClaim::Verified { matches: false },
+        Err(error) => SessionClaim::Unreadable(error),
+    }
+}
+
+/// Claim gate for write RPCs: `Some(reply)` refuses the call. A verified
+/// rebind (or verified-missing row) answers the stale-attribution refusal;
+/// an unreadable row answers a retryable read error instead — the Python
+/// listener treats the stale text as a verified rebind and permanently tears
+/// down, so conflating Err with stale would destroy a live listener over a
+/// transient failure.
+fn claimed_write_gate(db: &HcomDb, name: &str, claimed_session: &str) -> Option<String> {
+    match check_session_claim(db, name, claimed_session) {
+        SessionClaim::Unclaimed | SessionClaim::Verified { matches: true } => None,
+        SessionClaim::Verified { matches: false } => {
+            Some(stale_attribution_error(name, claimed_session))
+        }
+        SessionClaim::Unreadable(error) => Some(
+            serde_json::json!({
+                "error": format!(
+                    "Hermes instance '{name}' could not be read ({error}); \
+                     transient read failure — retry"
+                )
+            })
+            .to_string(),
+        ),
+    }
 }
 
 /// Refusal JSON for a stale-attribution write RPC.
@@ -693,15 +742,18 @@ fn handle_status(db: &HcomDb, argv: &[String]) -> (i32, String) {
     };
     let context = parse_flag(argv, "--context").unwrap_or_default();
     let detail = parse_flag(argv, "--detail").unwrap_or_default();
+    // Claim gate first: a claimed call must surface a transient read error
+    // as retryable, not as Unknown (which is_hermes_instance would mask it
+    // into) and never as the teardown-triggering stale text.
+    let claimed_session = parse_flag(argv, "--session-id").unwrap_or_default();
+    if let Some(reply) = claimed_write_gate(db, &name, &claimed_session) {
+        return (0, reply);
+    }
     if !is_hermes_instance(db, &name) {
         return (
             0,
             serde_json::json!({"error": format!("Unknown Hermes instance: {name}")}).to_string(),
         );
-    }
-    let claimed_session = parse_flag(argv, "--session-id").unwrap_or_default();
-    if !session_attribution_matches(db, &name, &claimed_session) {
-        return (0, stale_attribution_error(&name, &claimed_session));
     }
     let was_listening = db
         .get_instance_full(&name)
@@ -792,8 +844,10 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
     }
 
     let claimed_session = parse_flag(argv, "--session-id").unwrap_or_default();
-    if format_mode && !session_attribution_matches(db, &name, &claimed_session) {
-        return (0, stale_attribution_error(&name, &claimed_session));
+    if format_mode && let Some(reply) = claimed_write_gate(db, &name, &claimed_session) {
+        // Claim gate: a transient read error surfaces as retryable, never as
+        // the stale-attribution refusal the Python listener teardown keys on.
+        return (0, reply);
     }
 
     let raw_messages = db.get_unread_messages(&name);
@@ -827,6 +881,13 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
         );
     }
     if ack_mode {
+        // Claim gate first (see the format gate above): an ack is a write, a
+        // stale per-session callback must not advance the cursor of a name
+        // since rebound to another session, and a transient read error must
+        // not pose as that verified rebind.
+        if let Some(reply) = claimed_write_gate(db, &name, &claimed_session) {
+            return (0, reply);
+        }
         // Acks write a cursor: require a real hermes row. Without one the
         // UPDATE below would touch nothing while the reply claimed success.
         if !is_hermes_instance(db, &name) {
@@ -835,12 +896,6 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
                 serde_json::json!({"error": format!("Unknown Hermes instance: {name}")})
                     .to_string(),
             );
-        }
-        // And an ack is a write: a stale per-session callback must not
-        // advance the cursor of a name since rebound to another session.
-        let claimed_session = parse_flag(argv, "--session-id").unwrap_or_default();
-        if !session_attribution_matches(db, &name, &claimed_session) {
-            return (0, stale_attribution_error(&name, &claimed_session));
         }
         if let Some(up_to) = parse_flag(argv, "--up-to") {
             let Ok(ack_id) = up_to.parse::<i64>() else {
@@ -939,17 +994,19 @@ fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
         None => return (0, r#"{"error":"Missing --name"}"#.to_string()),
     };
     let reason = parse_flag(argv, "--reason").unwrap_or_else(|| "unknown".to_string());
+    // Claim gate first (see handle_status): finalizing is the strongest
+    // write — a stale per-session callback must not stop a name that has
+    // since been rebound to a different session, and a transient read error
+    // must not pose as that verified rebind.
+    let claimed_session = parse_flag(argv, "--session-id").unwrap_or_default();
+    if let Some(reply) = claimed_write_gate(db, &name, &claimed_session) {
+        return (0, reply);
+    }
     if !is_hermes_instance(db, &name) {
         return (
             0,
             serde_json::json!({"error": format!("Unknown Hermes instance: {name}")}).to_string(),
         );
-    }
-    // Finalizing is the strongest write: a stale per-session callback must
-    // not stop a name that has since been rebound to a different session.
-    let claimed_session = parse_flag(argv, "--session-id").unwrap_or_default();
-    if !session_attribution_matches(db, &name, &claimed_session) {
-        return (0, stale_attribution_error(&name, &claimed_session));
     }
     if has_flag(argv, "--soft") {
         common::soft_finalize_session(db, &name, &reason, None, true);
@@ -1979,6 +2036,150 @@ mod tests {
             "the placeholder is not bound to the session"
         );
         cleanup_db(&path);
+    }
+
+    #[test]
+    fn claimed_writes_answer_retryable_error_not_stale_on_read_failure() {
+        let (db, path) = setup_test_db();
+        save_hermes_instance(&db, "vega");
+        set_row_session(&db, "vega", "ses-new");
+        let before = db.get_last_event_id();
+
+        // Transient read failure: the instances table becomes unreadable, so
+        // every claim check reads Err — attribution is UNKNOWN, not verified.
+        db.conn().execute_batch("DROP TABLE instances").unwrap();
+
+        // Each claimed write must answer the retryable read error — never
+        // the stale-attribution text the Python listener treats as a
+        // verified rebind (and permanently tears down on).
+        for out in [
+            handle_status(
+                &db,
+                &argv_of(&[
+                    "--name",
+                    "vega",
+                    "--status",
+                    "active",
+                    "--session-id",
+                    "ses-new",
+                ]),
+            )
+            .1,
+            handle_read(
+                &db,
+                &argv_of(&["--name", "vega", "--format", "--session-id", "ses-new"]),
+            )
+            .1,
+            handle_read(
+                &db,
+                &argv_of(&[
+                    "--name",
+                    "vega",
+                    "--ack",
+                    "--up-to",
+                    "9",
+                    "--session-id",
+                    "ses-new",
+                ]),
+            )
+            .1,
+            handle_stop(
+                &db,
+                &argv_of(&["--name", "vega", "--reason", "r", "--session-id", "ses-new"]),
+            )
+            .1,
+        ] {
+            let doc = json_out(&out);
+            let error = doc["error"].as_str().unwrap_or_default();
+            assert!(
+                !error.contains("no longer attributed"),
+                "a read Err must not pose as a verified rebind: {doc}"
+            );
+            assert!(
+                error.contains("could not be read"),
+                "a retryable read error must be surfaced: {doc}"
+            );
+            assert!(
+                doc.get("acked_to").is_none() && doc.get("ok").is_none(),
+                "no success may be claimed while the row is unreadable: {doc}"
+            );
+        }
+        assert_eq!(
+            db.get_last_event_id(),
+            before,
+            "no ghost status/life events emitted while the row was unreadable"
+        );
+
+        // A REAL rebind (row readable, attributed elsewhere) still answers
+        // the stale-attribution refusal — teardown stays keyed on truth.
+        let (db2, path2) = setup_test_db();
+        save_hermes_instance(&db2, "vega");
+        set_row_session(&db2, "vega", "ses-new");
+        for out in [
+            handle_status(
+                &db2,
+                &argv_of(&[
+                    "--name",
+                    "vega",
+                    "--status",
+                    "active",
+                    "--session-id",
+                    "ses-old",
+                ]),
+            )
+            .1,
+            handle_read(
+                &db2,
+                &argv_of(&["--name", "vega", "--format", "--session-id", "ses-old"]),
+            )
+            .1,
+            handle_read(
+                &db2,
+                &argv_of(&[
+                    "--name",
+                    "vega",
+                    "--ack",
+                    "--up-to",
+                    "9",
+                    "--session-id",
+                    "ses-old",
+                ]),
+            )
+            .1,
+            handle_stop(
+                &db2,
+                &argv_of(&["--name", "vega", "--reason", "r", "--session-id", "ses-old"]),
+            )
+            .1,
+        ] {
+            let doc = json_out(&out);
+            assert!(
+                doc["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("no longer attributed"),
+                "a verified rebind must still answer the stale refusal: {doc}"
+            );
+        }
+        assert_eq!(
+            db2.get_instance_full("vega")
+                .unwrap()
+                .unwrap()
+                .last_event_id,
+            0,
+            "refused ack must not advance the cursor"
+        );
+        assert_eq!(
+            db2.get_instance_full("vega").unwrap().unwrap().status,
+            "listening",
+            "refused status must not mutate the row"
+        );
+        assert!(
+            db2.get_instance_full("vega").unwrap().is_some(),
+            "refused stop must not finalize the row"
+        );
+        cleanup_db(&path);
+        cleanup_db(&path2);
     }
 
     #[test]
