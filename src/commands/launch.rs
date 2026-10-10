@@ -119,6 +119,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
                     tag: remote_output.tag.as_deref(),
                     launcher_name: &remote_output.launcher_name,
                     terminal: remote_output.terminal.as_deref(),
+                    remote_terminal: Some(remote_terminal_preset(&inner, terminal.as_deref())),
                     background: remote_output.background,
                     run_here: remote_output.run_here,
                     hcom_config: &hcom_config,
@@ -153,6 +154,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         tag: tag_for_output.as_deref(),
         launcher_name: launcher_name_ref,
         terminal: terminal_for_output.as_deref(),
+        remote_terminal: None,
         background,
         run_here: hcom_flags.run_here,
         hcom_config: &hcom_config,
@@ -248,6 +250,18 @@ pub(crate) fn prepare_launch_execution(
 
 pub(crate) fn launch_result_to_json(result: &LaunchResult) -> serde_json::Value {
     serde_json::to_value(result).unwrap_or_else(|_| json!({}))
+}
+
+/// Preset a remote device reported using; older devices don't report one.
+pub(crate) fn remote_terminal_preset<'a>(
+    inner: &'a serde_json::Value,
+    requested: Option<&'a str>,
+) -> &'a str {
+    inner
+        .get("terminal_preset")
+        .and_then(|v| v.as_str())
+        .or(requested)
+        .unwrap_or("default")
 }
 
 pub(crate) fn launch_result_from_json(value: &serde_json::Value) -> Result<LaunchResult, String> {
@@ -661,6 +675,9 @@ pub(crate) struct LaunchOutputContext<'a> {
     pub tag: Option<&'a str>,
     pub launcher_name: &'a str,
     pub terminal: Option<&'a str>,
+    /// Remote launches: the preset the target device used. Resolving
+    /// `terminal` here would describe this device, not the target.
+    pub remote_terminal: Option<&'a str>,
     pub background: bool,
     pub run_here: Option<bool>,
     pub hcom_config: &'a HcomConfig,
@@ -717,12 +734,15 @@ pub(crate) fn print_launch_feedback(
         .ok()
         .flatten()
         .is_some();
-    let (terminal_mode, terminal_auto_detected) = crate::terminal::resolve_terminal_mode_for_tips(
-        ctx.terminal,
-        &ctx.hcom_config.terminal,
-        ctx.background,
-        ctx.run_here.unwrap_or(false),
-    );
+    let (terminal_mode, terminal_auto_detected) = match ctx.remote_terminal {
+        Some(preset) => (preset.to_string(), false),
+        None => crate::terminal::resolve_terminal_mode_for_tips(
+            ctx.terminal,
+            &ctx.hcom_config.terminal,
+            ctx.background,
+            ctx.run_here.unwrap_or(false),
+        ),
+    };
     tips::print_launch_tips(
         db,
         LaunchTipsContext {

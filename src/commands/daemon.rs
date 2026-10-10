@@ -33,7 +33,13 @@ pub(crate) fn daemon_start() -> i32 {
             println!("Daemon started{pid_str} (notify port not yet ready)");
             0
         } else {
-            eprintln!("Failed to start daemon (relay disabled or config error)");
+            if crate::sys::process::is_sandboxed() {
+                eprintln!(
+                    "Failed to start daemon: running inside a sandbox, which the daemon would inherit. Rerun with approval/escalation."
+                );
+            } else {
+                eprintln!("Failed to start daemon (relay disabled or config error)");
+            }
             1
         }
     }

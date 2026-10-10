@@ -127,8 +127,64 @@ impl Drop for PidFileGuard {
 
 // ── Worker entry point ──────────────────────────────────────────────
 
+/// Env the worker must not carry from whoever started it (often an agent's
+/// hook): its terminal pane, which remote launches would target long after it
+/// closed, and its AI-tool identity, which makes launch errors suggest sandbox
+/// escalation.
+fn inherited_identity_vars() -> impl Iterator<Item = String> {
+    let instance_state = crate::integration_spec::ALL
+        .iter()
+        .flat_map(|spec| spec.instance_state_env.iter().map(|v| v.to_string()));
+    crate::launcher::env_strip_set()
+        .into_iter()
+        .chain(instance_state)
+        .chain(
+            [
+                "HCOM_INSTANCE_NAME",
+                // Session sockets local launches keep on purpose (tab/split CLIs
+                // target the launcher's own server), but in the worker they name
+                // the spawner's, which may be gone. HERDR_PANE_ID also drives
+                // terminal auto-detection.
+                "WEZTERM_UNIX_SOCKET",
+                "TMUX",
+                "ZELLIJ",
+                "ZELLIJ_SESSION_NAME",
+                "HERDR_PANE_ID",
+                "HERDR_SOCKET_PATH",
+                "HERDR_ENV",
+            ]
+            .map(String::from),
+        )
+}
+
+/// Drop identity the worker inherited from its spawner. The spawner normally
+/// strips it, but after an upgrade the spawner is the previous build's worker,
+/// which may not. Called from `main` before anything caches the env.
+pub fn scrub_inherited_env() {
+    // The scrub removes `CODEX_SANDBOX`, one of the sandbox signals; record the
+    // verdict first.
+    STARTED_SANDBOXED.store(crate::sys::process::is_sandboxed(), Ordering::SeqCst);
+    for key in inherited_identity_vars() {
+        // SAFETY: called first thing in `main`, before any thread exists.
+        unsafe { std::env::remove_var(key) };
+    }
+}
+
+static STARTED_SANDBOXED: AtomicBool = AtomicBool::new(false);
+
 /// Run the relay-worker process. Called from router dispatch.
 pub fn run() -> i32 {
+    // The spawner normally refuses this, but after an upgrade the spawner is
+    // the previous build's worker, which may not.
+    if STARTED_SANDBOXED.load(Ordering::SeqCst) || crate::sys::process::is_sandboxed() {
+        log::log_warn(
+            "relay",
+            "relay_worker.sandboxed_exit",
+            "started inside a sandbox; exiting so an unsandboxed caller starts the worker",
+        );
+        return 1;
+    }
+
     // Check if already running
     if let Some(existing_pid) = read_pid_file() {
         let current_pid = std::process::id();
@@ -342,6 +398,18 @@ fn do_spawn() -> bool {
 
 /// `do_spawn` for a given executable: the hand-off passes the install path captured at start.
 fn do_spawn_with(binary: Option<PathBuf>) -> bool {
+    // A worker started from an agent's sandboxed shell stays sandboxed: it
+    // still relays, but remote launches can't open terminals. Leave the spawn
+    // to the next unsandboxed hook or command.
+    if crate::sys::process::is_sandboxed() {
+        log::log_warn(
+            "relay",
+            "relay_worker.spawn_skipped_sandboxed",
+            "not starting the relay worker from inside a sandbox",
+        );
+        return false;
+    }
+
     let lock_path = spawn_lock_path();
     if let Some(parent) = lock_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -407,6 +475,9 @@ fn do_spawn_with(binary: Option<PathBuf>) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    for key in inherited_identity_vars() {
+        cmd.env_remove(key);
+    }
 
     // Detach into its own session so it survives parent terminal close (no
     // SIGHUP) and, on Windows, doesn't inherit the parent's stdio handles

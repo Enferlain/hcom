@@ -264,6 +264,9 @@ pub fn send_rpc_request_and_wait_with_db(
     timeout: Duration,
 ) -> Result<Value, String> {
     if !super::worker::ensure_worker() {
+        if crate::sys::process::is_sandboxed() {
+            return Err("relay worker not running and can't be started from inside a sandbox - rerun with approval/escalation".to_string());
+        }
         return Err("relay worker not running - start with: hcom relay on".to_string());
     }
     ensure_remote_action_supported(db, target_device_short_id, action, target_name)?;
@@ -811,7 +814,7 @@ fn handle_remote_launch(
     )
     .map_err(|e| e.to_string())?;
 
-    Ok(crate::commands::launch::launch_result_to_json(&result))
+    Ok(launch_result_with_terminal(db, &result))
 }
 
 fn handle_remote_kill(
@@ -857,7 +860,23 @@ fn handle_remote_resume(
         &flags,
     )
     .map_err(|e| e.to_string())?;
-    Ok(crate::commands::launch::launch_result_to_json(&result))
+    Ok(launch_result_with_terminal(db, &result))
+}
+
+/// Launch result plus the terminal preset this device actually used, so the
+/// requester can report it instead of guessing from its own environment.
+fn launch_result_with_terminal(db: &HcomDb, result: &launcher::LaunchResult) -> Value {
+    let mut value = crate::commands::launch::launch_result_to_json(result);
+    let preset = result
+        .handles
+        .iter()
+        .filter_map(|h| h.get("instance_name").and_then(|v| v.as_str()))
+        .find_map(|name| db.get_instance_full(name).ok().flatten())
+        .and_then(|row| row.terminal_preset_effective);
+    if let (Some(preset), Some(obj)) = (preset, value.as_object_mut()) {
+        obj.insert("terminal_preset".into(), json!(preset));
+    }
+    value
 }
 
 fn handle_remote_config_get(

@@ -496,7 +496,7 @@ where
 /// Per-tool instance-state vars are NOT in the initial strip — they are
 /// stripped per-instance later via `strip_instance_state_vars` so that
 /// cross-tool nesting doesn't strip vars the child tool doesn't own.
-fn env_strip_set() -> std::collections::HashSet<String> {
+pub(crate) fn env_strip_set() -> std::collections::HashSet<String> {
     let mut strip: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     strip.extend(run_here_env_strip_set());

@@ -166,6 +166,9 @@ pub fn do_resume(
             tag: remote_output.tag.as_deref(),
             launcher_name: &remote_output.launcher_name,
             terminal: remote_output.terminal.as_deref(),
+            remote_terminal: Some(crate::commands::launch::remote_terminal_preset(
+                &inner, None,
+            )),
             background: remote_output.background,
             run_here: remote_output.run_here,
             hcom_config: &hcom_config,
@@ -624,6 +627,7 @@ fn execute_prepared_resume(
             tag: plan.output.tag.as_deref(),
             launcher_name: &plan.output.launcher_name,
             terminal: plan.output.terminal.as_deref(),
+            remote_terminal: None,
             background: plan.output.background,
             run_here: plan.output.run_here,
             hcom_config,

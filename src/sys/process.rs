@@ -13,6 +13,35 @@ pub fn identity(pid: u32) -> Option<String> {
     process_identity_platform(pid)
 }
 
+/// Whether this process runs inside an OS sandbox. Children inherit it for
+/// life, so long-lived daemons must not be started from one.
+///
+/// macOS asks the kernel (covers any Seatbelt profile). Elsewhere only Codex's
+/// marker is known; Linux sandboxes set nothing reliable.
+pub fn is_sandboxed() -> bool {
+    std::env::var_os("CODEX_SANDBOX").is_some() || is_sandboxed_platform()
+}
+
+#[cfg(target_os = "macos")]
+fn is_sandboxed_platform() -> bool {
+    unsafe extern "C" {
+        fn sandbox_check(
+            pid: libc::pid_t,
+            operation: *const libc::c_char,
+            kind: libc::c_int,
+            ...
+        ) -> libc::c_int;
+    }
+    // SAFETY: a null operation with SANDBOX_FILTER_NONE (0) only asks whether
+    // the PID is sandboxed; no further arguments are read.
+    unsafe { sandbox_check(libc::getpid(), std::ptr::null(), 0) != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_sandboxed_platform() -> bool {
+    false
+}
+
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn process_identity_platform(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;

@@ -697,12 +697,19 @@ pub fn spawn_background_push() {
 fn spawn_background_push_with(prefix: &[String]) {
     #[cfg(not(test))]
     if let Some((cmd, prefix_args)) = prefix.split_first() {
-        let _ = std::process::Command::new(cmd)
+        // Reap it: under the relay worker (remote launches) an unwaited
+        // child would stay a zombie for the worker's lifetime.
+        if let Ok(mut child) = std::process::Command::new(cmd)
             .args(prefix_args)
             .args(["relay", "push"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn();
+            .spawn()
+        {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
 
     #[cfg(test)]

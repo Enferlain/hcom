@@ -52,6 +52,10 @@ fn main() -> Result<()> {
         .and_then(|arg| tool::Tool::from_hook_name(&arg))
         .and_then(shared::nested::scrub_inherited_identity);
 
+    if std::env::args().nth(1).as_deref() == Some("relay-worker") {
+        relay::worker::scrub_inherited_env();
+    }
+
     // Initialize global config from environment variables
     config::Config::init();
 
