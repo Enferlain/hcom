@@ -480,11 +480,7 @@ pub fn should_deliver_message(
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                 .unwrap_or_default();
 
-            // Strip device suffix for cross-device matching
-            let receiver_base = receiver_name.split(':').next().unwrap_or(receiver_name);
-            Ok(mentions
-                .iter()
-                .any(|m| receiver_base == m.split(':').next().unwrap_or(m)))
+            Ok(mentions.contains(&receiver_name))
         }
         _ => Ok(false),
     }
@@ -1245,10 +1241,9 @@ mod tests {
     }
 
     #[test]
-    fn test_should_deliver_cross_device() {
+    fn test_should_deliver_skips_same_name_on_another_device() {
         let data = serde_json::json!({"scope": "mentions", "mentions": ["luna:BOXE"]});
-        // luna matches luna:BOXE after stripping device suffix
-        assert!(should_deliver_message(&data, "luna", "nova").unwrap());
+        assert!(!should_deliver_message(&data, "luna", "nova").unwrap());
     }
 
     #[test]

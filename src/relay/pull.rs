@@ -795,9 +795,9 @@ pub(crate) fn insert_remote_event(
         .cloned()
         .unwrap_or(Value::Object(Default::default()));
 
-    // Namespace asymmetry by design:
-    // - `instance` / `from` keep the remote short_id suffix -> globally unique history
-    // - `mentions` / `delivered_to` strip *our own* suffix -> local delivery still matches
+    // Names are rewritten into our namespace: the origin's bare (local) names gain
+    // its suffix, and names carrying *our* suffix become bare. Delivery matches
+    // names exactly, so a mention of the origin's `luna` never reaches ours.
     if let Some(obj) = data.as_object_mut() {
         // Namespace 'from' field
         if let Some(from) = obj.get("from").and_then(|v| v.as_str()).map(String::from)
@@ -809,13 +809,12 @@ pub(crate) fn insert_remote_event(
             );
         }
 
-        // Strip own device suffix from mentions and delivered_to
         for field in &["mentions", "delivered_to"] {
             if let Some(arr) = obj.get(*field).and_then(|v| v.as_array()).cloned() {
                 let fixed: Vec<Value> = arr
                     .iter()
                     .filter_map(|v| v.as_str())
-                    .map(|name| Value::String(strip_device_suffix(name, own_short_id)))
+                    .map(|name| Value::String(localize_name(name, short_id, own_short_id)))
                     .collect();
                 obj.insert(field.to_string(), Value::Array(fixed));
             }
@@ -905,6 +904,18 @@ fn emit_device_event(
     // reconnect: the snapshot handler logs those before it applies the peer's state, so a
     // waiter could act on the event and still be told the peer is unsynced.
     db.log_event("life", "", &data).is_ok()
+}
+
+/// Map a recipient name from the origin device's namespace into ours.
+/// `bigboss` is device-agnostic and stays bare.
+fn localize_name(name: &str, origin_short_id: &str, own_short_id: &str) -> String {
+    if name.contains(':') {
+        strip_device_suffix(name, own_short_id)
+    } else if name == crate::shared::SENDER {
+        name.to_string()
+    } else {
+        super::add_device_suffix(name, origin_short_id)
+    }
 }
 
 /// Strip own device suffix from a name (case-insensitive).
@@ -1470,6 +1481,41 @@ mod tests {
             "instance": "luna",
             "data": {"from": "luna", "text": text, "mentions": ["nova"]},
         })
+    }
+
+    #[test]
+    #[serial]
+    fn imported_recipients_are_rewritten_into_the_local_namespace() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut event = own_event(1, "hi");
+        event["data"]["scope"] = json!("mentions");
+        event["data"]["mentions"] = json!(["luna", "nova:MINE", "kira:OTHR", "bigboss"]);
+        event["data"]["delivered_to"] = json!(["luna"]);
+
+        assert!(import_remote_events(
+            &db,
+            "device-1234",
+            "ABCD",
+            &[event],
+            0.0,
+            "MINE"
+        ));
+
+        let data: Value = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type = 'message' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|s| serde_json::from_str(&s).unwrap())
+            .unwrap();
+        assert_eq!(
+            data["mentions"],
+            json!(["luna:ABCD", "nova", "kira:OTHR", "bigboss"])
+        );
+        assert_eq!(data["delivered_to"], json!(["luna:ABCD"]));
     }
 
     #[test]

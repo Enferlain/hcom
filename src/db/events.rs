@@ -35,11 +35,9 @@ impl HcomDb {
     /// Check if a message event should be delivered to the given receiver.
     ///
     /// Skips own messages. Checks scope: "broadcast" delivers to all,
-    /// "mentions" checks the mentions array with cross-device base-name matching.
-    ///
-    /// `receiver` may be local (`luna`) or relay-namespaced (`luna:ABCD`).
-    /// Mentions compare on base name so the same event JSON routes correctly
-    /// on both local and relayed peers without rewriting stored scope.
+    /// "mentions" requires the receiver's exact name in the mentions array.
+    /// Relay import rewrites mentions into the local namespace, so `luna:ABCD`
+    /// never matches a local `luna`.
     pub(super) fn should_deliver_to(json: &serde_json::Value, receiver: &str) -> bool {
         let from = json.get("from").and_then(|v| v.as_str()).unwrap_or("");
         if from == receiver {
@@ -51,19 +49,10 @@ impl HcomDb {
             .unwrap_or("broadcast");
         match scope {
             "broadcast" => true,
-            "mentions" => {
-                let receiver_base = receiver.split(':').next().unwrap_or(receiver);
-                json.get("mentions")
-                    .and_then(|m| m.as_array())
-                    .map(|arr| {
-                        arr.iter().any(|v| {
-                            v.as_str()
-                                .map(|m| receiver_base == m.split(':').next().unwrap_or(m))
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false)
-            }
+            "mentions" => json
+                .get("mentions")
+                .and_then(|m| m.as_array())
+                .is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(receiver))),
             _ => false,
         }
     }
