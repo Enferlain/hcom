@@ -220,12 +220,10 @@ fn load_config_content() -> String {
 fn set_nested_toml(doc: &mut toml_edit::DocumentMut, dotted_path: &str, value: &str) {
     let parts: Vec<&str> = dotted_path.split('.').collect();
 
-    // Ensure intermediate tables exist
-    for part in &parts[..parts.len() - 1] {
-        if doc.get(part).is_none() || !doc[part].is_table_like() {
-            doc[part] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        // For deeper nesting we need to navigate into the table via the Item API
+    // Ensure the top-level table exists (a 3-level path's second level is
+    // created inside it below, never at the top level)
+    if doc.get(parts[0]).is_none() || !doc[parts[0]].is_table_like() {
+        doc[parts[0]] = toml_edit::Item::Table(toml_edit::Table::new());
     }
 
     // For 2-level paths (e.g. "preferences.timeout")
@@ -2389,6 +2387,7 @@ mod tests {
             parsed["launch"]["pi"]["args"].as_str(),
             Some("--model safe-model")
         );
+        assert!(parsed.get("pi").is_none(), "no stray top-level [pi]");
     }
 
     #[test]
