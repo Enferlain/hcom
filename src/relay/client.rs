@@ -400,7 +400,7 @@ impl MqttRelay {
                         drained = true;
                         last_event_from_conn = Instant::now();
                         consecutive_errors += 1;
-                        let err_msg = format!("{:?}", conn_err);
+                        let err_msg = conn_err.to_string();
 
                         // Log first error, then every 10th
                         if connected
@@ -414,7 +414,9 @@ impl MqttRelay {
                             );
                         }
 
-                        if connected {
+                        // First error of a streak also covers a worker that never
+                        // connected (bad password, unreachable broker).
+                        if connected || consecutive_errors == 1 {
                             connected = false;
                             if let Ok(db) = HcomDb::open() {
                                 set_relay_status(&db, "error", Some(&err_msg), true);
@@ -469,7 +471,7 @@ impl MqttRelay {
                     Ok(Err(conn_err)) => {
                         last_event_from_conn = Instant::now();
                         consecutive_errors += 1;
-                        let err_msg = format!("{:?}", conn_err);
+                        let err_msg = conn_err.to_string();
 
                         if connected
                             || consecutive_errors <= 1
@@ -482,7 +484,9 @@ impl MqttRelay {
                             );
                         }
 
-                        if connected {
+                        // First error of a streak also covers a worker that never
+                        // connected (bad password, unreachable broker).
+                        if connected || consecutive_errors == 1 {
                             connected = false;
                             if let Ok(db) = HcomDb::open() {
                                 set_relay_status(&db, "error", Some(&err_msg), true);
