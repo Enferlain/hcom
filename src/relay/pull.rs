@@ -118,7 +118,6 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
     safe_kv_set(db, &format!("relay_sync_time_{}", device_id), None);
     safe_kv_set(db, &format!("relay_caps_{}", device_id), None);
     safe_kv_set(db, &format!("relay_ctrl_{}", device_id), None);
-    safe_kv_set(db, &state_ts_key(device_id), None);
     if let Some(ref short) = short_id {
         safe_kv_set(db, &format!("relay_short_{}", short), None);
     }
@@ -215,6 +214,9 @@ pub fn handle_state_message(
 
     if data.get("state").is_some() && data["state"].is_null() {
         handle_device_gone(db, device_id);
+        // Keep the watermark at the departure, so a captured snapshot from before
+        // it cannot bring the device back once its nonce has left the cache.
+        record_state_ts_watermark(db, device_id, opened.ts_secs);
         return false;
     }
 
@@ -1435,7 +1437,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_handle_state_message_authenticated_null_state_cleans_up_device_and_watermark() {
+    fn test_handle_state_message_authenticated_null_state_cleans_up_device_and_keeps_watermark() {
         let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         let db = HcomDb::open().unwrap();
         db.conn()
@@ -1471,7 +1473,10 @@ mod tests {
         ));
 
         assert!(db.get_instance_full("luna:ABCD").unwrap().is_none());
-        assert_eq!(safe_kv_get(&db, "relay_state_ts_device-1234"), None);
+        assert_eq!(
+            safe_kv_get(&db, "relay_state_ts_device-1234").as_deref(),
+            Some("2000")
+        );
     }
     fn own_event(id: i64, text: &str) -> serde_json::Value {
         json!({
