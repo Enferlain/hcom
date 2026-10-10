@@ -161,22 +161,22 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
     ),
     (
         "HCOM_RELAY",
-        "Relay MQTT broker URL (config file only)",
+        "Relay MQTT broker URL (read-only; managed by hcom relay)",
         "string",
     ),
     (
         "HCOM_RELAY_ID",
-        "Relay group identifier (config file only)",
+        "Relay group identifier (read-only; managed by hcom relay)",
         "string",
     ),
     (
         "HCOM_RELAY_TOKEN",
-        "Relay authentication token (config file only)",
+        "Relay authentication token (read-only; managed by hcom relay)",
         "string",
     ),
     (
         "HCOM_RELAY_ENABLED",
-        "Enable relay sync (config file only)",
+        "Enable relay sync (read-only; managed by hcom relay)",
         "boolean",
     ),
 ];
@@ -1115,6 +1115,14 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
 
     // Set mode: config KEY VALUE
     if argv.len() >= 2 && !wants_info {
+        // Relay settings change what the relay worker does and must go through
+        // `hcom relay`, which validates them and starts/stops the worker to match.
+        if key.starts_with("HCOM_RELAY") {
+            eprintln!(
+                "Error: {key} is managed by 'hcom relay' (new, connect, on, off).\nRun: hcom relay --help"
+            );
+            return 1;
+        }
         // Join all remaining args with spaces
         let value = argv[1..].join(" ");
         match config_set(&key, &value) {
@@ -1446,7 +1454,7 @@ All devices with the same relay_id sync state via MQTT pub/sub.",
             "\
 HCOM_RELAY_TOKEN - Auth token for MQTT broker
 
-Optional. Set via 'hcom relay new --password <secret>' or directly here.
+Optional. Set via 'hcom relay new|connect --password <secret>'.
 Stored in [relay] in config.toml. Environment overrides are ignored for relay fields.
 Only needed if your broker requires authentication.",
         ),
@@ -1629,16 +1637,14 @@ Prepended to launch-time cli args.",
 
         "HCOM_RELAY_ENABLED" => Some(
             "\
-HCOM_RELAY_ENABLED - Enable or disable relay sync
+HCOM_RELAY_ENABLED - Whether relay sync is on
 
 Default: true (when relay is configured)
 Stored in [relay] in config.toml. Environment overrides are ignored for relay fields.
 
 Usage:
-  hcom config relay_enabled false    Disable relay sync
-  hcom config relay_enabled true     Re-enable relay sync
-
-Temporarily disables MQTT sync without removing relay configuration.",
+  hcom relay off    Disable relay sync (keeps relay configuration)
+  hcom relay on     Re-enable relay sync",
         ),
 
         _ => None,

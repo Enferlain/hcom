@@ -921,6 +921,10 @@ fn handle_remote_config_set(
     reject_remote_secret_field(field)?;
     let value = required_param(params, "value")?;
     let normalized = normalize_config_field(field);
+    if normalized == "HCOM_RELAY_ENABLED" {
+        // Flipping the flag alone leaves the worker running; relay_off stops it.
+        return Err("relay_enabled is not remotely settable; use relay off".to_string());
+    }
     crate::commands::config::config_set(&normalized, value)?;
     Ok(json!({"field": field, "value": value}))
 }
