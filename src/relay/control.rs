@@ -1278,8 +1278,16 @@ fn handle_remote_sub_unsub(
     Ok(json!({ "id": sub_id, "removed": true }))
 }
 
+/// How long a processed control event is remembered, and the oldest event
+/// accepted. Wider than the envelope skew check so a redelivery after a worker
+/// restart (which empties the nonce cache) is still caught.
+const CONTROL_DEDUP_WINDOW_SECS: f64 = 300.0;
+
 /// Process incoming control events targeting this device.
-/// Deduplicates by timestamp to avoid re-processing.
+///
+/// Deduplicates on each event's exact timestamp within a time window. Senders
+/// are separate CLI processes publishing over their own connections, so events
+/// can arrive out of timestamp order; a high-water mark would drop the late ones.
 pub fn handle_control_events(
     db: &HcomDb,
     events: &[Value],
@@ -1287,25 +1295,26 @@ pub fn handle_control_events(
     source_device: &str,
 ) -> bool {
     let config = HcomConfig::load(None).unwrap_or_default();
-    let last_ctrl_ts: f64 = safe_kv_get(db, &format!("relay_ctrl_{}", source_device))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
+    let seen_key = format!("relay_ctrl_{}", source_device);
+    let now = crate::shared::time::now_epoch_f64();
+    // Keyed by the `ts` exactly as sent, mapped to its value for expiry. Keys stay
+    // strings: re-parsing a stored float may not reproduce the wire value.
+    let mut seen: serde_json::Map<String, Value> = safe_kv_get(db, &seen_key)
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let seen_before = seen.len();
+    seen.retain(|_, ts| {
+        ts.as_f64()
+            .is_some_and(|ts| now - ts < CONTROL_DEDUP_WINDOW_SECS)
+    });
+    let mut seen_changed = seen.len() != seen_before;
 
-    let mut max_ctrl_ts = last_ctrl_ts;
     let mut produced_rpc_results = false;
 
     for event in events {
         if event.get("type").and_then(|v| v.as_str()) != Some("control") {
             continue;
         }
-
-        let event_ts = event.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-        // Dedup by timestamp
-        if event_ts <= last_ctrl_ts {
-            continue;
-        }
-        max_ctrl_ts = max_ctrl_ts.max(event_ts);
 
         let data = match event.get("data") {
             Some(d) => d,
@@ -1321,6 +1330,17 @@ pub fn handle_control_events(
         if target_device != own_short_id.to_uppercase() {
             continue; // Not for us
         }
+
+        let Some(ts) = event.get("ts").filter(|v| v.is_number()) else {
+            continue;
+        };
+        let event_ts = ts.as_f64().unwrap_or(0.0);
+        let ts_key = ts.to_string();
+        if (now - event_ts).abs() >= CONTROL_DEDUP_WINDOW_SECS || seen.contains_key(&ts_key) {
+            continue;
+        }
+        seen.insert(ts_key, ts.clone());
+        seen_changed = true;
 
         let action = data.get("action").and_then(|v| v.as_str()).unwrap_or("");
         let request_id = data
@@ -1370,13 +1390,9 @@ pub fn handle_control_events(
         }
     }
 
-    // Persist dedup timestamp
-    if max_ctrl_ts > last_ctrl_ts {
-        safe_kv_set(
-            db,
-            &format!("relay_ctrl_{}", source_device),
-            Some(&max_ctrl_ts.to_string()),
-        );
+    if seen_changed {
+        let value = (!seen.is_empty()).then(|| Value::Object(seen).to_string());
+        safe_kv_set(db, &seen_key, value.as_deref());
     }
 
     produced_rpc_results
@@ -1446,7 +1462,7 @@ mod tests {
         // Control events targeting a different device should be ignored
         let events = vec![json!({
             "type": "control",
-            "ts": 1000.0,
+            "ts": crate::shared::time::now_epoch_f64(),
             "data": {
                 "action": "kill",
                 "target_device": "ABCD",
@@ -1658,7 +1674,7 @@ mod tests {
         let db = test_db();
         let events = vec![json!({
             "type": "control",
-            "ts": 1002.0,
+            "ts": crate::shared::time::now_epoch_f64(),
             "data": {
                 "action": "kill",
                 "target_device": "WXYZ",
@@ -1677,12 +1693,82 @@ mod tests {
         assert_eq!(result["ok"], false);
     }
 
+    fn kill_event(ts: f64, target_device: &str, request_id: &str) -> Value {
+        json!({
+            "type": "control",
+            "ts": ts,
+            "data": {
+                "action": "kill",
+                "target_device": target_device,
+                "from": "_:EFGH",
+                "request_id": request_id,
+                "params": { "target": "missing-agent" },
+            }
+        })
+    }
+
+    fn rpc_result_count(db: &HcomDb) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'rpc_result'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn test_handle_control_events_accepts_out_of_order_arrivals() {
+        let db = test_db();
+        let now = crate::shared::time::now_epoch_f64();
+        // A later event for another device, then a later one for us, arrive first.
+        let first = [
+            kill_event(now, "ABCD", "req-a"),
+            kill_event(now - 1.0, "WXYZ", "req-b"),
+        ];
+        assert!(handle_control_events(&db, &first, "WXYZ", "device-123"));
+        let late = [kill_event(now - 2.0, "WXYZ", "req-c")];
+        assert!(handle_control_events(&db, &late, "WXYZ", "device-123"));
+        assert_eq!(rpc_result_count(&db), 2);
+    }
+
+    #[test]
+    fn test_handle_control_events_dedup_survives_persisting_a_fractional_ts() {
+        let db = test_db();
+        let now = crate::shared::time::now_epoch_f64().floor();
+        // Parsed from wire text, as a received envelope would be.
+        let wire = format!(
+            r#"[{{"type":"control","ts":{now}.0000022,"data":{{"action":"kill","target_device":"WXYZ","from":"_:EFGH","request_id":"req-f","params":{{"target":"missing-agent"}}}}}}]"#
+        );
+        let events: Vec<Value> = serde_json::from_str(&wire).unwrap();
+        assert!(handle_control_events(&db, &events, "WXYZ", "device-123"));
+        let again: Vec<Value> = serde_json::from_str(&wire).unwrap();
+        assert!(!handle_control_events(&db, &again, "WXYZ", "device-123"));
+        assert_eq!(rpc_result_count(&db), 1);
+    }
+
+    #[test]
+    fn test_handle_control_events_drops_redelivery_and_stale_events() {
+        let db = test_db();
+        let now = crate::shared::time::now_epoch_f64();
+        let event = [kill_event(now, "WXYZ", "req-once")];
+        assert!(handle_control_events(&db, &event, "WXYZ", "device-123"));
+        assert!(!handle_control_events(&db, &event, "WXYZ", "device-123"));
+        let stale = [kill_event(
+            now - CONTROL_DEDUP_WINDOW_SECS - 1.0,
+            "WXYZ",
+            "req-old",
+        )];
+        assert!(!handle_control_events(&db, &stale, "WXYZ", "device-123"));
+        assert_eq!(rpc_result_count(&db), 1);
+    }
+
     #[test]
     fn test_handle_control_events_ignores_unknown_actions() {
         let db = test_db();
         let events = vec![json!({
             "type": "control",
-            "ts": 1004.0,
+            "ts": crate::shared::time::now_epoch_f64(),
             "data": {
                 "action": "mystery",
                 "target_device": "WXYZ",
