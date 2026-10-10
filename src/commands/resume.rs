@@ -479,13 +479,6 @@ fn prepare_resume_plan_from_source(
         ]);
     }
 
-    crate::commands::launch::validate_claude_headless_launch(
-        &tool,
-        is_headless,
-        &merged_args,
-        launch_flags.initial_prompt.as_deref(),
-    )?;
-
     let launcher_name =
         resolve_launcher_name(db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
     let launcher_name_for_output = launcher_name.clone();

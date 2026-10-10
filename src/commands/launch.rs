@@ -139,8 +139,6 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     let (merged_args, background) =
         prepare_launch_execution(&launch_tool, &tool_args, &hcom_config, headless);
 
-    validate_claude_headless_launch(&tool, background, &merged_args, initial_prompt.as_deref())?;
-
     // Open DB
     let db = HcomDb::open()?;
 
@@ -246,29 +244,6 @@ pub(crate) fn prepare_launch_execution(
     }
 
     (merged_args, background)
-}
-
-pub(crate) fn validate_claude_headless_launch(
-    tool: &str,
-    background: bool,
-    merged_args: &[String],
-    initial_prompt: Option<&str>,
-) -> Result<()> {
-    if tool != "claude" || !background {
-        return Ok(());
-    }
-
-    if !args_contain_any(merged_args, &["-p", "--print"]) {
-        return Ok(());
-    }
-
-    let has_hcom_prompt = initial_prompt.is_some_and(|p| !p.trim().is_empty());
-    if has_hcom_prompt {
-        return Ok(());
-    }
-    // User positionals cannot be identified without duplicating Claude's flag
-    // grammar. Let Claude validate whether print mode received a prompt.
-    Ok(())
 }
 
 pub(crate) fn launch_result_to_json(result: &LaunchResult) -> serde_json::Value {
@@ -1136,34 +1111,6 @@ mod tests {
         let (args, background) = prepare_launch_execution(&lt("claude"), &s(&[]), &config, false);
         assert!(!background);
         assert!(args.is_empty());
-    }
-
-    #[test]
-    fn test_validate_claude_print_defers_prompt_validation_to_claude() {
-        assert!(validate_claude_headless_launch("claude", true, &s(&["-p"]), None).is_ok());
-    }
-
-    #[test]
-    fn test_validate_claude_print_accepts_cli_prompt() {
-        assert!(
-            validate_claude_headless_launch("claude", true, &s(&["-p", "say hi in hcom"]), None)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_validate_claude_print_accepts_hcom_prompt() {
-        assert!(
-            validate_claude_headless_launch("claude", true, &s(&["-p"]), Some("say hi in hcom"))
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn test_validate_claude_headless_pty_allows_no_prompt() {
-        // Bare `hcom claude --headless` (no -p) is a valid live-session launch —
-        // the PTY wrapper keeps the TUI alive waiting for hcom inject.
-        assert!(validate_claude_headless_launch("claude", true, &[], None).is_ok());
     }
 
     #[test]
