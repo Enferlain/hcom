@@ -135,6 +135,37 @@ fn paint(code: &str, text: &str) -> String {
     }
 }
 
+fn is_public_broker(broker: &str) -> bool {
+    DEFAULT_BROKERS
+        .iter()
+        .any(|&(h, p)| broker == format!("mqtts://{h}:{p}") || broker == format!("mqtt://{h}:{p}"))
+}
+
+/// Hint for a broker error that looks like rejected credentials on a private broker.
+fn auth_hint(config: &crate::config::HcomConfig, error: Option<&str>) -> Option<&'static str> {
+    let err = error.unwrap_or("").to_ascii_lowercase();
+    let auth_error =
+        err.contains("password") || err.contains("auth") || err.contains("not authorized");
+    if !auth_error || is_public_broker(&config.relay) {
+        return None;
+    }
+    Some(if config.relay_token.is_empty() {
+        "this broker needs a password: hcom relay connect <token> --password <secret>"
+    } else {
+        "broker rejected the password: hcom relay connect <token> --password <secret>"
+    })
+}
+
+/// Peer agents shown per device in `hcom relay` before collapsing to "+N".
+const MAX_LISTED_AGENTS: usize = 5;
+
+fn sync_time_of(sync_map: &std::collections::HashMap<String, String>, device_id: &str) -> f64 {
+    sync_map
+        .get(&format!("relay_sync_time_{device_id}"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0)
+}
+
 /// Show relay status.
 fn relay_status(db: &HcomDb) -> i32 {
     let config = config::load_config_snapshot().core;
@@ -147,7 +178,7 @@ fn relay_status(db: &HcomDb) -> i32 {
 
     if !config.relay_enabled {
         println!("{}", paint(FG_YELLOW, "Relay: disabled"));
-        println!("\nRun: hcom relay connect");
+        println!("\nRun: hcom relay on");
         return 0;
     }
 
@@ -170,11 +201,12 @@ fn relay_status(db: &HcomDb) -> i32 {
                 paint(FG_YELLOW, "stale"),
                 age_s
             );
+            println!("  Fix: hcom relay daemon restart");
         }
         relay::RelayHealth::Waiting => {
             println!(
-                "Status:    {} (daemon may not be running)",
-                paint(FG_YELLOW, "waiting")
+                "Status:    {} — daemon not running (start: hcom relay daemon start)",
+                paint(FG_YELLOW, "stopped")
             );
         }
         relay::RelayHealth::Error {
@@ -187,19 +219,13 @@ fn relay_status(db: &HcomDb) -> i32 {
                 paint(FG_RED, "error"),
                 reason.clone().label(detail.as_deref(), *pid)
             );
-            if matches!(reason, relay::RelayErrorReason::Reported) {
-                let err_text = detail.as_deref().unwrap_or("");
-                if err_text.contains("password")
-                    || err_text.contains("auth")
-                    || err_text.contains("not authorized")
-                {
-                    let is_public = DEFAULT_BROKERS.iter().any(|&(h, p)| {
-                        config.relay == format!("mqtts://{h}:{p}")
-                            || config.relay == format!("mqtt://{h}:{p}")
-                    });
-                    if !is_public && config.relay_token.is_empty() {
-                        println!("  Hint: use --password when connecting to private brokers");
-                    }
+            match reason {
+                relay::RelayErrorReason::Reported => match auth_hint(&config, detail.as_deref()) {
+                    Some(hint) => println!("  Hint: {hint}"),
+                    None => println!("  If this persists: hcom relay daemon restart"),
+                },
+                relay::RelayErrorReason::StalePidfile | relay::RelayErrorReason::Ghost => {
+                    println!("  Fix: hcom relay daemon restart");
                 }
             }
         }
@@ -224,8 +250,6 @@ fn relay_status(db: &HcomDb) -> i32 {
     } else {
         println!("Broker:    auto (public fallback)");
     }
-
-    println!("Device:    {}", get_device_short_id(db));
 
     // Queued events
     let last_push_id: i64 = db
@@ -287,62 +311,57 @@ fn relay_status(db: &HcomDb) -> i32 {
         .into_iter()
         .collect();
 
-    let mut agent_counts = std::collections::HashMap::new();
+    let mut agent_names: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     if let Ok(mut stmt) = db.conn().prepare(
-        "SELECT origin_device_id, COUNT(*) as cnt FROM instances \
+        "SELECT origin_device_id, name FROM instances \
          WHERE origin_device_id IS NOT NULL AND origin_device_id != '' \
-         GROUP BY origin_device_id",
+         ORDER BY name",
     ) && let Ok(rows) = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     }) {
-        for row in rows.filter_map(|r| r.ok()) {
-            agent_counts.insert(row.0, row.1);
+        for (device_id, name) in rows.filter_map(|r| r.ok()) {
+            let base = name.split(':').next().unwrap_or(&name).to_string();
+            agent_names.entry(device_id).or_default().push(base);
         }
     }
 
-    let mut online_parts = Vec::new();
-    let mut offline_parts = Vec::new();
+    println!("\nDevice:    {}", get_device_short_id(db));
     let mut sorted_devices: Vec<_> = device_to_short.iter().collect();
     sorted_devices.sort_by(|a, b| a.1.cmp(b.1));
+    // Online peers first; within each group, alphabetical by short ID.
+    sorted_devices.sort_by_key(|(device_id, _)| {
+        let sync_time = sync_time_of(&sync_map, device_id);
+        !(sync_time > 0.0 && (now - sync_time) <= relay::DEVICE_STALE_SECS)
+    });
 
-    for (device_id, short) in sorted_devices {
-        let sync_time: f64 = sync_map
-            .get(&format!("relay_sync_time_{device_id}"))
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0);
-        let is_online = sync_time > 0.0 && (now - sync_time) <= relay::DEVICE_STALE_SECS;
-
-        let agents = agent_counts.get(device_id).copied().unwrap_or(0);
-        let mut details = Vec::new();
-        if sync_time > 0.0 {
-            details.push(format_time(sync_time));
-        }
-        if is_online && agents == 0 {
-            details.push("no agents".to_string());
-        }
-        let label = if details.is_empty() {
-            short.clone()
-        } else {
-            format!("{} ({})", short, details.join(", "))
-        };
-        if is_online {
-            online_parts.push(label);
-        } else {
-            offline_parts.push(label);
-        }
-    }
-
-    let total = online_parts.len() + offline_parts.len();
-    if total > 0 {
-        println!("\nDevices:   {} known", total + 1); // +1 for self
-        if !online_parts.is_empty() {
-            println!("  online:  {}", online_parts.join(", "));
-        }
-        if !offline_parts.is_empty() {
-            println!("  seen:    {}", offline_parts.join(", "));
-        }
+    if sorted_devices.is_empty() {
+        println!("Peers:     none yet — join from another device (token: hcom relay token)");
     } else {
-        println!("\nNo other devices");
+        println!("Peers:");
+        for (device_id, short) in sorted_devices {
+            let sync_time = sync_time_of(&sync_map, device_id);
+            let is_online = sync_time > 0.0 && (now - sync_time) <= relay::DEVICE_STALE_SECS;
+            let state = if is_online {
+                paint(FG_GREEN, "online")
+            } else if sync_time > 0.0 {
+                paint(FG_GRAY, &format!("seen {}", format_time(sync_time)))
+            } else {
+                paint(FG_GRAY, "not seen")
+            };
+            let agents = match agent_names.get(device_id.as_str()) {
+                Some(names) if names.len() > MAX_LISTED_AGENTS => format!(
+                    "{} +{}",
+                    names[..MAX_LISTED_AGENTS].join(", "),
+                    names.len() - MAX_LISTED_AGENTS
+                ),
+                Some(names) => names.join(", "),
+                None if is_online => "no agents".to_string(),
+                None => String::new(),
+            };
+            let line = format!("  {short}  {state}  {agents}");
+            println!("{}", line.trim_end());
+        }
     }
 
     // Show key fingerprint so two devices can visually verify they share the
@@ -372,6 +391,74 @@ fn restart_relay_worker_for_config_change() -> bool {
         crate::relay::worker::stop_relay_worker_blocking();
     }
     crate::relay::worker::ensure_worker()
+}
+
+/// How long `relay new/connect/on` wait for the broker handshake before
+/// reporting back. Covers TLS + MQTT connect on a slow public broker.
+const CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Poll until the worker reports connected or a broker error, or the wait runs out.
+fn await_broker_connection(db: &HcomDb) -> relay::RelayHealth {
+    let config = config::load_config_snapshot().core;
+    let deadline = std::time::Instant::now() + CONNECT_WAIT;
+    loop {
+        let health = relay::relay_health(&config, db);
+        let settled = matches!(
+            health,
+            relay::RelayHealth::Connected | relay::RelayHealth::Error { .. }
+        );
+        if settled || std::time::Instant::now() >= deadline {
+            return health;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Wait for the broker, then show full status. Fails on a broker error so
+/// `relay on` exits like `relay new/connect` do.
+fn status_after_connect(db: &HcomDb) -> i32 {
+    let health = await_broker_connection(db);
+    let rc = relay_status(db);
+    if matches!(health, relay::RelayHealth::Error { .. }) {
+        return 1;
+    }
+    rc
+}
+
+/// Restart the worker on new relay config and report whether it reached the
+/// broker — not just whether a process started.
+fn start_worker_and_report(db: &HcomDb) -> i32 {
+    if !restart_relay_worker_for_config_change() && !crate::relay::worker::is_relay_worker_running()
+    {
+        eprintln!("\nCould not start daemon automatically. Run 'hcom relay daemon start'.");
+        return 1;
+    }
+    match await_broker_connection(db) {
+        relay::RelayHealth::Connected => {
+            println!("\n{}", paint(FG_GREEN, "Connected."));
+            0
+        }
+        relay::RelayHealth::Error {
+            reason,
+            detail,
+            pid,
+        } => {
+            let config = config::load_config_snapshot().core;
+            eprintln!("\nNot connected: {}", reason.label(detail.as_deref(), pid));
+            if let Some(hint) = auth_hint(&config, detail.as_deref()) {
+                eprintln!("  Hint: {hint}");
+            }
+            eprintln!("The daemon keeps retrying. Check with: hcom relay");
+            1
+        }
+        _ => {
+            println!(
+                "\nDaemon running, broker not reached yet ({}s). Check with: hcom relay",
+                CONNECT_WAIT.as_secs()
+            );
+            0
+        }
+    }
 }
 
 fn ensure_relay_worker_running_for_cli() -> bool {
@@ -470,7 +557,7 @@ fn relay_off(db: &HcomDb, argv: &[String]) -> i32 {
 
     crate::relay::worker::stop_relay_worker_blocking();
     println!("{}", paint(FG_YELLOW, "Relay: disabled"));
-    println!("\nRun 'hcom relay connect' to reconnect");
+    println!("\nRun 'hcom relay on' to reconnect");
     0
 }
 
@@ -502,7 +589,7 @@ fn relay_toggle(db: &HcomDb, enable: bool) -> i32 {
             eprintln!("Error: relay daemon could not be started");
             return 1;
         }
-        relay_status(db)
+        status_after_connect(db)
     } else {
         relay_off(db, &[])
     }
@@ -641,15 +728,7 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
         }
     }
 
-    if restart_relay_worker_for_config_change() {
-        println!("\nConnected.");
-    } else if crate::relay::worker::is_relay_worker_running() {
-        println!("\nDaemon started (not yet ready). Run 'hcom relay status' to confirm.");
-    } else {
-        eprintln!("\nCould not start daemon automatically. Run 'hcom relay daemon start'.");
-        return 1;
-    }
-    0
+    start_worker_and_report(db)
 }
 
 /// Connect to relay — re-enable or join with token.
@@ -683,7 +762,7 @@ fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
                 eprintln!("Error: relay is enabled but the daemon could not be started");
                 return 1;
             }
-            return relay_status(db);
+            return status_after_connect(db);
         }
         return relay_toggle(db, true);
     }
@@ -725,8 +804,14 @@ fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
 
     let config = config::load_config_snapshot().core;
 
-    // Clear stale device state when switching groups
+    // Switching groups: say so, with the way back, before dropping the old peers.
     if config.relay_id != relay_id {
+        if let Some(old_token) = current_join_token(&config) {
+            let old_key = relay::load_psk(&config)
+                .map(|psk| relay::crypto::fingerprint(&psk))
+                .unwrap_or_default();
+            println!("Leaving group {old_key}. To rejoin: hcom relay connect {old_token}\n");
+        }
         relay::clear_relay_device_state(db);
     }
 
@@ -748,24 +833,12 @@ fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
     if auth_token.is_some() {
         println!("Password: set");
     } else {
-        let is_public = DEFAULT_BROKERS.iter().any(|&(h, p)| {
-            effective_broker == format!("mqtts://{h}:{p}")
-                || effective_broker == format!("mqtt://{h}:{p}")
-        });
-        if !is_public {
+        if !is_public_broker(&effective_broker) {
             println!("Password: not set (use --password if broker requires auth)");
         }
     }
 
-    if restart_relay_worker_for_config_change() {
-        println!("\nConnected.");
-    } else if crate::relay::worker::is_relay_worker_running() {
-        println!("\nDaemon started (not yet ready). Run 'hcom relay status' to confirm.");
-    } else {
-        eprintln!("\nCould not start daemon automatically. Run 'hcom relay daemon start'.");
-        return 1;
-    }
-    0
+    start_worker_and_report(db)
 }
 
 /// Update or add a key in TOML content (simple line-level editing).

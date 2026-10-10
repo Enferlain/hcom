@@ -1288,19 +1288,18 @@ fn test_relay_roundtrip() {
                 return None;
             }
             let stdout = String::from_utf8_lossy(&out.stdout);
-            for line in stdout.lines() {
-                if (line.contains("online:") || line.contains("Remote devices:"))
-                    && line.contains(&short_b)
-                {
-                    return Some(line.trim().to_string());
-                }
+            // Peer lines read "  <SHORT>  online  <agents>".
+            let peer_line = stdout
+                .lines()
+                .find(|l| l.trim_start().starts_with(short_b.as_str()));
+            if let Some(line) = peer_line
+                && line.contains("online")
+            {
+                return Some(line.trim().to_string());
             }
-            let remote_line = stdout.lines().find(|l| {
-                l.contains("online:") || l.contains("Remote") || l.contains("other devices")
-            });
             eprintln!(
                 "    relay status: {}",
-                remote_line.unwrap_or("(no remote line)")
+                peer_line.unwrap_or("(no peer line)").trim()
             );
             None
         },
