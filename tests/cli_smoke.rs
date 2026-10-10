@@ -9,6 +9,39 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use support::{Hcom, parse_hcom_marker};
 
+#[cfg(unix)]
+#[test]
+fn pty_defaults_missing_term_and_preserves_explicit_term() {
+    let h = Hcom::new();
+    for term in [None, Some("xterm-kitty"), Some("dumb"), Some("")] {
+        let mut command = h.cmd();
+        command.env_remove("TERM");
+        if let Some(term) = term {
+            command.env("TERM", term);
+        }
+        let output = command
+            .args([
+                "pty",
+                "sh",
+                "-c",
+                "printf 'CHILD_TERM=<%s>' \"${TERM-unset}\"",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "TERM={term:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected = format!("CHILD_TERM=<{}>", term.unwrap_or("xterm-256color"));
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&expected),
+            "TERM={term:?}: stdout={:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_pty_answers_startup_queries_while_waiting_for_terminal_metadata() {

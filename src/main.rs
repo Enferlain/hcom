@@ -283,7 +283,13 @@ pub fn run_pty(args: &[String]) -> Result<()> {
 }
 
 fn pty_child_env() -> Vec<(String, String)> {
-    vec![("HCOM_LAUNCHED".to_string(), "1".to_string())]
+    let mut env = vec![("HCOM_LAUNCHED".to_string(), "1".to_string())];
+    // Headless launches may inherit no terminal type. The child still has a
+    // PTY and needs terminal styling for readiness detection.
+    if std::env::var_os("TERM").is_none() {
+        env.push(("TERM".to_string(), "xterm-256color".to_string()));
+    }
+    env
 }
 
 #[cfg(test)]
@@ -337,9 +343,6 @@ mod tests {
 
     #[test]
     fn test_pty_child_env_marks_launched() {
-        assert_eq!(
-            super::pty_child_env(),
-            vec![("HCOM_LAUNCHED".to_string(), "1".to_string())]
-        );
+        assert!(super::pty_child_env().contains(&("HCOM_LAUNCHED".to_string(), "1".to_string())));
     }
 }
