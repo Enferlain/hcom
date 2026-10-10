@@ -972,7 +972,9 @@ fn install_diagnostic_panic_hook(path_a: String, path_b: String) {
 /// Kill orphan debug relay-worker processes from previous failed test runs.
 /// Without this, a stale daemon can hold MQTT connections and interfere with
 /// new test runs (the test creates isolated HCOM_DIRs but can't find orphan
-/// PIDs once the old temp dir is deleted).
+/// PIDs once the old temp dir is deleted). Only workers whose HCOM_DIR is under
+/// the temp dir are touched: a dev_root install runs the same debug binary for
+/// the developer's real relay worker.
 #[cfg(unix)]
 fn kill_orphan_debug_daemons() {
     let Ok(output) = std::process::Command::new("pgrep")
@@ -981,9 +983,27 @@ fn kill_orphan_debug_daemons() {
     else {
         return;
     };
+    let temp = std::env::temp_dir();
+    let temp_roots = [temp.canonicalize().unwrap_or_else(|_| temp.clone()), temp];
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if let Ok(pid) = line.trim().parse::<i32>() {
+    for pid in stdout.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
+        // `ps eww` appends the environment to the command line.
+        let Ok(ps) = std::process::Command::new("ps")
+            .args(["eww", "-o", "command=", "-p", &pid.to_string()])
+            .output()
+        else {
+            continue;
+        };
+        let cmdline = String::from_utf8_lossy(&ps.stdout);
+        let in_temp = cmdline
+            .split_whitespace()
+            .filter_map(|tok| tok.strip_prefix("HCOM_DIR="))
+            .any(|dir| {
+                temp_roots
+                    .iter()
+                    .any(|root| Path::new(dir).starts_with(root))
+            });
+        if in_temp {
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
             }
