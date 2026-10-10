@@ -95,6 +95,23 @@ const fn p(
 const DL: &[&str] = &["Darwin", "Linux"];
 const DLW: &[&str] = &["Darwin", "Linux", "Windows"];
 
+/// kitty-window starts a fresh kitty instance per agent. It gets its own
+/// remote-control socket so `hcom kill` can close the window without the user
+/// configuring `listen_on`, and on macOS it quits with its last window instead
+/// of lingering windowless (the option is ignored on Linux).
+const KITTY_WINDOW_OPEN: &[&str] = &[
+    "kitty",
+    "-o",
+    "allow_remote_control=socket-only",
+    "--listen-on",
+    "unix:/tmp/hcom-kitty-{process_id}",
+    "-o",
+    "macos_quit_when_last_window_closed=yes",
+    "--detach",
+    "bash",
+    "{script}",
+];
+
 pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = LazyLock::new(|| {
     vec![
         // macOS native
@@ -158,7 +175,7 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("kitty"),
                 Some("kitty"),
-                argv(&["kitty", "--env", "HCOM_PROCESS_ID={process_id}", "{script}"]),
+                argv(KITTY_WINDOW_OPEN),
                 argv(&["kitten", "@", "close-window", "--match", "id:{pane_id}"]),
                 None,
                 DL,
@@ -169,9 +186,9 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
             p(
                 Some("kitty"),
                 Some("kitty"),
-                argv(&["kitty", "--env", "HCOM_PROCESS_ID={process_id}", "{script}"]),
+                argv(KITTY_WINDOW_OPEN),
                 argv(&["kitten", "@", "close-window", "--match", "id:{pane_id}"]),
-                None,
+                Some("KITTY_WINDOW_ID"),
                 DL,
             ),
         ),

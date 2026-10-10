@@ -183,6 +183,7 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
         "KITTY_LISTEN_ON",
         "ALACRITTY_WINDOW_ID",
         "WEZTERM_PANE",
+        "WEZTERM_UNIX_SOCKET",
         "PTYXIS_PROFILE",
         "PTYXIS_VERSION",
         "GNOME_TERMINAL_SCREEN",

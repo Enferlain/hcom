@@ -90,6 +90,14 @@ fn is_herdr_argv(argv: &[String]) -> bool {
         .is_some_and(|stem| stem.eq_ignore_ascii_case("herdr"))
 }
 
+/// True if `argv` runs the wezterm CLI (`wezterm`, `wezterm.exe` or a full path).
+fn is_wezterm_argv(argv: &[String]) -> bool {
+    argv.first()
+        .and_then(|bin| std::path::Path::new(bin).file_stem())
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("wezterm"))
+}
+
 /// Terminal info resolved for an instance.
 #[derive(Debug, Clone, Default)]
 pub struct TerminalInfo {
@@ -101,6 +109,8 @@ pub struct TerminalInfo {
     pub zellij_session_name: String,
     /// The pane's `HERDR_SOCKET_PATH`: which herdr server (session) owns it.
     pub herdr_socket_path: String,
+    /// The pane's `WEZTERM_UNIX_SOCKET`: which wezterm GUI process owns it.
+    pub wezterm_unix_socket: String,
 }
 
 /// Result from launch_terminal.
@@ -119,7 +129,21 @@ pub enum LaunchResult {
 const MACOS_APP_FALLBACKS: &[(&str, ArgvTemplate)] = &[
     (
         "kitty-window",
-        &["open", "-n", "-a", "kitty.app", "--args", "{script}"],
+        &[
+            "open",
+            "-n",
+            "-a",
+            "kitty.app",
+            "--args",
+            "-o",
+            "allow_remote_control=socket-only",
+            "--listen-on",
+            "unix:/tmp/hcom-kitty-{process_id}",
+            "-o",
+            "macos_quit_when_last_window_closed=yes",
+            "bash",
+            "{script}",
+        ],
     ),
     (
         "wezterm-window",
@@ -362,12 +386,21 @@ pub fn find_kitty_socket() -> String {
     if let Ok(entries) = fs::read_dir("/tmp") {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("kitty") {
+            // `hcom-kitty-*`: kitty-window instances' own sockets.
+            if name.starts_with("kitty") || name.starts_with("hcom-kitty-") {
                 candidates.push(entry.path());
             }
         }
     }
-    candidates.sort_by(|a, b| b.cmp(a)); // Reverse sort (newest first)
+    // The user's own kitty first, kitty-window agents' instances only as a
+    // last resort; newest first within each (names carry PIDs, not age).
+    candidates.sort_by_key(|path| {
+        let agent_owned = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("hcom-kitty-"));
+        let modified = fs::metadata(path).and_then(|m| m.modified()).ok();
+        (agent_owned, std::cmp::Reverse(modified))
+    });
 
     for sock_path in &candidates {
         // Skip anything that isn't a Unix-domain socket
@@ -1830,7 +1863,10 @@ fn maybe_append_ai_tool_launch_hint(
     argv: &[String],
     inside_ai_tool: bool,
 ) -> String {
-    if !inside_ai_tool || !is_external_terminal_launcher(argv) {
+    if !inside_ai_tool
+        || !is_external_terminal_launcher(argv)
+        || !looks_like_permission_failure(&message)
+    {
         return message;
     }
 
@@ -1840,6 +1876,20 @@ fn maybe_append_ai_tool_launch_hint(
         "Hint: This launch was attempted from inside a managed AI tool session, where terminal or session creation may be restricted. Rerun it with approval/escalation."
     };
     format!("{message}\n{hint}")
+}
+
+/// Sandbox denials surface as EPERM/EACCES. Other failures (bad flags, stale
+/// targets) would be sent down a useless escalation path by the hint.
+fn looks_like_permission_failure(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    [
+        "not permitted",
+        "permission denied",
+        "access is denied",
+        "sandbox",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn zellij_action_stderr_failure(argv: &[String], stderr: &str) -> Option<String> {
@@ -1940,58 +1990,136 @@ fn spawn_terminal_process(argv: &[String], inside_ai_tool: bool) -> Result<(bool
         return Ok((true, String::new()));
     }
 
-    if inside_ai_tool {
-        // Fully detach: don't let AI tool's PTY capture our output
-        let launch_dir = paths::hcom_path(&[paths::LAUNCH_DIR]);
-        fs::create_dir_all(&launch_dir).ok();
-
-        let child = Command::new(&argv[0])
+    #[cfg(windows)]
+    let output = Command::new(&argv[0])
+        .args(&argv[1..])
+        .env_clear()
+        .envs(env_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map(Some);
+    #[cfg(not(windows))]
+    let output = if opens_own_window(argv) {
+        run_launcher_bounded(argv, &env_vec)
+    } else {
+        Command::new(&argv[0])
             .args(&argv[1..])
             .env_clear()
             .envs(env_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|err| {
-                anyhow!(maybe_append_ai_tool_launch_hint(
-                    format!("Failed to spawn terminal process: {err}"),
-                    argv,
-                    inside_ai_tool,
-                ))
-            })?;
-
-        let output = child
-            .wait_with_output()
-            .context("Failed to wait for terminal")?;
-
-        let captured = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .to_string();
-
-        validate_terminal_launch_output(argv, &output, inside_ai_tool)?;
-
-        Ok((true, captured))
-    } else {
-        // Normal case: wait for terminal launcher to complete
-        let output = Command::new(&argv[0])
-            .args(&argv[1..])
-            .env_clear()
-            .envs(env_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output()
-            .context("Failed to run terminal launcher")?;
+            .map(Some)
+    };
 
-        validate_terminal_launch_output(argv, &output, inside_ai_tool)?;
+    let output = match output {
+        Ok(Some(output)) => output,
+        Ok(None) => return Ok((true, String::new())),
+        Err(err) => {
+            return Err(anyhow!(maybe_append_ai_tool_launch_hint(
+                format!("Failed to spawn terminal process: {err}"),
+                argv,
+                inside_ai_tool,
+            )));
+        }
+    };
 
-        let captured = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .to_string();
-        Ok((true, captured))
+    validate_terminal_launch_output(argv, &output, inside_ai_tool)?;
+
+    let captured = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    Ok((true, captured))
+}
+
+/// Whether `argv` runs a terminal emulator itself, which may stay in the
+/// foreground until its window closes, rather than a CLI that asks a running
+/// terminal or multiplexer for a pane and exits (`kitten @`, `wezterm cli`,
+/// `tmux`, `open`, ...). Those keep a full wait: their stdout carries the pane
+/// id, and a slow one must not be mistaken for an open window.
+#[cfg(not(windows))]
+fn opens_own_window(argv: &[String]) -> bool {
+    let stem = argv
+        .first()
+        .and_then(|bin| Path::new(bin).file_stem())
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    match stem {
+        "wezterm" => argv.get(1).map(String::as_str) != Some("cli"),
+        "kitten" | "tmux" | "zellij" | "cmux" | "herdr" | "wsh" | "open" | "ttab" => false,
+        // Terminal emulators and unknown custom commands may block.
+        _ => true,
     }
+}
+
+/// How long a terminal launcher gets to exit before it is taken to be the
+/// window itself. Tab/split CLIs (`kitten @ launch`, `wezterm cli spawn`,
+/// `tmux split-window`) return in well under a second.
+#[cfg(not(windows))]
+const LAUNCHER_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run a terminal launcher without waiting on the window it opens.
+///
+/// Some launchers stay in the foreground until their window closes (`wezterm
+/// start`, `alacritty`, `xterm`, `konsole`, plain `kitty`). Waiting on them
+/// would hang the CLI, or the relay worker serving a remote launch, for the
+/// agent's whole lifetime. Output goes to files rather than pipes, which a
+/// GUI child could hold open, and the launcher gets its own session so it
+/// outlives us.
+///
+/// Returns the output if the launcher exits within [`LAUNCHER_EXIT_WAIT`],
+/// or `None` if it is still running (the window is open).
+#[cfg(not(windows))]
+fn run_launcher_bounded(
+    argv: &[String],
+    env_vec: &[(String, String)],
+) -> std::io::Result<Option<std::process::Output>> {
+    use std::io::{Read, Seek};
+
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
+        .env_clear()
+        .envs(env_vec.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?);
+    let mut child = crate::sys::process::spawn_detached(&mut cmd)?;
+
+    let deadline = std::time::Instant::now() + LAUNCHER_EXIT_WAIT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            crate::log::log_info(
+                "terminal",
+                "launcher.still_running",
+                &format!("{} still running; treating it as the window", argv[0]),
+            );
+            // Reap it when the window closes, or it lingers as a zombie under
+            // a long-lived caller such as the relay worker.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+
+    let read_all = |file: &mut fs::File| -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        file.rewind()?;
+        file.read_to_end(&mut buf)?;
+        Ok(buf)
+    };
+    Ok(Some(std::process::Output {
+        status,
+        stdout: read_all(&mut stdout)?,
+        stderr: read_all(&mut stderr)?,
+    }))
 }
 
 /// Write captured terminal ID to temp file for child to read.
@@ -2544,6 +2672,7 @@ pub fn close_terminal_pane(pid: u32, info: &TerminalInfo) -> PaneCloseResult {
         terminal_id,
         zellij_session_name,
         herdr_socket_path,
+        wezterm_unix_socket,
     } = info;
     let failed_without_command = || PaneCloseResult {
         closed: false,
@@ -2638,8 +2767,12 @@ pub fn close_terminal_pane(pid: u32, info: &TerminalInfo) -> PaneCloseResult {
     // back to the default session's. Point it at the server that owns the
     // pane: the same pane id exists in every session, so the killer's own
     // environment would close another session's pane.
+    // Same for wezterm: pane ids are per GUI process, and without the socket
+    // `wezterm cli` talks to the most recently started GUI.
     let close_env: Vec<(&str, &str)> = if is_herdr_argv(&argv) && !herdr_socket_path.is_empty() {
         vec![("HERDR_SOCKET_PATH", herdr_socket_path.as_str())]
+    } else if is_wezterm_argv(&argv) && !wezterm_unix_socket.is_empty() {
+        vec![("WEZTERM_UNIX_SOCKET", wezterm_unix_socket.as_str())]
     } else {
         Vec::new()
     };
@@ -2837,6 +2970,10 @@ pub fn resolve_terminal_info(
             .to_string();
         info.herdr_socket_path = lc_env
             .and_then(|e| e.get("HERDR_SOCKET_PATH").and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .to_string();
+        info.wezterm_unix_socket = lc_env
+            .and_then(|e| e.get("WEZTERM_UNIX_SOCKET").and_then(|v| v.as_str()))
             .unwrap_or("")
             .to_string();
     }
@@ -3784,6 +3921,46 @@ mod tests {
         );
         assert!(message.contains("managed AI tool session"));
         assert!(message.contains("Rerun it with approval/escalation."));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_opens_own_window_separates_emulators_from_pane_clis() {
+        for cmd in [
+            &["kitty", "--detach", "bash", "x"][..],
+            &[
+                "/Applications/WezTerm.app/Contents/MacOS/wezterm",
+                "start",
+                "--",
+                "bash",
+            ],
+            &["alacritty", "-e", "bash"],
+            &["my-term", "{script}"],
+        ] {
+            assert!(opens_own_window(&argv(cmd)), "{cmd:?}");
+        }
+        for cmd in [
+            &[
+                "/Applications/kitty.app/Contents/MacOS/kitten",
+                "@",
+                "launch",
+            ][..],
+            &["wezterm", "cli", "spawn", "--", "bash"],
+            &["tmux", "split-window"],
+            &["open", "-a", "Terminal"],
+        ] {
+            assert!(!opens_own_window(&argv(cmd)), "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn test_maybe_append_ai_tool_launch_hint_skips_non_permission_failures() {
+        let message = maybe_append_ai_tool_launch_hint(
+            "Terminal launch failed (exit code 1): Unknown flag: --env use --help.".to_string(),
+            &["kitty".to_string(), "bash".to_string()],
+            true,
+        );
+        assert!(!message.contains("escalation"));
     }
 
     #[test]

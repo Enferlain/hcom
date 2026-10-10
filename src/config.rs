@@ -1152,6 +1152,9 @@ fn pane_identity_env_vars_from_path(
         .iter()
         .map(|(env_var, _)| (*env_var).to_string())
         .collect::<std::collections::HashSet<_>>();
+    // wezterm sets it in every pane; the launcher's would name another GUI
+    // process when the new window starts its own.
+    vars.insert("WEZTERM_UNIX_SOCKET".to_string());
 
     if let Some(presets) = load_toml_presets(toml_path).and_then(|value| value.as_table().cloned())
     {

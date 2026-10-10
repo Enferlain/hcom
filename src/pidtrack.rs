@@ -32,6 +32,8 @@ pub struct PidEntry {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub herdr_socket_path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wezterm_unix_socket: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_id: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub notify_port: u16,
@@ -59,6 +61,7 @@ pub struct OrphanProcess {
     pub kitty_listen_on: String,
     pub zellij_session_name: String,
     pub herdr_socket_path: String,
+    pub wezterm_unix_socket: String,
     pub session_id: String,
     pub notify_port: u16,
     pub inject_port: u16,
@@ -76,6 +79,7 @@ impl OrphanProcess {
             terminal_id: self.terminal_id.clone(),
             zellij_session_name: self.zellij_session_name.clone(),
             herdr_socket_path: self.herdr_socket_path.clone(),
+            wezterm_unix_socket: self.wezterm_unix_socket.clone(),
         }
     }
 }
@@ -94,6 +98,7 @@ impl From<(u32, &PidEntry)> for OrphanProcess {
             kitty_listen_on: entry.kitty_listen_on.clone(),
             zellij_session_name: entry.zellij_session_name.clone(),
             herdr_socket_path: entry.herdr_socket_path.clone(),
+            wezterm_unix_socket: entry.wezterm_unix_socket.clone(),
             session_id: entry.session_id.clone(),
             notify_port: entry.notify_port,
             inject_port: entry.inject_port,
@@ -142,6 +147,7 @@ pub struct PidRecord<'a> {
     pub kitty_listen_on: &'a str,
     pub zellij_session_name: &'a str,
     pub herdr_socket_path: &'a str,
+    pub wezterm_unix_socket: &'a str,
     pub session_id: &'a str,
     pub notify_port: u16,
     pub inject_port: u16,
@@ -170,6 +176,7 @@ impl<'a> PidRecord<'a> {
             kitty_listen_on: "",
             zellij_session_name: "",
             herdr_socket_path: "",
+            wezterm_unix_socket: "",
             session_id: "",
             notify_port: 0,
             inject_port: 0,
@@ -193,6 +200,7 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         kitty_listen_on,
         zellij_session_name,
         herdr_socket_path,
+        wezterm_unix_socket,
         session_id,
         notify_port,
         inject_port,
@@ -228,6 +236,9 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         if !herdr_socket_path.is_empty() && entry.herdr_socket_path.is_empty() {
             entry.herdr_socket_path = herdr_socket_path.to_string();
         }
+        if !wezterm_unix_socket.is_empty() && entry.wezterm_unix_socket.is_empty() {
+            entry.wezterm_unix_socket = wezterm_unix_socket.to_string();
+        }
         if !session_id.is_empty() && entry.session_id.is_empty() {
             entry.session_id = session_id.to_string();
         }
@@ -255,6 +266,7 @@ pub fn record_pid(rec: &PidRecord<'_>) {
                 kitty_listen_on: kitty_listen_on.to_string(),
                 zellij_session_name: zellij_session_name.to_string(),
                 herdr_socket_path: herdr_socket_path.to_string(),
+                wezterm_unix_socket: wezterm_unix_socket.to_string(),
                 session_id: session_id.to_string(),
                 notify_port: *notify_port,
                 inject_port: *inject_port,
@@ -491,6 +503,7 @@ fn attach_runtime_state(
     for (key, value) in [
         ("ZELLIJ_SESSION_NAME", &orphan.zellij_session_name),
         ("HERDR_SOCKET_PATH", &orphan.herdr_socket_path),
+        ("WEZTERM_UNIX_SOCKET", &orphan.wezterm_unix_socket),
     ] {
         if value.is_empty() {
             continue;
@@ -628,6 +641,7 @@ mod tests {
             kitty_listen_on: "/tmp/kitty.sock",
             zellij_session_name: "wise-kangaroo",
             herdr_socket_path: "/run/herdr/sessions/work/herdr.sock",
+            wezterm_unix_socket: "",
             session_id: "sess-1",
             notify_port: 8080,
             inject_port: 8081,
@@ -801,6 +815,7 @@ mod tests {
             kitty_listen_on: String::new(),
             zellij_session_name: String::new(),
             herdr_socket_path: String::new(),
+            wezterm_unix_socket: String::new(),
             session_id: String::new(),
             notify_port: 0,
             inject_port: 0,
@@ -831,6 +846,7 @@ mod tests {
             kitty_listen_on: String::new(),
             zellij_session_name: String::new(),
             herdr_socket_path: String::new(),
+            wezterm_unix_socket: String::new(),
             session_id: "sess-retry".into(),
             notify_port: 0,
             inject_port: 0,
