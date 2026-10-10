@@ -1026,7 +1026,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             db,
         ) {
             Ok(bundle_id) => {
-                crate::relay::worker::ensure_worker(true);
+                crate::relay::worker::try_spawn_worker();
                 envelope.bundle_id = Some(bundle_id.clone());
 
                 // Append bundle summary text to message
@@ -1136,12 +1136,12 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             "delivered_to": delivered_to,
         });
         println!("{}", serde_json::to_string(&out).unwrap());
-        crate::relay::worker::ensure_worker(true);
+        crate::relay::worker::try_spawn_worker();
         return 0;
     }
 
     if args.quiet {
-        crate::relay::worker::ensure_worker(true);
+        crate::relay::worker::try_spawn_worker();
         return 0;
     }
 
@@ -1197,7 +1197,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         output.push_str(&batch.remaining_note(&receiver.name));
         if let Err(e) = batch.emit(db, &receiver.name, &output, set_status) {
             eprintln!("Message sent, but {e}");
-            crate::relay::worker::ensure_worker(true);
+            crate::relay::worker::try_spawn_worker();
             return 1;
         }
     } else {
@@ -1236,7 +1236,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         crate::core::tips::maybe_show_tip(db, &sender_identity.name, &tip_key, false);
     }
 
-    crate::relay::worker::ensure_worker(true);
+    crate::relay::worker::try_spawn_worker();
 
     0
 }

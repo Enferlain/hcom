@@ -371,11 +371,11 @@ fn restart_relay_worker_for_config_change() -> bool {
     if crate::relay::worker::is_relay_worker_running() {
         crate::relay::worker::stop_relay_worker_blocking();
     }
-    crate::relay::worker::ensure_worker(false)
+    crate::relay::worker::ensure_worker()
 }
 
 fn ensure_relay_worker_running_for_cli() -> bool {
-    if crate::relay::worker::ensure_worker(false) {
+    if crate::relay::worker::ensure_worker() {
         return true;
     }
 
@@ -385,7 +385,7 @@ fn ensure_relay_worker_running_for_cli() -> bool {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
-        if crate::relay::worker::ensure_worker(false) {
+        if crate::relay::worker::ensure_worker() {
             return true;
         }
     }

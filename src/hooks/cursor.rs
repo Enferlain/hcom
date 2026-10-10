@@ -524,7 +524,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         Default::default(),
     );
     crate::runtime_env::set_terminal_title(&instance_name);
-    crate::relay::worker::ensure_worker(true);
+    crate::relay::worker::try_spawn_worker();
     common::notify_hook_instance_with_db(db, &instance_name);
     let mut output = serde_json::Map::from_iter([("env".into(), cursor_session_env(ctx))]);
     if let Some(bootstrap) =

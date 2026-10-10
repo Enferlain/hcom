@@ -138,7 +138,7 @@ pub(crate) fn handle_sessionstart(
     );
 
     crate::runtime_env::set_terminal_title(&instance_name);
-    crate::relay::worker::ensure_worker(true);
+    crate::relay::worker::try_spawn_worker();
 
     // NOTE: bootstrap is intentionally NOT injected here. Kimi does not add
     // SessionStart hook output to model context (it is an observation-only

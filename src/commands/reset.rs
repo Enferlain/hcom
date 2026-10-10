@@ -93,7 +93,7 @@ fn cmd_reset_database(db: HcomDb, args: &ResetArgs, ctx: Option<&CommandContext>
 
     // Respawn relay worker (was stopped above) and push reset event to remote devices.
     // ensure_worker re-reads config, so this is a no-op when relay is not configured.
-    crate::relay::worker::ensure_worker(false);
+    crate::relay::worker::ensure_worker();
     crate::relay::trigger_push();
 
     // all: also remove hooks, reset config, clear device identity

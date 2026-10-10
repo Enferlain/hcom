@@ -141,7 +141,7 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
         "omp-start.bind",
         &format!("instance={} session_id={}", instance_name, session_id),
     );
-    crate::relay::worker::ensure_worker(true);
+    crate::relay::worker::try_spawn_worker();
 
     let response = serde_json::json!({
         "name": instance_name,

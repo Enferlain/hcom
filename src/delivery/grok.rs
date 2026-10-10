@@ -875,7 +875,7 @@ fn apply_bind(
     if first {
         crate::instance_binding::capture_and_store_launch_context(db, &name);
         lifecycle::set_status(db, &name, ST_LISTENING, "start", Default::default());
-        crate::relay::worker::ensure_worker(true);
+        crate::relay::worker::try_spawn_worker();
     }
     log_info(
         "native",

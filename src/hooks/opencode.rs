@@ -271,7 +271,7 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     let bootstrap_text = bootstrap::get_bootstrap(db, ctx, &instance_name, &tool);
 
     // Auto-spawn relay-worker now that an instance is active
-    crate::relay::worker::ensure_worker(true);
+    crate::relay::worker::try_spawn_worker();
 
     let (launch_agent, launch_model) = launch_agent_and_model(db, &instance_name);
     let mut response = serde_json::json!({

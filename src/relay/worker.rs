@@ -3,8 +3,8 @@
 //! Entry point for `hcom relay-worker`. Handles PID file management,
 //! signal handling, auto-exit watchdog, and relay lifecycle.
 //!
-//! Auto-spawn: `maybe_auto_spawn()` checks config, PID, and instance count
-//! before spawning a new relay-worker process.
+//! Auto-spawn: any hcom activity spawns the worker whenever relay is enabled,
+//! including on devices with no agents, so remote commands always land.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -19,8 +19,8 @@ use crate::log;
 use crate::relay::client::RelayCommand;
 
 /// Set when the worker exits because a new build was installed: the exiting worker spawns its
-/// successor after its pidfile is gone. Leaving the restart to the next hook left an idle device
-/// (no active local instance, so `ensure_worker(true)` never spawns) without a relay worker.
+/// successor after its pidfile is gone. Leaving the restart to the next hcom call would leave a
+/// device with no local activity without a relay worker.
 static HANDOFF_ON_EXIT: AtomicBool = AtomicBool::new(false);
 
 /// The executable path this worker was started from, captured ONCE at start. The upgrade
@@ -251,15 +251,16 @@ fn setup_notify_listener(cmd_tx: &std::sync::mpsc::Sender<RelayCommand>) -> Opti
     Some(port)
 }
 
-/// Auto-exit watchdog: every 30s, check if any local instances exist.
-/// If none for 2 consecutive checks, or shutdown signal received, send Shutdown.
+/// Auto-exit watchdog: send Shutdown on a shutdown signal, when the executable is
+/// replaced, or once relay is disabled for 2 consecutive checks (30s apart).
 ///
-/// When relay is enabled and configured, the worker stays alive even with zero
-/// local instances so it can receive remote RPCs (e.g. the first `launch` on a
+/// Local agent count deliberately plays no part: an enabled relay keeps the
+/// worker alive so it can receive remote RPCs (e.g. the first `launch` on a
 /// fresh device).
 fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: Arc<AtomicBool>) {
-    let mut consecutive_empty = 0u32;
-    let mut db = HcomDb::open().ok();
+    const CHECK_INTERVAL: Duration = Duration::from_secs(30);
+    const SIGNAL_POLL: Duration = Duration::from_millis(200);
+    let mut consecutive_disabled = 0u32;
     // An install replaces the executable file under a running worker. Exit when
     // that happens and the next hcom call (every hook calls ensure_worker)
     // starts a worker from the new build, so an upgrade needs no manual restart
@@ -268,11 +269,15 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
     let started_with = exe_path.as_deref().and_then(exe_fingerprint);
 
     loop {
-        std::thread::sleep(Duration::from_secs(30));
-
-        if shutdown.load(Ordering::Relaxed) {
-            let _ = cmd_tx.send(RelayCommand::Shutdown);
-            return;
+        // Poll the signal flag often: `relay daemon stop` force-kills after 5s,
+        // and a kill skips the clean shutdown that clears relay status.
+        let next_check = std::time::Instant::now() + CHECK_INTERVAL;
+        while std::time::Instant::now() < next_check {
+            if shutdown.load(Ordering::Relaxed) {
+                let _ = cmd_tx.send(RelayCommand::Shutdown);
+                return;
+            }
+            std::thread::sleep(SIGNAL_POLL);
         }
 
         if let (Some(path), Some(start)) = (exe_path.as_deref(), started_with)
@@ -288,39 +293,19 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
             return;
         }
 
-        // Re-open DB if previous connection failed
-        if db.is_none() {
-            db = HcomDb::open().ok();
+        if relay_enabled_in_config() {
+            consecutive_disabled = 0;
+            continue;
         }
-
-        let count = match &db {
-            Some(d) => local_instance_count(d),
-            None => {
-                consecutive_empty = 0;
-                continue;
-            }
-        };
-
-        if count == 0 {
-            // Keep the worker alive when relay is enabled so it can accept
-            // remote RPCs (launch, config, etc.) on a device with no agents yet.
-            if relay_enabled_in_config() {
-                consecutive_empty = 0;
-                continue;
-            }
-
-            consecutive_empty += 1;
-            if consecutive_empty >= 2 {
-                log::log_info(
-                    "relay",
-                    "relay_worker.auto_exit",
-                    "no local instances for 2 checks",
-                );
-                let _ = cmd_tx.send(RelayCommand::Shutdown);
-                return;
-            }
-        } else {
-            consecutive_empty = 0;
+        consecutive_disabled += 1;
+        if consecutive_disabled >= 2 {
+            log::log_info(
+                "relay",
+                "relay_worker.auto_exit",
+                "relay disabled for 2 checks",
+            );
+            let _ = cmd_tx.send(RelayCommand::Shutdown);
+            return;
         }
     }
 }
@@ -344,21 +329,6 @@ fn relay_enabled_in_config() -> bool {
     HcomConfig::load(None)
         .map(|c| super::is_relay_enabled(&c))
         .unwrap_or(false)
-}
-
-/// Count active local (non-remote) instances.
-/// Mirrors the filter in ensure_worker(true) so the watchdog exits when no syncable
-/// instances remain, not merely when all instances are stopped/dead.
-fn local_instance_count(db: &HcomDb) -> i64 {
-    db.conn()
-        .query_row(
-            "SELECT COUNT(*) FROM instances \
-             WHERE COALESCE(origin_device_id, '') = '' \
-             AND status NOT IN ('stopped', 'dead')",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0)
 }
 
 // ── Auto-spawn ──────────────────────────────────────────────────────
@@ -407,6 +377,13 @@ fn do_spawn_with(binary: Option<PathBuf>) -> bool {
         return false;
     }
 
+    // Whatever runtime status is left belongs to a dead worker (a force-kill
+    // skips clean shutdown). Clear it under the spawn lock, so it can't race a
+    // concurrent spawn, and readers only ever see what the new worker reports.
+    if let Ok(db) = HcomDb::open() {
+        super::clear_runtime_relay_kv(&db);
+    }
+
     // Pre-warm device_id in the parent so the spawned worker reads the same
     // UUID we'd report from this process. Without this, the worker and any
     // concurrent CLI (hcom relay status, etc.) can race read_device_uuid on
@@ -452,19 +429,13 @@ fn do_spawn_with(binary: Option<PathBuf>) -> bool {
     }
 }
 
-/// Ensure the relay worker is running.
+/// Ensure the relay worker is running and its notify port is live, for explicit
+/// commands (relay connect/new/on, daemon start). Polls for readiness (max 500ms)
+/// even when the worker was already running, to cover the startup window before
+/// port bind. Hooks and `send` use the fire-and-forget [`try_spawn_worker`].
 ///
-/// `require_instances` — if true, only spawn when active local instances exist
-/// (auto-spawn from hooks/send/TUI: no-op when nothing to sync). Fire-and-forget:
-/// no readiness wait, events push on the worker's next cycle.
-///
-/// If false, spawns whenever relay is enabled (relay connect/new/on, daemon start).
-/// On the explicit command path, polls until the notify port is live (max 500ms)
-/// even when the worker was already running, to handle the startup window before
-/// port bind.
-///
-/// Returns true if the worker is running (and port-ready when require_instances=false).
-pub fn ensure_worker(require_instances: bool) -> bool {
+/// Returns true if the worker is running and port-ready.
+pub fn ensure_worker() -> bool {
     let config = match HcomConfig::load(None) {
         Ok(c) => c,
         Err(_) => return false,
@@ -472,31 +443,6 @@ pub fn ensure_worker(require_instances: bool) -> bool {
 
     if !super::is_relay_enabled(&config) {
         return false;
-    }
-
-    if require_instances {
-        // Auto-spawn path: fire-and-forget, no readiness check.
-        if is_relay_worker_running() {
-            return true;
-        }
-        let db = match HcomDb::open() {
-            Ok(db) => db,
-            Err(_) => return false,
-        };
-        let count: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM instances \
-                 WHERE COALESCE(origin_device_id, '') = '' \
-                 AND status NOT IN ('stopped', 'dead')",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if count == 0 {
-            return false;
-        }
-        return do_spawn();
     }
 
     // Explicit command path: ensure running AND port-ready.
@@ -523,10 +469,12 @@ pub fn ensure_worker(require_instances: bool) -> bool {
 }
 
 /// Spawn the relay worker if relay is enabled and not already running.
-/// Fire-and-forget: no instance check, no readiness wait.
-/// Used by trigger_push() when no daemon is running, so events push on the
-/// worker's first cycle instead of sitting in the DB indefinitely.
+/// Fire-and-forget, no readiness wait: called from hooks, `send`, the TUI and
+/// trigger_push(), so any hcom activity revives a missing worker.
 pub fn try_spawn_worker() {
+    if is_relay_worker_running() {
+        return;
+    }
     let config = match HcomConfig::load(None) {
         Ok(c) => c,
         Err(_) => return,
@@ -589,8 +537,7 @@ pub fn stop_relay_worker() -> bool {
 /// other backstop must use this: [`terminate`](crate::sys::process::terminate)
 /// is best-effort and on Windows may not be delivered when the worker shares no
 /// console with the caller, so a bare `stop_relay_worker` could leave the worker
-/// running (the auto-exit watchdog only winds down when no local instances
-/// remain).
+/// running (the auto-exit watchdog keeps it alive while relay is enabled).
 pub fn stop_relay_worker_blocking() {
     let Some(pid) = read_pid_file() else {
         return;

@@ -263,7 +263,7 @@ pub fn send_rpc_request_and_wait_with_db(
     params: &serde_json::Value,
     timeout: Duration,
 ) -> Result<Value, String> {
-    if !super::worker::ensure_worker(false) {
+    if !super::worker::ensure_worker() {
         return Err("relay worker not running - start with: hcom relay on".to_string());
     }
     ensure_remote_action_supported(db, target_device_short_id, action, target_name)?;
@@ -968,7 +968,7 @@ fn handle_remote_relay_off(
             std::thread::sleep(Duration::from_millis(100));
             // Blocking + force-kill fallback: the graceful request is
             // best-effort and may not reach a consoleless worker on Windows,
-            // and the watchdog won't auto-exit while local instances remain.
+            // and the watchdog takes up to a minute to notice relay is disabled.
             super::worker::stop_relay_worker_blocking();
         });
     }

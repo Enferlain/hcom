@@ -232,7 +232,7 @@ fn bind_session(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option
     instance_binding::capture_and_store_launch_context(db, &instance_name);
     update_position(db, ctx, payload, &instance_name);
     crate::runtime_env::set_terminal_title(&instance_name);
-    crate::relay::worker::ensure_worker(true);
+    crate::relay::worker::try_spawn_worker();
     Some(instance_name)
 }
 

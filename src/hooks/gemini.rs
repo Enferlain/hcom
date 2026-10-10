@@ -294,7 +294,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     crate::runtime_env::set_terminal_title(&instance_name);
 
     // Auto-spawn relay-worker now that an instance is active
-    crate::relay::worker::ensure_worker(true);
+    crate::relay::worker::try_spawn_worker();
 
     // Gemini: SessionStart additionalContext is hidden after /clear — bootstrap stays in BeforeAgent.
     // Antigravity: initial bootstrap path (agy ignores GEMINI_SYSTEM_MD).

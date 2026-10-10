@@ -16,7 +16,7 @@ pub(crate) fn daemon_status() -> i32 {
 
 pub(crate) fn daemon_start() -> i32 {
     let was_running = crate::relay::worker::is_relay_worker_running();
-    if crate::relay::worker::ensure_worker(false) {
+    if crate::relay::worker::ensure_worker() {
         let pid = crate::relay::worker::relay_worker_pid();
         let pid_str = pid.map(|p| format!(" (PID {p})")).unwrap_or_default();
         if was_running {

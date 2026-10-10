@@ -1017,7 +1017,7 @@ fn bind_sessionstart(
                 session_id, source, owner
             ),
         );
-        crate::relay::worker::ensure_worker(true);
+        crate::relay::worker::try_spawn_worker();
         return bootstrap_for_existing_owner(db, ctx, owner);
     }
 
@@ -1033,7 +1033,7 @@ fn bind_sessionstart(
         }
     };
 
-    crate::relay::worker::ensure_worker(true);
+    crate::relay::worker::try_spawn_worker();
     let stdout = result_output
         .map(|value| serde_json::to_string(&value).unwrap_or_default())
         .unwrap_or_default();

@@ -414,7 +414,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         );
     }
     crate::runtime_env::set_terminal_title(&instance_name);
-    crate::relay::worker::ensure_worker(true);
+    crate::relay::worker::try_spawn_worker();
     common::notify_hook_instance_with_db(db, &instance_name);
     if let Some(bootstrap) =
         common::inject_bootstrap_once(db, ctx, &instance_name, &instance, "copilot")
