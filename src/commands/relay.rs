@@ -561,10 +561,6 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
         println!("Current group: hcom relay connect {old_token}\n");
     }
 
-    // Clear stale device state from the previous relay group so that
-    // relay_short_* / relay_caps_* only reflect the new token's peers.
-    relay::clear_relay_device_state(db);
-
     let relay_id = uuid::Uuid::new_v4().to_string();
     let psk = match relay::crypto::generate_psk() {
         Ok(p) => p,
@@ -619,6 +615,10 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
         }
     };
 
+    // Clear the previous group's device state only once the new group is
+    // certain to replace it: a failed probe above leaves the old config live.
+    relay::clear_relay_device_state(db);
+
     // Save config
     if let Err(e) = persist_relay_config(&relay_id, &pinned_broker, auth_token.as_deref(), &psk) {
         eprintln!("Error: {e}");
@@ -646,7 +646,8 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
     } else if crate::relay::worker::is_relay_worker_running() {
         println!("\nDaemon started (not yet ready). Run 'hcom relay status' to confirm.");
     } else {
-        println!("\nCould not start daemon automatically. Run 'hcom relay daemon start'.");
+        eprintln!("\nCould not start daemon automatically. Run 'hcom relay daemon start'.");
+        return 1;
     }
     0
 }
@@ -761,7 +762,8 @@ fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
     } else if crate::relay::worker::is_relay_worker_running() {
         println!("\nDaemon started (not yet ready). Run 'hcom relay status' to confirm.");
     } else {
-        println!("\nCould not start daemon automatically. Run 'hcom relay daemon start'.");
+        eprintln!("\nCould not start daemon automatically. Run 'hcom relay daemon start'.");
+        return 1;
     }
     0
 }
