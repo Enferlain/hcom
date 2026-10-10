@@ -364,9 +364,12 @@ fn config_set_at_path(path: &Path, key: &str, value: &str) -> Result<(), String>
 }
 
 /// Get a config value (checks env var, then TOML nested path, then default).
+/// Relay fields skip the env var: the loader reads them from config.toml only,
+/// and agents inherit them in env from their launch, so env would misreport them.
 pub fn config_get(key: &str) -> (String, &'static str) {
-    // Check env var first
-    if let Ok(val) = std::env::var(key) {
+    if !key.starts_with("HCOM_RELAY")
+        && let Ok(val) = std::env::var(key)
+    {
         return (val, "env");
     }
 
