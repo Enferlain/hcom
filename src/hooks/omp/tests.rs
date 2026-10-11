@@ -1,5 +1,6 @@
 use super::*;
 use crate::db::HcomDb;
+use crate::hooks::pi_family::OMP;
 use crate::instances;
 use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_LISTENING};
@@ -226,7 +227,7 @@ fn start_handler_registering_plugin_notify_wakes_pty_delivery_loop() {
     ]);
     let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
 
-    let (code, output) = handle_start(
+    let (code, output) = OMP.handle_start(
         &ctx,
         &db,
         &[
@@ -284,7 +285,7 @@ fn plugin_notify_registration_failure_does_not_wake_delivery_loop() {
 
     let plugin_listener = bind_probe();
     let plugin_port = plugin_listener.local_addr().unwrap().port();
-    upsert_plugin_notify_endpoint(&db, "luna", plugin_port);
+    OMP.upsert_plugin_notify_endpoint(&db, "luna", plugin_port);
 
     assert!(!db.has_notify_endpoint_kind("luna", "plugin"));
     assert!(
@@ -370,7 +371,7 @@ fn start_handler_uses_central_binding_for_existing_session() {
     ]);
     let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
 
-    let (code, output) = handle_start(
+    let (code, output) = OMP.handle_start(
         &ctx,
         &db,
         &[
@@ -476,7 +477,7 @@ fn start_rebinds_via_process_binding_after_soft_stop() {
     ]);
     let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
 
-    let (code, output) = handle_start(
+    let (code, output) = OMP.handle_start(
         &ctx,
         &db,
         &[
@@ -526,7 +527,7 @@ fn start_recovers_binding_via_instance_name_when_process_binding_cleared() {
     ]);
     let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
 
-    let (code, output) = handle_start(
+    let (code, output) = OMP.handle_start(
         &ctx,
         &db,
         &[
