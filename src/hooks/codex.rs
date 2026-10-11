@@ -375,7 +375,7 @@ fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> AnyResult<()> {
 /// hcom never declared hooks in config.toml, so its hook tables are left alone.
 /// State keys are removed only when they named an hcom handler position or are
 /// recorded in the metadata; a user's own hooks in the same file keep their trust.
-fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
+fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<bool> {
     let hooks_path = codex_hooks_path_at(home);
     let config_path = codex_config_path_at(home);
     let metadata_path = home.join(HCOM_HOOK_TRUST_METADATA_FILE);
@@ -439,6 +439,7 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
         }
     }
 
+    let mut removed = false;
     match std::fs::read_to_string(&config_path) {
         Ok(source) => {
             let mut config: DocumentMut = source
@@ -486,6 +487,7 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
             if changed {
                 paths::atomic_write_io(&config_path, &config.to_string())
                     .with_context(|| LegacyFile::write(&config_path, fix_config.clone()))?;
+                removed = true;
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -502,16 +504,18 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
             paths::atomic_write_io(&hooks_path, &serde_json::to_string_pretty(&hooks)?)
         }
         .with_context(|| LegacyFile::write(&hooks_path, fix_hooks))?;
+        removed = true;
     }
     match std::fs::remove_file(&metadata_path) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(removed),
+        Err(error) => {
             // Trust metadata never loads hooks.
             Err(error).with_context(|| LegacyFile {
                 still_loads: false,
                 ..LegacyFile::write(&metadata_path, runtime::FIX_DELETE)
             })
         }
-        _ => Ok(()),
     }
 }
 
@@ -1603,28 +1607,26 @@ fn remove_codex_execpolicy_at(codex_home: &Path) -> bool {
     }
 }
 
-fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
+/// A file that doesn't parse is the user's to fix; cleanup leaves it
+/// untouched and the failure is reported. Returns whether legacy hooks were
+/// removed; `hcom.rules` is current auto-approve state rewritten each launch,
+/// so deleting it doesn't count.
+fn remove_codex_hooks_from_dir(base: &std::path::Path) -> AnyResult<bool> {
     let rules_file = base.join("rules").join("hcom.rules");
-    // A file that doesn't parse is the user's to fix; cleanup leaves it
-    // untouched and the failure is reported.
-    let mut ok = match cleanup_codex_hooks_in_dir(base) {
-        Ok(()) => true,
-        Err(error) => {
-            crate::log::log_warn("codex", "codex.hooks_cleanup_failed", &format!("{error:#}"));
-            false
+    let rules_removed = match std::fs::remove_file(&rules_file) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(error).with_context(|| LegacyFile::write(&rules_file, runtime::FIX_DELETE))
         }
+        _ => Ok(false),
     };
-    if rules_file.exists() {
-        ok &= std::fs::remove_file(&rules_file).is_ok();
-    }
-    ok
+    runtime::sweep([cleanup_codex_hooks_in_dir(base), rules_removed], |r| r)
 }
 
-/// Remove hcom hooks from Codex config.
+/// Remove hcom hooks from Codex config. Returns whether anything was removed.
 ///
 /// Cleans the default (~/.codex), env-var (CODEX_HOME), and legacy
 /// `<HCOM_DIR parent>/.codex` paths.
-pub fn remove_codex_hooks() -> bool {
+pub fn remove_codex_hooks() -> AnyResult<bool> {
     let mut dirs = crate::runtime_env::tool_config_cleanup_dirs(".codex", "CODEX_HOME");
     // Codex uses the platform profile on Windows, unlike HOME-preferring tools.
     // Keep the old HOME path in the cleanup list for installs made by older hcom.
@@ -1639,11 +1641,11 @@ pub fn remove_codex_hooks() -> bool {
     // intentionally unsets CODEX_HOME to exercise legacy path discovery.
     #[cfg(test)]
     dirs.retain(|dir| crate::paths::test_roots::is_registered(dir));
-    dirs.iter()
-        .filter(|dir| crate::runtime_env::hook_cleanup_allowed(dir))
-        .filter(|dir| !remove_codex_hooks_from_dir(dir))
-        .count()
-        == 0
+    runtime::sweep(
+        dirs.iter()
+            .filter(|dir| crate::runtime_env::hook_cleanup_allowed(dir)),
+        |dir| remove_codex_hooks_from_dir(dir),
+    )
 }
 
 #[cfg(test)]
@@ -2185,7 +2187,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(remove_codex_hooks());
+        remove_codex_hooks().unwrap();
         assert!(
             hooks_path.exists(),
             "hooks.json was deleted but user hook was present"
@@ -2205,7 +2207,7 @@ mod tests {
     #[serial]
     fn test_remove_codex_noop_when_no_hooks_json() {
         let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
-        assert!(remove_codex_hooks());
+        remove_codex_hooks().unwrap();
     }
 
     #[test]
@@ -2256,7 +2258,7 @@ mod tests {
         .unwrap();
         std::fs::write(local_dir.join("rules/hcom.rules"), "allow").unwrap();
 
-        assert!(remove_codex_hooks());
+        remove_codex_hooks().unwrap();
         assert!(!local_dir.join("rules/hcom.rules").exists());
         if local_dir.join("hooks.json").exists() {
             let content = std::fs::read_to_string(local_dir.join("hooks.json")).unwrap();

@@ -307,13 +307,14 @@ fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
 
 /// Strip hcom's entries from a legacy `hooks/hcom.json`. When that removed
 /// something and only `version` and empty `hooks` remain, the file is deleted;
-/// a file hcom had no entries in is never touched.
-fn remove_hooks_at(path: &Path) -> Result<()> {
+/// a file hcom had no entries in is never touched. Returns whether anything
+/// was removed.
+fn remove_hooks_at(path: &Path) -> Result<bool> {
     if !crate::runtime_env::hook_cleanup_allowed(path) {
-        return Ok(());
+        return Ok(false);
     }
     if !path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let fix = runtime::FIX_REMOVE_HCOM_HOOKS;
     let mut value = Value::Object(
@@ -322,7 +323,7 @@ fn remove_hooks_at(path: &Path) -> Result<()> {
     let before = value.clone();
     remove_hcom_hooks(&mut value);
     if value == before {
-        return Ok(());
+        return Ok(false);
     }
     let only_hcom = value.as_object().is_some_and(|root| {
         root.iter().all(|(key, v)| match key.as_str() {
@@ -336,24 +337,14 @@ fn remove_hooks_at(path: &Path) -> Result<()> {
     } else {
         write_json(path, &value).map_err(anyhow::Error::from)
     }
-    .with_context(|| runtime::LegacyFile::write(path, fix))
+    .with_context(|| runtime::LegacyFile::write(path, fix))?;
+    Ok(true)
 }
 
 /// Clean every path the old installer could have used; one failure doesn't
 /// stop the others.
-pub fn remove_copilot_hooks() -> bool {
-    let mut ok = true;
-    for path in copilot_hooks_cleanup_paths() {
-        if let Err(error) = remove_hooks_at(&path) {
-            log::log_warn(
-                "copilot",
-                "copilot.hooks_cleanup_failed",
-                &format!("{error:#}"),
-            );
-            ok = false;
-        }
-    }
-    ok
+pub fn remove_copilot_hooks() -> Result<bool> {
+    runtime::sweep(copilot_hooks_cleanup_paths(), |path| remove_hooks_at(&path))
 }
 
 fn resolve_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {

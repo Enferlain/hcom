@@ -767,7 +767,7 @@ fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
     let paths = discovery_roots(ctx)
         .into_iter()
         .flat_map(|root| ["plugin", "plugins"].map(|dir| root.join(dir).join(PLUGIN_FILENAME)));
-    runtime::remove_owned_files(paths, is_hcom_owned)
+    runtime::remove_owned_files(paths, is_hcom_owned).map(drop)
 }
 
 fn current_home_dir() -> std::path::PathBuf {
@@ -812,7 +812,7 @@ fn get_kilo_plugin_path() -> std::path::PathBuf {
 ///
 /// Checks all candidate directories directly (without filtering by dir existence)
 /// to avoid missing stale plugins when path resolution differs between install/remove.
-fn remove_plugin(app: &str) -> std::io::Result<()> {
+fn remove_plugin(app: &str) -> std::io::Result<bool> {
     let mut paths = vec![plugin_dir_for_app(app).join(PLUGIN_FILENAME)];
 
     // Build candidate paths from all known locations (skip dir-exists filter
@@ -849,12 +849,14 @@ fn remove_plugin(app: &str) -> std::io::Result<()> {
         }
     }
 
+    let mut removed = false;
     for p in paths {
         if is_hcom_owned(&p)? {
             std::fs::remove_file(&p)?;
+            removed = true;
         }
     }
-    Ok(())
+    Ok(removed)
 }
 
 /// Marker line in `src/opencode_plugin/hcom.ts` identifying hcom's plugin.
@@ -871,11 +873,11 @@ pub fn is_hcom_owned(path: &std::path::Path) -> std::io::Result<bool> {
     })
 }
 
-pub fn remove_opencode_plugin() -> std::io::Result<()> {
+pub fn remove_opencode_plugin() -> std::io::Result<bool> {
     remove_plugin("opencode")
 }
 
-pub fn remove_kilo_plugin() -> std::io::Result<()> {
+pub fn remove_kilo_plugin() -> std::io::Result<bool> {
     remove_plugin("kilo")
 }
 

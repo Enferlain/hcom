@@ -129,33 +129,44 @@ impl Tool {
         }
     }
 
-    /// Remove hooks for this tool. Returns `Ok(true)` on success, `Ok(false)`
-    /// if the tool reports a non-error failure, and `Err(message)` on
-    /// recoverable errors that callers should display verbatim.
+    /// Remove hooks for this tool. `Ok(true)` when something was removed,
+    /// `Ok(false)` when nothing was there, `Err(message)` on failure (an empty
+    /// message when the tool only logged the detail).
     pub fn remove_hooks(&self) -> Result<bool, String> {
+        // Persistent removers only report success, so infer "removed" from
+        // the install state beforehand.
+        let persistent = |installed: bool, remove: fn() -> bool| {
+            if remove() {
+                Ok(installed)
+            } else {
+                Err(String::new())
+            }
+        };
+        let installed = || self.verify_hooks_installed(false);
         match self {
-            Tool::Claude => Ok(crate::hooks::claude::remove_claude_hooks()),
-            Tool::Gemini => Ok(crate::hooks::gemini::remove_gemini_hooks()),
-            Tool::Codex => Ok(crate::hooks::codex::remove_codex_hooks()),
-            Tool::OpenCode => crate::hooks::opencode::remove_opencode_plugin()
-                .map(|_| true)
-                .map_err(|e| e.to_string()),
-            Tool::Kilo => crate::hooks::opencode::remove_kilo_plugin()
-                .map(|_| true)
-                .map_err(|e| e.to_string()),
-            Tool::Antigravity => Ok(crate::hooks::antigravity::remove_antigravity_hooks()),
-            Tool::Cursor => Ok(crate::hooks::cursor::remove_cursor_hooks()),
-            Tool::Kimi => Ok(crate::hooks::kimi::remove_kimi_hooks()),
-            Tool::Copilot => Ok(crate::hooks::copilot::remove_copilot_hooks()),
-            Tool::Qoder => Ok(crate::hooks::qoder::remove_qoder_hooks()),
-            Tool::Grok => Ok(true),
-            Tool::Pi => crate::hooks::pi::remove_pi_plugin()
-                .map(|_| true)
-                .map_err(|e| e.to_string()),
-            Tool::Omp => crate::hooks::omp::remove_omp_plugin()
-                .map(|_| true)
-                .map_err(|e| format!("{e:#}")),
-            Tool::Adhoc => Ok(false),
+            Tool::Claude => {
+                crate::hooks::claude::remove_claude_hooks().map_err(|e| format!("{e:#}"))
+            }
+            Tool::Codex => crate::hooks::codex::remove_codex_hooks().map_err(|e| format!("{e:#}")),
+            Tool::Copilot => {
+                crate::hooks::copilot::remove_copilot_hooks().map_err(|e| format!("{e:#}"))
+            }
+            Tool::OpenCode => {
+                crate::hooks::opencode::remove_opencode_plugin().map_err(|e| e.to_string())
+            }
+            Tool::Kilo => crate::hooks::opencode::remove_kilo_plugin().map_err(|e| e.to_string()),
+            Tool::Pi => crate::hooks::pi::remove_pi_plugin().map_err(|e| e.to_string()),
+            Tool::Omp => crate::hooks::omp::remove_omp_plugin().map_err(|e| format!("{e:#}")),
+            // Per-run from the start: never installed anything globally.
+            Tool::Qoder | Tool::Grok => Ok(false),
+            Tool::Gemini => persistent(installed(), crate::hooks::gemini::remove_gemini_hooks),
+            Tool::Antigravity => persistent(
+                installed(),
+                crate::hooks::antigravity::remove_antigravity_hooks,
+            ),
+            Tool::Cursor => persistent(installed(), crate::hooks::cursor::remove_cursor_hooks),
+            Tool::Kimi => persistent(installed(), crate::hooks::kimi::remove_kimi_hooks),
+            Tool::Adhoc => Err(String::new()),
         }
     }
 

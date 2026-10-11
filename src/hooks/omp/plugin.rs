@@ -75,12 +75,13 @@ fn project_local_legacy_path() -> Option<std::path::PathBuf> {
         .map(|root| root.join(".omp").join("extensions").join(PLUGIN_FILENAME))
 }
 
-fn remove_owned(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Result<()> {
+fn remove_owned(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Result<bool> {
     runtime::remove_owned_files(paths, is_hcom_owned)
 }
 
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
     remove_owned(std::iter::once(effective_plugin_path(ctx)).chain(project_local_legacy_path()))
+        .map(drop)
 }
 
 /// Remove hcom's managed OMP extension injection (`-e <hcom.ts>` /
@@ -159,6 +160,6 @@ pub fn is_hcom_owned(path: &std::path::Path) -> std::io::Result<bool> {
     })
 }
 
-pub fn remove_omp_plugin() -> Result<()> {
+pub fn remove_omp_plugin() -> Result<bool> {
     remove_owned(std::iter::once(get_omp_plugin_path()).chain(project_local_legacy_path()))
 }

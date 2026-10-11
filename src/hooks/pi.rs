@@ -213,7 +213,7 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
 /// under a project-local HCOM_DIR; check both.
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
     let paths = std::iter::once(effective_plugin_path(ctx)).chain(project_local_legacy_path());
-    crate::hooks::runtime::remove_owned_files(paths, is_hcom_owned)
+    crate::hooks::runtime::remove_owned_files(paths, is_hcom_owned).map(drop)
 }
 
 /// True when `path` holds an hcom Pi plugin: the current source or any earlier
@@ -225,13 +225,15 @@ pub fn is_hcom_owned(path: &std::path::Path) -> std::io::Result<bool> {
 }
 
 /// Remove hcom's plugin file. A user file with the same name is left alone.
-pub fn remove_pi_plugin() -> std::io::Result<()> {
+pub fn remove_pi_plugin() -> std::io::Result<bool> {
+    let mut removed = false;
     for path in std::iter::once(get_pi_plugin_path()).chain(project_local_legacy_path()) {
         if is_hcom_owned(&path)? {
             std::fs::remove_file(path)?;
+            removed = true;
         }
     }
-    Ok(())
+    Ok(removed)
 }
 
 #[cfg(test)]

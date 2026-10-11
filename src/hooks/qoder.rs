@@ -137,11 +137,6 @@ fn cleanup_legacy_per_run(_ctx: &LaunchCtx) -> Result<()> {
     Ok(())
 }
 
-/// `hcom hooks remove`: no persistent install exists.
-pub fn remove_qoder_hooks() -> bool {
-    true
-}
-
 // ── Handlers ────────────────────────────────────────────────────────────
 
 fn resolve_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {

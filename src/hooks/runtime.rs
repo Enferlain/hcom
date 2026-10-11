@@ -331,25 +331,43 @@ fn legacy_cleanup_warning(tool: &str, error: &anyhow::Error) -> String {
     }
 }
 
+/// Run `remove` on every item, collecting failures. `Ok(true)` when any item
+/// removed something.
+pub fn sweep<T>(
+    items: impl IntoIterator<Item = T>,
+    mut remove: impl FnMut(T) -> Result<bool>,
+) -> Result<bool> {
+    let mut removed = false;
+    let mut errors = Vec::new();
+    for item in items {
+        match remove(item) {
+            Ok(r) => removed |= r,
+            Err(error) => errors.push(error),
+        }
+    }
+    collect_errors(errors).map(|()| removed)
+}
+
 /// Delete each of `paths` that `owned` says is hcom's plugin. Every path is
-/// tried; failures are collected.
+/// tried; failures are collected. `Ok(true)` when a file was deleted.
 pub fn remove_owned_files(
     paths: impl IntoIterator<Item = PathBuf>,
     owned: impl Fn(&Path) -> std::io::Result<bool>,
-) -> Result<()> {
-    let errors = paths
-        .into_iter()
-        .filter(|path| crate::runtime_env::hook_cleanup_allowed(path))
-        .filter_map(|path| remove_owned_file(&path, &owned).err())
-        .collect();
-    collect_errors(errors)
+) -> Result<bool> {
+    sweep(
+        paths
+            .into_iter()
+            .filter(|path| crate::runtime_env::hook_cleanup_allowed(path)),
+        |path| remove_owned_file(&path, &owned),
+    )
 }
 
-fn remove_owned_file(path: &Path, owned: impl Fn(&Path) -> std::io::Result<bool>) -> Result<()> {
-    if owned(path).with_context(|| LegacyFile::read(path, FIX_DELETE))? {
-        std::fs::remove_file(path).with_context(|| LegacyFile::write(path, FIX_DELETE))?;
+fn remove_owned_file(path: &Path, owned: impl Fn(&Path) -> std::io::Result<bool>) -> Result<bool> {
+    if !owned(path).with_context(|| LegacyFile::read(path, FIX_DELETE))? {
+        return Ok(false);
     }
-    Ok(())
+    std::fs::remove_file(path).with_context(|| LegacyFile::write(path, FIX_DELETE))?;
+    Ok(true)
 }
 
 // ── Ownership ────────────────────────────────────────────────────────────

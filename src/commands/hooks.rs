@@ -231,9 +231,8 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
         return 1;
     };
 
-    // Check status for messaging, but always attempt removal for all paths
-    // to clean up stale hooks at old paths (e.g. before env var override was set).
-    let pre_status = get_tool_status();
+    // Always attempt removal for all paths to clean up stale hooks at old
+    // paths (e.g. before an env var override was set).
     let mut fail_count = 0;
     for tool in &tools {
         if HookMode::of(*tool) == HookMode::None {
@@ -242,33 +241,30 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
             }
             continue;
         }
-        let per_run = runtime::is_per_run(*tool);
-        let was_installed = pre_status
-            .iter()
-            .find(|(t, _, _)| t == tool)
-            .map(|(_, installed, _)| *installed)
-            .unwrap_or(false);
         let name = tool.spec().label;
-
-        let ok = match tool.remove_hooks() {
-            Ok(ok) => ok,
+        match tool.remove_hooks() {
+            Ok(true) if runtime::is_per_run(*tool) => {
+                println!("Removed legacy {name} hooks (hcom now loads them per launch)")
+            }
+            Ok(true) => println!("Removed {name} hooks"),
+            // Per-run tools have no global install; only mention them when asked.
+            Ok(false) if runtime::is_per_run(*tool) => {
+                if tools.len() == 1 {
+                    println!(
+                        "{name} loads hcom's hooks per launch (hcom {}); nothing installed globally.",
+                        tool.as_str()
+                    );
+                }
+            }
+            Ok(false) => println!("{name} hooks already removed"),
+            Err(e) if e.is_empty() => {
+                eprintln!("Failed to remove {name} hooks");
+                fail_count += 1;
+            }
             Err(e) => {
                 eprintln!("Failed to remove {name} hooks: {e}");
                 fail_count += 1;
-                continue;
             }
-        };
-        if ok {
-            if per_run {
-                println!("Removed any legacy {name} hooks");
-            } else if was_installed {
-                println!("Removed {name} hooks");
-            } else {
-                println!("{name} hooks already removed");
-            }
-        } else {
-            eprintln!("Failed to remove {name} hooks");
-            fail_count += 1;
         }
     }
 

@@ -3140,52 +3140,39 @@ fn remove_hcom_hooks_from_settings(settings: &mut Value) -> bool {
 /// Remove hcom's hooks, `env.HCOM` and allow patterns from one settings file.
 /// A missing file is fine; an unreadable or malformed one is an error (left
 /// untouched), and the file is only rewritten when something was removed.
-fn remove_hooks_at(path: &Path) -> Result<()> {
+/// Returns whether anything was removed.
+fn remove_hooks_at(path: &Path) -> Result<bool> {
     if !crate::runtime_env::hook_cleanup_allowed(path) {
-        return Ok(());
+        return Ok(false);
     }
     let unreadable = || runtime::LegacyFile::read(path, runtime::FIX_REMOVE_HCOM_HOOKS);
     let source = match std::fs::read_to_string(path) {
         Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error).with_context(unreadable),
     };
     let mut settings: Value = serde_json::from_str(&source).with_context(unreadable)?;
     if !settings.is_object() {
         return Err(anyhow::anyhow!("must contain a JSON object")).with_context(unreadable);
     }
-    if remove_hcom_hooks_from_settings(&mut settings) {
-        let json = serde_json::to_string_pretty(&settings)?;
-        paths::atomic_write_io(path, &json)
-            .with_context(|| runtime::LegacyFile::write(path, runtime::FIX_REMOVE_HCOM_HOOKS))?;
+    if !remove_hcom_hooks_from_settings(&mut settings) {
+        return Ok(false);
     }
-    Ok(())
+    let json = serde_json::to_string_pretty(&settings)?;
+    paths::atomic_write_io(path, &json)
+        .with_context(|| runtime::LegacyFile::write(path, runtime::FIX_REMOVE_HCOM_HOOKS))?;
+    Ok(true)
 }
 
-fn remove_hooks_from_settings_path(path: &Path) -> bool {
-    match remove_hooks_at(path) {
-        Ok(()) => true,
-        Err(error) => {
-            crate::log::log_warn(
-                "claude",
-                "claude.hooks_cleanup_failed",
-                &format!("{error:#}"),
-            );
-            false
-        }
-    }
-}
-
-/// Remove hcom hooks from Claude settings.
+/// Remove hcom hooks from Claude settings. Returns whether anything was removed.
 ///
 /// Cleans ~/.claude, $CLAUDE_CONFIG_DIR and legacy `<HCOM_DIR parent>/.claude`.
 /// Only removes hcom-specific hooks, not the whole file.
-pub fn remove_claude_hooks() -> bool {
-    crate::runtime_env::tool_config_cleanup_dirs(".claude", "CLAUDE_CONFIG_DIR")
-        .iter()
-        .filter(|dir| !remove_hooks_from_settings_path(&dir.join("settings.json")))
-        .count()
-        == 0
+pub fn remove_claude_hooks() -> Result<bool> {
+    runtime::sweep(
+        crate::runtime_env::tool_config_cleanup_dirs(".claude", "CLAUDE_CONFIG_DIR"),
+        |dir| remove_hooks_at(&dir.join("settings.json")),
+    )
 }
 
 #[cfg(test)]
@@ -4320,7 +4307,7 @@ mod tests {
     fn test_remove_hooks_from_nonexistent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.json");
-        assert!(remove_hooks_from_settings_path(&path));
+        assert!(!remove_hooks_at(&path).unwrap());
     }
 
     #[test]
@@ -4339,7 +4326,7 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_string_pretty(&settings).unwrap()).unwrap();
 
-        assert!(remove_hooks_from_settings_path(&path));
+        assert!(remove_hooks_at(&path).unwrap());
 
         // Verify hooks are gone but other_key preserved
         let content = std::fs::read_to_string(&path).unwrap();
@@ -4463,7 +4450,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(remove_hooks_from_settings_path(&settings_path));
+        assert!(remove_hooks_at(&settings_path).unwrap());
 
         let updated = read_json(&settings_path);
         // User hook should remain
@@ -4514,7 +4501,7 @@ mod tests {
         );
 
         // Remove
-        assert!(remove_hooks_from_settings_path(&settings_path));
+        assert!(remove_hooks_at(&settings_path).unwrap());
         let after_remove = read_json(&settings_path);
         let violations = independently_verify_no_hcom_hooks_claude(&after_remove);
         assert!(
