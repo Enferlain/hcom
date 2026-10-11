@@ -9,5 +9,5 @@
     "target": "ES2022",
     "types": ["bun", "node"]
   },
-  "include": ["src/**/*_plugin/*.ts", "tests/plugin_delivery.test.ts"]
+  "include": ["src/**/*_plugin/*.ts", "tests/plugin_delivery.test.ts", "tests/plugin_types.ts"]
 }

@@ -1,5 +1,4 @@
 // hcom-managed-plugin: installed by hcom; removed automatically. Do not add this line to your own plugins.
-import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
 import type { Plugin as Plugin2 } from "@opencode/plugin"
 import { spawn } from "node:child_process"
 import { appendFileSync, mkdirSync } from "node:fs"
@@ -880,14 +879,25 @@ function createCore(transport: Transport) {
   }
 }
 
-export const HcomPlugin: Plugin = async ({ client }) => {
+// The calls the plugin makes on the OpenCode 1 / Kilo SDK client. Structural, so
+// one plugin fits both apps' clients; `tests/plugin_types.ts` checks it against
+// each app's own `Plugin` type.
+type OpenCode1Client = {
+  session: {
+    promptAsync(options: any): Promise<any>
+    status(options?: any): Promise<any>
+  }
+  postSessionIdPermissionsPermissionId(options: any): Promise<any>
+}
+
+export const HcomPlugin = async ({ client }: { client: OpenCode1Client }) => {
   if (!claimPluginHost()) return {}
   const core = createCore({
     async prompt({ sessionID, text, agent, model }) {
       // SDK types don't expose agent/model on the async variant; the body shape
       // matches the sync prompt endpoint. The SDK resolves (not rejects) with
       // `error` set for a refused request.
-      const result: any = await client.session.promptAsync({
+      const result = await client.session.promptAsync({
         path: { id: sessionID },
         body: {
           agent: agent ?? undefined,
@@ -895,24 +905,24 @@ export const HcomPlugin: Plugin = async ({ client }) => {
           variant: model?.variant ?? undefined,
           parts: [{ type: "text", text }],
         },
-      } as any)
+      })
       return result?.error ? JSON.stringify(result.error) : null
     },
     async status(sessionID) {
-      const result: any = await client.session.status()
+      const result = await client.session.status()
       if (!result?.data || result.error) return null
       const current = result.data[sessionID]
       return !current || current.type === "idle" ? "idle" : "busy"
     },
     async allowOnce(sessionID, requestID) {
-      const result: any = await client.postSessionIdPermissionsPermissionId({
+      const result = await client.postSessionIdPermissionsPermissionId({
         path: { id: sessionID, permissionID: requestID },
         body: { response: "once" },
       })
       return result?.error ? JSON.stringify(result.error) : null
     },
   })
-  const hooks: Hooks = {
+  return {
     event: async ({ event }: { event: any }) => core.event(event),
     "chat.message": async (input: any) => core.chatMessage(input),
     "tool.execute.before": async (input: any, output: any) => core.toolBefore(input.sessionID, input.tool, output.args),
@@ -923,7 +933,6 @@ export const HcomPlugin: Plugin = async ({ client }) => {
     },
     dispose: core.dispose,
   }
-  return hooks
 }
 
 // Reshapes OpenCode 2 events into the OpenCode 1 shape the core handles.

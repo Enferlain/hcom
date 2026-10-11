@@ -32,7 +32,7 @@ if [[ "$(uname -o 2>/dev/null || true)" == "Android" ]]; then
     "$project_root/"
   cp -R "$repo_root/src/omp_plugin" "$repo_root/src/opencode_plugin" \
     "$repo_root/src/pi_plugin" "$project_root/src/"
-  cp "$repo_root/tests/plugin_delivery.test.ts" "$project_root/tests/"
+  cp "$repo_root/tests/plugin_delivery.test.ts" "$repo_root/tests/plugin_types.ts" "$project_root/tests/"
 else
   project_root="$repo_root"
 fi
