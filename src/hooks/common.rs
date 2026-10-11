@@ -71,6 +71,14 @@ pub(crate) const SAFE_HCOM_COMMANDS: &[&str] = &[
     "--new-terminal",
 ];
 
+/// `HCOM_AUTO_APPROVE` is set in the launched agent's env from the same config
+/// value that decided whether hcom installed its approval path.
+pub(crate) fn auto_approve_enabled(ctx: &HcomContext) -> bool {
+    ctx.raw_env
+        .get("HCOM_AUTO_APPROVE")
+        .is_some_and(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
 /// Whether a shell command line is exactly one `hcom <safe command> …` (or
 /// `uvx hcom …`), for tools where hcom approves commands at runtime.
 ///

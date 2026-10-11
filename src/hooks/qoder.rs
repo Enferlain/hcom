@@ -411,14 +411,6 @@ fn auto_allows(tool_name: &str, tool_input: &Value) -> bool {
     tool_name == "Bash" && !cfg!(windows) && common::is_safe_hcom_command(command)
 }
 
-/// `HCOM_AUTO_APPROVE` is set in the launched agent's env from the same config
-/// value that decided whether the PermissionRequest hook was registered.
-fn auto_approve_enabled(ctx: &HcomContext) -> bool {
-    ctx.raw_env
-        .get("HCOM_AUTO_APPROVE")
-        .is_some_and(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-}
-
 fn handle_notification(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Value {
     if payload.notification_type.as_deref() != Some("permission_prompt") {
         return json!({});
@@ -431,7 +423,7 @@ fn handle_notification(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         .and_then(|d| d.get("toolName"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    if auto_approve_enabled(ctx)
+    if common::auto_approve_enabled(ctx)
         && let Some(input) = details.and_then(|d| d.get("input"))
         && auto_allows(tool_name, input)
     {

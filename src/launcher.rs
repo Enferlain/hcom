@@ -2420,9 +2420,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Pi | LaunchTool::Omp => {
                     opencode_preprocessing::preprocess_opencode_env(
                         &mut instance_env,
-                        base_tool,
                         &instance_name,
-                        hcom_config.auto_approve,
                     );
                     let effective_args = if normalized == LaunchTool::OpenCode {
                         opencode_preprocessing::preprocess_opencode_args(

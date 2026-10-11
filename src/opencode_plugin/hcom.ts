@@ -1,11 +1,21 @@
 // hcom-managed-plugin: installed by hcom; removed automatically. Do not add this line to your own plugins.
-import type { Plugin, PluginInput } from "@opencode-ai/plugin"
-import type { Event } from "@opencode-ai/sdk"
-import { appendFileSync } from "fs"
-import { homedir } from "os"
+import type { Hooks, Plugin, PluginInput } from "@opencode-ai/plugin"
+import type { Plugin as Plugin2 } from "@opencode/plugin"
+import { spawn } from "node:child_process"
+import { appendFileSync, mkdirSync } from "node:fs"
+import { createServer, type Server } from "node:net"
+import { homedir } from "node:os"
+import { dirname } from "node:path"
 
 const HCOM_DIR = process.env.HCOM_DIR || `${homedir()}/.hcom`
 const LOG_PATH = `${HCOM_DIR}/.tmp/logs/hcom.log`
+const HCOM_TIMEOUT_MS = 15_000
+const RECONCILE_MS = 5_000
+// How long a delivery may stay unadmitted while the session is idle before it
+// is presumed rejected and released for redelivery.
+const ADMIT_GRACE_MS = 10_000
+// Consecutive unadmitted deliveries redelivered without waiting for a wake.
+const MAX_UNADMITTED_RETRIES = 3
 
 function claimPluginHost(): boolean {
   const owner = process.env.HCOM_PLUGIN_HOST_PID
@@ -15,32 +25,149 @@ function claimPluginHost(): boolean {
   return true
 }
 
+function log(
+  level: "DEBUG" | "INFO" | "WARN" | "ERROR",
+  event: string,
+  instance?: string | null,
+  extra?: Record<string, unknown>,
+) {
+  const entry = JSON.stringify({
+    ts: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+    level,
+    subsystem: "plugin",
+    event,
+    ...(instance ? { instance } : {}),
+    ...extra,
+  })
+  try {
+    mkdirSync(dirname(LOG_PATH), { recursive: true })
+    appendFileSync(LOG_PATH, entry + "\n")
+  } catch {}
+}
+
+type HcomResult = { code: number; stdout: string; stderr: string }
+
+// Exit code is 124 on timeout and 128+ when hcom dies from a signal, so neither
+// can be mistaken for success.
+function hcom(args: string[]): Promise<HcomResult> {
+  return new Promise((resolve) => {
+    const child = spawn("hcom", args, { stdio: ["ignore", "pipe", "pipe"] })
+    let stdout = ""
+    let stderr = ""
+    let settled = false
+    const finish = (code: number) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ code, stdout, stderr })
+    }
+    const timer = setTimeout(() => {
+      stderr ||= `timed out after ${HCOM_TIMEOUT_MS}ms`
+      try { child.kill("SIGKILL") } catch {}
+      finish(124)
+    }, HCOM_TIMEOUT_MS)
+    timer.unref?.()
+    child.stdout.setEncoding("utf8")
+    child.stderr.setEncoding("utf8")
+    child.stdout.on("data", (chunk) => { stdout += chunk })
+    child.stderr.on("data", (chunk) => { stderr += chunk })
+    child.on("error", (error) => {
+      stderr ||= String(error)
+      finish(127)
+    })
+    child.on("close", (code, signal) => {
+      if (code === null) stderr ||= `killed by ${signal ?? "signal"}`
+      finish(code ?? 129)
+    })
+  })
+}
+
+type RpcReply = Record<string, any>
+
+// Every hcom plugin RPC exits 0 and answers with JSON: a payload on success or
+// `{"error": ...}`. Returns the payload, or null (logged) for any failure.
+async function rpc(args: string[], instance: string | null): Promise<RpcReply | null> {
+  const result = await hcom(args)
+  const fail = (extra: Record<string, unknown>) => {
+    log("WARN", "plugin.rpc_failed", instance, { command: args[0], ...extra })
+    return null
+  }
+  if (result.code !== 0) return fail({ exit_code: result.code, stderr: result.stderr.slice(0, 300) })
+  let reply: unknown
+  try {
+    reply = JSON.parse(result.stdout)
+  } catch {
+    return fail({ raw: result.stdout.slice(0, 300) })
+  }
+  if (!reply || typeof reply !== "object" || Array.isArray(reply)) return fail({ raw: result.stdout.slice(0, 300) })
+  if ("error" in reply) return fail({ error: (reply as RpcReply).error })
+  return reply as RpcReply
+}
+
+type Batch = { messages: any[]; ackId: number; hasMore: boolean }
+
+// The oldest unread messages (hcom bounds the batch), or null when the read failed.
+async function readBatch(instance: string): Promise<Batch | null> {
+  const reply = await rpc(["opencode-read", "--name", instance], instance)
+  if (!reply) return null
+  const messages = reply.messages
+  const valid =
+    Array.isArray(messages) &&
+    messages.every((m: any, i: number) => Number.isInteger(m?.event_id) && m.event_id > (i ? messages[i - 1].event_id : 0))
+  if (!valid) {
+    log("WARN", "plugin.rpc_failed", instance, { command: "opencode-read", error: "malformed batch" })
+    return null
+  }
+  return { messages, ackId: messages.at(-1)?.event_id ?? 0, hasMore: reply.has_more === true }
+}
+
+function formatMessagesForInjection(messages: any[], recipientName: string): string {
+  const parts = messages.map((m: any) => {
+    const prefix = m.intent
+      ? m.thread
+        ? `[${m.intent}:${m.thread} #${m.event_id}]`
+        : `[${m.intent} #${m.event_id}]`
+      : m.thread
+        ? `[thread:${m.thread} #${m.event_id}]`
+        : `[new message #${m.event_id}]`
+    return `${prefix} ${m.from} -> ${recipientName}: ${m.message}`
+  })
+  if (messages.length === 1) return `<hcom>${parts[0]}</hcom>`
+  return `<hcom>[${messages.length} new messages] | ${parts.join(" | ")}</hcom>`
+}
+
+// The PTY bootstrap types a body-free wake (`<hcom>`, or an envelope preview
+// with no `sender -> recipient: body`) because the TUI input box cannot safely
+// hold arbitrary message text. The plugin swaps in the real messages.
+function isWakeText(text: string): boolean {
+  const trimmed = text.trim()
+  if (trimmed === "<hcom>" || trimmed === "<hcom></hcom>") return true
+  return trimmed.startsWith("<hcom>") && trimmed.endsWith("</hcom>") && !trimmed.includes(": ")
+}
+
+function startNotifyServer(onWake: () => void): Promise<Server | null> {
+  return new Promise((resolve) => {
+    const server = createServer((socket) => {
+      socket.end()
+      onWake()
+    })
+    server.on("error", (error) => {
+      log("ERROR", "notify_server.start_failed", null, { error: String(error) })
+      resolve(null)
+    })
+    server.listen(0, "127.0.0.1", () => resolve(server))
+  })
+}
+
+function serverPort(server: Server | null): number | null {
+  const address = server?.address()
+  return typeof address === "object" && address ? address.port : null
+}
+
 type PromptModel = {
   providerID: string
   modelID: string
   variant?: string
-}
-
-type PermissionAskedEvent = {
-  type: "permission.asked"
-  properties: {
-    id: string
-    sessionID: string
-    permission: string
-  }
-}
-
-type HcomEvent = Event | PermissionAskedEvent
-
-function eventSessionID(event: HcomEvent): string | undefined {
-  if (!event.properties || typeof event.properties !== "object") return undefined
-  const properties = event.properties as Record<string, unknown>
-  if (typeof properties.sessionID === "string") return properties.sessionID
-  const info = properties.info
-  if (info && typeof info === "object" && typeof (info as Record<string, unknown>).id === "string") {
-    return (info as Record<string, unknown>).id as string
-  }
-  return undefined
 }
 
 // Best-effort fallback for non-hcom/manual plugin runs.
@@ -58,7 +185,7 @@ function parseCliArgValue(...flags: string[]): string | null {
   return null
 }
 
-function parseCliModelArg() {
+function parseCliModelArg(): PromptModel | null {
   const raw = parseCliArgValue("--model", "-m")
   if (!raw) return null
   const slash = raw.indexOf("/")
@@ -71,7 +198,7 @@ function parseCliModelArg() {
   }
 }
 
-function normalizePromptModel(model: unknown, inputVariant?: unknown) {
+function normalizePromptModel(model: unknown, inputVariant?: unknown): PromptModel | null {
   if (!model || typeof model !== "object") return null
   const providerID = (model as Record<string, unknown>).providerID
   const modelID = (model as Record<string, unknown>).modelID
@@ -89,247 +216,407 @@ function normalizePromptModel(model: unknown, inputVariant?: unknown) {
   }
 }
 
-function promptModelRef(model: PromptModel | null) {
-  if (!model) return undefined
-  return {
-    providerID: model.providerID,
-    modelID: model.modelID,
-  }
+type PromptRequest = {
+  sessionID: string
+  text: string
+  agent: string | null
+  model: PromptModel | null
+  messageID: string
 }
 
-function log(
-  level: "DEBUG" | "INFO" | "WARN" | "ERROR",
-  event: string,
-  instance?: string | null,
-  extra?: Record<string, unknown>,
-) {
-  const entry = JSON.stringify({
-    ts: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
-    level,
-    subsystem: "plugin",
-    event,
-    ...(instance ? { instance } : {}),
-    ...extra,
-  })
-  try { appendFileSync(LOG_PATH, entry + "\n") } catch {}
+// What differs between the OpenCode 1 (and Kilo) and OpenCode 2 hosts.
+type Transport = {
+  // Queue a user prompt. Resolves to null once accepted, or an error description.
+  prompt: (request: PromptRequest) => Promise<string | null>
+  // The session's run state from the host, or null when the host cannot say.
+  status: (sessionID: string) => Promise<"idle" | "busy" | null>
+  // Answer a permission request "once"; null on success, or an error. OpenCode 2
+  // approves hcom's commands through config rules instead, so it has none.
+  allowOnce?: (sessionID: string, requestID: string) => Promise<string | null>
 }
 
-export const HcomPlugin: Plugin = async ({ client, $ }) => {
-  if (!claimPluginHost()) return {}
+// A batch handed to OpenCode. It is acknowledged only once it is admitted to
+// the session (seen in a model request on OpenCode 1, `session.inbox.delivered`
+// on OpenCode 2), so a rejected or dropped prompt stays unread and is redelivered.
+type Delivery = {
+  text: string
+  ackId: number
+  hasMore: boolean
+  messageID: string
+  sentAt: number
+  admitted: boolean
+}
 
-  let hcomChecked = false
-  let hcomAvailable = false
-  let instanceName: string | null = null      // IDEN-03: bound instance name
-  let sessionId: string | null = null         // IDEN-02: tracked for messages.transform
-  let bootstrapText: string | null = null     // BOOT-01: cached from opencode-start
-  let bindingPromise: Promise<void> | null = null  // Prevents duplicate binding
-  let reconcileTimer: ReturnType<typeof setInterval> | null = null  // Periodic status sync + delivery fallback
-  let reconcileInFlight = false                 // Prevents concurrent reconcile calls from overlapping interval ticks
-  let notifyServer: Bun.TCPSocketListener | null = null  // TCP notify server for instant message wake
-  let lastReportedStatus: string | null = null  // Skip redundant status updates
-  let pendingAckId: number | null = null        // Deferred ack: set by deliverPendingToIdle, acked by transform
-  let deliveryInFlight = false                  // Delivery guard flag set before the first await
-  let deliveryPending = false                   // Wake arrived while delivery was already in flight
-  let deliveryRetryScheduled = false            // Avoid duplicate queued retry passes
-  let permissionPending = false                  // Exact permission gate from OpenCode events
-  let disposed = false                           // Plugin unloaded: its OpenCode client must not be called
+type HcomEvent = { type: string; properties?: any }
+
+// OpenCode 2 prompt IDs: `msg_` plus a time-ordered suffix, chosen up front so
+// the inbox events for this prompt can be told apart from the user's.
+const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+let idCounter = 0
+function newMessageID(): string {
+  const time = (BigInt(Date.now()) * 0x1000n + BigInt(idCounter++ & 0xfff)).toString(16).padStart(12, "0").slice(-12)
+  const random = Array.from(crypto.getRandomValues(new Uint8Array(14)), (byte) => ID_CHARS[byte % 62]).join("")
+  return `msg_${time}${random}`
+}
+
+function createCore(transport: Transport) {
+  let instanceName: string | null = null
+  let sessionId: string | null = null
+  let bootstrapText: string | null = null
+  let bindingPromise: Promise<void> | null = null
+  // Bumped on every reset. Async work started under an older generation must
+  // not touch state after it resumes.
+  let generation = 0
+  let notifyServer: Server | null = null
+  let reconcileTimer: ReturnType<typeof setInterval> | null = null
+  let reconcileInFlight = false
+  let delivery: Delivery | null = null
+  let deliveryInFlight = false   // reading a batch / handing it to OpenCode
+  let deliveryPending = false    // a wake arrived while delivery was gated; replay it once clear
+  let deliveryRetryScheduled = false
+  let unadmittedRetries = 0
+  let ackInFlight: Promise<void> | null = null
+  let statusChain: Promise<void> = Promise.resolve()
+  let lastReportedStatusKey: string | null = null
+  let sessionBusy = false
+  // Outstanding requests that hold the session for the user, by request ID.
+  const pendingPermissions = new Map<string, string>()
+  const pendingQuestions = new Set<string>()
+  // OpenCode 1 transform edits are request-local, so a filled wake is refilled
+  // with the same text on every later request. Keyed by part ID.
+  const filledWakes = new Map<string, string>()
+  let disposed = false
   let launchedAgent: string | null = parseCliArgValue("--agent")
   let launchedModel: PromptModel | null = parseCliModelArg()
   let currentAgent: string | null = launchedAgent
   let currentModel: PromptModel | null = launchedModel
 
-  // SAFE-02: Lazy PATH detection on first hook callback
-  function checkHcom(): boolean {
-    if (!hcomChecked) {
-      hcomChecked = true
-      hcomAvailable = Bun.which("hcom") !== null
-      if (!hcomAvailable) {
-        log("WARN", "plugin.no_hcom")
+  function isBoundSession(candidate: unknown): boolean {
+    return !!sessionId && candidate === sessionId
+  }
+
+  function statusKey(status: string, context = "", detail = ""): string {
+    return `${status}\0${context}\0${detail}`
+  }
+
+  function desiredStatus(): [string, string, string] {
+    const permission = pendingPermissions.values().next()
+    if (!permission.done) return ["blocked", "approval", permission.value]
+    if (pendingQuestions.size) return ["blocked", "approval", "question"]
+    return sessionBusy ? ["active", "", ""] : ["listening", "", ""]
+  }
+
+  function blocked(): boolean {
+    return pendingPermissions.size > 0 || pendingQuestions.size > 0
+  }
+
+  // Status writes run one at a time so they land in call order. Each write
+  // reports the state current when it runs, and the cache only records a write
+  // hcom confirmed, so a failed write is retried by the next sync.
+  function syncStatus(): Promise<void> {
+    const gen = generation
+    const run = statusChain.then(async () => {
+      const name = instanceName
+      if (!name || gen !== generation) return
+      const [status, context, detail] = desiredStatus()
+      const key = statusKey(status, context, detail)
+      if (key === lastReportedStatusKey) return
+      const args = ["opencode-status", "--name", name, "--status", status]
+      if (context) args.push("--context", context)
+      if (detail) args.push("--detail", detail)
+      const reply = await rpc(args, name)
+      if (reply && gen === generation) {
+        lastReportedStatusKey = key
+        log("DEBUG", "plugin.status", name, { status, context })
       }
+    })
+    statusChain = run.catch(() => {})
+    return run
+  }
+
+  // Tool activity for status/`events --cmd`/`--file`. hcom derives the detail
+  // from the tool's status_detail mapping; long strings (write content, patch
+  // bodies) are capped so argv stays small.
+  function reportTool(tool: string, input: unknown): Promise<void> {
+    const gen = generation
+    const args: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(input && typeof input === "object" ? input : {})) {
+      args[key] = typeof value === "string" && value.length > 2000 ? value.slice(0, 2000) : value
     }
-    return hcomAvailable
-  }
-
-  function isBoundSession(candidateSessionId?: string | null): boolean {
-    return !candidateSessionId || !sessionId || candidateSessionId === sessionId
-  }
-
-  function ignoreForeignSession(event: string, candidateSessionId?: string | null): boolean {
-    if (isBoundSession(candidateSessionId)) return false
-    log("DEBUG", event, instanceName, {
-      session_id: candidateSessionId,
-      bound_session_id: sessionId,
+    const run = statusChain.then(async () => {
+      const name = instanceName
+      if (!name || gen !== generation) return
+      const reply = await rpc(["opencode-status", "--name", name, "--tool", tool, "--input-json", JSON.stringify(args)], name)
+      // The tool detail is a form of active: a later sync must not overwrite it
+      // with a bare active, but must still report the idle edge.
+      if (reply && gen === generation) lastReportedStatusKey = statusKey("active")
     })
-    return true
+    statusChain = run.catch(() => {})
+    return run
   }
 
-  function formatMessagesForInjection(messages: any[], recipientName: string): string {
-    const parts = messages.map((m: any) => {
-      const prefix = m.intent
-        ? m.thread
-          ? `[${m.intent}:${m.thread} #${m.event_id}]`
-          : `[${m.intent} #${m.event_id}]`
-        : m.thread
-          ? `[thread:${m.thread} #${m.event_id}]`
-          : `[new message #${m.event_id}]`
-      return `${prefix} ${m.from} -> ${recipientName}: ${m.message}`
-    })
-    if (messages.length === 1) return `<hcom>${parts[0]}</hcom>`
-    return `<hcom>[${messages.length} new messages] | ${parts.join(" | ")}</hcom>`
+  function stopNotifyServer(): void {
+    try { notifyServer?.close() } catch {}
+    notifyServer = null
   }
 
-  function schedulePendingDelivery(sid: string, reason: string): void {
+  function startReconcileTimer(): void {
+    if (reconcileTimer) return
+    reconcileTimer = setInterval(() => { void reconcile() }, RECONCILE_MS)
+    reconcileTimer.unref?.()
+  }
+
+  function stopReconcileTimer(): void {
+    if (reconcileTimer) clearInterval(reconcileTimer)
+    reconcileTimer = null
+  }
+
+  function reset(): void {
+    generation++
+    stopNotifyServer()
+    stopReconcileTimer()
+    instanceName = null
+    sessionId = null
+    bootstrapText = null
+    bindingPromise = null
+    delivery = null
+    deliveryInFlight = false
+    deliveryPending = false
+    deliveryRetryScheduled = false
+    unadmittedRetries = 0
+    ackInFlight = null
+    statusChain = Promise.resolve()
+    lastReportedStatusKey = null
+    sessionBusy = false
+    pendingPermissions.clear()
+    pendingQuestions.clear()
+    filledWakes.clear()
+    currentAgent = launchedAgent
+    currentModel = launchedModel
+  }
+
+  async function bindIdentity(sid: string): Promise<void> {
+    if (instanceName) return
+    if (bindingPromise) return bindingPromise
+    if (disposed || process.env.HCOM_LAUNCHED !== "1") return
+    const gen = generation
+    const attempt = (async () => {
+      let server: Server | null = null
+      try {
+        // Start the notify server before binding so its port registers atomically.
+        server = await startNotifyServer(() => {
+          log("DEBUG", "notify_server.wake", instanceName, { pending_ack: delivery?.ackId ?? null })
+          void deliverPending("notify")
+        })
+        const port = serverPort(server)
+        const args = ["opencode-start", "--session-id", sid]
+        if (port) args.push("--notify-port", String(port))
+        const reply = await rpc(args, null)
+        if (gen !== generation || disposed) return
+        if (!reply || typeof reply.name !== "string" || !reply.name) {
+          log("WARN", "plugin.bind_failed", null, { reply })
+          return
+        }
+        const boundModel = normalizePromptModel(reply.model)
+        if (typeof reply.agent === "string") launchedAgent = reply.agent
+        if (boundModel) launchedModel = boundModel
+        notifyServer = server
+        server = null
+        instanceName = reply.name
+        sessionId = typeof reply.session_id === "string" && reply.session_id ? reply.session_id : sid
+        bootstrapText = typeof reply.bootstrap === "string" && reply.bootstrap ? reply.bootstrap : null
+        currentAgent = launchedAgent
+        currentModel = launchedModel
+        // opencode-start leaves the instance listening.
+        lastReportedStatusKey = statusKey("listening")
+        startReconcileTimer()
+        log("INFO", "plugin.bound", instanceName, {
+          session_id: sessionId,
+          notify_port: port,
+          bootstrap_len: bootstrapText?.length ?? 0,
+          launched_agent: launchedAgent,
+          launched_model: launchedModel?.modelID ?? null,
+        })
+      } catch (e) {
+        log("ERROR", "plugin.bind_error", null, { error: String(e) })
+      } finally {
+        // Not adopted (failed, or reset while binding): don't leak the listener.
+        server?.close()
+        if (gen === generation) bindingPromise = null
+      }
+    })()
+    bindingPromise = attempt
+    await attempt
+  }
+
+  // Replay a wake that was queued while delivery was gated. The microtask +
+  // dedup flag collapse a burst of queued wakes into one pass.
+  function drainPendingDelivery(reason: string): void {
+    if (!deliveryPending || deliveryInFlight || delivery || blocked()) return
+    deliveryPending = false
     if (deliveryRetryScheduled) return
     deliveryRetryScheduled = true
     log("DEBUG", "plugin.delivery_retry_scheduled", instanceName, { reason })
     queueMicrotask(() => {
       deliveryRetryScheduled = false
-      if (!instanceName) return
-      void deliverPendingToIdle(sid)
+      void deliverPending(reason)
     })
   }
 
-  // Re-arm a queued wake once nothing is mid-flight. The pendingAckId guard
-  // leaves the still-injecting case to the post-ack drain so we do not
-  // double-deliver the same unread message batch.
-  function drainPendingDelivery(sid: string, reason: string): void {
-    if (deliveryPending && pendingAckId === null) {
-      deliveryPending = false
-      schedulePendingDelivery(sid, reason)
-    }
-  }
-
-  // Deliver pending messages via promptAsync. Ack is deferred to transform
-  // (fires on the loop iteration that actually processes the user message).
-  //
-  // Three-layer serialization:
-  //   deliveryInFlight — guard flag set synchronously before the first await.
-  //     Closes the TOCTOU window where TCP notify and idle-status wake paths
-  //     could both pass a null check before either one set the value.
-  //     Concurrent callers set deliveryPending so their wake is replayed after
-  //     the current pass, or after the current injected message is acked.
-  //   pendingAckId — set after messages are read, cleared by transform.
-  //     Prevents re-delivery while a prior injection is still being processed.
-  //     If promptAsync fails to queue, pendingAckId is cleared immediately.
-  //   deliveryPending — a wake that arrived while delivery was in-flight or an
-  //     injection was pending ack. drainPendingDelivery replays it at each exit
-  //     point: normal finally, deferred ack, and promptAsync rejection.
-  async function deliverPendingToIdle(sid: string): Promise<boolean> {
-    if (disposed) return false
-    if (permissionPending) {
-      log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "permission_pending" })
-      return false
-    }
-    if (!instanceName) return false
-    if (ignoreForeignSession("plugin.delivery_ignored_foreign_session", sid)) {
-      return false
-    }
-    if (deliveryInFlight) {
+  async function deliverPending(reason: string): Promise<void> {
+    const name = instanceName
+    const sid = sessionId
+    const gen = generation
+    if (disposed || !name || !sid) return
+    if (deliveryInFlight || delivery || blocked()) {
+      // Drop nothing: replayed once the gate clears.
       deliveryPending = true
-      log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "delivery_in_flight", queued: true })
-      return false
-    }
-    if (pendingAckId !== null) {
-      deliveryPending = true
-      log("DEBUG", "plugin.delivery_skipped", instanceName, { reason: "pending_ack_in_flight", pending_ack: pendingAckId, queued: true })
-      return false
+      log("DEBUG", "plugin.delivery_skipped", name, {
+        reason: deliveryInFlight ? "delivery_in_flight" : delivery ? "awaiting_admission" : "blocked",
+        pending_ack: delivery?.ackId ?? null,
+        wake: reason,
+      })
+      return
     }
     deliveryInFlight = true
     try {
-      const msgResult = await $.nothrow()`hcom opencode-read --name ${instanceName}`.quiet()
-      // Unacked messages stay unread, so the next plugin instance delivers them.
-      if (disposed) return false
-      if (msgResult.exitCode !== 0) {
-        log("WARN", "plugin.delivery_read_failed", instanceName, { exit_code: msgResult.exitCode, stderr: msgResult.stderr.toString().slice(0, 200) })
-        return false
+      const batch = await readBatch(name)
+      if (gen !== generation || disposed || !batch || batch.messages.length === 0) return
+      const sent: Delivery = {
+        text: formatMessagesForInjection(batch.messages, name),
+        ackId: batch.ackId,
+        hasMore: batch.hasMore,
+        messageID: newMessageID(),
+        sentAt: Date.now(),
+        admitted: false,
       }
-      let rawMessages: any[] = []
-      try { rawMessages = JSON.parse(msgResult.text()) } catch (e) {
-        log("WARN", "plugin.delivery_parse_failed", instanceName, { error: String(e), raw: msgResult.text().slice(0, 200) })
-        return false
-      }
-      if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
-        log("DEBUG", "plugin.delivery_no_messages", instanceName)
-        return false
-      }
-
-      const maxId = Math.max(...rawMessages.map((m: any) => m.event_id || 0))
-      if (maxId === 0) return false
-
-      const formatted = formatMessagesForInjection(rawMessages, instanceName)
-      // Don't ack here — defer to transform so cursor advances only when
-      // the loop is actually processing the message. This keeps messages
-      // unread until delivery is confirmed.
-      pendingAckId = maxId
-      log("DEBUG", "plugin.delivery_payload", instanceName, {
-        session_id: sid,
-        current_agent: currentAgent,
-        current_model: currentModel?.modelID ?? null,
-        current_variant: currentModel?.variant ?? null,
-      })
+      // Set before prompting: admission can be observed before the call returns.
+      delivery = sent
+      let error: string | null
       try {
-        // Runtime contract note: keep this cast until the plugin's bundled client
-        // typings are aligned across shipped OpenCode builds.
-        const promptAsyncResult = client.session.promptAsync({
-          path: { id: sid },
-          body: {
-            agent: currentAgent ?? undefined,
-            model: promptModelRef(currentModel),
-            variant: currentModel?.variant ?? undefined,
-            parts: [{ type: "text", text: formatted }],
-          },
-        } as any) // SDK types don't expose agent/model on the async variant; body shape matches the sync prompt endpoint
-        if (promptAsyncResult && typeof (promptAsyncResult as Promise<unknown>).then === "function") {
-          void (promptAsyncResult as Promise<unknown>).catch((e) => {
-            if (pendingAckId === maxId) pendingAckId = null
-            log("ERROR", "plugin.delivery_prompt_failed", instanceName, {
-              error: String(e),
-              pending_ack: maxId,
-            })
-            drainPendingDelivery(sid, "prompt_async_failed_pending_wake")
-          })
-        }
-      } catch (e) {
-        pendingAckId = null
-        log("ERROR", "plugin.delivery_prompt_failed", instanceName, {
-          error: String(e),
-          pending_ack: maxId,
-          sync_throw: true,
+        error = await transport.prompt({
+          sessionID: sid,
+          text: sent.text,
+          agent: currentAgent,
+          model: currentModel,
+          messageID: sent.messageID,
         })
-        return false
+      } catch (e) {
+        error = String(e)
       }
-      log("INFO", "plugin.delivery_pending", instanceName, {
-        msg: `promptAsync, ack deferred to transform (maxId=${maxId})`,
-        count: rawMessages.length,
-        pending_ack: maxId,
-      })
-      return true
+      if (gen !== generation) return
+      if (error) {
+        // Retried on the next wake or idle edge, not at once, so a prompt that
+        // keeps failing (e.g. missing auth) is not resent in a loop.
+        if (delivery === sent && !sent.admitted) delivery = null
+        deliveryPending = false
+        log("ERROR", "plugin.delivery_prompt_failed", name, { error: error.slice(0, 300), ack_id: sent.ackId })
+        return
+      }
+      log("INFO", "plugin.delivery_sent", name, { count: batch.messages.length, ack_id: sent.ackId, wake: reason })
     } finally {
-      deliveryInFlight = false
-      drainPendingDelivery(sid, "delivery_in_flight_wake")
+      if (gen === generation) {
+        deliveryInFlight = false
+        drainPendingDelivery("delivery_in_flight_wake")
+      }
     }
   }
 
-  // Periodic status sync: polls session status API as a retry mechanism
-  // in case the event-driven opencode-status call failed (subprocess error,
-  // daemon down, etc. other made up scenario etc.). Does NOT deliver messages — that's handled by
-  // TCP notify (on message arrival) and session.status events (on idle).
+  // Acknowledge an admitted delivery. Serialized; on failure the delivery stays
+  // outstanding (gating redelivery) and reconcile retries.
+  function flushAck(source: string): Promise<void> {
+    if (ackInFlight) return ackInFlight
+    const sent = delivery
+    const name = instanceName
+    const gen = generation
+    if (!sent?.admitted || !name) return Promise.resolve()
+    const attempt = (async () => {
+      const reply = await rpc(["opencode-read", "--name", name, "--ack", "--up-to", String(sent.ackId)], name)
+      if (gen !== generation || delivery !== sent) return
+      if (reply?.acked_to !== sent.ackId) {
+        if (reply) log("WARN", "plugin.rpc_failed", name, { command: "opencode-read", error: "unexpected ack reply", reply })
+        return
+      }
+      delivery = null
+      log("INFO", "plugin.delivery_acked", name, { acked_to: sent.ackId, source, has_more: sent.hasMore })
+      if (sent.hasMore) deliveryPending = true
+      drainPendingDelivery("post_ack_wake")
+    })().finally(() => {
+      if (gen === generation) ackInFlight = null
+    })
+    ackInFlight = attempt
+    return attempt
+  }
+
+  function admit(source: string): void {
+    const sent = delivery
+    if (!sent || sent.admitted) return
+    sent.admitted = true
+    unadmittedRetries = 0
+    log("DEBUG", "plugin.delivery_admitted", instanceName, { ack_id: sent.ackId, source })
+    void flushAck(source)
+  }
+
+  // A delivery is never admitted when OpenCode rejects or drops the prompt;
+  // once the session sits idle past the grace period, release it. The idle
+  // edge may already have passed, so redeliver now, a bounded number of times
+  // in a row; past that, only the next wake retries.
+  function releaseUnadmitted(reason: string): void {
+    const sent = delivery
+    if (!sent || sent.admitted || deliveryInFlight || sessionBusy) return
+    if (Date.now() - sent.sentAt < ADMIT_GRACE_MS) return
+    delivery = null
+    const retry = unadmittedRetries < MAX_UNADMITTED_RETRIES
+    if (retry) unadmittedRetries++
+    deliveryPending = retry
+    log("WARN", "plugin.delivery_not_admitted", instanceName, { ack_id: sent.ackId, reason, retry })
+    drainPendingDelivery("not_admitted")
+  }
+
+  // Take the next batch for a body-free wake the user's prompt already carries.
+  // With a `messageID` (OpenCode 2) it is admitted when that prompt is
+  // delivered; otherwise at once, since OpenCode 1 refills the same text into
+  // every later request of the session.
+  async function claimWake(sid: string, messageID = ""): Promise<string | null> {
+    const name = instanceName
+    const gen = generation
+    if (!name || !isBoundSession(sid) || delivery || deliveryInFlight) return null
+    deliveryInFlight = true
+    try {
+      const batch = await readBatch(name)
+      if (gen !== generation || !batch || batch.messages.length === 0) return null
+      const text = formatMessagesForInjection(batch.messages, name)
+      delivery = {
+        text,
+        ackId: batch.ackId,
+        hasMore: batch.hasMore,
+        messageID,
+        sentAt: Date.now(),
+        admitted: false,
+      }
+      log("INFO", "plugin.wake_filled", name, { ack_id: batch.ackId, count: batch.messages.length })
+      if (!messageID) admit("wake_fill")
+      return text
+    } finally {
+      if (gen === generation) {
+        deliveryInFlight = false
+        drainPendingDelivery("wake_fill")
+      }
+    }
+  }
+
+  // Periodic sync: retries failed status writes and acks, and recovers state
+  // from the host when it can report it. Delivery itself is driven by the
+  // notify server and the idle edge.
   async function reconcile(): Promise<void> {
-    if (reconcileInFlight) return
-    if (permissionPending) return
-    if (!instanceName || !sessionId) return
+    if (reconcileInFlight || !instanceName || !sessionId) return
     reconcileInFlight = true
     try {
-      const statusResult = await client.session.status()
-      if (!statusResult.data) return
-      const current = statusResult.data[sessionId]
-      const isIdle = !current || current.type === "idle"
-      const hcomStatus = isIdle ? "listening" : "active"
-      if (hcomStatus !== lastReportedStatus) {
-        lastReportedStatus = hcomStatus
-        await $.nothrow()`hcom opencode-status --name ${instanceName} --status ${hcomStatus}`.quiet()
-        log("INFO", "plugin.reconcile_status", instanceName, { status: hcomStatus })
-      }
+      const status = await transport.status(sessionId).catch(() => null)
+      if (status) setBusy(status === "busy")
+      await syncStatus()
+      if (delivery?.admitted) await flushAck("reconcile")
+      releaseUnadmitted("reconcile")
     } catch (e) {
       log("ERROR", "plugin.reconcile_error", instanceName, { error: String(e) })
     } finally {
@@ -337,459 +624,373 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
     }
   }
 
-  function startReconcileTimer(): void {
-    stopReconcileTimer()
-    reconcileTimer = setInterval(() => { reconcile() }, 5_000)
-  }
-
-  function stopReconcileTimer(): void {
-    if (reconcileTimer) { clearInterval(reconcileTimer); reconcileTimer = null }
-  }
-
-  // TCP notify server: instant wake when hcom messages arrive.
-  // `crate::notify::wake_all` TCP-connects to this port on every send.
-  function startNotifyServer(): number | null {
-    if (notifyServer) return notifyServer.port
-    try {
-      notifyServer = Bun.listen({
-        hostname: "127.0.0.1",
-        port: 0,
-        socket: {
-          open(socket) {
-            socket.end()
-            log("DEBUG", "notify_server.wake", instanceName, { status: lastReportedStatus, pending_ack: pendingAckId })
-            if (sessionId && instanceName) deliverPendingToIdle(sessionId)
-          },
-          data() {},
-          close() {},
-          error() {},
-        },
-      })
-      log("INFO", "notify_server.started", instanceName, { port: notifyServer.port })
-      return notifyServer.port
-    } catch (e) {
-      log("ERROR", "notify_server.start_failed", instanceName, { error: String(e) })
-      return null
+  function setBusy(busy: boolean): void {
+    sessionBusy = busy
+    // An idle session is not waiting on the user: drop requests whose reply
+    // event was missed, so they cannot gate delivery forever.
+    if (!busy) {
+      pendingPermissions.clear()
+      pendingQuestions.clear()
     }
   }
 
-  function stopNotifyServer(): void {
-    if (notifyServer) {
-      try { notifyServer.stop(true) } catch {}
-      notifyServer = null
+  // OpenCode 1/Kilo: answer a bash request for exactly one safe hcom command,
+  // when auto-approve is on (hcom decides). Done here rather than with config
+  // rules, which would replace a user's own plain `"bash": "..."` setting.
+  async function approveHcomCommand(requestID: string, properties: any): Promise<boolean> {
+    const name = instanceName
+    const sid = sessionId
+    const command = properties.metadata?.command
+    if (!transport.allowOnce || !name || !sid || properties.permission !== "bash" || typeof command !== "string") return false
+    const reply = await rpc(["opencode-approve", "--name", name, "--command", command], name)
+    if (reply?.approve !== true) return false
+    const error = await transport.allowOnce(sid, requestID).catch((e) => String(e))
+    if (error) {
+      log("WARN", "plugin.auto_approve_failed", name, { request_id: requestID, error: error.slice(0, 300) })
+      return false
     }
+    log("INFO", "plugin.auto_approved", name, { request_id: requestID })
+    return true
   }
 
-  async function bindIdentity(sid: string): Promise<void> {
-    if (instanceName || bindingPromise) return
-    if (process.env.HCOM_LAUNCHED !== "1") return
+  function bindingEventSession(event: HcomEvent): string | undefined {
+    const properties = event.properties
+    switch (event.type) {
+      case "session.created":
+        return properties?.info?.id
+      case "session.status":
+      case "permission.asked":
+        return properties?.sessionID
+    }
+    return undefined
+  }
 
-    bindingPromise = (async () => {
-      try {
-        // Start TCP notify server before binding so port is registered atomically
-        const notifyPort = startNotifyServer()
-        const result = notifyPort
-          ? await $.nothrow()`hcom opencode-start --session-id ${sid} --notify-port ${String(notifyPort)}`.quiet()
-          : await $.nothrow()`hcom opencode-start --session-id ${sid}`.quiet()
-        if (result.exitCode !== 0) { stopNotifyServer(); return }
-        const json = JSON.parse(result.text())
-        if (json.error) {
-          log("WARN", "plugin.bind_failed", null, { error: json.error })
-          stopNotifyServer()
-          return
+  async function onEvent(event: HcomEvent): Promise<void> {
+    const properties = event.properties ?? {}
+    const bindSession = bindingEventSession(event)
+    if (typeof bindSession === "string" && !instanceName) await bindIdentity(bindSession)
+    else if (bindingPromise) await bindingPromise
+    const eventSession = event.type === "session.created" ? properties.info?.id : properties.sessionID
+    if (!instanceName || !isBoundSession(eventSession)) return
+
+    switch (event.type) {
+      case "session.status": {
+        const type = properties.status?.type
+        log("DEBUG", "plugin.session_status", instanceName, { status: type })
+        setBusy(type !== "idle")
+        await syncStatus()
+        if (type === "idle") {
+          releaseUnadmitted("idle")
+          deliveryPending = true
+          drainPendingDelivery("idle")
         }
-        const boundModel = normalizePromptModel(json.model)
-        if (typeof json.agent === "string") launchedAgent = json.agent
-        if (boundModel) launchedModel = boundModel
-        instanceName = json.name
-        sessionId = json.session_id
-        bootstrapText = json.bootstrap || null
-        currentAgent = launchedAgent
-        currentModel = launchedModel
-        log("INFO", "plugin.bound", instanceName, {
-          session_id: sessionId,
-          notify_port: notifyPort,
-          bootstrap_len: bootstrapText?.length ?? 0,
-          launched_agent: launchedAgent,
-          launched_model: launchedModel?.modelID ?? null,
-        })
-      } catch (e) {
-        log("ERROR", "plugin.bind_error", null, { error: String(e) })
-        stopNotifyServer()
-      } finally {
-        bindingPromise = null
+        break
       }
-    })()
-    await bindingPromise
+      case "permission.asked": {
+        const id = String(properties.id ?? "")
+        if (await approveHcomCommand(id, properties)) break
+        pendingPermissions.set(id, String(properties.permission ?? ""))
+        log("INFO", "plugin.permission_asked", instanceName, { permission: properties.permission, request_id: id })
+        await syncStatus()
+        break
+      }
+      case "permission.replied": {
+        const id = properties.requestID ?? properties.permissionID
+        if (typeof id === "string") pendingPermissions.delete(id)
+        else pendingPermissions.clear()
+        await syncStatus()
+        deliveryPending = true
+        drainPendingDelivery("permission_replied")
+        break
+      }
+      case "question.asked": {
+        // Kilo marks questions that leave the prompt usable as non-blocking.
+        if (properties.blocking === false) break
+        pendingQuestions.add(String(properties.id ?? ""))
+        log("INFO", "plugin.question_asked", instanceName, { request_id: properties.id })
+        await syncStatus()
+        break
+      }
+      case "question.replied":
+      case "question.rejected": {
+        if (typeof properties.requestID === "string") pendingQuestions.delete(properties.requestID)
+        else pendingQuestions.clear()
+        await syncStatus()
+        deliveryPending = true
+        drainPendingDelivery("question_answered")
+        break
+      }
+      case "session.inbox.delivered":
+        if (delivery && properties.inboxID === delivery.messageID) admit("inbox_delivered")
+        break
+      case "session.inbox.cancelled":
+        if (delivery && !delivery.admitted && properties.inboxID === delivery.messageID) {
+          log("WARN", "plugin.delivery_cancelled", instanceName, { ack_id: delivery.ackId })
+          delivery = null
+          deliveryPending = false
+        }
+        break
+      case "session.deleted": {
+        const name = instanceName
+        log("INFO", "plugin.session_deleted", name)
+        reset()
+        await rpc(["opencode-stop", "--name", name, "--reason", "closed"], name)
+        break
+      }
+    }
+  }
+
+  async function onChatMessage(input: any): Promise<void> {
+    const sid = input?.sessionID
+    if (typeof sid !== "string") return
+    if (!instanceName) await bindIdentity(sid)
+    else if (bindingPromise) await bindingPromise
+    if (!isBoundSession(sid)) return
+    if (input.agent) currentAgent = input.agent
+    const resolvedModel = normalizePromptModel(input.model, input.variant)
+    if (resolvedModel) currentModel = resolvedModel
+    log("DEBUG", "plugin.chat_message", instanceName, {
+      agent: input.agent,
+      model: input.model?.modelID,
+      variant: input.variant,
+    })
+  }
+
+  // OpenCode 1: the model request's messages, editable for this request only.
+  async function onMessagesTransform(messages: any[]): Promise<void> {
+    const sid = messages.find((m) => typeof m?.info?.sessionID === "string")?.info.sessionID
+    if (!sid) return
+    if (bindingPromise) await bindingPromise
+    if (!instanceName || !isBoundSession(sid)) return
+    const users = messages.filter((m) => m?.info?.role === "user" && Array.isArray(m.parts))
+    const textParts = (m: any) => m.parts.filter((p: any) => p?.type === "text" && typeof p.text === "string")
+    const partKey = (m: any, p: any) => String(p.id ?? `${m.info.id}:${m.parts.indexOf(p)}`)
+
+    for (const m of users) {
+      for (const p of textParts(m)) {
+        const filled = filledWakes.get(partKey(m, p))
+        if (filled) p.text = filled
+      }
+    }
+
+    const first = users[0]
+    if (bootstrapText && first) {
+      first.parts.push({
+        id: crypto.randomUUID(),
+        messageID: first.info.id,
+        sessionID: first.info.sessionID,
+        type: "text",
+        text: bootstrapText,
+        synthetic: true,
+      })
+    }
+
+    const last = users.at(-1)
+    const wake = last && textParts(last).find((p: any) => !p.synthetic && isWakeText(p.text) && !filledWakes.has(partKey(last, p)))
+    if (wake) {
+      const text = await claimWake(sid)
+      if (text) {
+        wake.text = text
+        filledWakes.set(partKey(last, wake), text)
+      }
+    }
+
+    const sent = delivery
+    if (sent && !sent.admitted && users.some((m) => textParts(m).some((p: any) => p.text === sent.text))) {
+      admit("transform")
+    }
+  }
+
+  // OpenCode 2: the prompt before it is stored, so a filled wake persists.
+  async function onPrompt(sid: string, messageID: string, text: string): Promise<string | null> {
+    await onChatMessage({ sessionID: sid })
+    if (!isWakeText(text)) return null
+    return claimWake(sid, messageID)
+  }
+
+  function bootstrapFor(sid: unknown): string | null {
+    return instanceName && isBoundSession(sid) ? bootstrapText : null
+  }
+
+  function compactionContext(sid: unknown): string | null {
+    if (!instanceName || !isBoundSession(sid)) return null
+    log("INFO", "plugin.compaction_reset", instanceName)
+    return `You are connected to hcom as "${instanceName}". Use --name ${instanceName} for all hcom commands.`
+  }
+
+  // After a gap in the host's event stream: re-read state and deliver anything
+  // the missed events would have.
+  function resync(): void {
+    void reconcile().then(() => {
+      if (!sessionBusy) {
+        deliveryPending = true
+        drainPendingDelivery("resync")
+      }
+    })
   }
 
   // Resumed session (`hcom r`): OpenCode emits no session.created, and no
   // session.status until the first prompt, so bind now and deliver anything
-  // already pending. Without this, messages waited for the user to type.
-  // Not awaited: plugin load must not wait on hcom.
+  // already pending. Not awaited: plugin load must not wait on hcom.
   const resumeSessionId = process.env.HCOM_RESUME_SESSION_ID
-  if (resumeSessionId && checkHcom()) {
+  if (resumeSessionId) {
     void (async () => {
       await bindIdentity(resumeSessionId)
       if (disposed || !instanceName || sessionId !== resumeSessionId) return
       log("INFO", "plugin.resume_bound", instanceName, { session_id: sessionId })
-      lastReportedStatus = "listening"
-      startReconcileTimer()
-      await deliverPendingToIdle(resumeSessionId)
+      await deliverPending("resume")
     })().catch((e) => log("ERROR", "plugin.resume_bind_error", instanceName, { error: String(e) }))
   }
 
+  async function guarded(name: string, fn: () => Promise<void>): Promise<void> {
+    try {
+      await fn()
+    } catch (e) {
+      log("ERROR", name, instanceName, { error: String(e) })
+    }
+  }
+
   return {
-    event: async ({ event }: { event: HcomEvent }) => {
+    event: (event: HcomEvent) => guarded("plugin.event_error", () => onEvent(event)),
+    chatMessage: (input: any) => guarded("plugin.chat_message_error", () => onChatMessage(input)),
+    toolBefore: (sid: unknown, tool: string, input: unknown) =>
+      guarded("plugin.tool_status_error", async () => {
+        if (instanceName && isBoundSession(sid)) await reportTool(tool, input)
+      }),
+    messagesTransform: (messages: any[]) => guarded("plugin.transform_error", () => onMessagesTransform(messages)),
+    prompt: async (sid: string, messageID: string, text: string) => {
       try {
-        if (!checkHcom()) return
-        const eventSessionId = eventSessionID(event)
-        if (eventSessionId && !sessionId) {
-          sessionId = eventSessionId as string
-        }
-        if (instanceName && ignoreForeignSession("plugin.event_ignored_foreign_session", eventSessionId)) {
-          return
-        }
-        switch (event.type) {
-          case "session.created": {
-            const createdSessionId = event.properties.info.id
-            log("INFO", "plugin.session_created", instanceName, { session_id: createdSessionId })
-            if (createdSessionId && !instanceName && !bindingPromise) {
-              await bindIdentity(createdSessionId)
-            }
-            break
-          }
-          case "permission.asked": {
-            permissionPending = true
-            const eventSessionId = event.properties.sessionID
-            if (eventSessionId && !instanceName && !bindingPromise) {
-              await bindIdentity(eventSessionId)
-            }
-            if (instanceName) {
-              lastReportedStatus = "blocked"
-              await $.nothrow()`hcom opencode-status --name ${instanceName} --status blocked --context ${"approval"} --detail ${String(event.properties.permission ?? "")}`.quiet()
-              log("INFO", "plugin.permission_asked", instanceName, { permission: event.properties.permission, request_id: event.properties.id })
-            }
-            break
-          }
-          case "permission.replied": {
-            permissionPending = false
-            const eventSessionId = event.properties.sessionID
-            if (instanceName) {
-              const statusResult = await client.session.status()
-              const current = eventSessionId ? statusResult.data?.[eventSessionId] : null
-              const hcomStatus = !current || current.type === "idle" ? "listening" : "active"
-              lastReportedStatus = hcomStatus
-              await $.nothrow()`hcom opencode-status --name ${instanceName} --status ${hcomStatus}`.quiet()
-              if (hcomStatus === "listening" && eventSessionId) {
-                await deliverPendingToIdle(eventSessionId)
-              }
-            }
-            break
-          }
-          case "session.status": {
-            const statusType = event.properties.status.type
-            const eventSessionId = event.properties.sessionID
-
-            log("DEBUG", "plugin.session_status", instanceName, { status: statusType })
-
-            // Bind identity on resume (session.created doesn't fire for existing sessions)
-            if (eventSessionId && !instanceName && !bindingPromise) {
-              await bindIdentity(eventSessionId)
-            }
-
-            // Report status to hcom daemon (skip if unchanged)
-            if (permissionPending) {
-              startReconcileTimer()
-              break
-            }
-            if (instanceName) {
-              const hcomStatus = statusType === "idle" ? "listening" : "active"
-              if (hcomStatus !== lastReportedStatus) {
-                lastReportedStatus = hcomStatus
-                await $.nothrow()`hcom opencode-status --name ${instanceName} --status ${hcomStatus}`.quiet()
-              }
-              // Ensure reconcile timer is running (catches missed idle events)
-              startReconcileTimer()
-            }
-
-            // Idle transition: deliver any pending messages
-            if (statusType === "idle" && instanceName && eventSessionId) {
-              await deliverPendingToIdle(eventSessionId)
-            }
-            break
-          }
-          case "session.deleted":
-            log("INFO", "plugin.session_deleted", instanceName)
-            stopNotifyServer()
-            stopReconcileTimer()
-            if (instanceName) {
-              await $.nothrow()`hcom opencode-stop --name ${instanceName} --reason closed`.quiet()
-            }
-            instanceName = null
-            sessionId = null
-            bootstrapText = null
-            bindingPromise = null
-            lastReportedStatus = null
-            pendingAckId = null
-            deliveryInFlight = false
-            deliveryPending = false
-            deliveryRetryScheduled = false
-            permissionPending = false
-            currentAgent = launchedAgent
-            currentModel = launchedModel
-            break
-        }
+        return await onPrompt(sid, messageID, text)
       } catch (e) {
-        log("ERROR", "plugin.event_error", instanceName, { error: String(e) })
+        log("ERROR", "plugin.prompt_error", instanceName, { error: String(e) })
+        return null
       }
     },
-
-    "chat.message": async (input, output) => {
-      try {
-        if (!checkHcom()) return
-        if (input.sessionID && !sessionId) {
-          sessionId = input.sessionID
-        }
-        if (bindingPromise) await bindingPromise
-        if (input.sessionID && !instanceName) {
-          await bindIdentity(input.sessionID)
-        }
-        if (isBoundSession(input.sessionID)) {
-          if (input.agent) currentAgent = input.agent
-          const resolvedModel = normalizePromptModel(input.model, input.variant)
-          if (resolvedModel) currentModel = resolvedModel
-        } else {
-          ignoreForeignSession("plugin.chat_message_ignored_foreign_session", input.sessionID)
-        }
-        log("DEBUG", "plugin.chat_message", instanceName, {
-          session_id: input.sessionID,
-          agent: input.agent,
-          model: input.model?.modelID,
-          variant: input.variant,
-        })
-      } catch (e) {
-        log("ERROR", "plugin.chat_message_error", instanceName, { error: String(e) })
-      }
-    },
-
-    // Tool activity for status/`events --cmd`/`--file`. hcom derives the detail
-    // from the tool's status_detail mapping; long strings (write content, patch
-    // bodies) are capped so argv stays small; the fields hcom reads come first.
-    "tool.execute.before": async (input, output) => {
-      try {
-        if (!checkHcom() || !instanceName || !isBoundSession(input.sessionID)) return
-        const args: Record<string, unknown> = {}
-        for (const [key, value] of Object.entries(output.args ?? {})) {
-          args[key] = typeof value === "string" && value.length > 2000 ? value.slice(0, 2000) : value
-        }
-        // Recorded so the next idle edge is not skipped as "unchanged".
-        lastReportedStatus = "active"
-        await $.nothrow()`hcom opencode-status --name ${instanceName} --status active --tool ${input.tool} --input-json ${JSON.stringify(args)}`.quiet()
-      } catch (e) {
-        log("ERROR", "plugin.tool_status_error", instanceName, { error: String(e) })
-      }
-    },
-
-    "experimental.chat.messages.transform": async (input, output) => {
-      try {
-        if (!checkHcom()) return
-        if (bindingPromise) await bindingPromise
-        if (!instanceName && sessionId) await bindIdentity(sessionId)
-        if (!instanceName || !sessionId) return
-
-        // OpenCode transform mutations are prompt-local, not persisted to stored
-        // session history, so keep injecting the original bootstrap payload.
-        const messages = output.messages ?? []
-        const msgCount = messages.length
-        const userMsgCount = messages.filter((m: any) => m.info.role === "user").length
-        if (bootstrapText) {
-          const firstUserMsg = messages.find((m: any) => m.info.role === "user")
-          if (firstUserMsg) {
-            firstUserMsg.parts.push({
-              id: crypto.randomUUID(),
-              messageID: firstUserMsg.info.id,
-              sessionID: firstUserMsg.info.sessionID,
-              type: "text",
-              text: bootstrapText,
-              synthetic: true,
-            })
-            log("DEBUG", "plugin.transform_bootstrap", instanceName, { msg_count: msgCount, user_msgs: userMsgCount, bootstrap_len: bootstrapText.length })
-          } else {
-            log("WARN", "plugin.transform_no_user_msg", instanceName, { msg_count: msgCount })
-          }
-        } else {
-          log("DEBUG", "plugin.transform_no_bootstrap", instanceName, { msg_count: msgCount, user_msgs: userMsgCount })
-        }
-
-        // Bootstrap body fill: the PTY bootstrap injects a bodyless <hcom> tag
-        // (no message text, just envelope) because the TUI input box can't safely
-        // hold arbitrary message bodies (@ triggers, width overflow). The transform
-        // hook fires on the same loop iteration, so we fetch the real body here,
-        // replace the bodyless tag, and ack — giving the agent the full message on
-        // its first turn without a wasted round-trip.
-        const lastUserMsg = [...messages].reverse().find((m: any) => m.info.role === "user")
-        if (lastUserMsg && lastUserMsg.parts) {
-          const textPart = lastUserMsg.parts.find((p: any) =>
-            p.type === "text" && !p.synthetic && typeof p.text === "string" &&
-            p.text.startsWith("<hcom>") && p.text.endsWith("</hcom>") && !p.text.includes(": ")
-          )
-          if (textPart?.type === "text" && pendingAckId === null) {
-            const msgResult = await $.nothrow()`hcom opencode-read --name ${instanceName}`.quiet()
-            if (msgResult.exitCode === 0) {
-              let rawMessages: any[] = []
-              try { rawMessages = JSON.parse(msgResult.text()) } catch {}
-              if (Array.isArray(rawMessages) && rawMessages.length > 0) {
-                const maxId = Math.max(...rawMessages.map((m: any) => m.event_id || 0))
-                if (maxId > 0) {
-                  const formatted = formatMessagesForInjection(rawMessages, instanceName)
-                  textPart.text = formatted
-                  pendingAckId = maxId
-                  log("INFO", "plugin.transform_bootstrap_delivery", instanceName, { max_id: maxId, msg_count: rawMessages.length })
-                }
-              }
-            }
-          }
-        }
-
-        // Deferred ack: deliverPendingToIdle called promptAsync but didn't ack.
-        // Transform fires on the loop iteration processing that message — ack now.
-        if (pendingAckId !== null) {
-          const ackId = pendingAckId
-          pendingAckId = null
-          await $.nothrow()`hcom opencode-read --name ${instanceName} --ack --up-to ${String(ackId)}`.quiet()
-          log("INFO", "plugin.deferred_ack", instanceName, { acked_to: ackId })
-          if (deliveryPending && sessionId) {
-            drainPendingDelivery(sessionId, "post_ack_pending_wake")
-          }
-        }
-      } catch (e) {
-        log("ERROR", "plugin.transform_error", instanceName, { error: String(e) })
-      }
-    },
-
-    "experimental.session.compacting": async (input, output) => {
-      try {
-        if (!checkHcom()) return
-        if (!instanceName) return
-
-        output.context.push(
-          `You are connected to hcom as "${instanceName}". ` +
-          `Use --name ${instanceName} for all hcom commands.`
-        )
-        log("INFO", "plugin.compaction_reset", instanceName)
-      } catch (e) {
-        log("ERROR", "plugin.compaction_error", instanceName, { error: String(e) })
-      }
-    },
-
+    bootstrapFor,
+    compactionContext,
+    resync,
     // Plugin unload, not session end: the hcom instance stays bound, since a
     // reloaded plugin rebinds the same session.
     dispose: async () => {
       disposed = true
+      generation++
       stopNotifyServer()
       stopReconcileTimer()
     },
   }
 }
 
-// OpenCode 2 loads plugins from the module's default export and hands `setup`
-// a context with no v1 `client`/`$`. Typed structurally: the published
-// @opencode-ai/plugin types do not describe the v2 session and event domains.
-type V2Event = { type: string; data: Record<string, any> }
-type V2TextPart = { type: string; text?: string }
-type V2Draft = {
-  sessionID: string
-  system: V2TextPart[]
-  messages?: { id?: string; role: string; content: V2TextPart[] }[]
-}
-type V2Registration = { dispose: () => Promise<void> }
-type V2Model = { providerID: string; id: string; variant?: string }
-type V2Context = {
-  event: { subscribe: (options?: { signal?: AbortSignal }) => AsyncIterable<V2Event> }
-  agent: { transform: (edit: (editor: { default: (id: string) => void }) => void) => Promise<V2Registration> }
-  session: {
-    prompt: (input: { sessionID: string; text: string; delivery?: "steer" | "queue" }) => Promise<unknown>
-    switchModel: (input: { sessionID: string; model: V2Model }) => Promise<unknown>
-    hook: (name: string, callback: (draft: any) => Promise<void> | void) => Promise<V2Registration>
+export const HcomPlugin: Plugin = async ({ client }) => {
+  if (!claimPluginHost()) return {}
+  const core = createCore({
+    async prompt({ sessionID, text, agent, model }) {
+      // SDK types don't expose agent/model on the async variant; the body shape
+      // matches the sync prompt endpoint. The SDK resolves (not rejects) with
+      // `error` set for a refused request.
+      const result: any = await client.session.promptAsync({
+        path: { id: sessionID },
+        body: {
+          agent: agent ?? undefined,
+          model: model ? { providerID: model.providerID, modelID: model.modelID } : undefined,
+          variant: model?.variant ?? undefined,
+          parts: [{ type: "text", text }],
+        },
+      } as any)
+      return result?.error ? JSON.stringify(result.error) : null
+    },
+    async status(sessionID) {
+      const result: any = await client.session.status()
+      if (!result?.data || result.error) return null
+      const current = result.data[sessionID]
+      return !current || current.type === "idle" ? "idle" : "busy"
+    },
+    async allowOnce(sessionID, requestID) {
+      const result: any = await client.postSessionIdPermissionsPermissionId({
+        path: { id: sessionID, permissionID: requestID },
+        body: { response: "once" },
+      })
+      return result?.error ? JSON.stringify(result.error) : null
+    },
+  })
+  const hooks: Hooks = {
+    event: async ({ event }: { event: any }) => core.event(event),
+    "chat.message": async (input: any) => core.chatMessage(input),
+    "tool.execute.before": async (input: any, output: any) => core.toolBefore(input.sessionID, input.tool, output.args),
+    "experimental.chat.messages.transform": async (_input: any, output: any) => core.messagesTransform(output.messages ?? []),
+    "experimental.session.compacting": async (input: any, output: any) => {
+      const context = core.compactionContext(input.sessionID)
+      if (context) output.context.push(context)
+    },
+    dispose: core.dispose,
   }
-  tool: {
-    hook: (
-      name: "execute.before",
-      callback: (event: { tool: string; sessionID: string; id: string; input: unknown }) => Promise<void> | void,
-    ) => Promise<V2Registration>
-  }
+  return hooks
 }
 
-// Reshapes v2 events into the v1 events HcomPlugin handles. Execution events
-// carry the busy/idle edge.
-function v1Event({ type, data }: V2Event): HcomEvent | null {
+// Reshapes OpenCode 2 events into the OpenCode 1 shape the core handles.
+// Execution events carry the busy/idle edge.
+function v1Event({ type, data }: { type: string; data: any }): HcomEvent | null {
   switch (type) {
     case "session.created":
-      return { type, properties: { info: { ...data, id: data.sessionID } } } as any
-    case "session.status":
-      return { type, properties: data } as any
+      return { type, properties: { info: { ...data, id: data.sessionID } } }
     case "session.execution.started":
-      return { type: "session.status", properties: { sessionID: data.sessionID, status: { type: "busy" } } } as any
+      return { type: "session.status", properties: { sessionID: data.sessionID, status: { type: "busy" } } }
     case "session.execution.succeeded":
     case "session.execution.failed":
     case "session.execution.interrupted":
-      return { type: "session.status", properties: { sessionID: data.sessionID, status: { type: "idle" } } } as any
+      return { type: "session.status", properties: { sessionID: data.sessionID, status: { type: "idle" } } }
     case "permission.asked":
       return { type, properties: { id: data.id, sessionID: data.sessionID, permission: data.action } }
+    case "session.status":
     case "permission.replied":
     case "session.deleted":
-      return { type, properties: data } as any
+    case "session.inbox.delivered":
+    case "session.inbox.cancelled":
+      return { type, properties: data }
   }
   return null
 }
 
+type LaunchModel = { providerID: string; id: string; variant?: string }
+
 // `provider/model[#variant]`, the form `opencode --model` took.
-function parseLaunchModel(raw: string | undefined): V2Model | undefined {
+function parseLaunchModel(raw: string | undefined): LaunchModel | undefined {
   const [ref, variant] = (raw ?? "").split("#")
   const slash = ref.indexOf("/")
   if (slash <= 0 || slash === ref.length - 1) return undefined
   return { providerID: ref.slice(0, slash), id: ref.slice(slash + 1), ...(variant ? { variant } : {}) }
 }
 
-async function setupOpenCode2(ctx: V2Context) {
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    signal.addEventListener("abort", () => { clearTimeout(timer); resolve() }, { once: true })
+  })
+}
+
+// OpenCode 2 loads plugins from the module's default export and hands `setup`
+// a context with no v1 `client`/`$`.
+async function setupOpenCode2(ctx: Plugin2.Context) {
   if (!claimPluginHost()) return async () => {}
 
-  const statusBySession: Record<string, { type: string }> = {}
-  const client = {
-    session: {
-      promptAsync: ({ path, body }: any) =>
-        ctx.session.prompt({
-          sessionID: path.id,
-          text: body.parts.map((p: V2TextPart) => p.text).join("\n"),
-          delivery: "queue",
-        }),
-      status: async () => ({ data: statusBySession }),
+  const core = createCore({
+    async prompt({ sessionID, text, messageID }) {
+      // Steering reaches the model at the next step boundary of a running turn.
+      await ctx.session.prompt({ sessionID, id: messageID, text, delivery: "steer" })
+      return null
     },
-  }
-  const hooks: any = await HcomPlugin({ client, $: Bun.$ } as unknown as PluginInput)
+    // OpenCode 2 has no run-state query; status comes from events alone, and
+    // the event stream is resubscribed after a gap.
+    async status() {
+      return null
+    },
+  })
 
-  // The v1 transform reads user messages as { info, parts }. Sharing the part
-  // objects lets its in-place text rewrite reach the request; parts it appends
-  // (the bootstrap) go to the system prompt instead of the user message.
-  async function transform(draft: V2Draft) {
-    const views = (draft.messages ?? []).map((m) => ({
-      info: { id: m.id, role: m.role, sessionID: draft.sessionID },
-      parts: [...m.content],
-      added: m.content.length,
-    }))
-    await hooks["experimental.chat.messages.transform"]({}, { messages: views })
-    for (const view of views) {
-      for (const part of view.parts.slice(view.added)) draft.system.push({ type: "text", text: part.text })
-    }
-  }
-
-  const registrations: V2Registration[] = []
+  const registrations: { dispose: () => Promise<void> | void }[] = []
   const disposeAll = async () => {
     try {
       await Promise.all(registrations.map((r) => r.dispose()))
     } finally {
-      await hooks.dispose()
+      await core.dispose()
     }
   }
   // `hcom opencode --agent/--model`, moved to env by the launcher: OpenCode 2's TUI
@@ -801,31 +1002,31 @@ async function setupOpenCode2(ctx: V2Context) {
   // One switch per session, shared by concurrent first prompts; a failed switch
   // is dropped so the next prompt retries it.
   const modelSwitches = new Map<string, Promise<unknown>>()
-  function switchToLaunchModel(sessionID: string, model: V2Model) {
+  function switchToLaunchModel(sessionID: string, model: LaunchModel) {
     let pending = modelSwitches.get(sessionID)
     if (!pending) {
-      pending = ctx.session.switchModel({ sessionID, model })
+      pending = ctx.session.switchModel({ sessionID, model } as any)
       modelSwitches.set(sessionID, pending)
       pending.catch(() => modelSwitches.delete(sessionID))
     }
     return pending
   }
-  async function onPrompt(draft: { sessionID: string }) {
-    if (launchModel) await switchToLaunchModel(draft.sessionID, launchModel)
-    await hooks["chat.message"]({ sessionID: draft.sessionID }, {})
-  }
 
   try {
     if (launchAgent) registrations.push(await ctx.agent.transform((editor) => editor.default(launchAgent)))
-    registrations.push(await ctx.session.hook("prompt", onPrompt))
-    registrations.push(await ctx.session.hook("context", transform))
-    registrations.push(await ctx.tool.hook("execute.before", (event) =>
-      hooks["tool.execute.before"]({ tool: event.tool, sessionID: event.sessionID, callID: event.id }, { args: event.input }),
-    ))
-    registrations.push(await ctx.session.hook("compaction", async (draft: V2Draft) => {
-      const output = { context: [] as string[] }
-      await hooks["experimental.session.compacting"]({ sessionID: draft.sessionID }, output)
-      for (const text of output.context) draft.system.push({ type: "text", text })
+    registrations.push(await ctx.session.hook("prompt", async (draft) => {
+      if (launchModel) await switchToLaunchModel(draft.sessionID, launchModel)
+      const filled = await core.prompt(draft.sessionID, draft.messageID, draft.prompt.text)
+      if (filled) draft.prompt.text = filled
+    }))
+    registrations.push(await ctx.session.hook("context", (draft) => {
+      const bootstrap = core.bootstrapFor(draft.sessionID)
+      if (bootstrap) draft.system.push({ type: "text", text: bootstrap })
+    }))
+    registrations.push(await ctx.tool.hook("execute.before", (event) => core.toolBefore(event.sessionID, event.tool, event.input)))
+    registrations.push(await ctx.session.hook("compaction", (draft) => {
+      const context = core.compactionContext(draft.sessionID)
+      if (context) draft.system.push({ type: "text", text: context })
     }))
   } catch (e) {
     await disposeAll().catch(() => {}) // the registration error is the one to report
@@ -834,15 +1035,23 @@ async function setupOpenCode2(ctx: V2Context) {
 
   const controller = new AbortController()
   const consuming = (async () => {
-    for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-      const mapped: any = v1Event(event)
-      if (!mapped) continue
-      if (mapped.type === "session.status") statusBySession[mapped.properties.sessionID] = mapped.properties.status
-      await hooks.event({ event: mapped })
+    let backoff = 250
+    for (let attempt = 0; !controller.signal.aborted; attempt++) {
+      try {
+        if (attempt > 0) core.resync()
+        for await (const event of ctx.event.subscribe({ signal: controller.signal } as any)) {
+          backoff = 250
+          const mapped = v1Event(event as any)
+          if (mapped) await core.event(mapped)
+        }
+        if (!controller.signal.aborted) log("WARN", "plugin.event_stream_ended", null)
+      } catch (e) {
+        if (!controller.signal.aborted) log("ERROR", "plugin.event_subscription_failed", null, { error: String(e) })
+      }
+      await sleep(backoff, controller.signal)
+      backoff = Math.min(backoff * 2, 10_000)
     }
-  })().catch((e) => {
-    if (!controller.signal.aborted) log("ERROR", "plugin.event_subscription_failed", null, { error: String(e) })
-  })
+  })()
 
   return async () => {
     controller.abort()

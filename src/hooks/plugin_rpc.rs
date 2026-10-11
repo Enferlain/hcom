@@ -1,4 +1,4 @@
-//! RPC handlers shared by the Pi-family TypeScript plugins (pi, omp).
+//! RPC handlers shared by hcom's TypeScript plugins (pi, omp, opencode/kilo).
 //!
 //! Every reply exits 0 so the agent never treats the hook itself as failed;
 //! success carries a payload and failure is `{"error": ...}`. The plugins must
@@ -140,8 +140,9 @@ pub(crate) fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
     }))
 }
 
-/// `<tool>-beforetool --name N --tool T [--input-json J]`: record the tool as
-/// the instance's activity. Observation only; it never blocks the tool.
+/// `<tool>-beforetool --name N --tool T [--input-json J]` (OpenCode/Kilo:
+/// `opencode-status` with `--tool`): record the tool as the instance's
+/// activity. Observation only; it never blocks the tool.
 pub(crate) fn handle_tool(db: &HcomDb, argv: &[String], tool: &str) -> (i32, String) {
     let name = match require_instance(db, argv) {
         Ok(name) => name,

@@ -1731,6 +1731,9 @@ pub fn run_delivery_loop(
             ),
         );
         let mut first_message_injected = false;
+        // Mail sent before this thread registered its notify port never wakes
+        // it, so the first pass checks for pending mail without waiting.
+        let mut first_pass = true;
 
         // Status tracking for terminal title updates
         let mut current_status = ST_LISTENING.to_string();
@@ -1757,7 +1760,9 @@ pub fn run_delivery_loop(
             );
 
             // Wait for notify or timeout
-            notify.wait(IDLE_WAIT);
+            if !std::mem::take(&mut first_pass) {
+                notify.wait(IDLE_WAIT);
+            }
             if !running.load(Ordering::Acquire) {
                 break;
             }

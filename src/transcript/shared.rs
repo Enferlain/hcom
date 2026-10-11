@@ -196,7 +196,7 @@ pub(crate) fn normalize_tool_name(name: &str) -> &str {
         "run_shell_command" | "shell" | "shell_command" | "bash" | "run_terminal_command" => "Bash",
         "read_file" | "read" | "read_many_files" => "Read",
         "write_file" | "write" => "Write",
-        "edit_file" | "edit" | "apply_patch" | "replace" | "search_replace" => "Edit",
+        "edit_file" | "edit" | "apply_patch" | "patch" | "replace" | "search_replace" => "Edit",
         "search_files" | "grep" | "grep_search" => "Grep",
         "list_files" | "list_directory" | "glob" => "Glob",
         "fetch" => "WebFetch",

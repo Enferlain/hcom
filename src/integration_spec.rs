@@ -279,6 +279,7 @@ const OPENCODE_HOOKS: &[&str] = &[
     "opencode-status",
     "opencode-read",
     "opencode-stop",
+    "opencode-approve",
 ];
 
 const PI_HOOKS: &[&str] = &[

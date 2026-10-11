@@ -1,9 +1,11 @@
-//! OpenCode hook handlers — argv-based lifecycle management (start, status, read, stop).
+//! OpenCode/Kilo hook handlers. `opencode-start` binds the session; status,
+//! read and stop are the shared plugin RPC handlers (see `plugin_rpc`).
 
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use serde_json::value::RawValue;
 
 use crate::bootstrap;
 use crate::db::HcomDb;
@@ -15,21 +17,8 @@ use crate::shared::ST_LISTENING;
 use crate::shared::context::HcomContext;
 
 use super::common;
-use super::common::finalize_session;
+use super::plugin_rpc::{self, parse_flag};
 use super::runtime::{self, LaunchCtx, PerRunAdapter, RuntimeInjection};
-
-/// Extract `--flag value` from argv. Returns None if not found.
-fn parse_flag(argv: &[String], flag: &str) -> Option<String> {
-    argv.iter()
-        .position(|a| a == flag)
-        .and_then(|i| argv.get(i + 1))
-        .cloned()
-}
-
-/// Check if a bare flag exists in argv (no value).
-fn has_flag(argv: &[String], flag: &str) -> bool {
-    argv.iter().any(|a| a == flag)
-}
 
 /// Extract `--flag value` or `--flag=value` from argv.
 fn parse_value_arg(argv: &[String], flags: &[&str]) -> Option<String> {
@@ -49,15 +38,25 @@ fn parse_value_arg(argv: &[String], flags: &[&str]) -> Option<String> {
     None
 }
 
-fn parse_launch_model(raw: &str) -> Option<Value> {
-    let (provider_id, model_id) = raw.split_once('/')?;
+/// `provider/model` or OpenCode 2's `provider/model#variant` as the plugin's
+/// model JSON; a separate OpenCode 1 `--variant` wins over an inline one.
+fn parse_launch_model(raw: &str, variant: Option<&str>) -> Option<Value> {
+    let (provider_id, rest) = raw.split_once('/')?;
+    let (model_id, inline_variant) = match rest.split_once('#') {
+        Some((model_id, variant)) => (model_id, Some(variant)),
+        None => (rest, None),
+    };
     if provider_id.is_empty() || model_id.is_empty() {
         return None;
     }
-    Some(serde_json::json!({
+    let mut model = serde_json::json!({
         "providerID": provider_id,
         "modelID": model_id,
-    }))
+    });
+    if let Some(variant) = variant.or(inline_variant).filter(|v| !v.is_empty()) {
+        model["variant"] = Value::String(variant.to_string());
+    }
+    Some(model)
 }
 
 fn launch_agent_and_model_from_args(launch_args: Option<&str>) -> (Option<String>, Option<Value>) {
@@ -70,8 +69,9 @@ fn launch_agent_and_model_from_args(launch_args: Option<&str>) -> (Option<String
     };
 
     let agent = parse_value_arg(&argv, &["--agent"]);
-    let model =
-        parse_value_arg(&argv, &["--model", "-m"]).and_then(|value| parse_launch_model(&value));
+    let variant = parse_value_arg(&argv, &["--variant"]);
+    let model = parse_value_arg(&argv, &["--model", "-m"])
+        .and_then(|value| parse_launch_model(&value, variant.as_deref()));
     (agent, model)
 }
 
@@ -95,15 +95,6 @@ fn upsert_plugin_notify_endpoint(db: &HcomDb, instance_name: &str, port: u16) {
             ),
         );
     }
-}
-
-/// Send TCP wake to ALL of an instance's wake endpoints.
-///
-/// Used by status handler when instance becomes listening.
-/// Wakes every registered wake kind (pty, hook, plugin, listen variants,
-/// events_wait). The inject endpoint is excluded — it speaks RPC, not wake.
-fn notify_all_endpoints(db: &HcomDb, instance_name: &str) {
-    crate::notify::wake(db, instance_name, &[]);
 }
 
 fn instance_tool(db: &HcomDb, instance_name: &str) -> String {
@@ -218,25 +209,9 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
         );
     }
 
-    // Initialize last_event_id BEFORE set_status() — set_status triggers
-    // `crate::notify::wake` which TCP-wakes the plugin's
-    // deliverPendingToIdle(). If last_event_id is still 0, ALL historical
-    // events get delivered.
-    if let Ok(Some(existing)) = db.get_instance_full(&instance_name)
-        && existing.last_event_id == 0
-    {
-        let launch_event_id: Option<i64> = std::env::var("HCOM_LAUNCH_EVENT_ID")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let current_max = db.get_last_event_id();
-        let new_id = match launch_event_id {
-            Some(lei) if lei <= current_max => lei,
-            _ => current_max,
-        };
-        let mut id_updates = serde_json::Map::new();
-        id_updates.insert("last_event_id".into(), serde_json::json!(new_id));
-        instances::update_instance_position(db, &instance_name, &id_updates);
-    }
+    // Initialize last_event_id BEFORE set_status(): set_status wakes the
+    // plugin, which would otherwise deliver the whole backlog from 0.
+    plugin_rpc::initialize_last_event_id(db, &instance_name);
 
     lifecycle::set_status(
         db,
@@ -288,157 +263,16 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     (0, serde_json::to_string(&response).unwrap_or_default())
 }
 
-/// Handle opencode-status: update instance status.
-///
-/// Called by OpenCode plugin on session.status and session.idle events.
-/// Expects: hcom opencode-status --name <name> --status <status> [--context <ctx>] [--detail <d>]
-///
-/// Tool activity (`tool.execute.before`) instead passes
-/// `--tool <id> --input-json <args>`; the detail is then derived from the
-/// tool's `status_detail` mapping, like every other tool's pre-tool hook.
+/// `opencode-status` carries both status changes and tool activity
+/// (`--tool T --input-json J` from `tool.execute.before`).
 fn handle_status(db: &HcomDb, argv: &[String]) -> (i32, String) {
-    let name = match parse_flag(argv, "--name") {
-        Some(n) => n,
-        None => return (0, r#"{"error":"Missing --name or --status"}"#.to_string()),
-    };
-    if let Some(tool_name) = parse_flag(argv, "--tool").filter(|t| !t.is_empty()) {
-        let input = parse_flag(argv, "--input-json")
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .unwrap_or_else(|| serde_json::json!({}));
-        let tool = instance_tool(db, &name);
-        common::update_tool_status(db, &name, &tool, &tool_name, &input);
-        return (0, r#"{"ok":true}"#.to_string());
+    if parse_flag(argv, "--tool").is_some() {
+        let tool = parse_flag(argv, "--name")
+            .map(|name| instance_tool(db, &name))
+            .unwrap_or_else(|| "opencode".to_string());
+        return plugin_rpc::handle_tool(db, argv, &tool);
     }
-    let status = match parse_flag(argv, "--status") {
-        Some(s) => s,
-        None => return (0, r#"{"error":"Missing --name or --status"}"#.to_string()),
-    };
-
-    let context = parse_flag(argv, "--context").unwrap_or_default();
-    let detail = parse_flag(argv, "--detail").unwrap_or_default();
-
-    lifecycle::set_status(
-        db,
-        &name,
-        &status,
-        &context,
-        lifecycle::StatusUpdate {
-            detail: &detail,
-            ..Default::default()
-        },
-    );
-
-    // Wake delivery thread if instance is now listening
-    if status == ST_LISTENING {
-        notify_all_endpoints(db, &name);
-    }
-
-    (0, r#"{"ok":true}"#.to_string())
-}
-
-/// Handle opencode-read: fetch pending messages, check, format, or ack.
-///
-/// Modes:
-/// - Default: Return pending messages as JSON array (does NOT advance cursor)
-/// - --format: Return formatted text (same format as Claude/Gemini delivery)
-/// - --check: Return "true" or "false" string
-/// - --ack --up-to <id>: Advance cursor to explicit event_id
-/// - --ack (no --up-to): Advance cursor to max pending event_id (legacy)
-fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
-    let name = match parse_flag(argv, "--name") {
-        Some(n) => n,
-        None => return (0, r#"{"error":"Missing --name"}"#.to_string()),
-    };
-
-    let format_mode = has_flag(argv, "--format");
-    let check_mode = has_flag(argv, "--check");
-    let ack_mode = has_flag(argv, "--ack");
-
-    // Fetch unread messages (without advancing cursor)
-    let raw_messages = db.get_unread_messages(&name);
-
-    // Convert db::Message to serde_json::Value
-    let messages: Vec<Value> = raw_messages.iter().map(common::message_to_value).collect();
-
-    if format_mode {
-        if messages.is_empty() {
-            return (0, String::new());
-        }
-        let deliver = common::limit_delivery_messages(&messages);
-        let formatted = common::format_messages_json_for_instance(db, &deliver, &name);
-        return (0, formatted);
-    }
-
-    if ack_mode {
-        let up_to = parse_flag(argv, "--up-to");
-        if let Some(up_to_str) = up_to {
-            // Explicit ack position
-            let ack_id: i64 = match up_to_str.parse() {
-                Ok(id) => id,
-                Err(_) => {
-                    return (
-                        0,
-                        serde_json::json!({"error": format!("Invalid --up-to: {}", up_to_str)})
-                            .to_string(),
-                    );
-                }
-            };
-            let mut updates = serde_json::Map::new();
-            updates.insert("last_event_id".into(), serde_json::json!(ack_id));
-            instances::update_instance_position(db, &name, &updates);
-            return (0, serde_json::json!({"acked_to": ack_id}).to_string());
-        }
-        // Legacy: ack all pending
-        if messages.is_empty() {
-            return (0, r#"{"acked":0}"#.to_string());
-        }
-        let last_id = messages
-            .iter()
-            .filter_map(|m| m.get("event_id").and_then(|v| v.as_i64()))
-            .max()
-            .unwrap_or(0);
-        // Fallback: when all event_ids are 0, use db max
-        let ack_id = if last_id > 0 {
-            last_id
-        } else {
-            db.get_last_event_id()
-        };
-        if ack_id > 0 {
-            let mut updates = serde_json::Map::new();
-            updates.insert("last_event_id".into(), serde_json::json!(ack_id));
-            instances::update_instance_position(db, &name, &updates);
-        }
-        return (0, serde_json::json!({"acked": messages.len()}).to_string());
-    }
-
-    if check_mode {
-        return (
-            0,
-            if messages.is_empty() { "false" } else { "true" }.to_string(),
-        );
-    }
-
-    // Default: return raw JSON array
-    (
-        0,
-        serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_string()),
-    )
-}
-
-/// Handle opencode-stop: finalize session and clean up instance.
-///
-/// Called by OpenCode plugin on session.deleted event.
-/// Expects: hcom opencode-stop --name <name> [--reason <reason>]
-fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
-    let name = match parse_flag(argv, "--name") {
-        Some(n) => n,
-        None => return (0, r#"{"error":"Missing --name"}"#.to_string()),
-    };
-    let reason = parse_flag(argv, "--reason").unwrap_or_else(|| "unknown".to_string());
-
-    finalize_session(db, &name, &reason, None);
-
-    (0, r#"{"ok":true}"#.to_string())
+    plugin_rpc::handle_status(db, argv)
 }
 
 /// Dispatch an OpenCode hook by name.
@@ -497,8 +331,9 @@ pub fn dispatch_opencode_hook(hook_name: &str, argv: &[String]) -> (i32, String)
         || match hook_name_owned.as_str() {
             "opencode-start" => handle_start(&ctx, &db, &handler_argv),
             "opencode-status" => handle_status(&db, &handler_argv),
-            "opencode-read" => handle_read(&db, &handler_argv),
-            "opencode-stop" => handle_stop(&db, &handler_argv),
+            "opencode-read" => plugin_rpc::handle_read(&db, &handler_argv),
+            "opencode-stop" => plugin_rpc::handle_stop(&db, &handler_argv),
+            "opencode-approve" => handle_approve(&ctx, &handler_argv),
             _ => (
                 0,
                 serde_json::json!({"error": format!("Unknown OpenCode hook: {}", hook_name_owned)})
@@ -650,33 +485,89 @@ fn jsonc_to_json(input: &str) -> Result<String> {
     String::from_utf8(out).context("JSONC input was not valid UTF-8")
 }
 
-fn parse_caller_config(ctx: &LaunchCtx, env_var: &str) -> Result<Value> {
+/// A JSON object in its written order. serde_json's `Value` sorts object keys,
+/// and OpenCode 1/Kilo resolve permission rules by position (last match wins),
+/// so re-sorting a caller's config could flip their allow/deny rules.
+#[derive(Debug)]
+struct OrderedObject(Vec<(String, Box<RawValue>)>);
+
+impl OrderedObject {
+    fn parse(json: &str) -> Result<Self> {
+        struct Entries;
+        impl<'de> serde::de::Visitor<'de> for Entries {
+            type Value = Vec<(String, Box<RawValue>)>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(entries)
+            }
+        }
+        let mut de = serde_json::Deserializer::from_str(json);
+        let entries = serde::Deserializer::deserialize_map(&mut de, Entries)?;
+        de.end()?;
+        Ok(Self(entries))
+    }
+
+    /// The effective value of `key`: JSON parsers keep the last duplicate.
+    fn get(&self, key: &str) -> Option<&RawValue> {
+        self.0
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| &**v)
+    }
+
+    /// Replace `key`'s value in place, or append it.
+    fn set(&mut self, key: &str, value: Box<RawValue>) {
+        match self.0.iter_mut().rev().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = value,
+            None => self.0.push((key.to_string(), value)),
+        }
+    }
+
+    fn to_raw(&self) -> Result<Box<RawValue>> {
+        let mut out = String::from("{");
+        for (i, (key, value)) in self.0.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&serde_json::to_string(key)?);
+            out.push(':');
+            out.push_str(value.get());
+        }
+        out.push('}');
+        Ok(RawValue::from_string(out)?)
+    }
+}
+
+fn raw_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<Box<RawValue>> {
+    Ok(RawValue::from_string(serde_json::to_string(value)?)?)
+}
+
+fn parse_caller_config(ctx: &LaunchCtx, env_var: &str) -> Result<OrderedObject> {
     let Some(raw) = ctx.var(env_var) else {
-        return Ok(serde_json::json!({}));
+        return Ok(OrderedObject(Vec::new()));
     };
     let parsed = jsonc_to_json(raw)
-        .and_then(|json| serde_json::from_str::<Value>(&json).context("invalid JSON/JSONC"));
-    let mut value = match parsed {
-        Ok(value) => value,
+        .and_then(|json| OrderedObject::parse(&json).context("must contain a JSON/JSONC object"));
+    match parsed {
+        Ok(config) => Ok(config),
         Err(error) if ctx.tool == crate::tool::Tool::Kilo => {
             let message = format!("Ignoring invalid KILO_CONFIG_CONTENT: {error:#}");
             crate::log::log_warn("launcher", "kilo.config_content_invalid", &message);
             eprintln!("Warning: {message}");
-            serde_json::json!({})
+            Ok(OrderedObject(Vec::new()))
         }
-        Err(error) => return Err(error).with_context(|| format!("Invalid {env_var}")),
-    };
-    if !value.is_object() {
-        if ctx.tool == crate::tool::Tool::Kilo {
-            let message = "Ignoring invalid KILO_CONFIG_CONTENT: root must be an object";
-            crate::log::log_warn("launcher", "kilo.config_content_invalid", message);
-            eprintln!("Warning: {message}");
-            value = serde_json::json!({});
-        } else {
-            bail!("{env_var} must contain a JSON object");
-        }
+        Err(error) => Err(error).with_context(|| format!("Invalid {env_var}")),
     }
-    Ok(value)
 }
 
 fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
@@ -687,24 +578,94 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
     let dir = runtime::publish_dir(app, &[("index.ts", PLUGIN_SOURCE.as_bytes())])
         .with_context(|| format!("Cannot publish {app} runtime plugin"))?;
     let plugin_url = runtime::file_url(&dir);
-    let mut config = parse_caller_config(ctx, env_var)?;
-    let object = config
-        .as_object_mut()
-        .expect("caller config object validated");
-    let plugins = object
-        .entry("plugin")
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut()
-        .with_context(|| format!("{env_var}.plugin must be an array"))?;
+    let caller = parse_caller_config(ctx, env_var)?;
+    // OpenCode 2 turns each config source's permissions into rules and appends
+    // them, so hcom's rules add to the user's. OpenCode 1 and Kilo deep-merge
+    // the sources instead, where hcom's `bash` object would replace a user's
+    // plain `"bash": "allow"`; there the plugin approves hcom's own commands
+    // at runtime (`opencode-approve`).
+    let permission_rules = ctx.auto_approve
+        && ctx.tool == crate::tool::Tool::OpenCode
+        && crate::tools::opencode_preprocessing::is_opencode_2();
+    let config = runtime_config(caller, &plugin_url, permission_rules)
+        .with_context(|| format!("Invalid {env_var}"))?;
+    let mut env = vec![(env_var.to_string(), config)];
+    if ctx.tool == crate::tool::Tool::Kilo {
+        // Kilo's TUI attaches to a running background daemon when one exists,
+        // and that daemon never sees this launch's KILO_CONFIG_CONTENT, so the
+        // plugin would not load. Run the server in-process instead.
+        env.push(("KILO_NO_DAEMON".to_string(), "1".to_string()));
+    }
+    Ok(RuntimeInjection {
+        args: ctx.args.clone(),
+        env,
+    })
+}
+
+/// The caller's config content plus hcom's plugin (and, for OpenCode 2, its
+/// auto-approve rules), with everything the caller wrote left in its order.
+fn runtime_config(
+    mut config: OrderedObject,
+    plugin_url: &str,
+    permission_rules: bool,
+) -> Result<String> {
+    let mut plugins: Vec<Box<RawValue>> = match config.get("plugin") {
+        Some(raw) => serde_json::from_str(raw.get()).context("plugin must be an array")?,
+        None => Vec::new(),
+    };
     // An inherited value (e.g. `hcom opencode` run from an hcom agent's shell)
     // can carry another hcom version's plugin; two copies in one process would
     // both claim the host, so keep only the current one.
-    plugins.retain(|value| !value.as_str().is_some_and(runtime::is_hcom_runtime_path));
-    plugins.push(Value::String(plugin_url));
-    Ok(RuntimeInjection {
-        args: ctx.args.clone(),
-        env: vec![(env_var.to_string(), serde_json::to_string(&config)?)],
-    })
+    plugins.retain(|plugin| {
+        !serde_json::from_str::<String>(plugin.get())
+            .is_ok_and(|path| runtime::is_hcom_runtime_path(&path))
+    });
+    plugins.push(raw_json(plugin_url)?);
+    config.set("plugin", raw_json(&plugins)?);
+    if permission_rules {
+        add_auto_approve_rules(&mut config).context("permission")?;
+    }
+    Ok(config.to_raw()?.get().to_string())
+}
+
+/// Append hcom's auto-approve rules (`permission.bash["<hcom> <cmd>*"] =
+/// "allow"`) after the caller's own. OpenCode 2 migrates the legacy
+/// `permission` key to rules (bash → shell), resolves a command with the last
+/// matching rule, and loads config content last, so these allows win over a
+/// broader `ask` from elsewhere. A caller string action (`"bash": "ask"`,
+/// `"permission": "ask"`) becomes a `"*"` rule ahead of them.
+fn add_auto_approve_rules(config: &mut OrderedObject) -> Result<()> {
+    fn rules(raw: Option<&RawValue>) -> Result<OrderedObject> {
+        let Some(raw) = raw else {
+            return Ok(OrderedObject(Vec::new()));
+        };
+        if serde_json::from_str::<String>(raw.get()).is_ok() {
+            return Ok(OrderedObject(vec![("*".to_string(), raw.to_owned())]));
+        }
+        OrderedObject::parse(raw.get()).context("must be a string or an object")
+    }
+    let mut permission = rules(config.get("permission"))?;
+    let mut bash = rules(permission.get("bash")).context("bash")?;
+    let prefix = crate::runtime_env::build_hcom_command();
+    let allow = raw_json("allow")?;
+    for command in common::SAFE_HCOM_COMMANDS {
+        bash.set(&format!("{prefix} {command}*"), allow.clone());
+    }
+    permission.set("bash", bash.to_raw()?);
+    config.set("permission", permission.to_raw()?);
+    Ok(())
+}
+
+/// `opencode-approve --command C` → `{"approve": bool}`: whether the plugin
+/// may answer an OpenCode 1/Kilo bash permission request itself, because the
+/// command is exactly one safe hcom command and auto-approve is on.
+fn handle_approve(ctx: &HcomContext, argv: &[String]) -> (i32, String) {
+    let command = parse_flag(argv, "--command").unwrap_or_default();
+    // POSIX shells only: the check parses POSIX quoting.
+    let approve = common::auto_approve_enabled(ctx)
+        && !cfg!(windows)
+        && common::is_safe_hcom_command(&command);
+    (0, serde_json::json!({ "approve": approve }).to_string())
 }
 
 fn discovery_roots(ctx: &LaunchCtx) -> Vec<std::path::PathBuf> {
@@ -926,14 +887,6 @@ mod tests {
     }
 
     #[test]
-    fn test_has_flag() {
-        let argv = sv(&["--name", "foo", "--format", "--check"]);
-        assert!(has_flag(&argv, "--format"));
-        assert!(has_flag(&argv, "--check"));
-        assert!(!has_flag(&argv, "--ack"));
-    }
-
-    #[test]
     fn test_parse_value_arg_supports_split_and_equals_forms() {
         let split = sv(&["--agent", "reviewer", "-m", "openai/gpt-5.4"]);
         assert_eq!(
@@ -959,15 +912,54 @@ mod tests {
     #[test]
     fn test_parse_launch_model_validates_provider_and_model() {
         assert_eq!(
-            parse_launch_model("openai/gpt-5.4"),
+            parse_launch_model("openai/gpt-5.4", None),
             Some(serde_json::json!({
                 "providerID": "openai",
                 "modelID": "gpt-5.4",
             }))
         );
-        assert_eq!(parse_launch_model("openai"), None);
-        assert_eq!(parse_launch_model("/gpt-5.4"), None);
-        assert_eq!(parse_launch_model("openai/"), None);
+        assert_eq!(parse_launch_model("openai", None), None);
+        assert_eq!(parse_launch_model("/gpt-5.4", None), None);
+        assert_eq!(parse_launch_model("openai/", None), None);
+        assert_eq!(parse_launch_model("openai/#high", None), None);
+    }
+
+    #[test]
+    fn test_parse_launch_model_carries_variant() {
+        let high = serde_json::json!({
+            "providerID": "openai",
+            "modelID": "gpt-5.4",
+            "variant": "high",
+        });
+        // OpenCode 2 inline form.
+        assert_eq!(
+            parse_launch_model("openai/gpt-5.4#high", None),
+            Some(high.clone())
+        );
+        // OpenCode 1 separate flag, which wins over an inline variant.
+        assert_eq!(
+            parse_launch_model("openai/gpt-5.4", Some("high")),
+            Some(high.clone())
+        );
+        assert_eq!(
+            parse_launch_model("openai/gpt-5.4#low", Some("high")),
+            Some(high)
+        );
+        // An empty inline variant is just the model.
+        assert_eq!(
+            parse_launch_model("openai/gpt-5.4#", None),
+            Some(serde_json::json!({"providerID": "openai", "modelID": "gpt-5.4"}))
+        );
+
+        let launch_args = serde_json::to_string(&sv(&[
+            "--model",
+            "anthropic/claude-opus-4",
+            "--variant",
+            "max",
+        ]))
+        .unwrap();
+        let (_, model) = launch_agent_and_model_from_args(Some(&launch_args));
+        assert_eq!(model.unwrap()["variant"], "max");
     }
 
     #[test]
@@ -1122,6 +1114,124 @@ mod tests {
         assert_eq!(plugins[0], "mine");
         assert_ne!(plugins[1].as_str(), Some(stale.as_str()));
         assert!(plugins[1].as_str().unwrap().contains("/integrations/kilo/"));
+    }
+
+    fn prepared_config(
+        tool: crate::tool::Tool,
+        caller: Option<Value>,
+        auto_approve: bool,
+    ) -> (Value, Vec<(String, String)>) {
+        let dir = tempfile::tempdir().unwrap();
+        let env_var = match tool {
+            crate::tool::Tool::Kilo => "KILO_CONFIG_CONTENT",
+            _ => "OPENCODE_CONFIG_CONTENT",
+        };
+        let ctx = LaunchCtx {
+            tool,
+            env: caller
+                .map(|c| (env_var.to_string(), c.to_string()))
+                .into_iter()
+                .collect(),
+            cwd: dir.path().to_path_buf(),
+            args: Vec::new(),
+            auto_approve,
+        };
+        let injection = prepare_per_run(&ctx).unwrap();
+        let (_, raw) = injection.env.iter().find(|(k, _)| k == env_var).unwrap();
+        (serde_json::from_str(raw).unwrap(), injection.env.clone())
+    }
+
+    fn config_with(caller: &str, permission_rules: bool) -> String {
+        runtime_config(
+            OrderedObject::parse(caller).unwrap(),
+            "file:///hcom",
+            permission_rules,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_runtime_config_keeps_caller_key_order() {
+        // Last match wins in OpenCode 1/Kilo: sorting these would deny `git push`.
+        let caller = r#"{"theme":"x","permission":{"bash":{"git push*":"deny","git *":"allow"}},"plugin":["mine"]}"#;
+        assert_eq!(
+            config_with(caller, false),
+            r#"{"theme":"x","permission":{"bash":{"git push*":"deny","git *":"allow"}},"plugin":["mine","file:///hcom"]}"#
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_runtime_config_auto_approve_rules_follow_caller_rules() {
+        let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let prefix = crate::runtime_env::build_hcom_command();
+        let send = format!("{prefix} send*");
+
+        let config: Value = serde_json::from_str(&config_with("{}", true)).unwrap();
+        assert_eq!(config["permission"]["bash"][&send], "allow");
+        assert!(
+            config["permission"]["bash"]
+                .get(format!("{prefix} kill*"))
+                .is_none()
+        );
+
+        let config: Value = serde_json::from_str(&config_with("{}", false)).unwrap();
+        assert!(config.get("permission").is_none());
+
+        // Caller rules come first, in their order; a string action becomes
+        // the "*" fallback.
+        let config = config_with(
+            r#"{"permission":{"edit":"deny","bash":{"z *":"ask","a *":"deny"}}}"#,
+            true,
+        );
+        assert!(
+            config.starts_with(r#"{"permission":{"edit":"deny","bash":{"z *":"ask","a *":"deny","#)
+        );
+        let config = config_with(r#"{"permission":{"bash":"deny"}}"#, true);
+        assert!(config.starts_with(r#"{"permission":{"bash":{"*":"deny","#));
+        let config: Value =
+            serde_json::from_str(&config_with(r#"{"permission":"ask"}"#, true)).unwrap();
+        assert_eq!(config["permission"]["*"], "ask");
+        assert_eq!(config["permission"]["bash"][&send], "allow");
+    }
+
+    #[test]
+    #[serial]
+    fn test_per_run_kilo_never_writes_permission_rules() {
+        let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (config, env) = prepared_config(crate::tool::Tool::Kilo, None, true);
+        assert!(config.get("permission").is_none());
+        assert!(env.iter().all(|(k, _)| !k.ends_with("_PERMISSION")));
+    }
+
+    #[test]
+    fn test_approve_only_single_safe_hcom_commands_with_auto_approve() {
+        let ctx = |on: bool| {
+            let mut env = std::collections::HashMap::new();
+            if on {
+                env.insert("HCOM_AUTO_APPROVE".to_string(), "1".to_string());
+            }
+            HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"))
+        };
+        let approve = |on: bool, command: &str| {
+            let (_, out) =
+                handle_approve(&ctx(on), &["--command".to_string(), command.to_string()]);
+            serde_json::from_str::<Value>(&out).unwrap()["approve"] == true
+        };
+        assert_eq!(approve(true, "hcom send @x -- hi"), !cfg!(windows));
+        assert!(!approve(true, "hcom send @x -- hi; rm -rf ~"));
+        assert!(!approve(true, "hcom kill x"));
+        assert!(!approve(false, "hcom send @x -- hi"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_per_run_kilo_bypasses_daemon() {
+        let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let (_, env) = prepared_config(crate::tool::Tool::Kilo, None, false);
+        assert!(env.contains(&("KILO_NO_DAEMON".to_string(), "1".to_string())));
+        let (_, env) = prepared_config(crate::tool::Tool::OpenCode, None, false);
+        assert!(env.iter().all(|(k, _)| k != "KILO_NO_DAEMON"));
     }
 
     #[test]
@@ -1452,152 +1562,81 @@ mod tests {
         assert!(payload["bootstrap"].as_str().is_some());
     }
 
-    #[test]
-    fn test_handle_status_missing_name() {
-        let (_dir, db) = test_db();
-        let argv = sv(&["--status", "listening"]);
-        let (code, output) = handle_status(&db, &argv);
-        assert_eq!(code, 0);
-        assert!(output.contains("Missing --name or --status"));
+    fn insert_instance(db: &HcomDb, name: &str, tool: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at)
+                 VALUES (?1, ?2, 'listening', 'idle', 0, 0)",
+                rusqlite::params![name, tool],
+            )
+            .unwrap();
+    }
+
+    fn reply(out: (i32, String)) -> Value {
+        assert_eq!(out.0, 0);
+        serde_json::from_str(&out.1).unwrap()
     }
 
     #[test]
-    fn test_handle_status_missing_status() {
+    fn test_handle_status_reports_missing_args_and_unknown_instance() {
         let (_dir, db) = test_db();
-        let argv = sv(&["--name", "test"]);
-        let (code, output) = handle_status(&db, &argv);
-        assert_eq!(code, 0);
-        assert!(output.contains("Missing --name or --status"));
-    }
-
-    #[test]
-    fn test_handle_read_missing_name() {
-        let (_dir, db) = test_db();
-        let argv = sv(&[]);
-        let (code, output) = handle_read(&db, &argv);
-        assert_eq!(code, 0);
-        assert!(output.contains("Missing --name"));
-    }
-
-    #[test]
-    fn test_handle_read_check_empty() {
-        let (_dir, db) = test_db();
-        let argv = sv(&["--name", "testinst", "--check"]);
-        let (code, output) = handle_read(&db, &argv);
-        assert_eq!(code, 0);
-        assert_eq!(output, "false");
-    }
-
-    #[test]
-    fn test_handle_read_default_empty() {
-        let (_dir, db) = test_db();
-        let argv = sv(&["--name", "testinst"]);
-        let (code, output) = handle_read(&db, &argv);
-        assert_eq!(code, 0);
-        assert_eq!(output, "[]");
-    }
-
-    #[test]
-    fn test_handle_read_format_empty() {
-        let (_dir, db) = test_db();
-        let argv = sv(&["--name", "testinst", "--format"]);
-        let (code, output) = handle_read(&db, &argv);
-        assert_eq!(code, 0);
-        assert_eq!(output, "");
-    }
-
-    #[test]
-    fn test_handle_read_ack_empty() {
-        let (_dir, db) = test_db();
-        let argv = sv(&["--name", "testinst", "--ack"]);
-        let (code, output) = handle_read(&db, &argv);
-        assert_eq!(code, 0);
-        assert!(output.contains("\"acked\":0") || output.contains("\"acked\": 0"));
-    }
-
-    #[test]
-    fn test_handle_read_ack_up_to() {
-        let (_dir, db) = test_db();
-        let argv = sv(&["--name", "testinst", "--ack", "--up-to", "42"]);
-        let (code, output) = handle_read(&db, &argv);
-        assert_eq!(code, 0);
-        assert!(output.contains("42"));
-    }
-
-    #[test]
-    fn test_handle_read_ack_invalid_up_to() {
-        let (_dir, db) = test_db();
-        let argv = sv(&["--name", "testinst", "--ack", "--up-to", "abc"]);
-        let (code, output) = handle_read(&db, &argv);
-        assert_eq!(code, 0);
-        assert!(output.contains("Invalid --up-to"));
-    }
-
-    #[test]
-    fn test_handle_stop_missing_name() {
-        let (_dir, db) = test_db();
-        let argv = sv(&[]);
-        let (code, output) = handle_stop(&db, &argv);
-        assert_eq!(code, 0);
-        assert!(output.contains("Missing --name"));
-    }
-
-    #[test]
-    fn test_handle_stop_nonexistent() {
-        crate::config::Config::init();
-        let (_dir, db) = test_db();
-        // finalize_session on nonexistent instance should be no-op
-        let argv = sv(&["--name", "testinst", "--reason", "test"]);
-        let (code, output) = handle_stop(&db, &argv);
-        assert_eq!(code, 0);
-        assert!(output.contains("\"ok\":true") || output.contains("\"ok\": true"));
+        insert_instance(&db, "testinst", "opencode");
+        for argv in [
+            sv(&["--status", "listening"]),
+            sv(&["--name", "testinst"]),
+            sv(&["--name", "gone", "--status", "listening"]),
+            sv(&["--name", "gone", "--tool", "bash"]),
+        ] {
+            let out = reply(handle_status(&db, &argv));
+            assert!(out.get("error").is_some(), "{argv:?} -> {out}");
+        }
     }
 
     #[test]
     fn test_handle_status_updates_status() {
         crate::config::Config::init();
         let (_dir, db) = test_db();
-        // Create an instance first
-        let _ = db.conn().execute(
-            "INSERT INTO instances (name, tool, status, status_context, status_time, created_at) VALUES ('testinst', 'opencode', 'active', 'new', 0, 0)",
-            [],
-        );
+        insert_instance(&db, "testinst", "opencode");
         let argv = sv(&[
             "--name",
             "testinst",
             "--status",
-            "listening",
+            "blocked",
             "--context",
-            "idle",
+            "approval",
+            "--detail",
+            "bash",
         ]);
-        let (code, output) = handle_status(&db, &argv);
-        assert_eq!(code, 0);
-        assert!(output.contains("\"ok\":true") || output.contains("\"ok\": true"));
+        assert_eq!(
+            reply(handle_status(&db, &argv)),
+            serde_json::json!({"ok": true})
+        );
+        let inst = db.get_instance_full("testinst").unwrap().unwrap();
+        assert_eq!(inst.status, "blocked");
+        assert_eq!(inst.status_context, "approval");
+        assert_eq!(inst.status_detail, "bash");
     }
 
+    /// Tool activity resolves the detail through the instance's own tool
+    /// spec, so a Kilo instance maps like OpenCode.
     #[test]
     fn test_handle_status_tool_derives_detail_from_spec() {
         crate::config::Config::init();
         let (_dir, db) = test_db();
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at) VALUES ('kiki', 'kilo', 'listening', 'idle', 0, 0)",
-                [],
-            )
-            .unwrap();
+        insert_instance(&db, "kiki", "kilo");
         let input = serde_json::json!({"filePath": "/src/main.rs", "oldString": "a"});
         let argv = sv(&[
             "--name",
             "kiki",
-            "--status",
-            "active",
             "--tool",
             "edit",
             "--input-json",
             &input.to_string(),
         ]);
-        let (code, output) = handle_status(&db, &argv);
-        assert_eq!(code, 0, "{output}");
+        assert_eq!(
+            reply(handle_status(&db, &argv)),
+            serde_json::json!({"ok": true})
+        );
         let inst = db.get_instance_full("kiki").unwrap().unwrap();
         assert_eq!(inst.status, "active");
         assert_eq!(inst.status_context, "tool:edit");
@@ -1605,80 +1644,40 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_read_with_messages() {
-        let (_dir, db) = test_db();
-        // Create instance with last_event_id = 0
-        let _ = db.conn().execute(
-            "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id) VALUES ('testinst', 'opencode', 'listening', 'start', 0, 0, 0)",
-            [],
-        );
-        // Insert a message event
-        let _ = db.conn().execute(
-            "INSERT INTO events (type, timestamp, instance, data) VALUES ('message', '2026-01-01T00:00:00Z', 'luna', '{\"from\":\"luna\",\"text\":\"hello\",\"scope\":\"broadcast\"}')",
-            [],
-        );
-        // Default mode: raw JSON array
-        let argv = sv(&["--name", "testinst"]);
-        let (code, output) = handle_read(&db, &argv);
-        assert_eq!(code, 0);
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0]["from"], "luna");
-
-        // Check mode
-        let argv = sv(&["--name", "testinst", "--check"]);
-        let (code, output) = handle_read(&db, &argv);
-        assert_eq!(code, 0);
-        assert_eq!(output, "true");
-    }
-
-    #[test]
-    fn test_handle_read_format_does_not_advance_cursor() {
-        let (_dir, db) = test_db();
-        let _ = db.conn().execute(
-            "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id) VALUES ('testinst', 'opencode', 'listening', 'start', 0, 0, 0)",
-            [],
-        );
-        let _ = db.conn().execute(
-            "INSERT INTO events (type, timestamp, instance, data) VALUES ('message', '2026-01-01T00:00:00Z', 'luna', '{\"from\":\"luna\",\"text\":\"hello\",\"scope\":\"broadcast\"}')",
-            [],
-        );
-
-        let before: i64 = db
-            .conn()
-            .query_row(
-                "SELECT last_event_id FROM instances WHERE name = 'testinst'",
-                [],
-                |row| row.get(0),
+    fn test_handle_start_initializes_cursor_to_launch_tail() {
+        crate::config::Config::init();
+        let (_env_dir, hcom_dir, test_home, _guard) =
+            crate::hooks::test_helpers::isolated_test_env();
+        let (_db_dir, db) = test_db();
+        let old_id = db
+            .log_event(
+                "message",
+                "bigboss",
+                &serde_json::json!({"from": "bigboss", "scope": "broadcast", "text": "old"}),
             )
             .unwrap();
-        assert_eq!(before, 0);
-
-        let (code, output) = handle_read(&db, &sv(&["--name", "testinst", "--format"]));
-        assert_eq!(code, 0);
-        assert!(output.contains("hello"));
-
-        let after: i64 = db
-            .conn()
-            .query_row(
-                "SELECT last_event_id FROM instances WHERE name = 'testinst'",
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at, last_event_id)
+                 VALUES ('luna', 'opencode', 'pending', 0, 0)",
                 [],
-                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(after, 0);
-    }
-
-    // ── Dispatcher (unit tests for routing logic, not full integration) ──
-
-    #[test]
-    fn test_dispatch_routes_correctly() {
-        // Verify the match arms exist and route correctly via direct handler calls.
-        // Full dispatch_opencode_hook() requires runtime (Config, DB) — tested via parity tests.
-        let (_dir, db) = test_db();
-        // Missing name → error JSON
-        let (code, output) = handle_stop(&db, &sv(&[]));
-        assert_eq!(code, 0);
-        assert!(output.contains("Missing --name"));
+        db.set_process_binding("pid-1", "", "luna").unwrap();
+        let env = std::collections::HashMap::from([
+            (
+                "HCOM_DIR".to_string(),
+                hcom_dir.to_string_lossy().to_string(),
+            ),
+            ("HOME".to_string(), test_home.to_string_lossy().to_string()),
+            ("HCOM_PROCESS_ID".to_string(), "pid-1".to_string()),
+        ]);
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+        let out = reply(handle_start(&ctx, &db, &sv(&["--session-id", "ses_new"])));
+        assert_eq!(out["name"], "luna", "{out}");
+        let inst = db.get_instance_full("luna").unwrap().unwrap();
+        assert!(inst.last_event_id >= old_id, "cursor must skip the backlog");
+        let unread = reply(plugin_rpc::handle_read(&db, &sv(&["--name", "luna"])));
+        assert_eq!(unread["messages"], serde_json::json!([]));
     }
 }

@@ -1999,25 +1999,28 @@ fn opencode_family_db_path(tool: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Query an OpenCode-family SQLite DB for a session's working directory.
-/// Returns (exists, cwd). `exists=true, cwd=None` is impossible given the
-/// schema (directory is NOT NULL), so `cwd=None` implies the row is absent.
+///
+/// OpenCode 1 and Kilo keep sessions in `session`; OpenCode 2 keeps them in
+/// `session_v2`. Either table may be absent, so a failed query (missing
+/// table or row) just falls through to the next.
 fn lookup_opencode_family_session(tool: &str, session_id: &str) -> Option<String> {
     let db_path = opencode_family_db_path(tool)?;
     if !db_path.exists() {
         return None;
     }
-    // Open read-only; no hcom-side schema assumptions beyond `session(id, directory)`.
     let conn = rusqlite::Connection::open_with_flags(
         &db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
-    conn.query_row(
-        "SELECT directory FROM session WHERE id = ?1",
-        rusqlite::params![session_id],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
+    ["session", "session_v2"].into_iter().find_map(|table| {
+        conn.query_row(
+            &format!("SELECT directory FROM {table} WHERE id = ?1"),
+            rusqlite::params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    })
 }
 
 fn lookup_family_session(session_id: &str) -> Option<(String, String)> {
@@ -2971,6 +2974,57 @@ mod tests {
 
         let found = find_session_on_disk("session-omp").unwrap();
         assert_eq!(found.0, "omp");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_lookup_opencode_family_session_falls_back_to_session_v2() {
+        let _guard = crate::hooks::test_helpers::EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let saved_db = std::env::var("OPENCODE_DB").ok();
+        let saved_xdg = std::env::var("XDG_DATA_HOME").ok();
+        let db_path = dir.path().join("oc.db");
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", dir.path());
+            std::env::set_var("OPENCODE_DB", &db_path);
+        }
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        // v2-only DB: no `session` table at all.
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL);
+             INSERT INTO session_v2 VALUES ('ses_v2only', '/work/v2');",
+        )
+        .unwrap();
+        assert_eq!(
+            lookup_opencode_family_session("opencode", "ses_v2only").as_deref(),
+            Some("/work/v2")
+        );
+        // Migrated DB: the v1 row wins.
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL);
+             INSERT INTO session VALUES ('ses_v2only', '/work/v1');",
+        )
+        .unwrap();
+        assert_eq!(
+            lookup_opencode_family_session("opencode", "ses_v2only").as_deref(),
+            Some("/work/v1")
+        );
+        assert_eq!(
+            lookup_opencode_family_session("opencode", "ses_missing"),
+            None
+        );
+
+        unsafe {
+            match saved_db {
+                Some(v) => std::env::set_var("OPENCODE_DB", v),
+                None => std::env::remove_var("OPENCODE_DB"),
+            }
+            match saved_xdg {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+        }
     }
 
     #[test]

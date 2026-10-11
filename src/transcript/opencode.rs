@@ -71,6 +71,102 @@ fn extract_opencode_edits(state: &Value, input: &Value) -> Vec<Value> {
     edits
 }
 
+/// Text rows to search, oldest first: `(session_id, title, text)`.
+///
+/// OpenCode 1/Kilo text parts for sessions OpenCode 2 hasn't migrated, then
+/// OpenCode 2 user/assistant text. Migration copies v1 history into
+/// `session_message` and keeps the v1 tables, so v2 is the complete copy.
+fn family_text_rows(conn: &rusqlite::Connection) -> Result<Vec<(String, String, String)>, String> {
+    let mut out = Vec::new();
+    let has_v2 = table_exists(conn, "session_v2") && table_exists(conn, "session_message");
+    if table_exists(conn, "session") && table_exists(conn, "part") {
+        let v2_filter = if has_v2 {
+            "AND s.id NOT IN (SELECT session_id FROM session_message)"
+        } else {
+            ""
+        };
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT s.id, s.title, p.data
+                 FROM session s
+                 JOIN part p ON p.session_id = s.id
+                 WHERE json_extract(p.data, '$.type') = 'text' {v2_filter}
+                 ORDER BY p.time_created ASC"
+            ))
+            .map_err(|e| format!("Query error: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("Query error: {e}"))?;
+        for (session_id, title, data_str) in rows.flatten() {
+            let Ok(data) = serde_json::from_str::<Value>(&data_str) else {
+                continue;
+            };
+            if data
+                .get("synthetic")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if let Some(text) = data.get("text").and_then(Value::as_str) {
+                out.push((session_id, title, text.to_string()));
+            }
+        }
+    }
+
+    if has_v2 {
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.title, m.type, m.data
+                 FROM session_v2 s
+                 JOIN session_message m ON m.session_id = s.id
+                 WHERE m.type IN ('user', 'assistant')
+                 ORDER BY m.time_created ASC, m.seq ASC",
+            )
+            .map_err(|e| format!("Query error: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| format!("Query error: {e}"))?;
+        for (session_id, title, kind, data_str) in rows.flatten() {
+            let Ok(data) = serde_json::from_str::<Value>(&data_str) else {
+                continue;
+            };
+            if kind == "user" {
+                if let Some(text) = data.get("text").and_then(Value::as_str) {
+                    out.push((session_id, title, text.to_string()));
+                }
+                continue;
+            }
+            for block in data
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if block.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(text) = block.get("text").and_then(Value::as_str)
+                {
+                    out.push((session_id.clone(), title.clone(), text.to_string()));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn search_family_sessions(
     db_path: &Path,
     pattern: &str,
@@ -82,48 +178,11 @@ fn search_family_sessions(
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| format!("Cannot open OpenCode DB: {e}"))?;
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT s.id, s.title, p.data
-             FROM session s
-             JOIN part p ON p.session_id = s.id
-             WHERE json_extract(p.data, '$.type') = 'text'
-             ORDER BY p.time_created ASC",
-        )
-        .map_err(|e| format!("Query error: {e}"))?;
-
     let mut by_session: std::collections::HashMap<String, TranscriptSearchMatch> =
         std::collections::HashMap::new();
     let mut order = Vec::new();
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(|e| format!("Query error: {e}"))?;
-
-    for row in rows {
-        let (session_id, title, data_str) = match row {
-            Ok(row) => row,
-            Err(_) => continue,
-        };
-        let data = match serde_json::from_str::<Value>(&data_str) {
-            Ok(data) => data,
-            Err(_) => continue,
-        };
-        if data
-            .get("synthetic")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-
-        let text = data.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        if text.is_empty() || !re.is_match(text) {
+    for (session_id, title, text) in family_text_rows(&conn)? {
+        if text.is_empty() || !re.is_match(&text) {
             continue;
         }
 
@@ -165,10 +224,199 @@ pub(crate) fn search_kilo_sessions(
     search_family_sessions(db_path, pattern, limit, "kilo")
 }
 
-/// Parse OpenCode SQLite transcript database.
+/// One conversation message, normalized to the OpenCode 1 shape: a role plus
+/// v1-style parts (`{"type":"text",...}` / `{"type":"tool","tool":...,"state":...}`).
+struct MsgRow {
+    role: String,
+    time_created: i64,
+    parts: Vec<Value>,
+}
+
+fn table_exists(conn: &rusqlite::Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        rusqlite::params![table],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// OpenCode 1 / Kilo: `message` rows (role in JSON `data`) with `part` rows.
+fn load_v1_messages(conn: &rusqlite::Connection, session_id: &str) -> Result<Vec<MsgRow>, String> {
+    if !table_exists(conn, "message") {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, data, time_created FROM message WHERE session_id = ? ORDER BY time_created ASC",
+        )
+        .map_err(|e| format!("Query error: {e}"))?;
+    let rows: Vec<(String, String, i64)> = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2).unwrap_or(0)))
+        })
+        .map_err(|e| format!("Query error: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Query per message_id to avoid dependency on part.session_id column.
+    let mut parts_stmt = if rows.is_empty() {
+        None
+    } else {
+        conn.prepare("SELECT data FROM part WHERE message_id = ? ORDER BY id ASC")
+            .ok()
+    };
+    let mut messages = Vec::with_capacity(rows.len());
+    for (id, data_str, time_created) in rows {
+        let data = match serde_json::from_str::<Value>(&data_str) {
+            Ok(data) => data,
+            Err(e) => {
+                log_warn(
+                    "transcript",
+                    "opencode_parse",
+                    &format!("skipping message {id}: invalid JSON in data column: {e}"),
+                );
+                continue;
+            }
+        };
+        let role = data
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let mut parts = Vec::new();
+        if let Some(stmt) = parts_stmt.as_mut()
+            && let Ok(rows) = stmt.query_map(rusqlite::params![id], |row| row.get::<_, String>(0))
+        {
+            parts.extend(
+                rows.flatten()
+                    .filter_map(|data| serde_json::from_str::<Value>(&data).ok()),
+            );
+        }
+        messages.push(MsgRow {
+            role,
+            time_created,
+            parts,
+        });
+    }
+    Ok(messages)
+}
+
+/// Text of an OpenCode 2 tool result: its text content blocks, joined.
+fn v2_content_text(content: Option<&Value>) -> Option<String> {
+    let text = content?
+        .as_array()?
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
+/// Convert an OpenCode 2 assistant content block to a v1-style part.
+fn v2_block_to_part(block: &Value) -> Option<Value> {
+    match block.get("type").and_then(Value::as_str)? {
+        "text" => {
+            Some(json!({"type": "text", "text": block.get("text").cloned().unwrap_or_default()}))
+        }
+        "tool" => {
+            let state = block.get("state").cloned().unwrap_or_else(|| json!({}));
+            let status = state.get("status").and_then(Value::as_str).unwrap_or("");
+            let mut v1_state = json!({
+                "status": status,
+                "input": state.get("input").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({})),
+            });
+            if let Some(metadata) = state.get("metadata") {
+                v1_state["metadata"] = metadata.clone();
+            }
+            if let Some(output) = v2_content_text(state.get("content")) {
+                v1_state["output"] = Value::String(output);
+            }
+            if status == "error" {
+                let message = state
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        v1_state
+                            .get("output")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                v1_state["error"] = Value::String(message);
+            }
+            Some(json!({
+                "type": "tool",
+                "tool": block.get("name").cloned().unwrap_or_default(),
+                "state": v1_state,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// OpenCode 2: `session_message` rows whose `type` is the role and whose JSON
+/// `data` holds the body (`text` for user, `content[]` blocks for assistant).
+/// Other row types (system, synthetic, idle, switches) are not conversation.
+fn load_v2_messages(conn: &rusqlite::Connection, session_id: &str) -> Result<Vec<MsgRow>, String> {
+    // OpenCode 1 DBs can carry a pre-split `session_message`; only the
+    // `session_v2` layout is OpenCode 2's canonical history.
+    if !(table_exists(conn, "session_v2") && table_exists(conn, "session_message")) {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, type, data, time_created FROM session_message
+             WHERE session_id = ?1 AND type IN ('user', 'assistant') ORDER BY seq ASC",
+        )
+        .map_err(|e| format!("Query error: {e}"))?;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3).unwrap_or(0),
+            ))
+        })
+        .map_err(|e| format!("Query error: {e}"))?;
+    let mut messages = Vec::new();
+    for (id, role, data_str, time_created) in rows.flatten() {
+        let data = match serde_json::from_str::<Value>(&data_str) {
+            Ok(data) => data,
+            Err(e) => {
+                log_warn(
+                    "transcript",
+                    "opencode_parse",
+                    &format!("skipping message {id}: invalid JSON in data column: {e}"),
+                );
+                continue;
+            }
+        };
+        let parts = if role == "user" {
+            vec![json!({"type": "text", "text": data.get("text").cloned().unwrap_or_default()})]
+        } else {
+            data.get("content")
+                .and_then(Value::as_array)
+                .map(|blocks| blocks.iter().filter_map(v2_block_to_part).collect())
+                .unwrap_or_default()
+        };
+        messages.push(MsgRow {
+            role,
+            time_created,
+            parts,
+        });
+    }
+    Ok(messages)
+}
+
+/// Parse an OpenCode-family SQLite transcript database.
 ///
-/// OpenCode stores conversations in `opencode.db` with `message` and `part` tables.
-/// Messages have role in their JSON `data` column; parts contain text, tool calls, etc.
+/// OpenCode 1 and Kilo store conversations in `message` + `part` tables;
+/// OpenCode 2 stores them in `session_message`. Migration copies v1 history
+/// into v2 and keeps the v1 tables, so v2 wins and v1 is the fallback.
 pub(crate) fn parse_opencode_sqlite(
     db_path: &Path,
     session_id: &str,
@@ -178,74 +426,12 @@ pub(crate) fn parse_opencode_sqlite(
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| format!("Cannot open OpenCode DB: {e}"))?;
 
-    // Fetch messages for this session (include time_created for timestamp)
-    let mut stmt = conn.prepare(
-        "SELECT id, data, time_created FROM message WHERE session_id = ? ORDER BY time_created ASC"
-    ).map_err(|e| format!("Query error: {e}"))?;
-
-    struct MsgRow {
-        id: String,
-        _data: Value,
-        role: String,
-        time_created: i64,
+    let mut messages = load_v2_messages(&conn, session_id)?;
+    if messages.is_empty() {
+        messages = load_v1_messages(&conn, session_id)?;
     }
-
-    let messages: Vec<MsgRow> = stmt
-        .query_map(rusqlite::params![session_id], |row| {
-            let id: String = row.get(0)?;
-            let data_str: String = row.get(1)?;
-            let time_created: i64 = row.get::<_, i64>(2).unwrap_or(0);
-            Ok((id, data_str, time_created))
-        })
-        .map_err(|e| format!("Query error: {e}"))?
-        .filter_map(|r| r.ok())
-        .filter_map(
-            |(id, data_str, time_created)| match serde_json::from_str::<Value>(&data_str) {
-                Ok(data) => {
-                    let role = data
-                        .get("role")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    Some(MsgRow {
-                        id,
-                        _data: data,
-                        role,
-                        time_created,
-                    })
-                }
-                Err(e) => {
-                    log_warn(
-                        "transcript",
-                        "opencode_parse",
-                        &format!("skipping message {id}: invalid JSON in data column: {e}"),
-                    );
-                    None
-                }
-            },
-        )
-        .collect();
-
     if messages.is_empty() {
         return Ok(Vec::new());
-    }
-
-    // Prefetch parts keyed by message_id.
-    // Query per message_id to avoid dependency on part.session_id column.
-    let mut parts_by_msg: std::collections::HashMap<String, Vec<Value>> =
-        std::collections::HashMap::new();
-    for msg in &messages {
-        if let Ok(mut parts_stmt) =
-            conn.prepare("SELECT data FROM part WHERE message_id = ? ORDER BY id ASC")
-            && let Ok(rows) =
-                parts_stmt.query_map(rusqlite::params![msg.id], |row| row.get::<_, String>(0))
-        {
-            for data_str in rows.flatten() {
-                if let Ok(v) = serde_json::from_str::<Value>(&data_str) {
-                    parts_by_msg.entry(msg.id.clone()).or_default().push(v);
-                }
-            }
-        }
     }
 
     // Build exchanges: group by user messages
@@ -258,8 +444,7 @@ pub(crate) fn parse_opencode_sqlite(
         if msg.role != "user" {
             continue;
         }
-        let parts = parts_by_msg.get(&msg.id).cloned().unwrap_or_default();
-        let has_text = parts.iter().any(|p| {
+        let has_text = msg.parts.iter().any(|p| {
             p.get("type").and_then(|v| v.as_str()) == Some("text")
                 && !p
                     .get("synthetic")
@@ -282,10 +467,9 @@ pub(crate) fn parse_opencode_sqlite(
             .copied()
             .unwrap_or(messages.len());
         let user_msg = &messages[user_idx];
-        let user_parts = parts_by_msg.get(&user_msg.id).cloned().unwrap_or_default();
-
         // Extract user text
-        let user_text: String = user_parts
+        let user_text: String = user_msg
+            .parts
             .iter()
             .filter(|p| {
                 p.get("type").and_then(|v| v.as_str()) == Some("text")
@@ -319,8 +503,7 @@ pub(crate) fn parse_opencode_sqlite(
             if msg.role != "assistant" {
                 continue;
             }
-            let msg_parts = parts_by_msg.get(&msg.id).cloned().unwrap_or_default();
-            for p in &msg_parts {
+            for p in &msg.parts {
                 let ptype = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match ptype {
                     "text" => {
@@ -532,5 +715,158 @@ mod tests {
         assert_eq!(exchanges[0].errors[0]["content"], "exit status 1");
         assert_eq!(exchanges[0].edits[0]["file"], "/work/a.rs");
         assert_eq!(exchanges[0].edits[0]["diff"], "-old\n+new");
+    }
+
+    fn v2_db(dir: &Path) -> std::path::PathBuf {
+        let db_path = dir.join("opencode.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT, title TEXT, directory TEXT);
+             CREATE TABLE message (id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
+             CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, data TEXT, time_created INTEGER);
+             CREATE TABLE session_v2 (id TEXT, title TEXT, directory TEXT);
+             CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER,
+                                           time_created INTEGER, data TEXT);
+             INSERT INTO session_v2 VALUES ('ses_2', 'v2 work', '/work');",
+        )
+        .unwrap();
+        let rows = [
+            ("system", json!({"text": "tools changed"})),
+            ("user", json!({"text": "run it", "files": [], "agents": []})),
+            (
+                "assistant",
+                json!({"content": [
+                    {"type": "reasoning", "text": "thinking"},
+                    {"type": "text", "text": "running now"},
+                    {"type": "tool", "id": "c1", "name": "shell", "state": {
+                        "status": "completed",
+                        "input": {"command": "echo hi"},
+                        "content": [{"type": "text", "text": "hi\n"}],
+                        "metadata": {"exit": 0}
+                    }},
+                    {"type": "tool", "id": "c2", "name": "edit", "state": {
+                        "status": "completed",
+                        "input": {"path": "/work/a.rs"},
+                        "content": [{"type": "text", "text": "Edited"}],
+                        "metadata": {"diff": "-a\n+b"}
+                    }},
+                    {"type": "tool", "id": "c3", "name": "shell", "state": {
+                        "status": "error",
+                        "input": {"command": "false"},
+                        "error": {"type": "tool.execution", "message": "exit status 1"}
+                    }}
+                ]}),
+            ),
+            ("synthetic", json!({"text": "internal"})),
+            ("user", json!({"text": "second"})),
+        ];
+        for (seq, (kind, data)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO session_message VALUES (?1, 'ses_2', ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    format!("msg_{seq}"),
+                    kind,
+                    seq as i64,
+                    1_000 + seq as i64,
+                    data.to_string()
+                ],
+            )
+            .unwrap();
+        }
+        db_path
+    }
+
+    #[test]
+    fn reads_opencode2_session_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = v2_db(dir.path());
+
+        let exchanges = parse_opencode_sqlite(&db_path, "ses_2", 10).unwrap();
+        assert_eq!(exchanges.len(), 2);
+        let first = &exchanges[0];
+        assert_eq!(first.user, "run it");
+        assert!(first.action.contains("running now"), "{}", first.action);
+        assert!(!first.action.contains("thinking"));
+        let names: Vec<_> = first.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Bash", "Edit", "Bash"]);
+        assert_eq!(first.tools[0].command.as_deref(), Some("echo hi"));
+        assert_eq!(first.tools[0].output.as_deref(), Some("hi\n"));
+        assert_eq!(first.tools[1].file.as_deref(), Some("a.rs"));
+        assert_eq!(first.edits[0]["file"], "/work/a.rs");
+        assert_eq!(first.edits[0]["diff"], "-a\n+b");
+        assert!(first.tools[2].is_error);
+        assert_eq!(first.errors[0]["content"], "exit status 1");
+        assert!(first.ended_on_error);
+        assert_eq!(exchanges[1].user, "second");
+
+        let hits = search_opencode_sessions(&db_path, "running", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id.as_deref(), Some("ses_2"));
+        assert_eq!(hits[0].label.as_deref(), Some("v2 work"));
+        assert!(
+            search_opencode_sessions(&db_path, "internal", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn v2_wins_for_migrated_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = v2_db(dir.path());
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        // ses_2 was migrated (v1 rows kept, history continues in v2);
+        // ses_old exists only in v1.
+        conn.execute_batch(
+            r#"INSERT INTO session VALUES ('ses_2', 'v1 copy', '/work');
+               INSERT INTO message VALUES ('u1', 'ses_2', '{"role":"user"}', 1);
+               INSERT INTO part VALUES ('p1', 'u1', 'ses_2', '{"type":"text","text":"from v1"}', 1);
+               INSERT INTO session VALUES ('ses_old', 'old', '/work');
+               INSERT INTO message VALUES ('u2', 'ses_old', '{"role":"user"}', 1);
+               INSERT INTO part VALUES ('p2', 'u2', 'ses_old', '{"type":"text","text":"legacy only"}', 1);"#,
+        )
+        .unwrap();
+        drop(conn);
+
+        let exchanges = parse_opencode_sqlite(&db_path, "ses_2", 10).unwrap();
+        assert_eq!(exchanges.len(), 2);
+        assert_eq!(exchanges[1].user, "second");
+        let old = parse_opencode_sqlite(&db_path, "ses_old", 10).unwrap();
+        assert_eq!(old[0].user, "legacy only");
+
+        let hits = search_opencode_sessions(&db_path, "second", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].label.as_deref(), Some("v2 work"));
+        assert!(
+            search_opencode_sessions(&db_path, "from v1", 10)
+                .unwrap()
+                .is_empty()
+        );
+        let hits = search_opencode_sessions(&db_path, "legacy only", 10).unwrap();
+        assert_eq!(hits[0].session_id.as_deref(), Some("ses_old"));
+    }
+
+    #[test]
+    fn v2_only_db_without_v1_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE session_v2 (id TEXT, title TEXT);
+               CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, seq INTEGER,
+                                             time_created INTEGER, data TEXT);
+               INSERT INTO session_v2 VALUES ('ses_3', NULL);
+               INSERT INTO session_message VALUES ('msg_1', 'ses_3', 'user', 1, 5, '{"text":"hello"}');"#,
+        )
+        .unwrap();
+        drop(conn);
+        let exchanges = parse_opencode_sqlite(&db_path, "ses_3", 10).unwrap();
+        assert_eq!(exchanges[0].user, "hello");
+        assert_eq!(
+            search_opencode_sessions(&db_path, "hello", 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

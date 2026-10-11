@@ -197,36 +197,36 @@ pub(crate) fn opencode_family_data_dir(tool: &str) -> Option<std::path::PathBuf>
 
 /// Resolve the SQLite database path for an OpenCode-family tool (`opencode`/`kilo`).
 ///
-/// Builds on [`opencode_family_data_dir`]. For `kilo`, honors `KILO_DB`: `:memory:`
-/// means no on-disk DB (returns `None`), an absolute path is used as-is, and a
-/// relative path is joined onto the data dir; if `KILO_DB` is unset, defaults to
-/// `<data_dir>/kilo.db`. Any other tool resolves to `<data_dir>/opencode.db`.
+/// Builds on [`opencode_family_data_dir`]. Honors the tool's DB override
+/// (`OPENCODE_DB` / `KILO_DB`): `:memory:` means no on-disk DB (returns `None`),
+/// an absolute path is used as-is, and a relative path is joined onto the data
+/// dir. Unset or empty defaults to `<data_dir>/<tool>.db`.
 ///
 /// This performs path construction only — it does not check whether the
 /// resulting path exists on disk. Callers that need "exists" semantics should
 /// apply their own `.exists()` check.
 pub(crate) fn opencode_family_db_path(tool: &str) -> Option<std::path::PathBuf> {
     let data_dir = opencode_family_data_dir(tool)?;
-    if tool == "kilo" {
-        if std::env::var("KILO_DB").as_deref() == Ok(":memory:") {
-            return None;
+    let (env_var, default_name) = if tool == "kilo" {
+        ("KILO_DB", "kilo.db")
+    } else {
+        ("OPENCODE_DB", "opencode.db")
+    };
+    match std::env::var(env_var)
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) if value == ":memory:" => None,
+        Some(value) => {
+            let path = std::path::PathBuf::from(value);
+            Some(if path.is_absolute() {
+                path
+            } else {
+                data_dir.join(path)
+            })
         }
-        return Some(
-            std::env::var("KILO_DB")
-                .ok()
-                .filter(|value| !value.is_empty())
-                .map(std::path::PathBuf::from)
-                .map(|path| {
-                    if path.is_absolute() {
-                        path
-                    } else {
-                        data_dir.join(path)
-                    }
-                })
-                .unwrap_or_else(|| data_dir.join("kilo.db")),
-        );
+        None => Some(data_dir.join(default_name)),
     }
-    Some(data_dir.join("opencode.db"))
 }
 
 // Records the name each `set_terminal_title` call would have written, so
@@ -507,6 +507,49 @@ mod tests {
             super::opencode_family_data_dir("opencode"),
             Some(home.join(".local/share/opencode"))
         );
+    }
+
+    #[test]
+    #[serial]
+    fn opencode_family_db_path_honors_per_tool_db_override() {
+        let _guard = EnvGuard::new();
+        let temp = tempfile::tempdir().unwrap();
+        let _xdg_guard = XdgDataHomeGuard::set(temp.path().to_str().unwrap());
+        let saved: Vec<_> = ["OPENCODE_DB", "KILO_DB"]
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        let set = |k: &str, v: Option<&str>| unsafe {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        };
+        let abs = temp.path().join("elsewhere.db");
+        for (tool, var) in [("opencode", "OPENCODE_DB"), ("kilo", "KILO_DB")] {
+            let data = temp.path().join(tool);
+            set(var, None);
+            assert_eq!(
+                super::opencode_family_db_path(tool),
+                Some(data.join(format!("{tool}.db")))
+            );
+            set(var, Some(":memory:"));
+            assert_eq!(super::opencode_family_db_path(tool), None);
+            set(var, Some("custom.db"));
+            assert_eq!(
+                super::opencode_family_db_path(tool),
+                Some(data.join("custom.db"))
+            );
+            set(var, Some(abs.to_str().unwrap()));
+            assert_eq!(super::opencode_family_db_path(tool), Some(abs.clone()));
+            set(var, None);
+        }
+        // Each tool reads only its own override.
+        set("KILO_DB", Some(":memory:"));
+        assert!(super::opencode_family_db_path("opencode").is_some());
+        for (k, v) in saved {
+            set(k, v.as_deref());
+        }
     }
 
     /// Mirrors uv's on-disk layouts: every uv venv has `pyvenv.cfg` and its own
