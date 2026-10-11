@@ -2614,7 +2614,7 @@ fn subagent_posttooluse(db: &HcomDb, subagent_name: &str) -> (i32, String, Optio
 }
 
 //
-// Manages hook installation in ~/.claude/settings.json.
+// Per-run hook settings, plus cleanup of hooks older hcom wrote to settings.json.
 
 use super::common::SAFE_HCOM_COMMANDS;
 
@@ -2724,10 +2724,7 @@ fn merge_per_run_settings(settings: &mut Value, auto_approve: bool) -> Result<()
         let entries = entries
             .as_array_mut()
             .with_context(|| format!("Caller --settings hooks.{event} must be an array"))?;
-        let mut hook = serde_json::json!({
-            "type": "command",
-            "command": build_hook_entry_command(command),
-        });
+        let mut hook = build_hook_entry(command);
         if let Some(seconds) = timeout {
             hook["timeout"] = serde_json::json!(seconds);
         }
@@ -2737,10 +2734,6 @@ fn merge_per_run_settings(settings: &mut Value, auto_approve: bool) -> Result<()
         }
         entries.push(group);
     }
-    object_field(settings, "env")?.insert(
-        "HCOM".to_string(),
-        Value::String(crate::runtime_env::build_hcom_command()),
-    );
     if auto_approve {
         let permissions = object_field(settings, "permissions")?;
         let allow = permissions
@@ -2868,23 +2861,14 @@ static RE_HCOM_PY_COMMANDS: LazyLock<Regex> = LazyLock::new(|| {
 });
 static RE_SH_HCOM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"sh\s+-c.*hcom").unwrap());
 
-/// Build a hook command that silently exits 0 when hcom is not installed.
-///
-/// Claude already executes hook commands through a shell, so this command keeps
-/// all shell logic inline instead of spawning another `sh -c`. It uses the
-/// ${HCOM:-hcom} env var (set in settings.json env block) so it works for both
-/// direct `hcom` and `uvx hcom` invocations. When the binary is absent (e.g.
-/// after `brew uninstall hcom`), the hook exits 0 instead of emitting a "command
-/// not found" error inside the tool.
-fn build_hook_entry_command(cmd_suffix: &str) -> String {
-    // Claude runs hook commands through a POSIX shell on every platform
-    // (Git Bash on Windows), so the same command works everywhere. The
-    // `${HCOM:-hcom}` default plus the `command -v` guard make it silently
-    // exit 0 when hcom isn't on PATH.
-    format!(
-        "cmd=${{HCOM:-hcom}}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {} || exit 0",
-        cmd_suffix
-    )
+/// Exec-form hook entry: Claude spawns the hcom prefix directly with `args`, so
+/// there is no shell quoting, no PowerShell/Git Bash difference on Windows,
+/// and paths with spaces stay one argument.
+fn build_hook_entry(cmd_suffix: &str) -> Value {
+    let mut argv = crate::runtime_env::get_hcom_prefix();
+    let command = argv.remove(0);
+    argv.push(cmd_suffix.to_string());
+    serde_json::json!({"type": "command", "command": command, "args": argv})
 }
 
 /// Format a single Claude permission pattern: `Bash(prefix cmd:*)`.
@@ -3195,7 +3179,15 @@ mod tests {
             2
         );
         assert_eq!(settings["env"]["CALLER"], "yes");
-        assert!(settings["env"]["HCOM"].is_string());
+        assert!(settings["env"].get("HCOM").is_none());
+        assert_eq!(
+            settings["hooks"]["SessionStart"][1]["hooks"][0]["args"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap(),
+            "sessionstart"
+        );
         assert_eq!(settings["permissions"]["allow"][0], "Bash(caller:*)");
         assert_eq!(settings["custom"], 42);
     }
@@ -4138,13 +4130,19 @@ mod tests {
     }
 
     #[test]
-    fn test_build_hook_entry_command_avoids_nested_shell() {
-        let command = build_hook_entry_command("poll");
-        assert_eq!(
-            command,
-            "cmd=${HCOM:-hcom}; command -v \"${cmd%% *}\" >/dev/null 2>&1 && exec $cmd poll || exit 0"
+    fn test_build_hook_entry_uses_exec_form() {
+        let hook = build_hook_entry("poll");
+        let mut argv = vec![hook["command"].as_str().unwrap().to_string()];
+        argv.extend(
+            hook["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| arg.as_str().unwrap().to_string()),
         );
-        assert!(!command.starts_with("sh -c"));
+        let mut expected = crate::runtime_env::get_hcom_prefix();
+        expected.push("poll".to_string());
+        assert_eq!(argv, expected);
     }
 
     #[test]
@@ -4378,6 +4376,13 @@ mod tests {
         violations
     }
 
+    /// Shell-form command older hcom wrote into settings.json.
+    fn legacy_hook_command(cmd_suffix: &str) -> String {
+        format!(
+            "cmd=${{HCOM:-hcom}}; command -v \"${{cmd%% *}}\" >/dev/null 2>&1 && exec $cmd {cmd_suffix} || exit 0"
+        )
+    }
+
     /// Independent verification: expected hcom hooks present.
     fn independently_verify_hcom_hooks_present_claude(
         settings: &Value,
@@ -4394,7 +4399,7 @@ mod tests {
             }
         };
         for &(hook_type, cmd_suffix) in expected {
-            let expected_full = build_hook_entry_command(cmd_suffix);
+            let expected_full = legacy_hook_command(cmd_suffix);
             let matchers = match hooks.get(hook_type).and_then(|v| v.as_array()) {
                 Some(a) => a,
                 None => {
@@ -4486,6 +4491,19 @@ mod tests {
         // Plant a legacy install (same shape older hcom wrote).
         let mut legacy = user_settings.clone();
         merge_per_run_settings(&mut legacy, true).unwrap();
+        for groups in legacy["hooks"].as_object_mut().unwrap().values_mut() {
+            for group in groups.as_array_mut().unwrap() {
+                for hook in group["hooks"].as_array_mut().unwrap() {
+                    let suffix = hook["args"].as_array().unwrap().last().unwrap().clone();
+                    *hook = serde_json::json!({
+                        "type": "command",
+                        "command": legacy_hook_command(suffix.as_str().unwrap()),
+                    });
+                }
+            }
+        }
+        let env = legacy["env"].as_object_mut().unwrap();
+        env.insert("HCOM".into(), serde_json::json!("hcom"));
         std::fs::write(&settings_path, legacy.to_string()).unwrap();
         let after_setup = read_json(&settings_path);
         let expected = vec![
