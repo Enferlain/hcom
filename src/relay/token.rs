@@ -5,7 +5,7 @@
 //!   v0x02: private broker, plaintext  — 0x02 + 16 UUID bytes + URL bytes → variable length base64url
 //!   v0x04: compact bearer token       — 0x04 + 16 UUID bytes + 32 PSK + (1 broker idx | URL bytes)
 //!
-//! v0x01/v0x02 still parse so that `hcom relay connect` can give a useful error
+//! Only v0x04 is minted. v0x01/v0x02 still parse so that `hcom relay connect` can give a useful error
 //! to a user pasting an old token. Connecting with a legacy token refuses to
 //! write the local config because those formats do not carry the relay PSK;
 //! the source device must run `hcom relay new` on a current build to mint a
@@ -26,44 +26,10 @@ pub struct DecodedToken {
     pub psk: Option<[u8; PSK_LEN]>,
 }
 
-/// Encode relay_id, broker, and optional PSK into a compact join token.
-///
-/// `psk = Some(..)` always produces a v0x04 token. `psk = None` produces a
-/// legacy v0x01/v0x02 plaintext token. Outside the token-format unit tests,
-/// production callers should always pass a PSK so the token carries the full
-/// relay credentials needed by the joining device.
-pub fn encode_join_token(
-    relay_id: &str,
-    broker_url: &str,
-    psk: Option<&[u8; PSK_LEN]>,
-) -> Option<String> {
+/// Encode relay_id, broker, and PSK into a compact v0x04 join token.
+pub fn encode_join_token(relay_id: &str, broker_url: &str, psk: &[u8; PSK_LEN]) -> Option<String> {
     let uuid_bytes = uuid_to_bytes(relay_id)?;
 
-    if let Some(psk) = psk {
-        return Some(encode_v04(&uuid_bytes, broker_url, psk));
-    }
-
-    // Plaintext path: try public broker first → v0x01, fall back to v0x02.
-    for (i, (host, port)) in DEFAULT_BROKERS.iter().enumerate() {
-        let mqtts = format!("mqtts://{}:{}", host, port);
-        let mqtt = format!("mqtt://{}:{}", host, port);
-        if broker_url == mqtts || broker_url == mqtt {
-            let mut buf = Vec::with_capacity(18);
-            buf.push(0x01);
-            buf.extend_from_slice(&uuid_bytes);
-            buf.push(i as u8);
-            return Some(URL_SAFE_NO_PAD.encode(&buf));
-        }
-    }
-
-    let mut buf = Vec::with_capacity(17 + broker_url.len());
-    buf.push(0x02);
-    buf.extend_from_slice(&uuid_bytes);
-    buf.extend_from_slice(broker_url.as_bytes());
-    Some(URL_SAFE_NO_PAD.encode(&buf))
-}
-
-fn encode_v04(uuid_bytes: &[u8; 16], broker_url: &str, psk: &[u8; PSK_LEN]) -> String {
     // Public broker → 1+16+32+1 = 50 bytes; private broker → variable.
     for (i, (host, port)) in DEFAULT_BROKERS.iter().enumerate() {
         let mqtts = format!("mqtts://{}:{}", host, port);
@@ -71,19 +37,19 @@ fn encode_v04(uuid_bytes: &[u8; 16], broker_url: &str, psk: &[u8; PSK_LEN]) -> S
         if broker_url == mqtts || broker_url == mqtt {
             let mut buf = Vec::with_capacity(1 + 16 + PSK_LEN + 1);
             buf.push(0x04);
-            buf.extend_from_slice(uuid_bytes);
+            buf.extend_from_slice(&uuid_bytes);
             buf.extend_from_slice(psk);
             buf.push(i as u8);
-            return URL_SAFE_NO_PAD.encode(&buf);
+            return Some(URL_SAFE_NO_PAD.encode(&buf));
         }
     }
 
     let mut buf = Vec::with_capacity(1 + 16 + PSK_LEN + broker_url.len());
     buf.push(0x04);
-    buf.extend_from_slice(uuid_bytes);
+    buf.extend_from_slice(&uuid_bytes);
     buf.extend_from_slice(psk);
     buf.extend_from_slice(broker_url.as_bytes());
-    URL_SAFE_NO_PAD.encode(&buf)
+    Some(URL_SAFE_NO_PAD.encode(&buf))
 }
 
 /// Decode a join token. Returns `None` if the token is unparseable.
@@ -217,37 +183,24 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_decode_v0x01_public_broker() {
+    fn test_decode_legacy_v0x01_public_broker() {
         let relay_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let uuid_bytes = uuid_to_bytes(relay_id).unwrap();
 
         for (i, (host, port)) in DEFAULT_BROKERS.iter().enumerate() {
-            let broker = format!("mqtts://{}:{}", host, port);
-            let token = encode_join_token(relay_id, &broker, None).unwrap();
-            let decoded = decode_join_token(&token).unwrap();
+            let mut buf = vec![0x01];
+            buf.extend_from_slice(&uuid_bytes);
+            buf.push(i as u8);
+            let decoded = decode_join_token(&URL_SAFE_NO_PAD.encode(&buf)).unwrap();
             assert_eq!(decoded.relay_id, relay_id, "broker index {}", i);
-            assert_eq!(decoded.broker_url, broker, "broker index {}", i);
+            assert_eq!(
+                decoded.broker_url,
+                format!("mqtts://{}:{}", host, port),
+                "broker index {}",
+                i
+            );
             assert!(decoded.psk.is_none());
         }
-    }
-
-    #[test]
-    fn test_encode_decode_v0x02_private_broker() {
-        let relay_id = "12345678-1234-1234-1234-123456789abc";
-        let broker = "mqtts://my-private-broker.example.com:8883";
-
-        let token = encode_join_token(relay_id, broker, None).unwrap();
-        let decoded = decode_join_token(&token).unwrap();
-        assert_eq!(decoded.relay_id, relay_id);
-        assert_eq!(decoded.broker_url, broker);
-        assert!(decoded.psk.is_none());
-    }
-
-    #[test]
-    fn test_v0x01_token_is_compact() {
-        let relay_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
-        let broker = format!("mqtts://{}:{}", DEFAULT_BROKERS[0].0, DEFAULT_BROKERS[0].1);
-        let token = encode_join_token(relay_id, &broker, None).unwrap();
-        assert_eq!(token.len(), 24);
     }
 
     #[test]
@@ -268,18 +221,16 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_language_parity_v0x01() {
+    fn test_decode_legacy_v0x01_fixture() {
         let expected_token = "AaGyw9Tl9niQq83vEjRWeJAA";
         let decoded = decode_join_token(expected_token).unwrap();
         assert_eq!(decoded.relay_id, "a1b2c3d4-e5f6-7890-abcd-ef1234567890");
         assert_eq!(decoded.broker_url, "mqtts://broker.emqx.io:8883");
-
-        let rust_token = encode_join_token(&decoded.relay_id, &decoded.broker_url, None).unwrap();
-        assert_eq!(rust_token, expected_token);
+        assert!(decoded.psk.is_none());
     }
 
     #[test]
-    fn test_cross_language_parity_v0x02() {
+    fn test_decode_legacy_v0x02_fixture() {
         let expected_token =
             "AqGyw9Tl9niQq83vEjRWeJBtcXR0czovL215LXByaXZhdGUtYnJva2VyLmV4YW1wbGUuY29tOjg4ODM";
         let decoded = decode_join_token(expected_token).unwrap();
@@ -288,9 +239,7 @@ mod tests {
             decoded.broker_url,
             "mqtts://my-private-broker.example.com:8883"
         );
-
-        let rust_token = encode_join_token(&decoded.relay_id, &decoded.broker_url, None).unwrap();
-        assert_eq!(rust_token, expected_token);
+        assert!(decoded.psk.is_none());
     }
 
     #[test]
@@ -299,7 +248,7 @@ mod tests {
         let psk = fake_psk();
         for (i, (host, port)) in DEFAULT_BROKERS.iter().enumerate() {
             let broker = format!("mqtts://{}:{}", host, port);
-            let token = encode_join_token(relay_id, &broker, Some(&psk)).unwrap();
+            let token = encode_join_token(relay_id, &broker, &psk).unwrap();
             let decoded = decode_join_token(&token).unwrap();
             assert_eq!(decoded.relay_id, relay_id, "broker index {}", i);
             assert_eq!(decoded.broker_url, broker);
@@ -313,7 +262,7 @@ mod tests {
         let broker = "mqtts://my-private-broker.example.com:8883";
         let psk = fake_psk();
 
-        let token = encode_join_token(relay_id, broker, Some(&psk)).unwrap();
+        let token = encode_join_token(relay_id, broker, &psk).unwrap();
         let decoded = decode_join_token(&token).unwrap();
         assert_eq!(decoded.relay_id, relay_id);
         assert_eq!(decoded.broker_url, broker);
@@ -325,7 +274,7 @@ mod tests {
         // 1 + 16 + 32 + 1 = 50 bytes → ceil(50*4/3) = 67 base64url chars (no pad).
         let relay_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
         let broker = format!("mqtts://{}:{}", DEFAULT_BROKERS[0].0, DEFAULT_BROKERS[0].1);
-        let token = encode_join_token(relay_id, &broker, Some(&fake_psk())).unwrap();
+        let token = encode_join_token(relay_id, &broker, &fake_psk()).unwrap();
         assert_eq!(token.len(), 67);
     }
 
@@ -350,7 +299,7 @@ mod tests {
         let broker = "my-private-broker.example.com:8883";
         let psk = fake_psk();
 
-        let token = encode_join_token(relay_id, broker, Some(&psk)).unwrap();
+        let token = encode_join_token(relay_id, broker, &psk).unwrap();
         let decoded = decode_join_token(&token).unwrap();
         assert_eq!(decoded.relay_id, relay_id);
         assert_eq!(decoded.broker_url, broker);
@@ -368,7 +317,7 @@ mod tests {
             *b = i as u8;
         }
         let broker = format!("mqtts://{}:{}", DEFAULT_BROKERS[0].0, DEFAULT_BROKERS[0].1);
-        let token = encode_join_token(relay_id, &broker, Some(&psk)).unwrap();
+        let token = encode_join_token(relay_id, &broker, &psk).unwrap();
         let raw = URL_SAFE_NO_PAD.decode(token.as_bytes()).unwrap();
 
         assert_eq!(raw[0], 0x04);

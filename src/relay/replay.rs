@@ -123,32 +123,6 @@ impl ReplayGuard {
         Ok(())
     }
 
-    /// Backwards-compatible helper for tests/callers that want the old
-    /// check-and-insert behavior in one call.
-    pub fn check_and_record(
-        &mut self,
-        sender: &str,
-        nonce: [u8; NONCE_LEN],
-        ts_secs: u64,
-        now_secs: u64,
-    ) -> Result<(), ReplayError> {
-        self.check(sender, nonce, ts_secs, now_secs)?;
-        self.record_nonce(sender, nonce, now_secs)
-    }
-
-    /// Helper for state snapshots.
-    pub fn check_and_record_state(
-        &mut self,
-        sender: &str,
-        nonce: [u8; NONCE_LEN],
-        ts_secs: u64,
-        now_secs: u64,
-        min_accepted_ts: Option<u64>,
-    ) -> Result<(), ReplayError> {
-        self.check_state(sender, nonce, ts_secs, now_secs, min_accepted_ts)?;
-        self.record_nonce(sender, nonce, now_secs)
-    }
-
     fn check_inner(
         &mut self,
         sender: &str,
@@ -193,6 +167,32 @@ impl ReplayGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl ReplayGuard {
+        /// Check and record in one call, for tests that don't model authentication.
+        fn check_and_record(
+            &mut self,
+            sender: &str,
+            nonce: [u8; NONCE_LEN],
+            ts_secs: u64,
+            now_secs: u64,
+        ) -> Result<(), ReplayError> {
+            self.check(sender, nonce, ts_secs, now_secs)?;
+            self.record_nonce(sender, nonce, now_secs)
+        }
+
+        fn check_and_record_state(
+            &mut self,
+            sender: &str,
+            nonce: [u8; NONCE_LEN],
+            ts_secs: u64,
+            now_secs: u64,
+            min_accepted_ts: Option<u64>,
+        ) -> Result<(), ReplayError> {
+            self.check_state(sender, nonce, ts_secs, now_secs, min_accepted_ts)?;
+            self.record_nonce(sender, nonce, now_secs)
+        }
+    }
 
     fn nonce(byte: u8) -> [u8; NONCE_LEN] {
         [byte; NONCE_LEN]

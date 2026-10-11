@@ -333,12 +333,6 @@ pub fn format_time(t: f64) -> String {
 // ── Message ──────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum MessageScope {
-    Broadcast,
-    Mentions,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SenderKind {
     External,
     Instance,
@@ -352,10 +346,6 @@ pub struct Message {
     pub recipients: Vec<String>,
     pub body: String,
     pub time: f64,
-    #[allow(dead_code)] // read in tests
-    pub delivered: Vec<String>,
-    #[allow(dead_code)] // read in tests
-    pub scope: MessageScope,
     pub sender_kind: SenderKind,
     pub intent: Option<String>,
     pub reply_to: Option<u64>,

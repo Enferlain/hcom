@@ -3,7 +3,7 @@
 use crate::config;
 use crate::db::HcomDb;
 use crate::relay::broker::BrokerProbe;
-use crate::relay::token::DecodedToken;
+use crate::relay::token::{DecodedToken, encode_join_token};
 use crate::relay::{self, DEFAULT_BROKERS};
 use crate::shared::CommandContext;
 use crate::shared::ansi::{FG_GRAY, FG_GREEN, FG_RED, FG_YELLOW, RESET};
@@ -43,13 +43,6 @@ fn parse_broker_flags(argv: &[String]) -> (Option<String>, Option<String>, Vec<S
 /// Returns round-trip ms or None on failure.
 fn ping_broker(host: &str, port: u16, use_tls: bool) -> Option<u32> {
     crate::relay::broker::ping_broker(host, port, use_tls).map(|ms| ms as u32)
-}
-
-/// Encode relay_id + broker into a join token. Always passes the active PSK so
-/// new tokens are always v0x04 (PSK-bearing). Legacy v0x01/v0x02 tokens are only
-/// produced by tests via the underlying `relay::token::encode_join_token`.
-fn encode_join_token(relay_id: &str, broker_url: &str, psk: &[u8; 32]) -> Option<String> {
-    relay::token::encode_join_token(relay_id, broker_url, Some(psk))
 }
 
 /// Decode a join token. Returns the parsed structure including the optional
@@ -1015,10 +1008,7 @@ mod tests {
     fn test_legacy_token_rejected_in_connect_decode() {
         // A v0x01 (plaintext) token decodes to psk=None; relay_connect refuses
         // it instead of writing config.
-        let relay_id = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
-        let broker = format!("mqtts://{}:{}", DEFAULT_BROKERS[0].0, DEFAULT_BROKERS[0].1);
-        let legacy = relay::token::encode_join_token(relay_id, &broker, None).unwrap();
-        let decoded = decode_join_token(&legacy).unwrap();
+        let decoded = decode_join_token("AaGyw9Tl9niQq83vEjRWeJAA").unwrap();
         assert!(decoded.psk.is_none());
     }
 

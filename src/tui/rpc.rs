@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn launch_argv_headless_for_non_claude_tool() {
         // Headless is now offered for every tool; non-claude routes through the
-        // PTY headless wrapper via a plain --headless (no --pty).
+        // PTY headless wrapper via a plain --headless.
         let argv = build_launch_argv(Tool::Gemini, 1, "", true, false, "kitty", "do task");
         assert_eq!(
             argv,

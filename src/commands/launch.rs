@@ -651,13 +651,6 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
             "--go" => {
                 i += 1;
             }
-            "--pty" => {
-                // Deprecated no-op: --pty was previously used to request a
-                // pseudo-terminal session. PTY behaviour is now the default
-                // (or controlled by --headless). Silently consume the flag so
-                // legacy scripts continue to work.
-                i += 1;
-            }
             _ => {
                 tool_args.push(args[i].clone());
                 i += 1;
@@ -899,15 +892,6 @@ mod tests {
             parse_launch_argv(&s(&["claude", "--tag", "test", "--model", "haiku"])).unwrap();
         assert_eq!(tool, "claude");
         assert_eq!(flags.tag, Some("test".to_string()));
-        assert_eq!(args, s(&["--model", "haiku"]));
-    }
-
-    #[test]
-    fn test_parse_launch_argv_accepts_legacy_pty() {
-        let (_, tool, flags, args) =
-            parse_launch_argv(&s(&["claude", "--headless", "--pty", "--model", "haiku"])).unwrap();
-        assert_eq!(tool, "claude");
-        assert!(flags.headless);
         assert_eq!(args, s(&["--model", "haiku"]));
     }
 

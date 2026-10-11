@@ -946,13 +946,8 @@ fn parse_message_row(id: i64, timestamp: &str, data: &str) -> Option<Message> {
 
     let from = json_str(&json, "from", "?").to_string();
     let text = json_str(&json, "text", "").to_string();
-    let scope_s = json_str(&json, "scope", "broadcast");
     let sender_kind_s = json_str(&json, "sender_kind", "agent");
 
-    let scope = match scope_s {
-        "mentions" => MessageScope::Mentions,
-        _ => MessageScope::Broadcast,
-    };
     let sender_kind = match sender_kind_s {
         "system" | "sys" => SenderKind::System,
         "user" | "human" | "external" => SenderKind::External,
@@ -961,16 +956,6 @@ fn parse_message_row(id: i64, timestamp: &str, data: &str) -> Option<Message> {
 
     let recipients: Vec<String> = json
         .get("mentions")
-        .and_then(|m| m.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let delivered: Vec<String> = json
-        .get("delivered_to")
         .and_then(|m| m.as_array())
         .map(|arr| {
             arr.iter()
@@ -991,8 +976,6 @@ fn parse_message_row(id: i64, timestamp: &str, data: &str) -> Option<Message> {
         recipients,
         body: text,
         time: parse_iso_to_epoch(timestamp),
-        delivered,
-        scope,
         sender_kind,
         intent,
         reply_to,
@@ -1523,9 +1506,7 @@ mod tests {
         compute_unread_batch, count_gt, load_instances, load_recently_stopped, parse_message_row,
         parse_status_or_life_row, parse_tool,
     };
-    use crate::tui::model::{
-        ActivityKind, Agent, AgentStatus, EventKind, MessageScope, SenderKind, Tool,
-    };
+    use crate::tui::model::{ActivityKind, Agent, AgentStatus, EventKind, SenderKind, Tool};
     use rusqlite::Connection;
 
     // Blocker 1 regression: the no-arg TUI must route through the owner-only
@@ -1871,10 +1852,8 @@ mod tests {
         assert_eq!(msg.event_id, 7);
         assert_eq!(msg.sender, "?");
         assert_eq!(msg.body, "");
-        assert_eq!(msg.scope, MessageScope::Broadcast);
         assert_eq!(msg.sender_kind, SenderKind::Instance);
         assert!(msg.recipients.is_empty());
-        assert!(msg.delivered.is_empty());
         assert!(msg.intent.is_none());
         assert!(msg.reply_to.is_none());
     }
@@ -1888,10 +1867,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(msg.scope, MessageScope::Mentions);
         assert_eq!(msg.sender_kind, SenderKind::External);
         assert_eq!(msg.recipients, vec!["nova"]);
-        assert_eq!(msg.delivered, vec!["nova"]);
         assert_eq!(msg.intent.as_deref(), Some("request"));
         assert_eq!(msg.reply_to, Some(42));
     }
