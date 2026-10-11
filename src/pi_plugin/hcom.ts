@@ -167,7 +167,7 @@ function serverPort(server: Server | null): number | null {
 
 // A batch handed to Pi. It is acknowledged only once Pi admits it to the
 // transcript (its user message ends), so a prompt Pi rejects, or a queued
-// follow-up dropped by an abort, stays unread and is delivered again.
+// delivery dropped by an abort, stays unread and is delivered again.
 type Delivery = { text: string; ackId: number; hasMore: boolean; sentAt: number; admitted: boolean };
 
 // How long an idle Pi with nothing queued may take to admit a delivery before it
@@ -294,7 +294,8 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			try {
 				// Returns void; Pi reports a rejected prompt only to its own error
 				// handler. Admission is observed in message_end instead.
-				pi.sendUserMessage(text, idle ? undefined : { deliverAs: "followUp" });
+				// Steering reaches the next request after the running tools finish.
+				pi.sendUserMessage(text, idle ? undefined : { deliverAs: "steer" });
 			} catch (error) {
 				if (delivery === sent) delivery = null;
 				log("ERROR", "plugin.delivery_send_failed", name, { error: String(error) });
@@ -358,7 +359,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	}
 
 	// Pi reports a rejected prompt (no model, no auth, compaction running) only to
-	// its error handler, and an abort can drop a queued follow-up. Either way Pi
+	// its error handler, and an abort can drop a queued delivery. Either way Pi
 	// goes idle with the delivery never admitted: release it so it is redelivered.
 	function releaseUnadmitted(ctx: ExtensionContext, reason: string): void {
 		const sent = delivery;
@@ -518,7 +519,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	// The delivery's user message reaching the transcript is the receipt: Pi
 	// persists it right after this handler, whether it was sent directly, queued
-	// as a follow-up, or substituted for a bare <hcom> wake.
+	// as steering, or substituted for a bare <hcom> wake.
 	pi.on("message_end", (event) => {
 		const sent = delivery;
 		if (!sent || sent.admitted || event.message.role !== "user") return;

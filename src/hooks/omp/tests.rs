@@ -197,13 +197,11 @@ fn plugin_keeps_ack_gate_until_hcom_confirms() {
 fn plugin_rebinds_identity_on_session_branch() {
     // /branch mints a new session id and emits only session_branch (not
     // session_switch); the plugin must reset+rebind or delivery dies.
-    // keepOwner retains process-env identity ownership so nested task
-    // extensions still skip bind while this instance rebinds.
     let idx = PLUGIN_SOURCE
         .find("pi.on(\"session_branch\"")
         .expect("session_branch handler present");
     let handler = &PLUGIN_SOURCE[idx..];
-    assert!(handler.contains("resetBinding({ keepOwner: true })"));
+    assert!(handler.contains("resetBinding()"));
     assert!(handler.contains("bindIdentity(ctx)"));
 }
 
@@ -591,36 +589,9 @@ fn recover_rejects_active_instance() {
 }
 
 #[test]
-fn plugin_source_pins_soft_stop_polish_markers() {
-    assert!(PLUGIN_SOURCE.contains("Symbol.for(\"hcom.omp.identity\")"));
+fn plugin_source_has_rpc_timeout_and_reconciliation_cleanup() {
     assert!(PLUGIN_SOURCE.contains("stopReconcileTimer"));
     assert!(PLUGIN_SOURCE.contains("HCOM_TIMEOUT_MS"));
-    let shutdown_idx = PLUGIN_SOURCE
-        .find("pi.on(\"session_shutdown\"")
-        .expect("session_shutdown handler present");
-    let handler = &PLUGIN_SOURCE[shutdown_idx..];
-    assert!(
-        handler.contains("if (reply?.ok === true)"),
-        "ownership is released only on a confirmed stop"
-    );
-    assert!(
-        handler.contains("reg.tearingDown = false"),
-        "failed soft-stop must clear tearingDown so the owner can rebind"
-    );
-    assert!(
-        PLUGIN_SOURCE.contains("reg.tearingDown && !ownsIdentity"),
-        "tearingDown must not block the owning extension from rebinding"
-    );
-}
-
-/// Manual/CI scenario: nested OMP task extension must not steal parent identity
-/// after soft-stop + session_branch rebind. Run with:
-/// `cargo test omp_nested_task_identity_survives_soft_stop -- --ignored`
-#[test]
-#[ignore = "requires live OMP nested task; run manually"]
-fn omp_nested_task_identity_survives_soft_stop() {
-    // Launch OMP via hcom, soft-stop parent turn, spawn nested task extension,
-    // verify child does not bind and parent recovers on next turn.
 }
 
 // ── Plugin install/remove safety ──────────────────────────────────
@@ -697,20 +668,6 @@ fn plugin_source_handles_omp_session_switch_and_shutdown_shape() {
     assert!(PLUGIN_SOURCE.contains("pi.on(\"session_shutdown\""));
     // Soft-finalize on bound shutdown; never hard-delete from this path.
     assert!(PLUGIN_SOURCE.contains("\"--soft\""));
-    assert!(PLUGIN_SOURCE.contains("plugin.session_shutdown_skipped"));
-    assert!(PLUGIN_SOURCE.contains("nested_session"));
-    assert!(PLUGIN_SOURCE.contains("HCOM_OMP_IDENTITY_OWNER"));
-    assert!(PLUGIN_SOURCE.contains("plugin.bind_skipped_nested"));
-    assert!(PLUGIN_SOURCE.contains("ownsIdentity"));
-    assert!(PLUGIN_SOURCE.contains("keepOwner: true"));
-    // session_switch must also keepOwner (same race as session_branch).
-    let switch_idx = PLUGIN_SOURCE
-        .find("pi.on(\"session_switch\"")
-        .expect("session_switch handler present");
-    assert!(
-        PLUGIN_SOURCE[switch_idx..].contains("resetBinding({ keepOwner: true })"),
-        "session_switch must keepOwner across rebind"
-    );
     // Dead session-id gates removed (SessionShutdownEvent has no sessionId).
     assert!(!PLUGIN_SOURCE.contains("foreign_session"));
     assert!(!PLUGIN_SOURCE.contains("rootSessionId"));

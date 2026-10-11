@@ -51,7 +51,7 @@ mock-tools:
     HCOM_MOCK_TOOLS_PREFIX="{{mock-prefix}}" HCOM_MOCK_TOOLS_NPM_CACHE="{{mock-cache}}" bash ./scripts/install-mock-tools.sh
 
 [group("checks")]
-[doc("Typecheck the omp/opencode/pi plugin sources (skips loudly on Android)")]
+[doc("Typecheck the plugins and run delivery regressions (skips loudly on Android)")]
 typecheck:
     bash ./scripts/typecheck.sh
 

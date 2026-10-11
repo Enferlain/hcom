@@ -146,36 +146,6 @@ function messageText(message: any): string {
 		.join("\n");
 }
 
-// Same-process latch: OMP task subagents load a fresh extension instance in the
-// parent Node process (SessionShutdownEvent has no sessionId). The first binder
-// owns hcom identity; nested instances skip bind/stop so dispose cannot soft-stop
-// the parent. ExtensionContext does not expose taskDepth.
-const IDENTITY_REGISTRY_KEY = Symbol.for("hcom.omp.identity");
-const IDENTITY_OWNER_ENV = "HCOM_OMP_IDENTITY_OWNER";
-
-type OmpIdentityRegistry = {
-	owner: string | null;
-	tearingDown: boolean;
-};
-
-function getIdentityRegistry(): OmpIdentityRegistry {
-	const g = globalThis as Record<symbol, OmpIdentityRegistry | undefined>;
-	g[IDENTITY_REGISTRY_KEY] ??= { owner: null, tearingDown: false };
-	return g[IDENTITY_REGISTRY_KEY]!;
-}
-
-function syncIdentityOwnerEnv(owner: string | null): void {
-	if (owner) process.env[IDENTITY_OWNER_ENV] = owner;
-	else delete process.env[IDENTITY_OWNER_ENV];
-}
-
-function clearIdentityOwnership(): void {
-	const reg = getIdentityRegistry();
-	reg.owner = null;
-	reg.tearingDown = false;
-	syncIdentityOwnerEnv(null);
-}
-
 function startNotifyServer(onWake: () => void): Promise<Server | null> {
 	return new Promise((resolve) => {
 		const server = createServer((socket) => {
@@ -195,9 +165,8 @@ function serverPort(server: Server | null): number | null {
 	return typeof address === "object" && address ? address.port : null;
 }
 
-// A batch handed to OMP. It is acknowledged only once OMP admits it to the
-// transcript (its user message ends), so a prompt OMP rejects, or a queued
-// follow-up dropped by an abort, stays unread and is delivered again.
+// A batch handed to OMP. Acknowledge only after its user message reaches the
+// transcript, so rejected prompts and queued mail dropped by an abort stay unread.
 type Delivery = { text: string; ackId: number; hasMore: boolean; sentAt: number; admitted: boolean };
 
 // How long an idle OMP with nothing queued may take to admit a delivery before it
@@ -213,8 +182,6 @@ const IDLE_DEBOUNCE_MS = 250;
 export default function hcomExtension(pi: ExtensionAPI) {
 	let instanceName: string | null = null;
 	let sessionId: string | null = null;
-	let ownsIdentity = false;
-	let nestedOptOut = false;
 	let bootstrapText: string | null = null;
 	let bindingPromise: Promise<void> | null = null;
 	// Bumped on every reset. Async work started under an older generation must
@@ -250,39 +217,10 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		notifyServer = null;
 	}
 
-	function nestedSkipReason(): string | null {
-		const reg = getIdentityRegistry();
-		if (nestedOptOut) return "sticky_nested_opt_out";
-		// The owner may rebind after a failed soft-stop kept the latch;
-		// tearingDown only blocks nested/non-owner extensions.
-		if (reg.tearingDown && !ownsIdentity) return "tearing_down";
-		if (reg.owner && !ownsIdentity) return "nested_registry";
-		if (!reg.owner && process.env[IDENTITY_OWNER_ENV] && !ownsIdentity) return "nested_env";
-		return null;
-	}
-
 	async function bindIdentity(ctx: ExtensionContext): Promise<void> {
 		currentCtx = ctx;
 		if (instanceName || bindingPromise) return bindingPromise ?? Promise.resolve();
 		if (process.env.HCOM_LAUNCHED !== "1") return;
-		const skipReason = nestedSkipReason();
-		if (skipReason) {
-			nestedOptOut = true;
-			log("INFO", "plugin.bind_skipped_nested", null, {
-				reason: skipReason,
-				owner: getIdentityRegistry().owner ?? process.env[IDENTITY_OWNER_ENV] ?? null,
-			});
-			return;
-		}
-		// Claim before the first await: a nested extension binding concurrently in
-		// this process must see an owner and skip, or both register notify ports.
-		const reg = getIdentityRegistry();
-		const freshClaim = !ownsIdentity;
-		if (freshClaim) {
-			ownsIdentity = true;
-			reg.owner = "binding";
-			syncIdentityOwnerEnv(reg.owner);
-		}
 		const gen = generation;
 		const attempt = (async () => {
 			let server: Server | null = null;
@@ -306,8 +244,6 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				notifyServer = server;
 				server = null;
 				instanceName = reply.name;
-				reg.owner = reply.name;
-				syncIdentityOwnerEnv(reply.name);
 				sessionId = typeof reply.session_id === "string" && reply.session_id ? reply.session_id : sid;
 				bootstrapText = typeof reply.bootstrap === "string" ? reply.bootstrap : null;
 				startReconcileTimer();
@@ -323,11 +259,6 @@ export default function hcomExtension(pi: ExtensionAPI) {
 				server?.close();
 				if (gen === generation) {
 					bindingPromise = null;
-					// A failed first bind gives the claim back; resets handle their own.
-					if (freshClaim && !instanceName && ownsIdentity) {
-						clearIdentityOwnership();
-						ownsIdentity = false;
-					}
 				}
 			}
 		})();
@@ -368,7 +299,8 @@ export default function hcomExtension(pi: ExtensionAPI) {
 			try {
 				// Returns void; OMP reports a rejected prompt only to its own error
 				// handler. Admission is observed in message_end instead.
-				pi.sendUserMessage(text, idle ? undefined : { deliverAs: "followUp" });
+				// Aside reaches the next request and wakes native wait without aborting jobs.
+				pi.sendUserMessage(text, idle ? undefined : { deliverAs: "aside" });
 			} catch (error) {
 				if (delivery === sent) delivery = null;
 				log("ERROR", "plugin.delivery_send_failed", name, { error: String(error) });
@@ -432,7 +364,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	}
 
 	// OMP reports a rejected prompt (no model, no auth) only to its error
-	// handler, and an abort can drop a queued follow-up. Either way OMP
+	// handler, and an abort can drop a queued delivery. Either way OMP
 	// goes idle with the delivery never admitted: release it so it is redelivered.
 	function releaseUnadmitted(ctx: ExtensionContext, reason: string): void {
 		const sent = delivery;
@@ -520,10 +452,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		idleTimer = null;
 	}
 
-	// keepOwner: a rebind in this same extension instance (switch/branch, or a
-	// shutdown awaiting its soft-stop) keeps process-local ownership so nested
-	// task extensions still skip bind.
-	function resetBinding(opts?: { keepOwner?: boolean }): void {
+	function resetBinding(): void {
 		generation++;
 		clearIdleTimer();
 		stopReconcileTimer();
@@ -542,54 +471,31 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		bootstrapInjectedForSession = null;
 		lastReportedStatusKey = null;
 		lastPendingPollAt = 0;
-		if (!opts?.keepOwner && ownsIdentity) {
-			clearIdentityOwnership();
-			ownsIdentity = false;
-		}
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
 		currentCtx = ctx;
 		resetBinding();
 		await bindIdentity(ctx);
 	});
 
-	// SessionShutdownEvent is only `{ type: "session_shutdown" }` — no sessionId.
-	// Soft-stop only when THIS extension instance owns the identity (nested task
-	// instances never bind, so they never stop the parent). Ownership is released
-	// only once hcom confirms the stop; otherwise the owner keeps the latch and
-	// can rebind.
-	pi.on("session_shutdown", async () => {
+	// Shutdown's context identifies the agent even though its event has no session id.
+	pi.on("session_shutdown", async (_event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
 		const name = instanceName;
-		if (!name || !ownsIdentity) {
-			const skipReason = nestedSkipReason();
-			if (skipReason) {
-				nestedOptOut = true;
-				log("INFO", "plugin.session_shutdown_skipped", null, {
-					reason: "nested_session",
-					skip_reason: skipReason,
-					owner: getIdentityRegistry().owner ?? process.env[IDENTITY_OWNER_ENV] ?? null,
-				});
-			}
-			resetBinding();
-			return;
-		}
-		const reg = getIdentityRegistry();
-		reg.tearingDown = true;
-		resetBinding({ keepOwner: true });
+		resetBinding();
+		if (!name) return;
 		const reply = await rpc(["omp-stop", "--name", name, "--reason", "shutdown", "--soft"], name);
-		if (reply?.ok === true) {
-			clearIdentityOwnership();
-			ownsIdentity = false;
-		} else {
+		if (reply?.ok !== true) {
 			log("WARN", "plugin.session_shutdown_soft_stop_failed", name, { reply });
-			reg.tearingDown = false;
 		}
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
 		currentCtx = ctx;
-		resetBinding({ keepOwner: true });
+		resetBinding();
 		await bindIdentity(ctx);
 	});
 
@@ -598,17 +504,20 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	// rebind the stale sessionId fails isBoundSession() and delivery stops. An
 	// in-place rewind emits it too, keeping the id; rebinding then is harmless.
 	pi.on("session_branch", async (_event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
 		currentCtx = ctx;
-		resetBinding({ keepOwner: true });
+		resetBinding();
 		await bindIdentity(ctx);
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
 		clearIdleTimer();
 		await reportStatus(ctx, "active", "agent");
 	});
 
 	pi.on("input", async (event: InputEvent, ctx) => {
+		if (ctx.agent.kind !== "main") return;
 		currentCtx = ctx;
 		await bindIdentity(ctx);
 		const name = instanceName;
@@ -640,10 +549,11 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	});
 
 	// The delivery's user message reaching the transcript is the receipt: OMP
-	// commits it in emission order, whether it was sent directly, queued as a
-	// follow-up, or substituted for a bare <hcom> wake. (OMP emits no input event
+	// commits it in emission order, whether it was sent directly, queued as an
+	// aside, or substituted for a bare <hcom> wake. (OMP emits no input event
 	// for extension sends, and applies a wake's transform inline.)
-	pi.on("message_end", (event) => {
+	pi.on("message_end", (event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
 		const sent = delivery;
 		if (!sent || sent.admitted || event.message.role !== "user") return;
 		if (!messageText(event.message).includes(sent.text)) return;
@@ -653,6 +563,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
 		currentCtx = ctx;
 		await bindIdentity(ctx);
 		if (!instanceName || !bootstrapText) return undefined;
@@ -671,6 +582,7 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	// Observation only: record the tool as current activity, never block it.
 	pi.on("tool_call", (event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
 		currentCtx = ctx;
 		if (!instanceName) return undefined;
 		void queueStatus(
@@ -681,14 +593,17 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_result", async (_event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
 		await deliverPending(ctx);
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
 		await deliverPending(ctx);
 	});
 
 	pi.on("agent_end", (_event, ctx) => {
+		if (ctx.agent.kind !== "main") return;
 		currentCtx = ctx;
 		clearIdleTimer();
 		const gen = generation;

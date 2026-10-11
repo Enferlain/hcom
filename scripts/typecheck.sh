@@ -27,11 +27,12 @@ if [[ "$(uname -o 2>/dev/null || true)" == "Android" ]]; then
   fi
 
   rm -rf "$project_root/src"
-  mkdir -p "$project_root/src"
+  mkdir -p "$project_root/src" "$project_root/tests"
   cp "$repo_root/package.json" "$repo_root/package-lock.json" "$repo_root/tsconfig.json" \
     "$project_root/"
   cp -R "$repo_root/src/omp_plugin" "$repo_root/src/opencode_plugin" \
     "$repo_root/src/pi_plugin" "$project_root/src/"
+  cp "$repo_root/tests/plugin_delivery.test.ts" "$project_root/tests/"
 else
   project_root="$repo_root"
 fi
@@ -54,3 +55,4 @@ elif [[ ! node_modules/.package-lock.json -nt package-lock.json \
   npm ci --ignore-scripts --prefer-offline --engine-strict=false
 fi
 npm run typecheck
+npm run test:plugins
