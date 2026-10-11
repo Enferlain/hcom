@@ -66,6 +66,14 @@ impl StdoutQueue {
         }
     }
 
+    /// A guard that, once dropped, discards everything not yet written. The
+    /// owner of the console modes holds it across their restore, so a reader
+    /// still running past its join (late EOF, blocked on a full queue) can't
+    /// get output onto the restored console.
+    pub(super) fn cutoff(&self) -> Cutoff {
+        Cutoff(self.abandon.clone())
+    }
+
     /// Block until everything queued so far is on the console.
     pub(super) fn barrier(&self) {
         let Some(tx) = &self.tx else { return };
@@ -97,6 +105,14 @@ impl Drop for StdoutQueue {
     /// exits on its own; don't wait for it, as the console may never drain.
     fn drop(&mut self) {
         self.tx.take();
+    }
+}
+
+pub(super) struct Cutoff(Arc<AtomicBool>);
+
+impl Drop for Cutoff {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -213,6 +229,22 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         thread::sleep(Duration::from_millis(50));
+        assert_eq!(*console.written.lock().unwrap(), b"first");
+    }
+
+    #[test]
+    fn cutoff_discards_output_queued_after_it_drops() {
+        let console = Console::default();
+        let stalled = console.gate.lock().unwrap();
+        let queue = StdoutQueue::spawn(console.clone(), |_| {});
+        let cutoff = queue.cutoff();
+        queue.write(b"first");
+        thread::sleep(Duration::from_millis(50));
+        queue.write(b"queued");
+        drop(cutoff);
+        queue.write(b"later");
+        drop(stalled);
+        assert!(queue.finish(LONG));
         assert_eq!(*console.written.lock().unwrap(), b"first");
     }
 

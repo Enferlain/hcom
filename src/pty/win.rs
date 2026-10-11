@@ -23,7 +23,7 @@ use super::ProxyConfig;
 use super::inject::{InjectResult, InjectServer, QueryCommand};
 use super::screen::ScreenTracker;
 use super::shared;
-use super::stdout_queue::StdoutQueue;
+use super::stdout_queue::{Cutoff, StdoutQueue};
 use super::trace::{self, Hop};
 
 use crate::db::HcomDb;
@@ -249,8 +249,9 @@ impl Proxy {
         // failure here must tear nothing half-up (#23), so it bails before any
         // other thread exists. The already-spawned child is reaped by Drop. Keep
         // its handle: run() joins it below so the EOF-captured launch-failure
-        // tail is available.
-        let reader_handle = self.spawn_reader_thread(inject_port)?;
+        // tail is available. The cutoff drops before `_console`, so a reader
+        // that outlives its join below never writes to the restored console.
+        let (reader_handle, _stdout_cutoff) = self.spawn_reader_thread(inject_port)?;
         // A dedicated coordinator owns delivery-thread startup (ready-or-timeout
         // gated); the reader can't, since it blocks in read() and cannot run a
         // timer while the child is idle.
@@ -523,7 +524,7 @@ impl Proxy {
     /// coordination, and no launch-failure tail, so a silently degraded session
     /// is worse than a loud failure (#23). `run()` calls this with `?` before
     /// spawning any other thread, so an early bail tears nothing half-up.
-    fn spawn_reader_thread(&self, inject_port: u16) -> Result<JoinHandle<()>> {
+    fn spawn_reader_thread(&self, inject_port: u16) -> Result<(JoinHandle<()>, Cutoff)> {
         let reader = match self.master.lock() {
             Ok(master) => master
                 .try_clone_reader()
@@ -583,10 +584,11 @@ impl Proxy {
             // then captures the launch-failure tail and does a final snapshot.
         });
 
-        Ok(thread::spawn(move || {
+        let stdout = StdoutQueue::spawn(std::io::stdout(), |b| trace::bytes(Hop::Stdout, b));
+        let cutoff = stdout.cutoff();
+        let handle = thread::spawn(move || {
             let mut screen =
                 ScreenTracker::new_with_instance(rows, cols, &ready_patterns, instance.as_deref());
-            let stdout = StdoutQueue::spawn(std::io::stdout(), |b| trace::bytes(Hop::Stdout, b));
             let mut filter = shared::OutputModeFilter::default();
             let mut scratch: Vec<u8> = Vec::with_capacity(8192);
 
@@ -826,8 +828,8 @@ impl Proxy {
             }
             // Get the child's last frame onto the console before run() moves on
             // to exit and restores the console modes. Bounded below run()'s 2s
-            // join on this thread: past it, what's still queued is dropped
-            // rather than written raw after the restore.
+            // join on this thread; a reader past that join is cut off by run()'s
+            // stdout cutoff instead.
             if !stdout.finish(Duration::from_millis(1500)) {
                 log_warn(
                     "native",
@@ -840,7 +842,8 @@ impl Proxy {
             // sees running=false and enters cleanup. If the reader set it first,
             // the delivery loop could read EXIT_WAS_KILLED=false and record
             // exit:closed even when the child was killed via `hcom kill`.
-        }))
+        });
+        Ok((handle, cutoff))
     }
 
     /// Our stdin → PTY input. Intentionally detached and never joined.
