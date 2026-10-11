@@ -655,6 +655,20 @@ pub(super) fn finalize_launch_failure_after_exit(
     elapsed: Duration,
     exit_code: i32,
 ) {
+    // Fast fail with the fix: shown in the terminal and in the launch failure.
+    let hint = tail
+        .filter(|_| exit_code != 0)
+        .and_then(crate::hooks::claude_mod::launch_failure_hint);
+    let tail_with_hint;
+    let tail = match &hint {
+        Some(hint) => {
+            eprint!("\r\n{hint}\r\n");
+            tail_with_hint = format!("{}\n{hint}", tail.unwrap_or_default());
+            Some(tail_with_hint.as_str())
+        }
+        None => tail,
+    };
+
     let Some(instance_name) = instance_name_cfg else {
         return;
     };

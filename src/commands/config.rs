@@ -34,7 +34,7 @@ pub struct ConfigArgs {
     /// Open config in editor
     #[arg(long)]
     pub edit: bool,
-    /// Unset value (supported for dev_root)
+    /// Unset value (back to the default)
     #[arg(long)]
     pub unset: bool,
     /// Reset config
@@ -55,6 +55,11 @@ pub struct ConfigArgs {
 
 /// Known config keys with descriptions and types.
 pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
+    (
+        "HCOM_CLAUDE_DELIVERY",
+        "Claude delivery for new launches (native | inject, default: inject)",
+        "string",
+    ),
     ("HCOM_TAG", "Group tag for launched instances", "string"),
     ("HCOM_HINTS", "Text injected with all messages", "string"),
     (
@@ -330,6 +335,16 @@ fn config_set_at_path(path: &Path, key: &str, value: &str) -> Result<(), String>
     let field_name = key.strip_prefix("HCOM_").unwrap_or(key).to_lowercase();
     validate_config_args(&field_name, value)?;
 
+    if field_name == "claude_delivery"
+        && !value.is_empty()
+        && !crate::hooks::claude_mod::DELIVERY_MODES.contains(&value)
+    {
+        return Err(format!(
+            "claude_delivery must be one of: {}. Got '{value}'",
+            crate::hooks::claude_mod::DELIVERY_MODES.join(", ")
+        ));
+    }
+
     if field_name == "title_mode"
         && !value.is_empty()
         && !crate::shared::VALID_TITLE_MODES.contains(&value)
@@ -411,6 +426,7 @@ pub fn config_get(key: &str) -> (String, &'static str) {
         "HCOM_AUTO_APPROVE" => "true",
         "HCOM_AUTO_TRUST_WORKSPACE" => "true",
         "HCOM_TITLE_MODE" => "combined",
+        "HCOM_CLAUDE_DELIVERY" => crate::hooks::claude_mod::DEFAULT_DELIVERY,
         _ => "",
     };
     (default.to_string(), "default")
@@ -1065,11 +1081,6 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
         );
     }
 
-    if unset_mode {
-        eprintln!("Error: --unset is only supported with 'hcom config dev_root'");
-        return 1;
-    }
-
     // Terminal subcommand
     if key_arg == "terminal" {
         if info_mode {
@@ -1094,7 +1105,7 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
     // Unknown keys would silently read as "(not set)" or be written to
     // config.toml where nothing reads them. Reading an env-only setting that
     // is actually set (e.g. HCOM_DIR) stays allowed.
-    let is_set_mode = argv.len() >= 2;
+    let is_set_mode = argv.len() >= 2 || unset_mode;
     let env_readable = !is_set_mode && std::env::var(&key).is_ok();
     if !CONFIG_KEYS.iter().any(|(k, _, _)| *k == key) && !env_readable {
         let typed = key_arg.to_lowercase();
@@ -1114,8 +1125,12 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
         return 1;
     }
 
-    // Set mode: config KEY VALUE
-    if argv.len() >= 2 && !wants_info {
+    // Set mode: config KEY VALUE, or config KEY --unset (back to the default)
+    if is_set_mode {
+        if unset_mode && argv.len() >= 2 {
+            eprintln!("Error: pass a value or --unset, not both");
+            return 1;
+        }
         // Relay settings change what the relay worker does and must go through
         // `hcom relay`, which validates them and starts/stops the worker to match.
         if key.starts_with("HCOM_RELAY") {
@@ -1128,11 +1143,20 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
         let value = argv[1..].join(" ");
         match config_set(&key, &value) {
             Ok(()) => {
-                println!("Set {key} = {value}");
+                if unset_mode {
+                    println!("Unset {key}");
+                } else {
+                    println!("Set {key} = {value}");
+                }
 
                 // Side effect: auto_approve changes must update tool permissions
                 if key == "HCOM_AUTO_APPROVE" {
-                    return if update_auto_approve_permissions(&value) {
+                    let effective = if unset_mode {
+                        config_get(&key).0
+                    } else {
+                        value
+                    };
+                    return if update_auto_approve_permissions(&effective) {
                         0
                     } else {
                         1
@@ -1399,6 +1423,26 @@ Notes:
   - Only applies to Claude Code's Task tool spawned agents
   - Parent agent blocks until subagent completes or times out
   - Increase for complex subagent tasks",
+        ),
+
+        "HCOM_CLAUDE_DELIVERY" => Some(
+            "\
+HCOM_CLAUDE_DELIVERY - How hcom wakes idle Claude agents
+
+Default: inject
+
+  hcom config claude_delivery native     # experimental Claude mod
+  hcom config claude_delivery --unset    # back to inject
+  HCOM_CLAUDE_DELIVERY=native hcom claude  # one launch
+
+native  bundled Claude mod (loaded with --plugin-dir) submits the wake
+inject  PTY wrapper types the wake into Claude's prompt
+
+Native needs Claude Code mod support. Managed disableSideloadFlags rejects
+--plugin-dir and the launch fails; allowManagedModsOnly or a disabled mod
+rollout leave the mod unloaded, shown as unavailable in list/TUI. Use inject
+in both cases. Applies to new launches; kill and resume to change an agent.
+Print (-p) sessions use hook delivery either way.",
         ),
 
         "HCOM_CLAUDE_ARGS" => Some(

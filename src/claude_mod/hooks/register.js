@@ -1,0 +1,123 @@
+// The binary owns identity, the queue, and acknowledgement. This module only wakes Claude.
+let timer;
+let probing = false;
+let submitting = false;
+let submittingSession;
+let generation = 0;
+let command;
+let failed = false;
+// Ticks to skip after a failed poll, so a broken hcom is not respawned 4x/s.
+let backoff = 0;
+
+async function report($, session, event, detail) {
+  try {
+    const result = await $.process.run(
+      [...command, 'claude-mod-poll', '--session-id', session, '--event', event, '--detail', detail],
+      { timeoutMs: 10000 },
+    );
+    if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout);
+  } catch (error) {
+    await $.ui.log('hcom mod could not record ' + event + ': ' + String(error)).catch(() => {});
+  }
+}
+
+async function poll($) {
+  if (probing) return;
+  if (backoff > 0) {
+    backoff--;
+    return;
+  }
+  probing = true;
+  const currentGeneration = generation;
+  let session;
+  try {
+    // session.start does not fire after /clear or /resume.
+    session = await $.session.id();
+    const result = await $.process.run(
+      [...command, 'claude-mod-poll', '--session-id', session, ...(submitting ? ['--observe'] : [])],
+      { timeoutMs: 30000 },
+    );
+    if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout || 'hcom poll failed');
+    const state = JSON.parse(result.stdout);
+    failed = false;
+    if (currentGeneration !== generation || !state.wake || submitting) return;
+    submitting = true;
+    submittingSession = session;
+    // A queued submission must not block polling or a lifecycle hook.
+    try {
+      void $.prompt.submit({ text: '<hcom>', asUser: true }).then(
+        async (result) => {
+          submitting = false;
+          // A hook may drop the wake; nothing was delivered, so it is a failure.
+          if (result?.drop) {
+            await report($, session, 'submission-failed', 'wake dropped: ' + result.drop);
+          } else {
+            await report($, session, 'submitted', 'Claude completed the native wake submission');
+          }
+        },
+        async (error) => {
+          submitting = false;
+          await report($, session, 'submission-failed', String(error));
+          await $.ui.log('hcom mod wake failed; messages remain queued: ' + String(error)).catch(() => {});
+        },
+      );
+    } catch (error) {
+      submitting = false;
+      await report($, session, 'submission-failed', String(error));
+    }
+  } catch (error) {
+    // Record every failure: hcom clears the error after one good cycle, so a
+    // repeat failure must set it again. Backoff limits this to one per ~5s.
+    if (session) await report($, session, 'poll-failed', String(error));
+    if (!failed) {
+      await $.ui.log('hcom mod poll failed; messages remain queued: ' + String(error)).catch(() => {});
+    }
+    failed = true;
+    backoff = 20;
+  } finally {
+    probing = false;
+  }
+}
+
+export function register(on) {
+  timer?.cancel();
+  timer = undefined;
+  probing = false;
+  submitting = false;
+  submittingSession = undefined;
+  generation = 0;
+  failed = false;
+  backoff = 0;
+  on('session.start', async ($, e, next) => {
+    if (!e.isInteractive || !await $.env.get('HCOM_PROCESS_ID') || await $.env.get('HCOM_PTY_MODE') !== '1'
+        || await $.env.get('HCOM_CLAUDE_DELIVERY') !== 'native') return next(e);
+    try {
+      command = JSON.parse(await $.env.get('HCOM_MOD_COMMAND'));
+      if (!Array.isArray(command) || command.length === 0
+          || command.some(value => typeof value !== 'string' || !value)) {
+        throw new Error('expected a nonempty command argument array');
+      }
+    } catch (error) {
+      await $.ui.log('hcom mod cannot start: invalid HCOM_MOD_COMMAND: ' + String(error)).catch(() => {});
+      return next(e);
+    }
+    timer?.cancel();
+    timer = $.clock.every(250, () => poll($));
+    return next(e);
+  });
+
+  on('prompt.submit', async ($, e, next) => {
+    if (e.text === '<hcom>' && e.origin?.kind === 'plugin'
+        && (e.origin.name === 'hcom' || e.origin.name === 'hcom@inline')
+        && submittingSession && await $.session.id() !== submittingSession) {
+      return { drop: 'hcom wake belongs to a previous session' };
+    }
+    return next(e);
+  });
+
+  on('session.end', async ($, e, next) => {
+    generation++;
+    if (e.reason !== 'clear' && e.reason !== 'resume') timer?.cancel();
+    return next(e);
+  });
+}

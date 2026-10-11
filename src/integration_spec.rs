@@ -237,6 +237,7 @@ pub struct IntegrationSpec {
 // ── Hook command name tables ────────────────────────────────────────────
 
 const CLAUDE_HOOKS: &[&str] = &[
+    "claude-mod-poll",
     "poll",
     "notify",
     "permission-request",

@@ -1,0 +1,6 @@
+{
+  "name": "hcom",
+  "version": "1.0.0",
+  "author": { "name": "hcom" },
+  "description": "Wake Claude for queued hcom messages without changing the input draft"
+}

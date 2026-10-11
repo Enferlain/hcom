@@ -1501,6 +1501,9 @@ fn stop_instance_inner(
     if let Some(ref session_id) = instance_data.session_id {
         let _ = db.revoke_claude_actor_capabilities_for_session(session_id);
         let _ = db.kv_delete_prefix(&format!("subagent_stop_inflight:{session_id}:"));
+        if instance_data.parent_name.is_none() {
+            let _ = db.kv_delete_prefix(&super::claude_mod::session_prefix(session_id));
+        }
     }
 
     // Notify remaining listeners AFTER delete (so they see the row is gone)

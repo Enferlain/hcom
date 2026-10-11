@@ -1640,6 +1640,13 @@ enum State {
     WakeUnacknowledged,
 }
 
+/// A running `hcom listen` is a quiet tool call, not a missed turn end; it
+/// delivers itself, so stability-based status recovery must leave it alone.
+fn in_listen(db: &HcomDb, name: &str) -> bool {
+    db.has_notify_endpoint_kind(name, "listen")
+        || db.has_notify_endpoint_kind(name, "listen_filter")
+}
+
 /// Run the delivery loop — surfaces out-of-band hcom messages into the tool's
 /// conversation by injecting text at a safe prompt state.
 ///
@@ -1696,6 +1703,8 @@ pub fn run_delivery_loop(
         ),
     );
 
+    // This choice is frozen in the launch environment, never mod health.
+    let claude_mod = config.tool == "claude" && crate::hooks::claude_mod::launched_native();
     let mut launch_outcome = LaunchOutcome::Pending;
 
     // Set initial listening status AFTER resolving authoritative name. This is
@@ -1758,23 +1767,27 @@ pub fn run_delivery_loop(
             &mut host_label,
             &mut launch_outcome,
         );
-    } else if let Ok(tool @ (Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp)) =
-        Tool::from_str(&config.tool)
+    } else if let Ok(tool) = Tool::from_str(&config.tool)
+        && (matches!(tool, Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp) || claude_mod)
     {
         log_info(
             "native",
             "delivery.plugin_mode",
             &format!(
-                "Plugin mode for {}: the plugin handles delivery",
-                current_name
+                "Plugin mode for {}: the plugin handles delivery (tool={}, claude_mod={})",
+                current_name, config.tool, claude_mod
             ),
         );
+        // Only OpenCode and Kilo need a first session started; a Claude mod
+        // never bootstraps by typing into the terminal.
         let mut session_started = !matches!(tool, Tool::OpenCode | Tool::Kilo);
         // Mail sent before this thread registered its notify port never wakes
         // it, so the first pass checks for pending mail without waiting.
         let mut first_pass = true;
         // Mail is waiting for the TUI to come up; poll its screen.
         let mut awaiting_ready = false;
+        let loop_started = Instant::now();
+        let mut was_idle = true;
 
         // Status tracking for terminal title updates
         let mut current_status = ST_LISTENING.to_string();
@@ -1800,10 +1813,22 @@ pub fn run_delivery_loop(
                 &mut launch_outcome,
             );
 
-            // Wait for notify or timeout
+            // Claude needs a few seconds to start and load the mod; reporting
+            // before then flashes a false "unavailable" on every launch.
+            if claude_mod
+                && loop_started.elapsed() >= crate::hooks::claude_mod::CONNECT_GRACE
+                && let Err(error) =
+                    crate::hooks::claude_mod::report_health(db, &process_id, &current_name)
+            {
+                log_warn("native", "claude.mod_health_failed", &error.to_string());
+            }
+            // Wait for notify or timeout. Native Claude monitoring also
+            // notices a missing/failed mod, so it checks every second.
             if !std::mem::take(&mut first_pass) {
                 notify.wait(if awaiting_ready {
                     Duration::from_millis(250)
+                } else if claude_mod {
+                    Duration::from_secs(1)
                 } else {
                     IDLE_WAIT
                 });
@@ -1832,6 +1857,36 @@ pub fn run_delivery_loop(
 
             // Detect DB file replacement (hcom reset / schema bump) and reconnect
             db.reconnect_if_stale();
+
+            // Escape fires no Stop hook, so status stays "active" and the mod
+            // never wakes. Same recovery as PTY delivery, plus a visible prompt.
+            if claude_mod && db.has_pending(&current_name) {
+                let quiet_prompt = state.screen.read().is_ok_and(|s| {
+                    s.ready && !s.approval && s.last_output.elapsed() > Duration::from_secs(10)
+                });
+                if quiet_prompt
+                    && !in_listen(db, &current_name)
+                    && matches!(db.get_status(&current_name), Ok(Some((s, _))) if s == ST_ACTIVE)
+                {
+                    match db.set_status(&current_name, ST_LISTENING, "pty:recovered") {
+                        Ok(()) => log_info(
+                            "native",
+                            "delivery.recovered",
+                            "Status recovered: prompt visible, output stable 10s, active -> listening",
+                        ),
+                        Err(e) => log_warn("native", "delivery.set_status_fail", &e.to_string()),
+                    }
+                }
+            }
+            // Status changes wake this loop but not the mod's poll, which would
+            // otherwise sleep out its wait after Stop. Forward each idle edge.
+            if claude_mod {
+                let idle = db.is_idle(&current_name);
+                if idle && !was_idle && db.has_pending(&current_name) {
+                    crate::notify::wake(db, &current_name, &[crate::notify::WakeKind::Plugin]);
+                }
+                was_idle = idle;
+            }
 
             // Heartbeat + port re-registration
             refresh_liveness(db, &current_name);
@@ -2110,15 +2165,7 @@ pub fn run_delivery_loop(
                                     let stable_10s =
                                         screen.last_output.elapsed().as_millis() > 10000;
                                     drop(screen);
-                                    // A running `hcom listen` is a quiet tool call,
-                                    // not a missed turn end; it delivers itself.
-                                    let in_listen = db
-                                        .has_notify_endpoint_kind(&current_name, "listen")
-                                        || db.has_notify_endpoint_kind(
-                                            &current_name,
-                                            "listen_filter",
-                                        );
-                                    if stable_10s && !in_listen {
+                                    if stable_10s && !in_listen(db, &current_name) {
                                         if let Err(e) = db.set_status(
                                             &current_name,
                                             "listening",

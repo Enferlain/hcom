@@ -111,6 +111,7 @@ fn maybe_external_send_name_hint(
 
 fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, String) {
     match tool {
+        Tool::Claude if hook == "claude-mod-poll" => crate::hooks::claude_mod::dispatch(args),
         Tool::Claude => (
             crate::hooks::claude::dispatch_claude_hook(hook),
             String::new(),

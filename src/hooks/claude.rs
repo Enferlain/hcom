@@ -2063,6 +2063,7 @@ fn handle_sessionend(
 }
 
 fn cleanup_sessionend_scoped_state(db: &HcomDb, session_id: &str) {
+    let _ = db.kv_delete_prefix(&super::claude_mod::session_prefix(session_id));
     // The lineage validation cache is per session generation and nothing else
     // ever deletes it, so an ended generation would leak a kv row forever. A
     // generation that comes back is re-validated by its next SessionStart.
@@ -2679,7 +2680,7 @@ pub static PER_RUN: PerRunAdapter = PerRunAdapter {
     prepare: prepare_per_run,
     cleanup_legacy: cleanup_legacy_per_run,
     ensure_permissions: None,
-    managed_value_flags: &["--settings"],
+    managed_value_flags: &["--settings", "--plugin-dir"],
     strip_legacy_args: None,
 };
 
@@ -2769,6 +2770,29 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
         None => serde_json::json!({}),
     };
     merge_per_run_settings(&mut settings, ctx.auto_approve)?;
+    // Freeze one delivery mode in both the wrapper and Claude. Caller settings
+    // cannot accidentally select a different transport from the wrapper.
+    // Print sessions deliver through hooks; skip a mod they would never run.
+    let print = ctx.args.iter().any(|arg| arg == "-p" || arg == "--print");
+    let native = !print
+        && ctx
+            .var(super::claude_mod::DELIVERY_ENV)
+            .unwrap_or(super::claude_mod::DEFAULT_DELIVERY)
+            == "native";
+    let mode = if native { "native" } else { "inject" };
+    let mut injected_env = vec![(
+        super::claude_mod::DELIVERY_ENV.to_string(),
+        mode.to_string(),
+    )];
+    if native {
+        let command = serde_json::to_string(&crate::runtime_env::get_hcom_prefix())?;
+        injected_env.push(("HCOM_MOD_COMMAND".into(), command));
+    }
+    let env = object_field(&mut settings, "env")?;
+    env.remove("HCOM_MOD_COMMAND");
+    for (key, value) in &injected_env {
+        env.insert(key.clone(), Value::String(value.clone()));
+    }
     let json = serde_json::to_vec(&settings)?;
     let path = runtime::publish_file("claude", "settings.json", &json)
         .context("Cannot publish Claude runtime settings")?;
@@ -2779,9 +2803,19 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
             path.to_string_lossy().into_owned(),
         ],
     );
+    if native {
+        let mod_path = super::claude_mod::publish()?;
+        runtime::insert_before_separator(
+            &mut args,
+            [
+                "--plugin-dir".to_string(),
+                mod_path.to_string_lossy().into_owned(),
+            ],
+        );
+    }
     Ok(RuntimeInjection {
         args,
-        env: Vec::new(),
+        env: injected_env,
     })
 }
 

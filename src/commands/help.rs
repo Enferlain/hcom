@@ -586,6 +586,10 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
+        "  claude_delivery",
+        "Claude delivery: inject (PTY, default) | native (experimental mod)",
+    ),
+    (
         "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / qoder_args / grok_args",
         "Default launch args per tool",
     ),

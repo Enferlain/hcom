@@ -128,6 +128,7 @@ pub(crate) const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("subagent_timeout", "launch.subagent_timeout"),
     ("auto_subscribe", "launch.auto_subscribe"),
     ("claude_args", "launch.claude.args"),
+    ("claude_delivery", "launch.claude.delivery"),
     ("gemini_args", "launch.gemini.args"),
     ("gemini_system_prompt", "launch.gemini.system_prompt"),
     ("codex_args", "launch.codex.args"),
@@ -170,6 +171,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("notes", "HCOM_NOTES"),
     ("tag", "HCOM_TAG"),
     ("claude_args", "HCOM_CLAUDE_ARGS"),
+    ("claude_delivery", "HCOM_CLAUDE_DELIVERY"),
     ("gemini_args", "HCOM_GEMINI_ARGS"),
     ("codex_args", "HCOM_CODEX_ARGS"),
     ("gemini_system_prompt", "HCOM_GEMINI_SYSTEM_PROMPT"),
@@ -284,6 +286,8 @@ pub struct HcomConfig {
     pub notes: String,
     pub tag: String,
     pub claude_args: String,
+    /// Claude delivery transport ("native" | "inject"), fixed for each new launch.
+    pub claude_delivery: String,
     pub gemini_args: String,
     pub codex_args: String,
     pub opencode_args: String,
@@ -324,6 +328,7 @@ impl Default for HcomConfig {
             notes: String::new(),
             tag: String::new(),
             claude_args: String::new(),
+            claude_delivery: crate::hooks::claude_mod::DEFAULT_DELIVERY.to_string(),
             gemini_args: String::new(),
             codex_args: String::new(),
             opencode_args: String::new(),
@@ -423,6 +428,17 @@ impl HcomConfig {
             }
         }
 
+        if !crate::hooks::claude_mod::DELIVERY_MODES.contains(&self.claude_delivery.as_str()) {
+            errors.insert(
+                "claude_delivery".into(),
+                format!(
+                    "claude_delivery must be one of: {}. Got '{}'",
+                    crate::hooks::claude_mod::DELIVERY_MODES.join(", "),
+                    self.claude_delivery
+                ),
+            );
+        }
+
         // Validate tag (alphanumeric + hyphens only)
         if !self.tag.is_empty() && !RE_TAG.is_match(&self.tag) {
             errors.insert(
@@ -500,6 +516,7 @@ impl HcomConfig {
             "notes" => Some(self.notes.clone()),
             "tag" => Some(self.tag.clone()),
             "claude_args" => Some(self.claude_args.clone()),
+            "claude_delivery" => Some(self.claude_delivery.clone()),
             "gemini_args" => Some(self.gemini_args.clone()),
             "codex_args" => Some(self.codex_args.clone()),
             "opencode_args" => Some(self.opencode_args.clone()),
@@ -547,6 +564,7 @@ impl HcomConfig {
             "notes" => self.notes = value.to_string(),
             "tag" => self.tag = value.to_string(),
             "claude_args" => self.claude_args = value.to_string(),
+            "claude_delivery" => self.claude_delivery = value.to_string(),
             "gemini_args" => self.gemini_args = value.to_string(),
             "codex_args" => self.codex_args = value.to_string(),
             "opencode_args" => self.opencode_args = value.to_string(),
@@ -674,6 +692,7 @@ impl HcomConfig {
             "notes",
             "tag",
             "claude_args",
+            "claude_delivery",
             "gemini_args",
             "codex_args",
             "opencode_args",
@@ -692,8 +711,8 @@ impl HcomConfig {
         for str_field in &str_fields {
             if let Some(val) = get_var(str_field) {
                 let s = val.as_string();
-                // Empty terminal uses the default.
-                if *str_field == "terminal" && s.is_empty() {
+                // Empty terminal or delivery uses the default.
+                if matches!(*str_field, "terminal" | "claude_delivery") && s.is_empty() {
                     continue;
                 }
                 let _ = config.set_field(str_field, &s);
@@ -1018,6 +1037,8 @@ auto_trust_workspace = true
 
 [launch.claude]
 args = ""
+# "inject" (PTY typing) | "native" (experimental Claude mod); new launches only.
+delivery = "inject"
 
 [launch.gemini]
 args = ""
@@ -1612,6 +1633,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn claude_delivery_defaults_to_inject_and_rejects_unknown_modes() {
+        let mut config = HcomConfig::default();
+        assert_eq!(config.to_env_dict()["HCOM_CLAUDE_DELIVERY"], "inject");
+        config.set_field("claude_delivery", "native").unwrap();
+        assert_eq!(
+            config.to_toml_table()["launch"]["claude"]["delivery"].as_str(),
+            Some("native")
+        );
+        assert_eq!(
+            HcomConfig::from_env_dict(&config.to_env_dict())
+                .unwrap()
+                .claude_delivery,
+            "native"
+        );
+        config.set_field("claude_delivery", "pty").unwrap();
+        assert!(config.collect_errors().contains_key("claude_delivery"));
     }
 
     // Unix-only: asserts against $HOME and POSIX absolute paths; Windows

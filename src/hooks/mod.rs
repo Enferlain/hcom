@@ -2,6 +2,7 @@
 
 pub mod antigravity;
 pub mod claude;
+pub mod claude_mod;
 pub mod codex;
 pub mod common;
 pub mod copilot;
