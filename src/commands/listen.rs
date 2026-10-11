@@ -14,10 +14,10 @@ use crate::core::filters::{EventFilterArgs, build_sql_from_flags, resolve_filter
 use crate::db::HcomDb;
 use crate::identity;
 use crate::identity::get_display_name;
-use crate::instance_lifecycle::{StatusUpdate, set_status};
+use crate::instance_lifecycle::set_status;
 use crate::instances;
 use crate::notify::NotifyServer;
-use crate::shared::{CommandContext, ST_ACTIVE, ST_INACTIVE, ST_LISTENING};
+use crate::shared::{CommandContext, ST_INACTIVE, ST_LISTENING};
 
 /// Parsed arguments for `hcom listen`.
 #[derive(clap::Parser, Debug)]
@@ -100,22 +100,34 @@ fn message_json(msg: &crate::db::Message) -> String {
     .to_string()
 }
 
-/// Status after listen returns. Adhoc has no hooks to move it back out of
-/// active, so it records what happened as inactive, like every other adhoc
-/// command. This is deliberately not an `exit:*` context: a quiet poll is not
-/// a process exit, and exit contexts are reaped after 60s regardless of PID.
+/// Listen writes status only for adhoc rows: with no hooks, `hcom listen` is
+/// their idle state. Every other row runs listen as a tool call mid-turn and
+/// its hooks own status. Marking it listening would read as turn end to
+/// request watches ("went idle without responding"), `events sub --idle` and
+/// the PTY inject gate.
+fn set_adhoc_listening(
+    db: &HcomDb,
+    instance_name: &str,
+    instance_data: &serde_json::Value,
+    context: &str,
+) {
+    if is_adhoc(instance_data) {
+        set_status(db, instance_name, ST_LISTENING, context, Default::default());
+    }
+}
+
+/// Adhoc status after listen returns: inactive, like every other adhoc
+/// command. Deliberately not an `exit:*` context: a quiet poll is not a
+/// process exit, and exit contexts are reaped after 60s regardless of PID.
 fn set_listen_done_status(
     db: &HcomDb,
     instance_name: &str,
     instance_data: &serde_json::Value,
     context: &str,
 ) {
-    let status = if is_adhoc(instance_data) {
-        ST_INACTIVE
-    } else {
-        ST_ACTIVE
-    };
-    set_status(db, instance_name, status, context, Default::default());
+    if is_adhoc(instance_data) {
+        set_status(db, instance_name, ST_INACTIVE, context, Default::default());
+    }
 }
 
 fn is_adhoc(instance_data: &serde_json::Value) -> bool {
@@ -254,17 +266,7 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
     }
 
     // Standard message-wait mode
-    // Mark as listening
-    set_status(
-        db,
-        &instance_name,
-        ST_LISTENING,
-        "ready",
-        StatusUpdate {
-            detail: "cmd:listen",
-            ..Default::default()
-        },
-    );
+    set_adhoc_listening(db, &instance_name, instance_data.unwrap(), "ready");
 
     let start_time = std::time::Instant::now();
 
@@ -309,19 +311,6 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
         notify_server.as_ref(),
         &shutdown,
     );
-
-    // Cleanup: clear cmd:listen detail if still set
-    if let Ok(Some(current)) = db.get_instance_full(&instance_name)
-        && current.status_detail == "cmd:listen"
-    {
-        set_status(
-            db,
-            &instance_name,
-            ST_LISTENING,
-            "ready",
-            Default::default(),
-        );
-    }
 
     // Cleanup notify endpoint
     let _ = db.delete_notify_endpoint(&instance_name, "listen");
@@ -390,12 +379,7 @@ fn listen_loop(
                 print!("{late}");
             }
 
-            let context = if is_adhoc(instance_data) {
-                "message received"
-            } else {
-                "finished listening"
-            };
-            set_listen_done_status(db, instance_name, instance_data, context);
+            set_listen_done_status(db, instance_name, instance_data, "message received");
             return 0;
         }
 
@@ -404,9 +388,7 @@ fn listen_loop(
         // consume that budget under load even when a message is already queued.
         let elapsed = start_time.elapsed().as_secs_f64();
         if elapsed >= timeout {
-            if is_adhoc(instance_data) {
-                set_listen_done_status(db, instance_name, instance_data, "listen timeout");
-            }
+            set_listen_done_status(db, instance_name, instance_data, "listen timeout");
             if !json_output {
                 eprintln!("\n[Timeout: no messages after {timeout}s]");
             }
@@ -500,13 +482,13 @@ fn listen_with_filter(
     };
     let sub_key = format!("events_sub:{sub_id}");
 
-    // Mark as listening BEFORE capturing last_id
-    set_status(
+    // Adhoc: mark listening BEFORE capturing last_id so the status event is
+    // excluded from the subscription.
+    set_adhoc_listening(
         db,
         instance_name,
-        ST_LISTENING,
+        instance_data,
         &format!("filter:{sub_id}"),
-        Default::default(),
     );
 
     let sub_data = serde_json::json!({
@@ -579,9 +561,7 @@ fn filter_listen_loop(
             if !json_output {
                 eprintln!("\n[Timeout: no match after {timeout}s]");
             }
-            if is_adhoc(instance_data) {
-                set_listen_done_status(db, instance_name, instance_data, "listen timeout");
-            }
+            set_listen_done_status(db, instance_name, instance_data, "listen timeout");
             return 0;
         }
 
@@ -875,6 +855,43 @@ mod tests {
             .unwrap();
         backdate_status(&db, 120);
         assert!(!cleanup_keeps_luna(&db));
+
+        cleanup_test_db(path);
+    }
+
+    /// A hooked agent runs listen mid-turn; its hooks own status. Listen must
+    /// not log `listening` (read as turn end by request watches and
+    /// `events sub --idle`) nor rewrite status on return.
+    #[test]
+    #[serial]
+    fn hooked_listen_leaves_status_to_hooks() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, tool, status, status_context) \
+                 VALUES ('luna', 1000.0, 'claude', 'active', 'tool:Bash')",
+                [],
+            )
+            .unwrap();
+
+        for args in [
+            listen_args(&["1"]),
+            listen_args(&["--timeout", "1", "--from", "nobody"]),
+        ] {
+            assert_eq!(cmd_listen(&db, &args, Some(&ctx("luna"))), 0);
+            assert_eq!(row(&db).status, "active", "{args:?}");
+            assert_eq!(row(&db).status_context, "tool:Bash", "{args:?}");
+        }
+        let listening_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events_v WHERE type='status' AND instance='luna' \
+                 AND status_val='listening'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(listening_events, 0);
 
         cleanup_test_db(path);
     }

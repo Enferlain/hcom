@@ -256,13 +256,9 @@ impl HcomDb {
     /// Args:
     ///   context: Gate context like "tui:not-ready", "tui:user-active", etc.
     ///   detail: Human-readable description like "user is typing"
-    /// Preserve status_detail when it's "cmd:listen" — gate diagnostics must not
-    /// overwrite the flag that blocks PTY injection during `hcom listen`.
     pub fn set_gate_status(&self, name: &str, context: &str, detail: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE instances SET status_context = ?,
-                status_detail = CASE WHEN status_detail = 'cmd:listen' THEN status_detail ELSE ? END
-             WHERE name = ?",
+            "UPDATE instances SET status_context = ?, status_detail = ? WHERE name = ?",
             params![context, detail, name],
         )?;
         Ok(())
@@ -1102,12 +1098,9 @@ impl HcomDb {
     }
 
     /// Check if instance is idle (safe for PTY injection).
-    /// Returns true only when status is "listening" AND detail is not "cmd:listen".
-    /// The "cmd:listen" detail is set by `hcom listen` as its first operation,
-    /// ensuring the gate blocks before any async setup (endpoint registration, etc.).
     pub fn is_idle(&self, name: &str) -> bool {
         match self.get_instance_status(name) {
-            Ok(Some(s)) => s.status == ST_LISTENING && s.detail != "cmd:listen",
+            Ok(Some(s)) => s.status == ST_LISTENING,
             _ => false,
         }
     }

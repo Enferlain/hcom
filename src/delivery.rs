@@ -2084,7 +2084,15 @@ pub fn run_delivery_loop(
                                     let stable_10s =
                                         screen.last_output.elapsed().as_millis() > 10000;
                                     drop(screen);
-                                    if stable_10s {
+                                    // A running `hcom listen` is a quiet tool call,
+                                    // not a missed turn end; it delivers itself.
+                                    let in_listen = db
+                                        .has_notify_endpoint_kind(&current_name, "listen")
+                                        || db.has_notify_endpoint_kind(
+                                            &current_name,
+                                            "listen_filter",
+                                        );
+                                    if stable_10s && !in_listen {
                                         if let Err(e) = db.set_status(
                                             &current_name,
                                             "listening",
