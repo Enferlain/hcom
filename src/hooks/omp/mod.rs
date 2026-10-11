@@ -12,6 +12,6 @@ pub use plugin::{
 };
 
 #[cfg(test)]
-pub(crate) use handlers::{
-    handle_start, handle_status, handle_stop, upsert_plugin_notify_endpoint,
-};
+pub(crate) use crate::hooks::plugin_rpc::{handle_status, handle_stop};
+#[cfg(test)]
+pub(crate) use handlers::{handle_start, upsert_plugin_notify_endpoint};

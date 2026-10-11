@@ -633,6 +633,7 @@ pub fn get_status_description(status: &str, context: &str) -> String {
 }
 
 /// Set instance status with timestamp and log the status-change event.
+/// Best-effort: a failed write is logged, not returned.
 #[track_caller]
 pub fn set_status(
     db: &HcomDb,
@@ -641,6 +642,24 @@ pub fn set_status(
     context: &str,
     upd: StatusUpdate<'_>,
 ) {
+    if let Err(e) = try_set_status(db, instance_name, status, context, upd) {
+        crate::log::log_error(
+            "core",
+            "db.error",
+            &format!("set_status: {instance_name} - {e}"),
+        );
+    }
+}
+
+/// [`set_status`] for callers that must report whether the status was stored.
+#[track_caller]
+pub fn try_set_status(
+    db: &HcomDb,
+    instance_name: &str,
+    status: &str,
+    context: &str,
+    upd: StatusUpdate<'_>,
+) -> anyhow::Result<()> {
     let StatusUpdate {
         detail,
         msg_ts,
@@ -653,13 +672,7 @@ pub fn set_status(
     // per hook instead of two. Wake and subscriptions run after commit so
     // woken readers see both.
     let committed = db.with_write_scope(|| {
-        let current_data = match db.get_instance_full(instance_name) {
-            Ok(data) => data,
-            Err(e) => {
-                eprintln!("[hcom] warn: set_status DB read failed for {instance_name}: {e}");
-                None
-            }
-        };
+        let current_data = db.get_instance_full(instance_name)?;
         let now = now_epoch_i64();
         let mut updates = serde_json::Map::new();
         updates.insert("status".into(), serde_json::json!(status));
@@ -673,24 +686,8 @@ pub fn set_status(
 
         let old_status = current_data.as_ref().map(|d| d.status.as_str());
         let status_changed = old_status != Some(status);
-        let status_event_changed = current_data.as_ref().is_none_or(|d| {
-            d.status != status || d.status_context != context || d.status_detail != detail
-        });
 
-        crate::instances::update_instance_position(db, instance_name, &updates);
-
-        // The pi-family plugins (pi, and its fork omp) structurally double-write tool
-        // status: the extension's tool_call handler calls reportStatus (omp/pi-status)
-        // AND the Rust beforetool hook calls update_tool_status, both with the same
-        // tool:<name>+detail. Suppress the redundant unchanged event for this family so
-        // it doesn't emit duplicate status events (~30% of events for omp otherwise).
-        let is_pi_family = matches!(
-            current_data.as_ref().map(|d| d.tool.as_str()),
-            Some("pi") | Some("omp")
-        );
-        if is_pi_family && !status_event_changed && msg_ts.is_empty() {
-            return Ok((status_changed, None));
-        }
+        db.update_instance_fields(instance_name, &updates)?;
 
         let position = current_data.as_ref().map(|d| d.last_event_id).unwrap_or(0);
         let mut data = serde_json::json!({
@@ -735,23 +732,14 @@ pub fn set_status(
         Ok((status_changed, event))
     });
 
-    let (status_changed, event) = match committed {
-        Ok(v) => v,
-        Err(e) => {
-            crate::log::log_error(
-                "core",
-                "db.error",
-                &format!("set_status: {instance_name} - {e}"),
-            );
-            return;
-        }
-    };
+    let (status_changed, event) = committed?;
     if status_changed {
         crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
     if let Some((event_id, data)) = event {
         db.after_event_logged(event_id, "status", instance_name, &data);
     }
+    Ok(())
 }
 
 /// Delete placeholder instances that have been launching too long.
@@ -1729,105 +1717,8 @@ mod tests {
         cleanup(path);
     }
 
-    fn assert_pi_family_skips_duplicate(tool: &str) {
-        let (db, path) = setup_test_db();
-        let mut row = serde_json::Map::new();
-        row.insert("name".into(), serde_json::json!("luna"));
-        row.insert("tool".into(), serde_json::json!(tool));
-        row.insert("status".into(), serde_json::json!(ST_ACTIVE));
-        row.insert("status_context".into(), serde_json::json!("tool:bash"));
-        row.insert("status_detail".into(), serde_json::json!("echo hi"));
-        row.insert("status_time".into(), serde_json::json!(1));
-        row.insert("last_stop".into(), serde_json::json!(0));
-        row.insert("created_at".into(), serde_json::json!(1.0));
-        db.save_instance_named("luna", &row).unwrap();
-
-        // Two identical unchanged writes (reportStatus + beforetool) → one event.
-        set_status(
-            &db,
-            "luna",
-            ST_ACTIVE,
-            "tool:bash",
-            StatusUpdate {
-                detail: "ls -la",
-                ..Default::default()
-            },
-        );
-        set_status(
-            &db,
-            "luna",
-            ST_ACTIVE,
-            "tool:bash",
-            StatusUpdate {
-                detail: "ls -la",
-                ..Default::default()
-            },
-        );
-        let event_count: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE type = 'status' AND instance = 'luna'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            event_count, 1,
-            "pi-family tool {tool} should dedup identical status events"
-        );
-        cleanup(path);
-    }
-
     #[test]
-    fn test_set_status_dedup_covers_pi_family() {
-        assert_pi_family_skips_duplicate("pi");
-        assert_pi_family_skips_duplicate("omp");
-    }
-
-    #[test]
-    fn test_set_status_skips_duplicate_status_events_but_refreshes_heartbeat() {
-        let (db, path) = setup_test_db();
-        let mut row = serde_json::Map::new();
-        row.insert("name".into(), serde_json::json!("luna"));
-        row.insert("tool".into(), serde_json::json!("pi"));
-        row.insert("status".into(), serde_json::json!(ST_ACTIVE));
-        row.insert("status_context".into(), serde_json::json!("prompt"));
-        row.insert("status_detail".into(), serde_json::json!(""));
-        row.insert("status_time".into(), serde_json::json!(1));
-        row.insert("last_stop".into(), serde_json::json!(0));
-        row.insert("created_at".into(), serde_json::json!(1.0));
-        db.save_instance_named("luna", &row).unwrap();
-
-        set_status(&db, "luna", ST_LISTENING, "", Default::default());
-        let event_count_after_change: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE type = 'status' AND instance = 'luna'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(event_count_after_change, 1);
-        let first_last_stop: i64 = db.get_instance_full("luna").unwrap().unwrap().last_stop;
-
-        set_status(&db, "luna", ST_LISTENING, "", Default::default());
-        let event_count_after_duplicate: i64 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE type = 'status' AND instance = 'luna'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(event_count_after_duplicate, 1);
-        let refreshed_last_stop: i64 = db.get_instance_full("luna").unwrap().unwrap().last_stop;
-        assert!(refreshed_last_stop >= first_last_stop);
-
-        cleanup(path);
-    }
-
-    #[test]
-    fn test_set_status_logs_duplicate_status_events_for_non_pi_tools() {
+    fn test_set_status_logs_duplicate_status_events() {
         let (db, path) = setup_test_db();
         let mut row = serde_json::Map::new();
         row.insert("name".into(), serde_json::json!("luna"));

@@ -11,6 +11,7 @@ pub mod gemini;
 pub mod kimi;
 pub mod opencode;
 pub mod pi;
+pub(crate) mod plugin_rpc;
 pub mod qoder;
 pub mod runtime;
 pub mod utils;

@@ -2,8 +2,6 @@
 
 use std::time::Instant;
 
-use serde_json::Value;
-
 use crate::bootstrap;
 use crate::db::HcomDb;
 use crate::instance_binding;
@@ -14,18 +12,7 @@ use crate::shared::ST_LISTENING;
 use crate::shared::context::HcomContext;
 
 use crate::hooks::common;
-use crate::hooks::common::finalize_session;
-
-fn parse_flag(argv: &[String], flag: &str) -> Option<String> {
-    argv.iter()
-        .position(|a| a == flag)
-        .and_then(|i| argv.get(i + 1))
-        .cloned()
-}
-
-fn has_flag(argv: &[String], flag: &str) -> bool {
-    argv.iter().any(|a| a == flag)
-}
+use crate::hooks::plugin_rpc::{self, parse_flag};
 
 pub(crate) fn upsert_plugin_notify_endpoint(db: &HcomDb, instance_name: &str, port: u16) {
     if let Err(e) = db.upsert_notify_endpoint(instance_name, "plugin", port) {
@@ -41,24 +28,6 @@ pub(crate) fn upsert_plugin_notify_endpoint(db: &HcomDb, instance_name: &str, po
     }
 
     crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
-}
-
-fn initialize_last_event_id(db: &HcomDb, instance_name: &str) {
-    if let Ok(Some(existing)) = db.get_instance_full(instance_name)
-        && existing.last_event_id == 0
-    {
-        let launch_event_id: Option<i64> = std::env::var("HCOM_LAUNCH_EVENT_ID")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let current_max = db.get_last_event_id();
-        let new_id = match launch_event_id {
-            Some(lei) if lei <= current_max => lei,
-            _ => current_max,
-        };
-        let mut updates = serde_json::Map::new();
-        updates.insert("last_event_id".into(), serde_json::json!(new_id));
-        instances::update_instance_position(db, instance_name, &updates);
-    }
 }
 
 fn instance_name_from_env(ctx: &HcomContext) -> Option<String> {
@@ -109,7 +78,7 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
             },
         };
 
-    initialize_last_event_id(db, &instance_name);
+    plugin_rpc::initialize_last_event_id(db, &instance_name);
     lifecycle::set_status(
         db,
         &instance_name,
@@ -151,132 +120,6 @@ pub(crate) fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (
     (0, response.to_string())
 }
 
-pub(crate) fn handle_status(db: &HcomDb, argv: &[String]) -> (i32, String) {
-    let name = match parse_flag(argv, "--name") {
-        Some(n) => n,
-        None => return (0, r#"{"error":"Missing --name or --status"}"#.to_string()),
-    };
-    let status = match parse_flag(argv, "--status") {
-        Some(s) => s,
-        None => return (0, r#"{"error":"Missing --name or --status"}"#.to_string()),
-    };
-    let context = parse_flag(argv, "--context").unwrap_or_default();
-    let detail = parse_flag(argv, "--detail").unwrap_or_default();
-    let was_listening = db
-        .get_instance_full(&name)
-        .ok()
-        .flatten()
-        .is_some_and(|inst| inst.status == ST_LISTENING);
-
-    lifecycle::set_status(
-        db,
-        &name,
-        &status,
-        &context,
-        lifecycle::StatusUpdate {
-            detail: &detail,
-            ..Default::default()
-        },
-    );
-    if status == ST_LISTENING && !was_listening {
-        crate::notify::wake(db, &name, &[]);
-    }
-    (0, r#"{"ok":true}"#.to_string())
-}
-
-fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
-    let name = match parse_flag(argv, "--name") {
-        Some(n) => n,
-        None => return (0, r#"{"error":"Missing --name"}"#.to_string()),
-    };
-    let format_mode = has_flag(argv, "--format");
-    let check_mode = has_flag(argv, "--check");
-    let ack_mode = has_flag(argv, "--ack");
-
-    let raw_messages = db.get_unread_messages(&name);
-    let messages: Vec<Value> = raw_messages.iter().map(common::message_to_value).collect();
-
-    if format_mode {
-        if messages.is_empty() {
-            return (0, String::new());
-        }
-        let deliver = common::limit_delivery_messages(&messages);
-        return (
-            0,
-            common::format_messages_json_for_instance(db, &deliver, &name),
-        );
-    }
-    if ack_mode {
-        if let Some(up_to) = parse_flag(argv, "--up-to") {
-            let Ok(ack_id) = up_to.parse::<i64>() else {
-                return (
-                    0,
-                    serde_json::json!({"error": format!("Invalid --up-to: {}", up_to)}).to_string(),
-                );
-            };
-            let mut updates = serde_json::Map::new();
-            updates.insert("last_event_id".into(), serde_json::json!(ack_id));
-            instances::update_instance_position(db, &name, &updates);
-            return (0, serde_json::json!({"acked_to": ack_id}).to_string());
-        }
-        if messages.is_empty() {
-            return (0, r#"{"acked":0}"#.to_string());
-        }
-        let ack_id = messages
-            .iter()
-            .filter_map(|m| m.get("event_id").and_then(|v| v.as_i64()))
-            .max()
-            .filter(|id| *id > 0)
-            .unwrap_or_else(|| db.get_last_event_id());
-        if ack_id > 0 {
-            let mut updates = serde_json::Map::new();
-            updates.insert("last_event_id".into(), serde_json::json!(ack_id));
-            instances::update_instance_position(db, &name, &updates);
-        }
-        return (0, serde_json::json!({"acked": messages.len()}).to_string());
-    }
-    if check_mode {
-        return (
-            0,
-            if messages.is_empty() { "false" } else { "true" }.to_string(),
-        );
-    }
-    (
-        0,
-        serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_string()),
-    )
-}
-
-fn handle_beforetool(db: &HcomDb, argv: &[String]) -> (i32, String) {
-    let name = match parse_flag(argv, "--name") {
-        Some(n) => n,
-        None => return (0, r#"{"decision":"allow"}"#.to_string()),
-    };
-    let tool_name = parse_flag(argv, "--tool").unwrap_or_default();
-    let input = parse_flag(argv, "--input-json")
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !tool_name.is_empty() {
-        common::update_tool_status(db, &name, "omp", &tool_name, &input);
-    }
-    (0, r#"{"decision":"allow"}"#.to_string())
-}
-
-pub(crate) fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
-    let name = match parse_flag(argv, "--name") {
-        Some(n) => n,
-        None => return (0, r#"{"error":"Missing --name"}"#.to_string()),
-    };
-    let reason = parse_flag(argv, "--reason").unwrap_or_else(|| "unknown".to_string());
-    if has_flag(argv, "--soft") {
-        common::soft_finalize_session(db, &name, &reason, None, true);
-        (0, r#"{"ok":true,"soft":true}"#.to_string())
-    } else {
-        finalize_session(db, &name, &reason, None);
-        (0, r#"{"ok":true}"#.to_string())
-    }
-}
-
 pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
     let start = Instant::now();
     let ctx = HcomContext::from_os();
@@ -314,10 +157,10 @@ pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
         ),
         || match hook_name_owned.as_str() {
             "omp-start" => handle_start(&ctx, &db, &handler_argv),
-            "omp-status" => handle_status(&db, &handler_argv),
-            "omp-read" => handle_read(&db, &handler_argv),
-            "omp-beforetool" => handle_beforetool(&db, &handler_argv),
-            "omp-stop" => handle_stop(&db, &handler_argv),
+            "omp-status" => plugin_rpc::handle_status(&db, &handler_argv),
+            "omp-read" => plugin_rpc::handle_read(&db, &handler_argv),
+            "omp-beforetool" => plugin_rpc::handle_tool(&db, &handler_argv, "omp"),
+            "omp-stop" => plugin_rpc::handle_stop(&db, &handler_argv),
             _ => (
                 0,
                 serde_json::json!({"error": format!("Unknown Omp hook: {}", hook_name_owned)})

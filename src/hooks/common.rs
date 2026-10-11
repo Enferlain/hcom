@@ -1525,28 +1525,28 @@ pub fn soft_finalize_session(
     reason: &str,
     updates: Option<&serde_json::Map<String, Value>>,
     keep_process_binding: bool,
-) {
+) -> anyhow::Result<()> {
     log::log_info(
         "hooks",
         "sessionend.soft",
         &format!("instance={} reason={}", instance_name, reason),
     );
 
-    lifecycle::set_status(
+    lifecycle::try_set_status(
         db,
         instance_name,
         ST_INACTIVE,
         &format!("exit:{}", reason),
         Default::default(),
-    );
+    )?;
 
     if let Some(updates) = updates {
         instances::update_instance_position(db, instance_name, updates);
     }
 
-    let instance_data = match db.get_instance_full(instance_name) {
-        Ok(Some(data)) => data,
-        _ => return,
+    // No row: nothing left to stop.
+    let Some(instance_data) = db.get_instance_full(instance_name)? else {
+        return Ok(());
     };
 
     let snapshot = serde_json::json!({
@@ -1573,25 +1573,27 @@ pub fn soft_finalize_session(
         "last_event_id": instance_data.last_event_id,
     });
 
+    // Binding and endpoint cleanup is what makes the stop real; subscription
+    // cleanup and the life event below stay best-effort.
     if let Some(ref session_id) = instance_data.session_id {
-        let _ = db.conn().execute(
+        db.conn().execute(
             "DELETE FROM session_bindings WHERE session_id = ?",
             params![session_id],
-        );
+        )?;
         if !keep_process_binding {
-            let _ = db.conn().execute(
+            db.conn().execute(
                 "DELETE FROM process_bindings WHERE session_id = ?",
                 params![session_id],
-            );
+            )?;
         }
     }
 
-    let _ = db.delete_notify_endpoints(instance_name);
+    db.delete_notify_endpoints(instance_name)?;
     if !keep_process_binding {
-        let _ = db.conn().execute(
+        db.conn().execute(
             "DELETE FROM process_bindings WHERE instance_name = ?",
             params![instance_name],
-        );
+        )?;
     }
     let _ = db.cleanup_subscriptions(instance_name);
 
@@ -1608,19 +1610,19 @@ pub fn soft_finalize_session(
             &format!("log_life_event failed for {instance_name}: {e}"),
         );
     }
+    Ok(())
 }
 
 /// Set inactive status, persist updates, and stop instance.
 ///
-/// Common to Claude and Gemini SessionEnd handlers. Catches all errors
-/// internally — callers don't need error handling.
-///
+/// Common to SessionEnd handlers. Errors are handled internally; the returned
+/// outcome is for callers that must report whether the stop completed.
 pub fn finalize_session(
     db: &HcomDb,
     instance_name: &str,
     reason: &str,
     updates: Option<&serde_json::Map<String, Value>>,
-) {
+) -> StopOutcome {
     log::log_info(
         "hooks",
         "sessionend",
@@ -1660,7 +1662,7 @@ pub fn finalize_session(
         }
         Some(_) => stop_instance(db, instance_name, "session", "killed"),
         None => stop_instance(db, instance_name, "session", &format!("exit:{}", reason)),
-    };
+    }
 }
 
 /// Whether launch `batch_id` has emitted `ready` for `instance_name`.
@@ -2817,7 +2819,7 @@ mod tests {
             )
             .unwrap();
 
-        soft_finalize_session(&db, "vine", "unknown", None, false);
+        soft_finalize_session(&db, "vine", "unknown", None, false).unwrap();
 
         assert!(db.get_instance_full("vine").unwrap().is_some());
         let status = db.get_status("vine").unwrap().map(|(s, _)| s);
@@ -2861,7 +2863,7 @@ mod tests {
             )
             .unwrap();
 
-        soft_finalize_session(&db, "luna", "turn_end", None, true);
+        soft_finalize_session(&db, "luna", "turn_end", None, true).unwrap();
 
         assert_eq!(
             db.get_process_binding("pid-keep").unwrap(),

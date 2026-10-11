@@ -135,15 +135,14 @@ fn plugin_bootstraps_via_hidden_message() {
 }
 
 #[test]
-fn plugin_reconcile_does_not_report_active_polling_status() {
-    assert!(
-        !PLUGIN_SOURCE
-            .contains("reportStatus(currentCtx, currentCtx.isIdle() ? \"listening\" : \"active\")")
-    );
-    assert!(PLUGIN_SOURCE.contains("pi.on(\"agent_end\""));
-    assert!(PLUGIN_SOURCE.contains("IDLE_DEBOUNCE_MS"));
-    assert!(PLUGIN_SOURCE.contains("currentCtx?.isIdle()"));
-    assert!(!PLUGIN_SOURCE.contains("pi.on(\"turn_end\", async (_event, ctx) => {\n\t\tcurrentCtx = ctx;\n\t\tawait reportStatus(ctx, \"listening\");"));
+fn plugin_confirms_idle_after_agent_end() {
+    // OMP has no settled event: agent_end is debounced and re-checks isIdle.
+    let idx = PLUGIN_SOURCE
+        .find("pi.on(\"agent_end\"")
+        .expect("agent_end handler");
+    let handler = &PLUGIN_SOURCE[idx..];
+    assert!(handler.contains("IDLE_DEBOUNCE_MS"));
+    assert!(handler.contains("latest?.isIdle()"));
 }
 
 #[test]
@@ -152,54 +151,46 @@ fn plugin_delivery_reports_active_edge() {
     assert!(PLUGIN_SOURCE.contains("`deliver:${sender}`"));
 }
 
-// The embedded plugin is include_str!'d and never tsc'd, so these guard the
-// delivery-correctness invariants that upstream API/lifecycle drift silently
-// broke before (see PR review). They pin behavior, not just strings.
+// These pin delivery-correctness invariants that upstream API/lifecycle drift
+// broke before; `just typecheck` covers the types, not the behavior.
 
 #[test]
-fn plugin_acks_transform_submission_in_before_agent_start() {
-    // omp applies the bodyless-wake transform inline (no source:"extension"
-    // re-emit), so the transform-path ack must happen in before_agent_start.
-    // Without it pendingAckId stays set and deliverPending jams forever.
+fn plugin_acks_on_admission_not_on_send() {
+    // sendUserMessage() returns void and OMP emits no input event for extension
+    // sends, so neither is a receipt. The user message ending is.
     let idx = PLUGIN_SOURCE
-        .find("pi.on(\"before_agent_start\"")
-        .expect("before_agent_start handler present");
-    assert!(
-        PLUGIN_SOURCE[idx..].contains("ackPending(\"before_agent_start\")"),
-        "before_agent_start must ack the inline transform submission"
-    );
-    assert!(PLUGIN_SOURCE.contains("if (pendingAckId !== null) await ackPending"));
+        .find("pi.on(\"message_end\"")
+        .expect("message_end handler");
+    let handler = &PLUGIN_SOURCE[idx..];
+    assert!(handler.contains("sent.admitted = true"));
+    assert!(handler.contains("void flushAck(\"message_end\")"));
+    let send = PLUGIN_SOURCE.find("pi.sendUserMessage(").expect("send");
+    assert!(!PLUGIN_SOURCE[send..send + 600].contains("flushAck"));
+    // Never-admitted deliveries are released for redelivery, not acked.
+    assert!(PLUGIN_SOURCE.contains("function releaseUnadmitted"));
 }
 
 #[test]
 fn plugin_replays_wakes_dropped_during_in_flight_window() {
-    // In-flight/pending-ack wakes must be queued and replayed, not dropped.
-    assert!(PLUGIN_SOURCE.contains("deliveryPending"));
+    assert!(PLUGIN_SOURCE.contains("deliveryPending = true"));
     assert!(PLUGIN_SOURCE.contains("schedulePendingDelivery"));
-    assert!(PLUGIN_SOURCE.contains("drainPendingDelivery"));
-    // ackPending drains so the transform-path ack replays queued wakes.
-    let idx = PLUGIN_SOURCE
-        .find("async function ackPending")
-        .expect("ackPending present");
+    let idx = PLUGIN_SOURCE.find("function flushAck").expect("flushAck");
     assert!(PLUGIN_SOURCE[idx..].contains("drainPendingDelivery(\"post_ack_wake\")"));
 }
 
 #[test]
-fn plugin_keeps_ack_gate_until_command_succeeds() {
-    let idx = PLUGIN_SOURCE
-        .find("async function ackPending")
-        .expect("ackPending present");
+fn plugin_keeps_ack_gate_until_hcom_confirms() {
+    let idx = PLUGIN_SOURCE.find("function flushAck").expect("flushAck");
     let ack = &PLUGIN_SOURCE[idx..];
-    let command = ack.find("await hcom([\"omp-read\"").expect("ack command");
-    let clear = ack.find("pendingAckId = null").expect("pending ack clear");
-    assert!(
-        command < clear,
-        "pendingAckId must remain set while the ack command is in flight"
-    );
-    assert!(ack.contains("if (result.code !== 0)"));
-    assert!(ack.contains("plugin.delivery_ack_failed"));
-    assert!(PLUGIN_SOURCE.contains("ackInFlight"));
-    assert!(PLUGIN_SOURCE.contains("await ackPending(\"reconcile\")"));
+    let command = ack
+        .find("[\"omp-read\", \"--name\", name, \"--ack\"")
+        .expect("ack command");
+    let check = ack
+        .find("reply?.acked_to !== sent.ackId")
+        .expect("reply validated");
+    let clear = ack.find("delivery = null").expect("gate cleared");
+    assert!(command < check && check < clear);
+    assert!(PLUGIN_SOURCE.contains("await flushAck(\"reconcile\")"));
 }
 
 #[test]
@@ -603,20 +594,18 @@ fn recover_rejects_active_instance() {
 fn plugin_source_pins_soft_stop_polish_markers() {
     assert!(PLUGIN_SOURCE.contains("Symbol.for(\"hcom.omp.identity\")"));
     assert!(PLUGIN_SOURCE.contains("stopReconcileTimer"));
-    assert!(PLUGIN_SOURCE.contains("tearingDown"));
     assert!(PLUGIN_SOURCE.contains("HCOM_TIMEOUT_MS"));
-    assert!(PLUGIN_SOURCE.contains("1800"));
     let shutdown_idx = PLUGIN_SOURCE
         .find("pi.on(\"session_shutdown\"")
         .expect("session_shutdown handler present");
     let handler = &PLUGIN_SOURCE[shutdown_idx..];
     assert!(
-        handler.contains("keepOwner = !softStopOk"),
-        "failed soft-stop path must keepOwner"
+        handler.contains("if (reply?.ok === true)"),
+        "ownership is released only on a confirmed stop"
     );
     assert!(
         handler.contains("reg.tearingDown = false"),
-        "failed soft-stop keepOwner must clear tearingDown so owner can rebind"
+        "failed soft-stop must clear tearingDown so the owner can rebind"
     );
     assert!(
         PLUGIN_SOURCE.contains("reg.tearingDown && !ownsIdentity"),
@@ -694,7 +683,7 @@ fn plugin_source_uses_omp_cli_commands_only() {
 #[test]
 fn plugin_source_matches_omp_input_result_shape() {
     assert!(PLUGIN_SOURCE.contains("return {}"));
-    assert!(PLUGIN_SOURCE.contains("return { text:"));
+    assert!(PLUGIN_SOURCE.contains("return { text }"));
     assert!(PLUGIN_SOURCE.contains("return { handled: true }"));
     assert!(!PLUGIN_SOURCE.contains("action: \"continue\""));
     assert!(!PLUGIN_SOURCE.contains("action: \"transform\""));

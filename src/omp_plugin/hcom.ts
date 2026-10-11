@@ -8,11 +8,15 @@ import { createServer, type Server } from "node:net";
 const HCOM_DIR = process.env.HCOM_DIR || `${homedir()}/.hcom`;
 const LOG_PATH = `${HCOM_DIR}/.tmp/logs/hcom.log`;
 
+const HCOM_TIMEOUT_MS = 5_000;
+
 type HcomResult = {
 	code: number;
 	stdout: string;
 	stderr: string;
 };
+
+type RpcReply = Record<string, unknown>;
 
 function log(
 	level: "DEBUG" | "INFO" | "WARN" | "ERROR",
@@ -34,8 +38,8 @@ function log(
 	} catch {}
 }
 
-const HCOM_TIMEOUT_MS = 1800;
-
+// Exit code is 124 on timeout and 128+ when hcom dies from a signal, so neither
+// can be mistaken for success.
 function hcom(args: string[]): Promise<HcomResult> {
 	return new Promise((resolve) => {
 		const child = spawn("hcom", args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -49,8 +53,9 @@ function hcom(args: string[]): Promise<HcomResult> {
 			resolve({ code, stdout, stderr });
 		};
 		const timer = setTimeout(() => {
+			stderr ||= `timed out after ${HCOM_TIMEOUT_MS}ms`;
 			try {
-				child.kill("SIGTERM");
+				child.kill("SIGKILL");
 			} catch {}
 			finish(124);
 		}, HCOM_TIMEOUT_MS);
@@ -64,11 +69,51 @@ function hcom(args: string[]): Promise<HcomResult> {
 			stderr += chunk;
 		});
 		child.on("error", (error) => {
-			stderr = stderr || String(error);
+			stderr ||= String(error);
 			finish(127);
 		});
-		child.on("close", (code) => finish(code === null ? 1 : code));
+		child.on("close", (code, signal) => {
+			if (code === null) stderr ||= `killed by ${signal ?? "signal"}`;
+			finish(code ?? 129);
+		});
 	});
+}
+
+// Every hcom plugin RPC exits 0 and answers with JSON: a payload on success or
+// `{"error": ...}`. Returns the payload, or null (logged) for any failure.
+async function rpc(args: string[], instance: string | null): Promise<RpcReply | null> {
+	const result = await hcom(args);
+	const fail = (extra: Record<string, unknown>) => {
+		log("WARN", "plugin.rpc_failed", instance, { command: args[0], ...extra });
+		return null;
+	};
+	if (result.code !== 0) return fail({ exit_code: result.code, stderr: result.stderr.slice(0, 300) });
+	let reply: unknown;
+	try {
+		reply = JSON.parse(result.stdout);
+	} catch {
+		return fail({ raw: result.stdout.slice(0, 300) });
+	}
+	if (!reply || typeof reply !== "object" || Array.isArray(reply)) return fail({ raw: result.stdout.slice(0, 300) });
+	if ("error" in reply) return fail({ error: (reply as RpcReply).error });
+	return reply as RpcReply;
+}
+
+type Batch = { messages: any[]; ackId: number; hasMore: boolean };
+
+// The oldest unread messages (hcom bounds the batch), or null when the read failed.
+async function readBatch(instance: string): Promise<Batch | null> {
+	const reply = await rpc(["omp-read", "--name", instance], instance);
+	if (!reply) return null;
+	const messages = reply.messages;
+	const valid =
+		Array.isArray(messages) &&
+		messages.every((m: any, i: number) => Number.isInteger(m?.event_id) && m.event_id > (i ? messages[i - 1].event_id : 0));
+	if (!valid) {
+		log("WARN", "plugin.rpc_failed", instance, { command: "omp-read", error: "malformed batch" });
+		return null;
+	}
+	return { messages, ackId: messages.at(-1)?.event_id ?? 0, hasMore: reply.has_more === true };
 }
 
 function formatMessagesForInjection(messages: any[], recipientName: string): string {
@@ -91,10 +136,20 @@ function isBodylessWake(text: string): boolean {
 	return trimmed === "<hcom>" || trimmed === "<hcom></hcom>";
 }
 
+function messageText(message: any): string {
+	const content = message?.content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part: any) => part?.type === "text" && typeof part.text === "string")
+		.map((part: any) => part.text)
+		.join("\n");
+}
+
 // Same-process latch: OMP task subagents load a fresh extension instance in the
 // parent Node process (SessionShutdownEvent has no sessionId). The first binder
 // owns hcom identity; nested instances skip bind/stop so dispose cannot soft-stop
-// the parent (lefo / task repro). ExtensionContext does not expose taskDepth.
+// the parent. ExtensionContext does not expose taskDepth.
 const IDENTITY_REGISTRY_KEY = Symbol.for("hcom.omp.identity");
 const IDENTITY_OWNER_ENV = "HCOM_OMP_IDENTITY_OWNER";
 
@@ -105,9 +160,7 @@ type OmpIdentityRegistry = {
 
 function getIdentityRegistry(): OmpIdentityRegistry {
 	const g = globalThis as Record<symbol, OmpIdentityRegistry | undefined>;
-	if (!g[IDENTITY_REGISTRY_KEY]) {
-		g[IDENTITY_REGISTRY_KEY] = { owner: null, tearingDown: false };
-	}
+	g[IDENTITY_REGISTRY_KEY] ??= { owner: null, tearingDown: false };
 	return g[IDENTITY_REGISTRY_KEY]!;
 }
 
@@ -123,6 +176,40 @@ function clearIdentityOwnership(): void {
 	syncIdentityOwnerEnv(null);
 }
 
+function startNotifyServer(onWake: () => void): Promise<Server | null> {
+	return new Promise((resolve) => {
+		const server = createServer((socket) => {
+			socket.end();
+			onWake();
+		});
+		server.on("error", (error) => {
+			log("ERROR", "notify_server.start_failed", null, { error: String(error) });
+			resolve(null);
+		});
+		server.listen(0, "127.0.0.1", () => resolve(server));
+	});
+}
+
+function serverPort(server: Server | null): number | null {
+	const address = server?.address();
+	return typeof address === "object" && address ? address.port : null;
+}
+
+// A batch handed to OMP. It is acknowledged only once OMP admits it to the
+// transcript (its user message ends), so a prompt OMP rejects, or a queued
+// follow-up dropped by an abort, stays unread and is delivered again.
+type Delivery = { text: string; ackId: number; hasMore: boolean; sentAt: number; admitted: boolean };
+
+// How long an idle OMP with nothing queued may take to admit a delivery before it
+// is presumed rejected and released for redelivery.
+const ADMIT_GRACE_MS = 10_000;
+const RECONCILE_MS = 5_000;
+const PENDING_POLL_MS = 60_000;
+const FALLBACK_PENDING_POLL_MS = 5_000;
+// OMP has no settled event and agent_end can be followed by queued work, so
+// idle is confirmed shortly after.
+const IDLE_DEBOUNCE_MS = 250;
+
 export default function hcomExtension(pi: ExtensionAPI) {
 	let instanceName: string | null = null;
 	let sessionId: string | null = null;
@@ -130,26 +217,23 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	let nestedOptOut = false;
 	let bootstrapText: string | null = null;
 	let bindingPromise: Promise<void> | null = null;
+	// Bumped on every reset. Async work started under an older generation must
+	// not touch state after it resumes.
+	let generation = 0;
 	let notifyServer: Server | null = null;
-	let notifyPort: number | null = null;
 	let currentCtx: ExtensionContext | null = null;
-	let pendingAckId: number | null = null;
-	let ackInFlight: Promise<boolean> | null = null;
-	let bindingGeneration = 0;
-	let deliveryInFlight = false;
+	let delivery: Delivery | null = null;
+	let deliveryInFlight = false; // reading a batch / handing it to OMP
 	let deliveryPending = false; // a wake arrived while delivery was gated; replay it once clear
 	let deliveryRetryScheduled = false; // dedup the queued replay pass
+	let ackInFlight: Promise<void> | null = null;
+	let statusChain: Promise<void> = Promise.resolve();
 	let reconcileTimer: ReturnType<typeof setInterval> | null = null;
 	let reconcileInFlight = false;
 	let bootstrapInjectedForSession: string | null = null;
 	let lastReportedStatusKey: string | null = null;
 	let lastPendingPollAt = 0;
-	let agentActive = false;
 	let idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-	const PENDING_POLL_MS = 60_000;
-	const FALLBACK_PENDING_POLL_MS = 5_000;
-	const IDLE_DEBOUNCE_MS = 250;
 
 	function statusKey(status: string, context: string, detail: string): string {
 		return `${status}\0${context}\0${detail}`;
@@ -159,42 +243,17 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		return !candidateSessionId || !sessionId || candidateSessionId === sessionId;
 	}
 
-	function startNotifyServer(): Promise<number | null> {
-		if (notifyServer && notifyPort) return Promise.resolve(notifyPort);
-		return new Promise((resolve) => {
-			const server = createServer((socket) => {
-				socket.end();
-				log("DEBUG", "notify_server.wake", instanceName, { pending_ack: pendingAckId });
-				if (currentCtx) void deliverPending(currentCtx);
-			});
-			server.on("error", (error) => {
-				log("ERROR", "notify_server.start_failed", instanceName, { error: String(error) });
-				resolve(null);
-			});
-			server.listen(0, "127.0.0.1", () => {
-				notifyServer = server;
-				const address = server.address();
-				notifyPort = typeof address === "object" && address ? address.port : null;
-				log("INFO", "notify_server.started", instanceName, { port: notifyPort });
-				resolve(notifyPort);
-			});
-		});
-	}
-
 	function stopNotifyServer(): void {
-		if (notifyServer) {
-			try {
-				notifyServer.close();
-			} catch {}
-		}
+		try {
+			notifyServer?.close();
+		} catch {}
 		notifyServer = null;
-		notifyPort = null;
 	}
 
 	function nestedSkipReason(): string | null {
 		const reg = getIdentityRegistry();
 		if (nestedOptOut) return "sticky_nested_opt_out";
-		// Owner may rebind after a failed soft-stop while keepOwner retained the latch;
+		// The owner may rebind after a failed soft-stop kept the latch;
 		// tearingDown only blocks nested/non-owner extensions.
 		if (reg.tearingDown && !ownsIdentity) return "tearing_down";
 		if (reg.owner && !ownsIdentity) return "nested_registry";
@@ -209,48 +268,48 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		const skipReason = nestedSkipReason();
 		if (skipReason) {
 			nestedOptOut = true;
-			const reg = getIdentityRegistry();
 			log("INFO", "plugin.bind_skipped_nested", null, {
 				reason: skipReason,
-				owner: reg.owner ?? process.env[IDENTITY_OWNER_ENV] ?? null,
+				owner: getIdentityRegistry().owner ?? process.env[IDENTITY_OWNER_ENV] ?? null,
 			});
 			return;
 		}
-		bindingPromise = (async () => {
+		// Claim before the first await: a nested extension binding concurrently in
+		// this process must see an owner and skip, or both register notify ports.
+		const reg = getIdentityRegistry();
+		const freshClaim = !ownsIdentity;
+		if (freshClaim) {
+			ownsIdentity = true;
+			reg.owner = "binding";
+			syncIdentityOwnerEnv(reg.owner);
+		}
+		const gen = generation;
+		const attempt = (async () => {
+			let server: Server | null = null;
 			try {
-				const reg = getIdentityRegistry();
-				if ((reg.tearingDown && !ownsIdentity) || (reg.owner && !ownsIdentity)) {
-					nestedOptOut = true;
-					log("INFO", "plugin.bind_skipped_nested", null, {
-						reason: reg.tearingDown && !ownsIdentity ? "tearing_down" : "nested_registry",
-						owner: reg.owner,
-					});
-					return;
-				}
 				const sid = ctx.sessionManager.getSessionId();
 				const transcriptPath = ctx.sessionManager.getSessionFile();
-				const port = await startNotifyServer();
+				server = await startNotifyServer(() => {
+					log("DEBUG", "notify_server.wake", instanceName, { pending_ack: delivery?.ackId ?? null });
+					if (currentCtx) void deliverPending(currentCtx);
+				});
+				const port = serverPort(server);
 				const args = ["omp-start", "--session-id", sid, "--cwd", ctx.cwd];
 				if (transcriptPath) args.push("--transcript-path", transcriptPath);
 				if (port) args.push("--notify-port", String(port));
-				const result = await hcom(args);
-				if (result.code !== 0) {
-					stopNotifyServer();
-					log("WARN", "plugin.bind_failed", null, { exit_code: result.code, stderr: result.stderr.slice(0, 300) });
+				const reply = await rpc(args, null);
+				if (gen !== generation) return;
+				if (!reply || typeof reply.name !== "string" || !reply.name) {
+					log("WARN", "plugin.bind_failed", null, { reply });
 					return;
 				}
-				const json = JSON.parse(result.stdout || "{}");
-				if (json.error) {
-					stopNotifyServer();
-					log("WARN", "plugin.bind_failed", null, { error: json.error });
-					return;
-				}
-				instanceName = json.name;
-				sessionId = json.session_id || sid;
-				ownsIdentity = true;
-				reg.owner = instanceName;
-				syncIdentityOwnerEnv(instanceName ?? "1");
-				bootstrapText = typeof json.bootstrap === "string" ? json.bootstrap : null;
+				notifyServer = server;
+				server = null;
+				instanceName = reply.name;
+				reg.owner = reply.name;
+				syncIdentityOwnerEnv(reply.name);
+				sessionId = typeof reply.session_id === "string" && reply.session_id ? reply.session_id : sid;
+				bootstrapText = typeof reply.bootstrap === "string" ? reply.bootstrap : null;
 				startReconcileTimer();
 				log("INFO", "plugin.bound", instanceName, {
 					session_id: sessionId,
@@ -258,88 +317,76 @@ export default function hcomExtension(pi: ExtensionAPI) {
 					bootstrap_len: bootstrapText?.length ?? 0,
 				});
 			} catch (error) {
-				stopNotifyServer();
 				log("ERROR", "plugin.bind_error", null, { error: String(error) });
 			} finally {
-				bindingPromise = null;
+				// Not adopted (failed, or reset while binding): don't leak the listener.
+				server?.close();
+				if (gen === generation) {
+					bindingPromise = null;
+					// A failed first bind gives the claim back; resets handle their own.
+					if (freshClaim && !instanceName && ownsIdentity) {
+						clearIdentityOwnership();
+						ownsIdentity = false;
+					}
+				}
 			}
 		})();
-		await bindingPromise;
+		bindingPromise = attempt;
+		await attempt;
 	}
 
-	async function fetchPending(): Promise<{ messages: any[]; maxId: number } | null> {
-		if (!instanceName) return null;
-		const result = await hcom(["omp-read", "--name", instanceName]);
-		if (result.code !== 0) {
-			log("WARN", "plugin.delivery_read_failed", instanceName, { exit_code: result.code, stderr: result.stderr.slice(0, 300) });
-			return null;
-		}
-		let messages: any[] = [];
-		try {
-			messages = JSON.parse(result.stdout || "[]");
-		} catch (error) {
-			log("WARN", "plugin.delivery_parse_failed", instanceName, { error: String(error), raw: result.stdout.slice(0, 300) });
-			return null;
-		}
-		if (!Array.isArray(messages) || messages.length === 0) return null;
-		const maxId = Math.max(...messages.map((m: any) => m.event_id || 0));
-		if (maxId <= 0) return null;
-		return { messages, maxId };
-	}
-
-	async function deliverPending(ctx: ExtensionContext): Promise<boolean> {
+	async function deliverPending(ctx: ExtensionContext): Promise<void> {
 		currentCtx = ctx;
 		await bindIdentity(ctx);
-		if (!instanceName || !sessionId) return false;
-		if (!isBoundSession(ctx.sessionManager.getSessionId())) return false;
-		if (deliveryInFlight || pendingAckId !== null) {
-			// A delivery is mid-flight or awaiting ack. Drop nothing: record the wake
-			// so it is replayed once clear, otherwise a message that arrives in this
-			// window stays unread until an unrelated later wake (reconcile is idle-gated).
+		const name = instanceName;
+		const gen = generation;
+		if (!name || !sessionId) return;
+		if (!isBoundSession(ctx.sessionManager.getSessionId())) return;
+		if (deliveryInFlight || delivery) {
+			// Drop nothing: record the wake so it is replayed once the outstanding
+			// delivery is acknowledged or released.
 			deliveryPending = true;
-			log("DEBUG", "plugin.delivery_skipped", instanceName, {
-				reason: deliveryInFlight ? "delivery_in_flight" : "pending_ack_in_flight",
-				pending_ack: pendingAckId,
-				queued: true,
+			log("DEBUG", "plugin.delivery_skipped", name, {
+				reason: deliveryInFlight ? "delivery_in_flight" : "awaiting_admission",
+				pending_ack: delivery?.ackId ?? null,
 			});
-			return false;
+			return;
 		}
 		deliveryInFlight = true;
 		try {
-			const pending = await fetchPending();
-			if (!pending) return false;
-			const formatted = formatMessagesForInjection(pending.messages, instanceName);
-			pendingAckId = pending.maxId;
-			try {
-				const isIdle = ctx.isIdle();
-				if (isIdle) {
-					await pi.sendUserMessage(formatted);
-				} else {
-					await pi.sendUserMessage(formatted, { deliverAs: "followUp" });
-				}
-				const sender = String(pending.messages[0]?.from ?? "");
-				await reportStatus(ctx, "active", sender ? `deliver:${sender}` : "deliver");
-				log("INFO", "plugin.delivery_pending", instanceName, {
-					count: pending.messages.length,
-					pending_ack: pending.maxId,
-					idle: isIdle,
-				});
-				await ackPending(isIdle ? "sendUserMessage" : "followUp");
-				return true;
-			} catch (error) {
-				if (pendingAckId === pending.maxId) pendingAckId = null;
-				log("ERROR", "plugin.delivery_send_failed", instanceName, { error: String(error) });
-				return false;
+			const batch = await readBatch(name);
+			if (gen !== generation) return;
+			if (!batch) {
+				lastPendingPollAt = 0; // failed read: the next reconcile retries
+				return;
 			}
+			if (batch.messages.length === 0) return;
+			const text = formatMessagesForInjection(batch.messages, name);
+			const idle = ctx.isIdle();
+			const sent: Delivery = { text, ackId: batch.ackId, hasMore: batch.hasMore, sentAt: Date.now(), admitted: false };
+			delivery = sent;
+			try {
+				// Returns void; OMP reports a rejected prompt only to its own error
+				// handler. Admission is observed in message_end instead.
+				pi.sendUserMessage(text, idle ? undefined : { deliverAs: "followUp" });
+			} catch (error) {
+				if (delivery === sent) delivery = null;
+				log("ERROR", "plugin.delivery_send_failed", name, { error: String(error) });
+				return;
+			}
+			log("INFO", "plugin.delivery_sent", name, { count: batch.messages.length, ack_id: batch.ackId, idle });
+			const sender = String(batch.messages[0]?.from ?? "");
+			void reportStatus(ctx, "active", sender ? `deliver:${sender}` : "deliver");
 		} finally {
-			deliveryInFlight = false;
-			drainPendingDelivery("delivery_in_flight_wake");
+			if (gen === generation) {
+				deliveryInFlight = false;
+				drainPendingDelivery("delivery_in_flight_wake");
+			}
 		}
 	}
 
-	// Replay a wake that was queued while delivery was gated. Re-armed once nothing
-	// is mid-flight and no ack is pending, so the same unread batch is not delivered
-	// twice. The microtask + dedup flag collapse a burst of queued wakes into one pass.
+	// Replay a wake that was queued while delivery was gated. The microtask +
+	// dedup flag collapse a burst of queued wakes into one pass.
 	function schedulePendingDelivery(reason: string): void {
 		if (deliveryRetryScheduled) return;
 		deliveryRetryScheduled = true;
@@ -352,84 +399,103 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	}
 
 	function drainPendingDelivery(reason: string): void {
-		if (deliveryPending && !deliveryInFlight && pendingAckId === null) {
+		if (deliveryPending && !deliveryInFlight && !delivery) {
 			deliveryPending = false;
 			schedulePendingDelivery(reason);
 		}
 	}
 
-	async function ackPending(source: string): Promise<boolean> {
+	// Acknowledge an admitted delivery. Serialized; on failure the delivery stays
+	// outstanding (gating redelivery) and reconcile retries.
+	function flushAck(source: string): Promise<void> {
 		if (ackInFlight) return ackInFlight;
-		if (!instanceName || pendingAckId === null) return false;
-		const ackInstance = instanceName;
-		const ackId = pendingAckId;
-		const generation = bindingGeneration;
-		const attempt = (async (): Promise<boolean> => {
-			const result = await hcom(["omp-read", "--name", ackInstance, "--ack", "--up-to", String(ackId)]);
-			if (result.code !== 0) {
-				log("WARN", "plugin.delivery_ack_failed", ackInstance, {
-					acked_to: ackId,
-					source,
-					exit_code: result.code,
-					stderr: result.stderr.slice(0, 300),
-				});
-				return false;
+		const sent = delivery;
+		const name = instanceName;
+		const gen = generation;
+		if (!sent?.admitted || !name) return Promise.resolve();
+		const attempt = (async () => {
+			const reply = await rpc(["omp-read", "--name", name, "--ack", "--up-to", String(sent.ackId)], name);
+			if (gen !== generation || delivery !== sent) return;
+			if (reply?.acked_to !== sent.ackId) {
+				if (reply) log("WARN", "plugin.rpc_failed", name, { command: "omp-read", error: "unexpected ack reply", reply });
+				return;
 			}
-			// Keep the delivery gate closed until the durable acknowledgement has
-			// succeeded. A reset/rebind invalidates this attempt's local state.
-			if (bindingGeneration === generation && instanceName === ackInstance && pendingAckId === ackId) {
-				pendingAckId = null;
-				log("INFO", "plugin.deferred_ack", ackInstance, { acked_to: ackId, source });
-				drainPendingDelivery("post_ack_wake");
-			}
-			return true;
-		})();
+			delivery = null;
+			log("INFO", "plugin.delivery_acked", name, { acked_to: sent.ackId, source, has_more: sent.hasMore });
+			if (sent.hasMore) deliveryPending = true;
+			drainPendingDelivery("post_ack_wake");
+		})().finally(() => {
+			if (gen === generation) ackInFlight = null;
+		});
 		ackInFlight = attempt;
-		try {
-			return await attempt;
-		} finally {
-			if (ackInFlight === attempt) ackInFlight = null;
-		}
+		return attempt;
 	}
 
-	async function reportStatus(ctx: ExtensionContext, status: "active" | "listening", context = "", detail = ""): Promise<void> {
-		await bindIdentity(ctx);
-		if (!instanceName) return;
-		const args = ["omp-status", "--name", instanceName, "--status", status];
+	// OMP reports a rejected prompt (no model, no auth) only to its error
+	// handler, and an abort can drop a queued follow-up. Either way OMP
+	// goes idle with the delivery never admitted: release it so it is redelivered.
+	function releaseUnadmitted(ctx: ExtensionContext, reason: string): void {
+		const sent = delivery;
+		if (!sent || sent.admitted || deliveryInFlight) return;
+		if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+		if (Date.now() - sent.sentAt < ADMIT_GRACE_MS) return;
+		delivery = null;
+		log("WARN", "plugin.delivery_not_admitted", instanceName, { ack_id: sent.ackId, reason });
+		// Retry on the next wake or poll rather than at once, so a prompt that
+		// keeps being rejected (e.g. missing auth) is not resent in a tight loop.
+		deliveryPending = false;
+		lastPendingPollAt = Date.now();
+	}
+
+	// Status writes run one at a time so they land in call order, and the cache
+	// only records a write hcom confirmed.
+	function queueStatus(args: string[], key: string): Promise<void> {
+		const gen = generation;
+		const run = statusChain.then(async () => {
+			const name = instanceName;
+			if (!name || gen !== generation) return;
+			const reply = await rpc([args[0], "--name", name, ...args.slice(1)], name);
+			if (reply && gen === generation) lastReportedStatusKey = key;
+		});
+		statusChain = run.catch(() => {});
+		return run;
+	}
+
+	function reportStatus(ctx: ExtensionContext, status: "active" | "listening", context = "", detail = ""): Promise<void> {
+		currentCtx = ctx;
+		if (!instanceName) return Promise.resolve();
+		const args = ["omp-status", "--status", status];
 		if (context) args.push("--context", context);
 		if (detail) args.push("--detail", detail);
-		await hcom(args);
-		lastReportedStatusKey = statusKey(status, context, detail);
+		return queueStatus(args, statusKey(status, context, detail));
 	}
 
 	async function reportReconciledStatus(ctx: ExtensionContext): Promise<void> {
-		const key = statusKey("listening", "", "");
-		if (lastReportedStatusKey !== key) {
+		if (lastReportedStatusKey !== statusKey("listening", "", "")) {
 			await reportStatus(ctx, "listening");
 		}
 	}
 
 	async function pollPendingIfDue(ctx: ExtensionContext): Promise<void> {
 		const now = Date.now();
-		const interval = notifyPort ? PENDING_POLL_MS : FALLBACK_PENDING_POLL_MS;
+		const interval = notifyServer ? PENDING_POLL_MS : FALLBACK_PENDING_POLL_MS;
 		if (now - lastPendingPollAt < interval) return;
 		lastPendingPollAt = now;
 		await deliverPending(ctx);
 	}
 
-	function clearIdleTimer(): void {
-		if (idleTimer) clearTimeout(idleTimer);
-		idleTimer = null;
-	}
-
+	// Fallback for missed events and failed RPCs: retry acknowledgement, release
+	// deliveries OMP dropped, and when idle restore listening and poll for mail.
 	async function reconcile(): Promise<void> {
-		if (reconcileInFlight || !currentCtx || !instanceName) return;
+		const ctx = currentCtx;
+		if (reconcileInFlight || !ctx || !instanceName) return;
 		reconcileInFlight = true;
 		try {
-			if (pendingAckId !== null) await ackPending("reconcile");
-			if (currentCtx.isIdle()) {
-				await reportReconciledStatus(currentCtx);
-				await pollPendingIfDue(currentCtx);
+			if (delivery?.admitted) await flushAck("reconcile");
+			releaseUnadmitted(ctx, "reconcile");
+			if (ctx.isIdle()) {
+				await reportReconciledStatus(ctx);
+				await pollPendingIfDue(ctx);
 			}
 		} catch (error) {
 			log("ERROR", "plugin.reconcile_error", instanceName, { error: String(error) });
@@ -440,36 +506,42 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	function startReconcileTimer(): void {
 		stopReconcileTimer();
-		reconcileTimer = setInterval(() => void reconcile(), 5_000);
+		reconcileTimer = setInterval(() => void reconcile(), RECONCILE_MS);
+		reconcileTimer.unref?.();
 	}
 
 	function stopReconcileTimer(): void {
-		if (reconcileTimer) {
-			clearInterval(reconcileTimer);
-			reconcileTimer = null;
-		}
+		if (reconcileTimer) clearInterval(reconcileTimer);
+		reconcileTimer = null;
 	}
 
+	function clearIdleTimer(): void {
+		if (idleTimer) clearTimeout(idleTimer);
+		idleTimer = null;
+	}
+
+	// keepOwner: a rebind in this same extension instance (switch/branch, or a
+	// shutdown awaiting its soft-stop) keeps process-local ownership so nested
+	// task extensions still skip bind.
 	function resetBinding(opts?: { keepOwner?: boolean }): void {
+		generation++;
+		clearIdleTimer();
 		stopReconcileTimer();
 		stopNotifyServer();
-		bindingGeneration++;
 		instanceName = null;
 		sessionId = null;
 		bootstrapText = null;
 		bindingPromise = null;
-		pendingAckId = null;
-		ackInFlight = null;
+		delivery = null;
 		deliveryInFlight = false;
 		deliveryPending = false;
 		deliveryRetryScheduled = false;
+		ackInFlight = null;
+		statusChain = Promise.resolve();
+		reconcileInFlight = false;
 		bootstrapInjectedForSession = null;
 		lastReportedStatusKey = null;
 		lastPendingPollAt = 0;
-		agentActive = false;
-		clearIdleTimer();
-		// keepOwner: session_branch rebinds in the same extension instance — retain
-		// process-local ownership so nested task extensions still skip bind.
 		if (!opts?.keepOwner && ownsIdentity) {
 			clearIdentityOwnership();
 			ownsIdentity = false;
@@ -484,68 +556,47 @@ export default function hcomExtension(pi: ExtensionAPI) {
 
 	// SessionShutdownEvent is only `{ type: "session_shutdown" }` — no sessionId.
 	// Soft-stop only when THIS extension instance owns the identity (nested task
-	// instances never bind, so they never stop the parent).
+	// instances never bind, so they never stop the parent). Ownership is released
+	// only once hcom confirms the stop; otherwise the owner keeps the latch and
+	// can rebind.
 	pi.on("session_shutdown", async () => {
-		let keepOwner = false;
-		if (instanceName && ownsIdentity) {
-			const reg = getIdentityRegistry();
-			reg.tearingDown = true;
-			const reason = "shutdown";
-			const stopName = instanceName;
-			let softStopOk = false;
-			try {
-				const result = await hcom(["omp-stop", "--name", stopName, "--reason", reason, "--soft"]);
-				if (result.code === 0) {
-					softStopOk = true;
-				} else {
-					log("WARN", "plugin.session_shutdown_soft_stop_failed", stopName, {
-						exit_code: result.code,
-						reason,
-						stderr: result.stderr.slice(0, 300),
-					});
-				}
-			} catch (error) {
-				log("ERROR", "plugin.session_shutdown_soft_stop_error", stopName, {
-					error: String(error),
-					reason,
-				});
-			}
-			keepOwner = !softStopOk;
-			// Shutdown attempt finished. If we retain ownership after a failed stop,
-			// drop tearingDown so the owner can re-omp-start; nested skip still uses reg.owner.
-			if (keepOwner) {
-				reg.tearingDown = false;
-			}
-		} else {
+		const name = instanceName;
+		if (!name || !ownsIdentity) {
 			const skipReason = nestedSkipReason();
 			if (skipReason) {
 				nestedOptOut = true;
-				const reg = getIdentityRegistry();
 				log("INFO", "plugin.session_shutdown_skipped", null, {
 					reason: "nested_session",
 					skip_reason: skipReason,
-					owner: reg.owner ?? process.env[IDENTITY_OWNER_ENV] ?? null,
+					owner: getIdentityRegistry().owner ?? process.env[IDENTITY_OWNER_ENV] ?? null,
 				});
 			}
+			resetBinding();
+			return;
 		}
-		resetBinding({ keepOwner });
+		const reg = getIdentityRegistry();
+		reg.tearingDown = true;
+		resetBinding({ keepOwner: true });
+		const reply = await rpc(["omp-stop", "--name", name, "--reason", "shutdown", "--soft"], name);
+		if (reply?.ok === true) {
+			clearIdentityOwnership();
+			ownsIdentity = false;
+		} else {
+			log("WARN", "plugin.session_shutdown_soft_stop_failed", name, { reply });
+			reg.tearingDown = false;
+		}
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
 		currentCtx = ctx;
-		// Keep process-local ownership across switch rebind so a live nested task
-		// extension cannot claim identity in the window between clear and omp-start.
 		resetBinding({ keepOwner: true });
 		await bindIdentity(ctx);
 	});
 
-	// OMP's /branch (and /btw's branched path) calls createBranchedSession(),
-	// which mints a NEW session id + file and emits only session_branch — not
-	// session_switch. Without rebinding here the cached sessionId stays stale,
-	// isBoundSession() fails against the new id, and every later deliverPending
-	// silently returns false (delivery dead after branch). Rebind like a switch,
-	// but keep process-local ownership so nested task extensions still skip bind.
-	// session_tree does NOT mint a new session id/file, so it needs no rebind.
+	// session_branch (not session_switch) is all OMP emits when branching into a
+	// new session (e.g. /fork), which mints a new session id + file; without a
+	// rebind the stale sessionId fails isBoundSession() and delivery stops. An
+	// in-place rewind emits it too, keeping the id; rebinding then is harmless.
 	pi.on("session_branch", async (_event, ctx) => {
 		currentCtx = ctx;
 		resetBinding({ keepOwner: true });
@@ -553,46 +604,58 @@ export default function hcomExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
-		currentCtx = ctx;
 		clearIdleTimer();
-		agentActive = true;
 		await reportStatus(ctx, "active", "agent");
 	});
 
 	pi.on("input", async (event: InputEvent, ctx) => {
 		currentCtx = ctx;
 		await bindIdentity(ctx);
-		if (!instanceName) return {};
-		if (event.source === "extension") {
-			await ackPending("extension");
-			return {};
-		}
-		if (isBodylessWake(event.text) && pendingAckId === null) {
-			const pending = await fetchPending();
-			if (pending) {
-				pendingAckId = pending.maxId;
-				return { text: formatMessagesForInjection(pending.messages, instanceName) };
+		const name = instanceName;
+		const gen = generation;
+		if (!name || event.source === "extension") return {};
+		if (isBodylessWake(event.text)) {
+			// A PTY wake: replace it with the pending batch, or swallow it when
+			// there is none or a delivery is already outstanding.
+			if (deliveryInFlight || delivery) {
+				deliveryPending = true;
+				return { handled: true };
 			}
-			return { handled: true };
+			deliveryInFlight = true;
+			try {
+				const batch = await readBatch(name);
+				if (gen !== generation) return { handled: true };
+				if (!batch) lastPendingPollAt = 0;
+				if (!batch?.messages.length) return { handled: true };
+				const text = formatMessagesForInjection(batch.messages, name);
+				delivery = { text, ackId: batch.ackId, hasMore: batch.hasMore, sentAt: Date.now(), admitted: false };
+				log("INFO", "plugin.delivery_sent", name, { count: batch.messages.length, ack_id: batch.ackId, via: "wake" });
+				return { text };
+			} finally {
+				if (gen === generation) deliveryInFlight = false;
+			}
 		}
-		await reportStatus(ctx, "active", event.text.trim() === "<hcom>" ? "trigger" : "prompt");
+		await reportStatus(ctx, "active", "prompt");
 		return {};
+	});
+
+	// The delivery's user message reaching the transcript is the receipt: OMP
+	// commits it in emission order, whether it was sent directly, queued as a
+	// follow-up, or substituted for a bare <hcom> wake. (OMP emits no input event
+	// for extension sends, and applies a wake's transform inline.)
+	pi.on("message_end", (event) => {
+		const sent = delivery;
+		if (!sent || sent.admitted || event.message.role !== "user") return;
+		if (!messageText(event.message).includes(sent.text)) return;
+		sent.admitted = true;
+		log("DEBUG", "plugin.delivery_admitted", instanceName, { ack_id: sent.ackId });
+		void flushAck("message_end");
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
 		currentCtx = ctx;
 		await bindIdentity(ctx);
-		if (!instanceName) return undefined;
-		// Ack the bodyless-wake transform here. The input handler sets pendingAckId
-		// and returns { text } for a bare <hcom>; omp applies that transform INLINE
-		// and submits it (input-controller.ts) — it never re-emits an input event
-		// with source "extension", so the input handler's extension-ack branch is
-		// dead for the transform path. before_agent_start fires for the submitted
-		// turn, so ack here; otherwise pendingAckId stays set and deliverPending
-		// early-returns forever, permanently jamming delivery. (For the
-		// sendUserMessage path deliverPending already acked, so this no-ops.)
-		if (pendingAckId !== null) await ackPending("before_agent_start");
-		if (!bootstrapText) return undefined;
+		if (!instanceName || !bootstrapText) return undefined;
 		const sid = ctx.sessionManager.getSessionId();
 		if (bootstrapInjectedForSession === sid) return undefined;
 		bootstrapInjectedForSession = sid;
@@ -606,53 +669,38 @@ export default function hcomExtension(pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("tool_call", async (event, ctx) => {
+	// Observation only: record the tool as current activity, never block it.
+	pi.on("tool_call", (event, ctx) => {
 		currentCtx = ctx;
-		await bindIdentity(ctx);
 		if (!instanceName) return undefined;
-		await reportStatus(ctx, "active", `tool:${event.toolName}`, String((event.input as any)?.path ?? (event.input as any)?.command ?? ""));
-		const result = await hcom([
-			"omp-beforetool",
-			"--name",
-			instanceName,
-			"--tool",
-			event.toolName,
-			"--input-json",
-			JSON.stringify(event.input ?? {}),
-		]);
-		try {
-			const json = JSON.parse(result.stdout || "{}");
-			if (json.decision === "block") {
-				return { block: true, reason: String(json.reason || "Blocked by hcom") };
-			}
-		} catch {}
+		void queueStatus(
+			["omp-beforetool", "--tool", event.toolName, "--input-json", JSON.stringify(event.input ?? {})],
+			statusKey("active", `tool:${event.toolName}`, ""),
+		);
 		return undefined;
 	});
 
-	pi.on("tool_result", async (event, ctx) => {
-		currentCtx = ctx;
-		await reportStatus(ctx, "active", `tool:${event.toolName}`);
+	pi.on("tool_result", async (_event, ctx) => {
 		await deliverPending(ctx);
 	});
 
 	pi.on("turn_end", async (_event, ctx) => {
-		currentCtx = ctx;
 		await deliverPending(ctx);
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_end", (_event, ctx) => {
 		currentCtx = ctx;
-		if (!agentActive) return;
-		agentActive = false;
 		clearIdleTimer();
+		const gen = generation;
 		idleTimer = setTimeout(() => {
 			idleTimer = null;
-			if (currentCtx?.isIdle()) {
-				void (async () => {
-					await reportStatus(currentCtx, "listening");
-					await deliverPending(currentCtx);
-				})();
-			}
+			const latest = currentCtx;
+			if (gen !== generation || !latest?.isIdle()) return;
+			void (async () => {
+				await reportStatus(latest, "listening");
+				releaseUnadmitted(latest, "agent_end");
+				await deliverPending(latest);
+			})();
 		}, IDLE_DEBOUNCE_MS);
 		idleTimer.unref?.();
 	});

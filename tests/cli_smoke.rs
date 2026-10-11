@@ -1680,7 +1680,7 @@ fn pi_e2e_hook_dispatch() {
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("list json");
     assert_eq!(v["status"].as_str(), Some("active"));
 
-    // 3. pi-beforetool records tool status and allows the tool call.
+    // 3. pi-beforetool records tool status (observation only, never blocks).
     let before_tool = run_argv_hook(
         &h,
         "pi-beforetool",
@@ -1694,7 +1694,7 @@ fn pi_e2e_hook_dispatch() {
             r#"{"command":"echo hello"}"#,
         ],
     );
-    assert_eq!(before_tool, serde_json::json!({ "decision": "allow" }));
+    assert_eq!(before_tool, serde_json::json!({ "ok": true }));
     let (code, stdout, _) = h.run(["events", "--agent", &me, "--type", "status", "--last", "5"]);
     assert_eq!(code, 0);
     let tool_status: serde_json::Value = stdout
@@ -1728,16 +1728,21 @@ fn pi_e2e_hook_dispatch() {
 
     let read = h.run(["pi-read", "--name", &me]);
     assert_eq!(read.0, 0, "pi-read stderr={}", read.2);
-    let messages: serde_json::Value = serde_json::from_str(&read.1).expect("pi-read json");
-    assert!(
-        messages
-            .as_array()
-            .is_some_and(|items| items.iter().any(|m| m["message"] == "ping")),
-        "pi-read should return pending ping: {messages}"
-    );
+    let batch: serde_json::Value = serde_json::from_str(&read.1).expect("pi-read json");
+    assert_eq!(batch["has_more"], false, "pi-read batch: {batch}");
+    let ping = batch["messages"]
+        .as_array()
+        .and_then(|items| items.iter().find(|m| m["message"] == "ping"))
+        .unwrap_or_else(|| panic!("pi-read should return pending ping: {batch}"));
+    let ping_id = ping["event_id"].as_i64().expect("event_id").to_string();
 
-    let ack = run_argv_hook(&h, "pi-read", None, &["--name", &me, "--ack"]);
-    assert_eq!(ack["acked"].as_u64(), Some(1));
+    let ack = run_argv_hook(
+        &h,
+        "pi-read",
+        None,
+        &["--name", &me, "--ack", "--up-to", &ping_id],
+    );
+    assert_eq!(ack["acked_to"].to_string(), ping_id);
     let check = h.run(["pi-read", "--name", &me, "--check"]);
     assert_eq!(check.0, 0, "pi-read --check after ack stderr={}", check.2);
     assert_eq!(check.1.trim(), "false");

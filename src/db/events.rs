@@ -99,56 +99,44 @@ impl HcomDb {
         false
     }
 
+    /// Get unread messages for an instance; read failures log and yield none.
+    pub fn get_unread_messages(&self, name: &str) -> Vec<Message> {
+        self.try_get_unread_messages(name).unwrap_or_else(|e| {
+            crate::log::log_error("db", "get_unread_messages", &format!("{e}"));
+            vec![]
+        })
+    }
+
     /// Get unread messages for an instance
     ///
     /// Returns messages where:
     /// - event.id > instance.last_event_id
     /// - event.type = 'message'
     /// - instance is in scope (broadcast or direct)
-    pub fn get_unread_messages(&self, name: &str) -> Vec<Message> {
-        // Get last_event_id for this instance. A missing/unreadable row means there is
-        // no recipient — return no unread rather than falling back to cursor 0, which
-        // would treat the whole channel backlog (broadcasts match everyone) as unread.
-        let last_event_id = match self.get_instance_status(name) {
-            Ok(Some(status)) => status.last_event_id,
-            Ok(None) => return vec![],
-            Err(e) => {
-                crate::log::log_error(
-                    "db",
-                    "get_unread_messages.get_instance_status",
-                    &format!("{e}"),
-                );
-                return vec![];
-            }
+    ///
+    /// A missing instance row has no recipient and so no unread messages; it is
+    /// not treated as cursor 0, which would surface the whole broadcast backlog.
+    pub fn try_get_unread_messages(&self, name: &str) -> Result<Vec<Message>> {
+        let Some(status) = self.get_instance_status(name)? else {
+            return Ok(vec![]);
         };
+        let last_event_id = status.last_event_id;
 
-        let mut stmt = match self.conn.prepare_cached(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, timestamp, data FROM events
              WHERE id > ? AND type = 'message'
              ORDER BY id",
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                crate::log::log_error("db", "get_unread_messages.prepare", &format!("{e}"));
-                return vec![];
-            }
-        };
-
-        let rows = match stmt.query_map(params![last_event_id], |row| {
+        )?;
+        let rows = stmt.query_map(params![last_event_id], |row| {
             let id: i64 = row.get(0)?;
             let timestamp: String = row.get(1)?;
             let data: String = row.get(2)?;
             Ok((id, timestamp, data))
-        }) {
-            Ok(r) => r,
-            Err(e) => {
-                crate::log::log_error("db", "get_unread_messages.query", &format!("{e}"));
-                return vec![];
-            }
-        };
+        })?;
 
         let mut messages = Vec::new();
-        for (id, timestamp, data) in rows.flatten() {
+        for row in rows {
+            let (id, timestamp, data) = row?;
             // Parse JSON data
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
                 if !Self::should_deliver_to(&json, name) {
@@ -206,7 +194,7 @@ impl HcomDb {
             }
         }
 
-        messages
+        Ok(messages)
     }
 
     /// Build the shared envelope every launch-lifecycle life event uses

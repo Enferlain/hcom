@@ -80,7 +80,9 @@ fn ready_patterns(tool: &str) -> &'static [&'static str] {
         "opencode" => &["ctrl+p commands"],
         // Kilo is an OpenCode-family fork: same TUI footer.
         "kilo" => &["ctrl+p commands"],
-        "pi" => &["/ commands"],
+        // Pi's header hint varies by startup mode (compact/expanded/quiet), so
+        // like OMP its readiness is the extension bind; spec ready_patterns is empty.
+        "pi" => &[],
         // OMP (Oh My Pi) has no reliable on-screen ready marker: its only chrome
         // candidates live in the preset/theme-configurable status line. Launch
         // readiness is proven by the hcom extension bind instead
