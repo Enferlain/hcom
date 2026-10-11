@@ -2777,7 +2777,7 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
     let native = !print
         && ctx
             .var(super::claude_mod::DELIVERY_ENV)
-            .unwrap_or(super::claude_mod::DEFAULT_DELIVERY)
+            .unwrap_or(crate::config::DEFAULT_DELIVERY)
             == "native";
     let mode = if native { "native" } else { "inject" };
     let mut injected_env = vec![(

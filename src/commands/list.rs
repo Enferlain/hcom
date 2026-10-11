@@ -768,6 +768,9 @@ fn print_instance_details(db: &HcomDb, data: &InstanceRow, display_name: &str) {
         "  Bindings:    {}",
         bindings_display(Bindings::for_instance(db, &data.name), data)
     );
+    if let Some(port) = db.get_notify_endpoint_port(&data.name, "plugin") {
+        println!("  Plugin:      wake port {port}");
+    }
 
     if let Some(pid) = data.pid {
         println!("  PID:         {pid}");

@@ -151,6 +151,7 @@ pub(crate) const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("auto_approve", "preferences.auto_approve"),
     ("name_export", "preferences.name_export"),
     ("auto_trust_workspace", "launch.auto_trust_workspace"),
+    ("copilot_delivery", "launch.copilot.delivery"),
     ("title_mode", "terminal.title_mode"),
 ];
 
@@ -199,6 +200,7 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("auto_subscribe", "HCOM_AUTO_SUBSCRIBE"),
     ("name_export", "HCOM_NAME_EXPORT"),
     ("auto_trust_workspace", "HCOM_AUTO_TRUST_WORKSPACE"),
+    ("copilot_delivery", "HCOM_COPILOT_DELIVERY"),
     ("title_mode", "HCOM_TITLE_MODE"),
 ];
 
@@ -215,6 +217,11 @@ const RELAY_FIELDS: &[&str] = &[
 const TERMINAL_DANGEROUS_CHARS: &[char] = &['`', '$', ';', '|', '&', '\n', '\r'];
 
 use crate::shared::terminal_presets::TERMINAL_PRESETS;
+
+/// `<tool>_delivery` values: `native` (the tool's own API: mod, extension)
+/// or `inject` (typing into the PTY, [`DEFAULT_DELIVERY`]).
+pub const DELIVERY_MODES: &[&str] = &["native", "inject"];
+pub const DEFAULT_DELIVERY: &str = "inject";
 
 /// TOML file header comment.
 const TOML_HEADER: &str = "\
@@ -311,6 +318,10 @@ pub struct HcomConfig {
     pub auto_subscribe: String,
     pub name_export: String,
     pub auto_trust_workspace: bool,
+    /// How Copilot agents get messages while idle: `"native"` through hcom's
+    /// Copilot CLI extension, `"inject"` (default) by typing into the PTY.
+    /// See [`DELIVERY_MODES`].
+    pub copilot_delivery: String,
     /// Terminal-title behavior: `"combined"` (default) shows
     /// `{icon} name - {tool's live title}`, `"label"` shows hcom's
     /// `{icon} name [tool]` only, `"off"` leaves the tool's own title untouched.
@@ -328,7 +339,7 @@ impl Default for HcomConfig {
             notes: String::new(),
             tag: String::new(),
             claude_args: String::new(),
-            claude_delivery: crate::hooks::claude_mod::DEFAULT_DELIVERY.to_string(),
+            claude_delivery: DEFAULT_DELIVERY.to_string(),
             gemini_args: String::new(),
             codex_args: String::new(),
             opencode_args: String::new(),
@@ -351,6 +362,7 @@ impl Default for HcomConfig {
             auto_subscribe: "collision".to_string(),
             name_export: String::new(),
             auto_trust_workspace: true,
+            copilot_delivery: DEFAULT_DELIVERY.to_string(),
             title_mode: "combined".to_string(),
         }
     }
@@ -428,15 +440,19 @@ impl HcomConfig {
             }
         }
 
-        if !crate::hooks::claude_mod::DELIVERY_MODES.contains(&self.claude_delivery.as_str()) {
-            errors.insert(
-                "claude_delivery".into(),
-                format!(
-                    "claude_delivery must be one of: {}. Got '{}'",
-                    crate::hooks::claude_mod::DELIVERY_MODES.join(", "),
-                    self.claude_delivery
-                ),
-            );
+        for (field, mode) in [
+            ("claude_delivery", &self.claude_delivery),
+            ("copilot_delivery", &self.copilot_delivery),
+        ] {
+            if !DELIVERY_MODES.contains(&mode.as_str()) {
+                errors.insert(
+                    field.into(),
+                    format!(
+                        "{field} must be one of: {}. Got '{mode}'",
+                        DELIVERY_MODES.join(", ")
+                    ),
+                );
+            }
         }
 
         // Validate tag (alphanumeric + hyphens only)
@@ -541,6 +557,7 @@ impl HcomConfig {
             "auto_trust_workspace" => {
                 Some(if self.auto_trust_workspace { "1" } else { "0" }.into())
             }
+            "copilot_delivery" => Some(self.copilot_delivery.clone()),
             "title_mode" => Some(self.title_mode.clone()),
             _ => None,
         }
@@ -587,6 +604,7 @@ impl HcomConfig {
             "auto_subscribe" => self.auto_subscribe = value.to_string(),
             "name_export" => self.name_export = value.to_string(),
             "auto_trust_workspace" => self.auto_trust_workspace = !is_falsy(value),
+            "copilot_delivery" => self.copilot_delivery = value.to_string(),
             // Stored leniently; `TitleMode::from_config` maps unknown → default.
             // The CLI set path (`config_set_at_path`) validates against
             // `VALID_TITLE_MODES` before this is ever written to the file.
@@ -707,12 +725,17 @@ impl HcomConfig {
             "auto_subscribe",
             "name_export",
             "title_mode",
+            "copilot_delivery",
         ];
         for str_field in &str_fields {
             if let Some(val) = get_var(str_field) {
                 let s = val.as_string();
-                // Empty terminal or delivery uses the default.
-                if matches!(*str_field, "terminal" | "claude_delivery") && s.is_empty() {
+                // Empty terminal or delivery mode uses the default.
+                if matches!(
+                    *str_field,
+                    "terminal" | "claude_delivery" | "copilot_delivery"
+                ) && s.is_empty()
+                {
                     continue;
                 }
                 let _ = config.set_field(str_field, &s);
@@ -1066,6 +1089,7 @@ args = ""
 
 [launch.copilot]
 args = ""
+delivery = "inject"
 
 [launch.qoder]
 args = ""
@@ -2136,6 +2160,29 @@ mod tests {
 
         let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
         assert_eq!(config.title_mode, "off");
+    }
+
+    #[test]
+    fn test_load_from_sources_copilot_delivery() {
+        let none = HashMap::new();
+        let config = HcomConfig::load_from_sources(&none, None).unwrap();
+        assert_eq!(config.copilot_delivery, "inject");
+
+        let mut file_config = HashMap::new();
+        file_config.insert(
+            "copilot_delivery".to_string(),
+            TomlFieldValue::Str("native".to_string()),
+        );
+        let config = HcomConfig::load_from_sources(&file_config, None).unwrap();
+        assert_eq!(config.copilot_delivery, "native");
+
+        let mut env = HashMap::new();
+        env.insert("HCOM_COPILOT_DELIVERY".to_string(), "inject".to_string());
+        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        assert_eq!(config.copilot_delivery, "inject");
+
+        env.insert("HCOM_COPILOT_DELIVERY".to_string(), "typo".to_string());
+        assert!(HcomConfig::load_from_sources(&none, Some(&env)).is_err());
     }
 
     #[test]

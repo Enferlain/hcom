@@ -348,6 +348,9 @@ const COPILOT_HOOKS: &[&str] = &[
     "copilot-subagentstart",
     "copilot-subagentstop",
     "copilot-sessionend",
+    // Argv commands run by hcom's Copilot extension, not Copilot hook events.
+    "copilot-ext-poll",
+    "copilot-ext-sent",
 ];
 
 /// Grok has no hooks: status and delivery come over its ACP (`delivery/grok.rs`).
@@ -1092,7 +1095,8 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
         delivery_start_timeout_secs: 60,
         console_input: ConsoleInput::Vt,
     },
-    instance_state_env: &[],
+    // hcom's per-launch delivery mode; a nested `hcom copilot` decides its own.
+    instance_state_env: &["HCOM_COPILOT_EXT_DELIVERY"],
     hooks: HooksSpec {
         names: COPILOT_HOOKS,
         shared_hooks_with: None,

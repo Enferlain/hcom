@@ -603,6 +603,10 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
         "  auto_trust_workspace",
         "Auto-trust launch dir (skip folder-trust prompt)",
     ),
+    (
+        "  copilot_delivery",
+        "Idle Copilot delivery: native (CLI extension) or inject",
+    ),
     ("  name_export", "Export agent name to custom env var"),
     (
         "  title_mode",

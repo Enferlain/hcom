@@ -1591,6 +1591,54 @@ fn start_plugin_session(db: &HcomDb, state: &DeliveryState, name: &str) -> bool 
 /// How long to wait in idle state before checking again.
 const IDLE_WAIT: Duration = Duration::from_secs(30);
 
+/// How long messages may sit pending at an idle Copilot with extension
+/// delivery before the PTY loop logs that the extension is not delivering.
+const EXTENSION_STALL_WARN: Duration = Duration::from_secs(20);
+
+/// Log (once per episode) when a Copilot launched with extension delivery has
+/// messages pending while idle, which only the extension can deliver. Says
+/// whether the extension ever registered, which separates "Copilot did not
+/// load it" from "it loaded but is not delivering".
+fn watch_extension_stall(db: &HcomDb, name: &str, since: &mut Option<Instant>, warned: &mut bool) {
+    if !(db.has_pending(name) && db.is_idle(name)) {
+        *since = None;
+        *warned = false;
+        return;
+    }
+    let started = *since.get_or_insert_with(Instant::now);
+    if *warned || started.elapsed() < EXTENSION_STALL_WARN {
+        return;
+    }
+    *warned = true;
+    let detail = match db.get_notify_endpoint_port(name, "plugin") {
+        None => "the hcom Copilot extension never registered; check `/extensions` in Copilot \
+                 and its logs (~/.copilot/logs), or `hcom config copilot_delivery inject`"
+            .to_string(),
+        Some(port) => {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                format!(
+                    "the hcom Copilot extension answers on port {port} but has not delivered; \
+                     look for plugin.copilot_* events in hcom.log"
+                )
+            } else {
+                format!(
+                    "the hcom Copilot extension stopped (port {port} refused); Copilot restarts \
+                     extensions on /clear, or check `/extensions`"
+                )
+            }
+        }
+    };
+    log_warn(
+        "native",
+        "delivery.copilot_extension_stalled",
+        &format!(
+            "{name}: messages pending {}s while idle; {detail}",
+            started.elapsed().as_secs()
+        ),
+    );
+}
+
 /// Maximum number of Enter-key retries during phase 2 (text clear).
 const MAX_ENTER_ATTEMPTS: u32 = 3;
 
@@ -1705,6 +1753,8 @@ pub fn run_delivery_loop(
 
     // This choice is frozen in the launch environment, never mod health.
     let claude_mod = config.tool == "claude" && crate::hooks::claude_mod::launched_native();
+    let copilot_extension =
+        config.tool == "copilot" && crate::hooks::copilot::extension_delivery_enabled();
     let mut launch_outcome = LaunchOutcome::Pending;
 
     // Set initial listening status AFTER resolving authoritative name. This is
@@ -1768,18 +1818,20 @@ pub fn run_delivery_loop(
             &mut launch_outcome,
         );
     } else if let Ok(tool) = Tool::from_str(&config.tool)
-        && (matches!(tool, Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp) || claude_mod)
+        && (matches!(tool, Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp)
+            || claude_mod
+            || copilot_extension)
     {
         log_info(
             "native",
             "delivery.plugin_mode",
             &format!(
-                "Plugin mode for {}: the plugin handles delivery (tool={}, claude_mod={})",
-                current_name, config.tool, claude_mod
+                "Plugin mode for {}: the plugin handles delivery (tool={}, claude_mod={}, copilot_extension={})",
+                current_name, config.tool, claude_mod, copilot_extension
             ),
         );
-        // Only OpenCode and Kilo need a first session started; a Claude mod
-        // never bootstraps by typing into the terminal.
+        // Only OpenCode and Kilo need a first session started; a Claude mod or
+        // Copilot extension never bootstraps by typing into the terminal.
         let mut session_started = !matches!(tool, Tool::OpenCode | Tool::Kilo);
         // Mail sent before this thread registered its notify port never wakes
         // it, so the first pass checks for pending mail without waiting.
@@ -1788,6 +1840,8 @@ pub fn run_delivery_loop(
         let mut awaiting_ready = false;
         let loop_started = Instant::now();
         let mut was_idle = true;
+        let mut stall_since: Option<Instant> = None;
+        let mut stall_warned = false;
 
         // Status tracking for terminal title updates
         let mut current_status = ST_LISTENING.to_string();
@@ -1835,6 +1889,9 @@ pub fn run_delivery_loop(
             }
             if !running.load(Ordering::Acquire) {
                 break;
+            }
+            if copilot_extension {
+                watch_extension_stall(db, &current_name, &mut stall_since, &mut stall_warned);
             }
 
             // The user typed first, or the session was resumed.

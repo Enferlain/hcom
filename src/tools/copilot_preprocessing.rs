@@ -123,9 +123,163 @@ pub(crate) fn ensure_copilot_workspace_trusted(workspace: &Path) -> anyhow::Resu
     Ok(())
 }
 
+/// Rewrite `settings.json` so Copilot runs hcom's extension: turns on the
+/// EXTENSIONS flag (not all of experimental mode) when nothing chose otherwise.
+/// An explicit choice against extensions (flag false, extension mode
+/// "disabled", hcom in `disabledExtensions`) is an error, not overridden.
+/// Returns the new file and a description of the change, or `None` when
+/// nothing needed changing.
+fn settings_with_extensions(existing: &str) -> anyhow::Result<Option<(String, String)>> {
+    let (header, body) = split_leading_comments(existing);
+    let mut root: serde_json::Map<String, Value> = if body.trim().is_empty() {
+        serde_json::Map::new()
+    } else {
+        serde_json::from_str::<Value>(body)
+            .context("invalid Copilot settings.json")?
+            .as_object()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Copilot settings.json must be a JSON object"))?
+    };
+
+    let extensions = root.get("extensions");
+    let mut disabled_by = Vec::new();
+    let flag = root
+        .get("enabledFeatureFlags")
+        .and_then(|flags| flags.get("EXTENSIONS"))
+        .and_then(Value::as_bool);
+    if flag == Some(false) {
+        disabled_by.push("enabledFeatureFlags.EXTENSIONS is false");
+    }
+    if extensions
+        .and_then(|e| e.get("mode"))
+        .and_then(Value::as_str)
+        == Some("disabled")
+    {
+        disabled_by.push("extensions.mode is \"disabled\"");
+    }
+    let hcom_disabled = extensions
+        .and_then(|e| e.get("disabledExtensions"))
+        .and_then(Value::as_array)
+        .is_some_and(|ids| {
+            ids.iter().filter_map(Value::as_str).any(|id| {
+                id.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+                    .any(|part| part == "hcom")
+            })
+        });
+    if hcom_disabled {
+        disabled_by.push("hcom is in extensions.disabledExtensions");
+    }
+    if !disabled_by.is_empty() {
+        anyhow::bail!(
+            "Copilot extensions are turned off ({}); turn them back on with /extensions in Copilot",
+            disabled_by.join(", ")
+        );
+    }
+
+    let experimental = root.get("experimental").and_then(Value::as_bool) == Some(true);
+    if flag == Some(true) || experimental {
+        return Ok(None);
+    }
+    let flags = root
+        .entry("enabledFeatureFlags".to_string())
+        .or_insert_with(|| json!({}));
+    if !flags.is_object() {
+        *flags = json!({});
+    }
+    flags
+        .as_object_mut()
+        .unwrap()
+        .insert("EXTENSIONS".to_string(), Value::Bool(true));
+    let mut content = format!(
+        "{header}{}",
+        serde_json::to_string_pretty(&Value::Object(root))?
+    );
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    Ok(Some((
+        content,
+        "enabledFeatureFlags.EXTENSIONS = true".to_string(),
+    )))
+}
+
+/// Make sure Copilot will run hcom's extension (`copilot_delivery = "native"` launches),
+/// saying once on stderr what was changed.
+pub(crate) fn ensure_copilot_extensions_enabled(copilot_home: &Path) -> anyhow::Result<()> {
+    let path = copilot_home.join("settings.json");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let Some((updated, change)) =
+        settings_with_extensions(&existing).with_context(|| path.display().to_string())?
+    else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(copilot_home)?;
+    crate::paths::atomic_write_io(&path, &updated)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    eprintln!(
+        "[hcom] Enabled Copilot CLI extensions for hcom delivery ({}: {})",
+        path.display(),
+        change
+    );
+    crate::log::log_info(
+        "copilot",
+        "copilot.ext_settings_enabled",
+        &format!("{}: {change}", path.display()),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extensions_settings_enabled_unless_explicitly_disabled() {
+        let (out, change) = settings_with_extensions("{\n  \"model\": \"auto\"\n}")
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["enabledFeatureFlags"]["EXTENSIONS"], true);
+        assert_eq!(value["model"], "auto");
+        assert_eq!(change, "enabledFeatureFlags.EXTENSIONS = true");
+        assert!(settings_with_extensions("").unwrap().is_some());
+
+        for already_on in [
+            r#"{"experimental": true}"#,
+            r#"{"enabledFeatureFlags": {"EXTENSIONS": true}}"#,
+            r#"{"experimental": true, "extensions": {"mode": "load_only", "disabledExtensions": ["mine"]}}"#,
+        ] {
+            assert!(settings_with_extensions(already_on).unwrap().is_none());
+        }
+
+        for (explicitly_off, reason) in [
+            (
+                r#"{"experimental": true, "enabledFeatureFlags": {"EXTENSIONS": false}}"#,
+                "EXTENSIONS is false",
+            ),
+            (
+                r#"{"experimental": true, "extensions": {"mode": "disabled"}}"#,
+                "mode",
+            ),
+            (
+                r#"{"experimental": true, "extensions": {"disabledExtensions": ["plugin:hcom/hcom"]}}"#,
+                "disabledExtensions",
+            ),
+        ] {
+            let err = settings_with_extensions(explicitly_off)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(reason), "{err}");
+        }
+
+        assert!(settings_with_extensions("{ not json").is_err());
+    }
 
     #[test]
     fn trust_write_adds_folder_to_empty_config() {

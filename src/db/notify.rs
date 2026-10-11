@@ -96,6 +96,19 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Port of an instance's endpoint of `kind`, if registered.
+    pub fn get_notify_endpoint_port(&self, name: &str, kind: &str) -> Option<u16> {
+        self.conn
+            .query_row(
+                "SELECT port FROM notify_endpoints WHERE instance = ? AND kind = ?",
+                params![name, kind],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port > 0)
+    }
+
     /// Check if any notify endpoint exists for an instance.
     pub fn has_notify_endpoint(&self, name: &str) -> bool {
         self.conn

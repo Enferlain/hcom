@@ -636,6 +636,10 @@ impl HcomDb {
                 params![name],
             )?;
             tx.execute(
+                "DELETE FROM kv WHERE key = 'copilot_ext_inflight:' || ?",
+                params![name],
+            )?;
+            tx.execute(
                 "DELETE FROM kv
                  WHERE key LIKE 'events_sub:%'
                    AND json_extract(value, '$.caller') = ?

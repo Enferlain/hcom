@@ -18,8 +18,6 @@ const HEALTH_TIMEOUT: f64 = 40.0;
 pub const CONNECT_GRACE: Duration = Duration::from_secs(15);
 /// Launch env and `claude_delivery` config values; the launch freezes one.
 pub const DELIVERY_ENV: &str = "HCOM_CLAUDE_DELIVERY";
-pub const DELIVERY_MODES: &[&str] = &["native", "inject"];
-pub const DEFAULT_DELIVERY: &str = "inject";
 const INJECT_HINT: &str = "hcom config claude_delivery inject";
 
 /// Whether this process was launched with native (mod) delivery.

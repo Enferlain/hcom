@@ -155,6 +155,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "boolean",
     ),
     (
+        "HCOM_COPILOT_DELIVERY",
+        "Idle Copilot delivery: native (its CLI extension) or inject (PTY, default)",
+        "string",
+    ),
+    (
         "HCOM_NAME_EXPORT",
         "Export instance name to custom env var",
         "string",
@@ -335,13 +340,13 @@ fn config_set_at_path(path: &Path, key: &str, value: &str) -> Result<(), String>
     let field_name = key.strip_prefix("HCOM_").unwrap_or(key).to_lowercase();
     validate_config_args(&field_name, value)?;
 
-    if field_name == "claude_delivery"
+    if field_name.ends_with("_delivery")
         && !value.is_empty()
-        && !crate::hooks::claude_mod::DELIVERY_MODES.contains(&value)
+        && !crate::config::DELIVERY_MODES.contains(&value)
     {
         return Err(format!(
-            "claude_delivery must be one of: {}. Got '{value}'",
-            crate::hooks::claude_mod::DELIVERY_MODES.join(", ")
+            "{field_name} must be one of: {}. Got '{value}'",
+            crate::config::DELIVERY_MODES.join(", ")
         ));
     }
 
@@ -425,8 +430,9 @@ pub fn config_get(key: &str) -> (String, &'static str) {
         "HCOM_SUBAGENT_TIMEOUT" => "30",
         "HCOM_AUTO_APPROVE" => "true",
         "HCOM_AUTO_TRUST_WORKSPACE" => "true",
+        "HCOM_COPILOT_DELIVERY" => crate::config::DEFAULT_DELIVERY,
         "HCOM_TITLE_MODE" => "combined",
-        "HCOM_CLAUDE_DELIVERY" => crate::hooks::claude_mod::DEFAULT_DELIVERY,
+        "HCOM_CLAUDE_DELIVERY" => crate::config::DEFAULT_DELIVERY,
         _ => "",
     };
     (default.to_string(), "default")
@@ -1087,6 +1093,9 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
             print_terminal_info();
             return 0;
         }
+        if unset_mode {
+            return config_terminal(&["default".to_string()], setup_mode);
+        }
         return config_terminal(&argv[1..], setup_mode);
     }
 
@@ -1141,6 +1150,7 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
         }
         // Join all remaining args with spaces
         let value = argv[1..].join(" ");
+
         match config_set(&key, &value) {
             Ok(()) => {
                 if unset_mode {
@@ -1150,6 +1160,7 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
                 }
 
                 // Side effect: auto_approve changes must update tool permissions
+                // (after --unset, to whatever the key now falls back to)
                 if key == "HCOM_AUTO_APPROVE" {
                     let effective = if unset_mode {
                         config_get(&key).0
@@ -1628,6 +1639,29 @@ Example: hcom config kilo_args \"--model kilo/kilo-auto/free\"
 Clear:   hcom config kilo_args \"\"
 
 Prepended to launch-time cli args.",
+        ),
+
+        "HCOM_COPILOT_DELIVERY" => Some(
+            "\
+HCOM_COPILOT_DELIVERY - How idle Copilot agents get messages
+
+  hcom config copilot_delivery native   # Copilot CLI extension
+  hcom config copilot_delivery inject   # type into the terminal (default)
+  hcom config copilot_delivery --unset  # back to the default
+  HCOM_COPILOT_DELIVERY=native hcom copilot   # per-launch override
+
+native: `hcom copilot` ships an extension in its per-run plugin that hands
+messages to an idle session with the Copilot SDK (`session.send`) instead of
+typing into the terminal: no waiting for an empty prompt, no extra wake turn.
+Copilot CLI extensions are experimental: if Copilot's settings.json leaves
+them unset, launch turns on enabledFeatureFlags.EXTENSIONS and says so on
+stderr; if they were turned off (flag false, /extensions mode disabled, hcom
+disabled), launch fails. Mid-turn delivery uses Copilot hooks either way.
+Applies to new launches.
+
+Diagnose: `hcom list <name>` shows the extension's wake port once bound;
+hcom.log has plugin.copilot_* (extension), copilot.ext_* (hcom side) and
+delivery.copilot_extension_stalled when idle messages are not delivered.",
         ),
 
         "HCOM_COPILOT_ARGS" => Some(
@@ -2432,6 +2466,24 @@ mod tests {
             Some("--model safe-model")
         );
         assert!(parsed.get("pi").is_none(), "no stray top-level [pi]");
+    }
+
+    #[test]
+    fn test_config_set_copilot_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let read = || -> toml::Table { std::fs::read_to_string(&path).unwrap().parse().unwrap() };
+
+        config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", "native").unwrap();
+        assert_eq!(
+            read()["launch"]["copilot"]["delivery"].as_str(),
+            Some("native")
+        );
+        assert!(config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", "pty").is_err());
+
+        // --unset writes "", which removes the key (back to the default).
+        config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", "").unwrap();
+        assert!(read()["launch"]["copilot"].get("delivery").is_none());
     }
 
     #[test]

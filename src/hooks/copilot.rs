@@ -65,6 +65,36 @@ pub static PER_RUN: PerRunAdapter = PerRunAdapter {
 
 const COPILOT_PLUGIN_MANIFEST: &[u8] =
     br#"{"name":"hcom","description":"hcom per-run hooks","hooks":"hooks.json"}"#;
+const COPILOT_PLUGIN_MANIFEST_WITH_EXTENSION: &[u8] = br#"{"name":"hcom","description":"hcom per-run hooks","hooks":"hooks.json","extensions":"extensions"}"#;
+const EXTENSION_SOURCE: &str = include_str!("../copilot_plugin/extension.mjs");
+const EXTENSION_PATH: &str = "extensions/hcom/extension.mjs";
+
+/// Set on a launch whose idle delivery belongs to the extension; the PTY
+/// delivery loop reads it and never injects.
+pub const EXTENSION_DELIVERY_ENV: &str = "HCOM_COPILOT_EXT_DELIVERY";
+
+/// Whether this PTY process was launched with extension delivery.
+pub fn extension_delivery_enabled() -> bool {
+    std::env::var(EXTENSION_DELIVERY_ENV).is_ok_and(|v| v == "1")
+}
+
+/// The extension invokes hcom the same way the hooks do.
+fn extension_source() -> Result<String> {
+    let prefix = serde_json::to_string(&crate::runtime_env::get_hcom_prefix())?;
+    Ok(EXTENSION_SOURCE.replace("__HCOM_PREFIX__", &prefix))
+}
+
+/// `copilot_delivery = "native"`, resolved with the launch env (HCOM_* overrides).
+fn native_delivery_configured(ctx: &LaunchCtx) -> bool {
+    crate::config::HcomConfig::load(Some(&ctx.env))
+        .is_ok_and(|config| config.copilot_delivery == "native")
+}
+
+/// Copilot's settings.json for this launch's `COPILOT_HOME`.
+fn copilot_home(ctx: &LaunchCtx) -> PathBuf {
+    ctx.path_var("COPILOT_HOME")
+        .unwrap_or_else(|| ctx.home().join(".copilot"))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
@@ -272,14 +302,30 @@ fn runtime_hooks_json(include_permissions: bool) -> Result<Vec<u8>> {
 
 fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
     let hooks = runtime_hooks_json(ctx.auto_approve)?;
-    let plugin_dir = runtime::publish_dir(
-        "copilot",
-        &[
-            ("plugin.json", COPILOT_PLUGIN_MANIFEST),
-            ("hooks.json", hooks.as_slice()),
-        ],
-    )
-    .context("Cannot publish Copilot runtime plugin")?;
+    // `copilot_delivery = "native"`: Copilot is made to load the extension,
+    // and failing that the launch fails rather than silently degrading to
+    // terminal delivery.
+    let with_extension = native_delivery_configured(ctx);
+    if with_extension {
+        crate::tools::copilot_preprocessing::ensure_copilot_extensions_enabled(&copilot_home(ctx))
+            .context("copilot_delivery is native (hcom config copilot_delivery inject to use terminal delivery)")?;
+    }
+    let extension = if with_extension {
+        extension_source()?
+    } else {
+        String::new()
+    };
+    let mut files = vec![("hooks.json", hooks.as_slice())];
+    let mut env = Vec::new();
+    if with_extension {
+        files.push(("plugin.json", COPILOT_PLUGIN_MANIFEST_WITH_EXTENSION));
+        files.push((EXTENSION_PATH, extension.as_bytes()));
+        env.push((EXTENSION_DELIVERY_ENV.to_string(), "1".to_string()));
+    } else {
+        files.push(("plugin.json", COPILOT_PLUGIN_MANIFEST));
+    }
+    let plugin_dir =
+        runtime::publish_dir("copilot", &files).context("Cannot publish Copilot runtime plugin")?;
     let mut args = ctx.args.clone();
     runtime::insert_before_separator(
         &mut args,
@@ -288,10 +334,7 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
             plugin_dir.to_string_lossy().into_owned(),
         ],
     );
-    Ok(RuntimeInjection {
-        args,
-        env: Vec::new(),
-    })
+    Ok(RuntimeInjection { args, env })
 }
 
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
@@ -436,7 +479,12 @@ fn handle_userpromptsubmit(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload
             .or_else(|| payload.raw.get("initial_prompt"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        let context = if prompt.trim() == HCOM_TRIGGER {
+        let prompt = prompt.trim();
+        // The extension's delivery turn: the ack sets `deliver:<sender>`.
+        if prompt.starts_with(HCOM_TRIGGER) && ack_ext_delivery(db, &instance.name, prompt) {
+            return json!({});
+        }
+        let context = if prompt == HCOM_TRIGGER {
             "trigger"
         } else {
             "prompt"
@@ -459,8 +507,29 @@ fn handle_pretooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> V
     json!({})
 }
 
-fn pending_additional_context(db: &HcomDb, instance_name: &str) -> (Value, Option<DeliveryAck>) {
-    match common::prepare_pending_messages(db, instance_name) {
+/// Pending messages for the hooks to deliver, unless the extension already
+/// holds them: a batch it handed to `session.send` just as the user's own
+/// prompt won the race to the idle session is queued in Copilot and runs
+/// after this turn, so delivering it here too would show it twice.
+fn hook_pending_messages(db: &HcomDb, instance: &InstanceRow) -> Option<common::PreparedDelivery> {
+    // The instance's own session, not the payload's: a subagent's hooks run in
+    // a session of their own.
+    if let Some(inflight) = ExtInflight::live(db, instance, None) {
+        log::log_info(
+            "hooks",
+            "copilot.ext_inflight_deferred",
+            &format!(
+                "instance={} inflight={}; queued delivery prompt will carry it",
+                instance.name, inflight.last_event_id
+            ),
+        );
+        return None;
+    }
+    common::prepare_pending_messages(db, &instance.name)
+}
+
+fn pending_additional_context(db: &HcomDb, instance: &InstanceRow) -> (Value, Option<DeliveryAck>) {
+    match hook_pending_messages(db, instance) {
         Some(prepared) => (
             json!({ "additionalContext": prepared.formatted }),
             Some(prepared.ack),
@@ -477,7 +546,7 @@ fn handle_posttooluse(
     let Some(instance) = resolved_instance(db, ctx, payload) else {
         return (json!({}), None);
     };
-    pending_additional_context(db, &instance.name)
+    pending_additional_context(db, &instance)
 }
 
 /// A hook from a session other than the instance's own: a Copilot subagent
@@ -506,7 +575,7 @@ fn handle_agentstop(
     if from_subagent_session(payload, &instance) {
         return (json!({ "decision": "allow" }), None);
     }
-    if let Some(prepared) = common::prepare_pending_messages(db, &instance.name) {
+    if let Some(prepared) = hook_pending_messages(db, &instance) {
         return (
             json!({ "decision": "block", "reason": prepared.formatted }),
             Some(prepared.ack),
@@ -672,6 +741,277 @@ fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> V
     update_position(db, ctx, payload, &instance.name);
     common::finalize_session(db, &instance.name, reason, None);
     json!({})
+}
+
+fn flag<'a>(argv: &'a [String], name: &str) -> Option<&'a str> {
+    argv.iter()
+        .position(|arg| arg == name)
+        .and_then(|i| argv.get(i + 1))
+        .map(String::as_str)
+}
+
+fn bound_instance(db: &HcomDb, ctx: &HcomContext) -> Option<InstanceRow> {
+    instance_binding::resolve_instance_from_binding(db, None, ctx.process_id.as_deref())
+}
+
+/// Extension poll: (re)register its wake port and, only while the instance is
+/// idle, hand over pending messages; mid-turn delivery stays with the hooks.
+/// Resolved through the process binding on every call so the extension follows
+/// renames and session switches without tracking identity itself.
+///
+/// `--session-id`: the extension's Copilot session. Copilot runs extensions
+/// per session, so one attached to a background session must not take this
+/// instance's messages (or its wake endpoint). Before SessionStart binds a
+/// session, the foreground one at launch is the only candidate.
+///
+/// `--idle`: Copilot reported `session.idle`. That is authoritative, so it
+/// also recovers a turn whose Stop hook never ran (e.g. an interrupt).
+fn handle_ext_poll(db: &HcomDb, ctx: &HcomContext, argv: &[String]) -> Value {
+    let Some(instance) = bound_instance(db, ctx) else {
+        return json!({ "error": "no instance bound to this process" });
+    };
+    let name = instance.name.as_str();
+    if let (Some(sid), Some(bound)) = (flag(argv, "--session-id"), instance.session_id.as_deref())
+        && sid != bound
+    {
+        log::log_warn(
+            "hooks",
+            "copilot.ext_session_mismatch",
+            &format!("instance={name} extension_session={sid} bound_session={bound}"),
+        );
+        return json!({ "name": name, "skipped": "session_mismatch" });
+    }
+    if let Some(port) = flag(argv, "--notify-port").and_then(|p| p.parse::<u16>().ok())
+        && port > 0
+        && db.get_notify_endpoint_port(name, "plugin") != Some(port)
+    {
+        match db.upsert_notify_endpoint(name, "plugin", port) {
+            Ok(()) => log::log_info(
+                "hooks",
+                "copilot.ext_bound",
+                &format!(
+                    "instance={name} port={port} session={}",
+                    flag(argv, "--session-id").unwrap_or("")
+                ),
+            ),
+            Err(e) => log::log_warn(
+                "hooks",
+                "copilot.ext_register_failed",
+                &format!("instance={name} err={e}"),
+            ),
+        }
+    }
+    if argv.iter().any(|a| a == "--idle") && instance.status != ST_LISTENING {
+        log::log_info(
+            "hooks",
+            "copilot.ext_idle",
+            &format!(
+                "instance={name} status was {}:{}; Copilot reports idle",
+                instance.status, instance.status_context
+            ),
+        );
+        lifecycle::set_status(db, name, ST_LISTENING, "", Default::default());
+    }
+    if !db.is_idle(name) {
+        return json!({ "name": name });
+    }
+    if let Some(inflight) = ExtInflight::live(db, &instance, flag(argv, "--session-id")) {
+        return json!({ "name": name, "inflight": inflight.last_event_id });
+    }
+    let Some(prepared) = common::prepare_pending_messages(db, name) else {
+        return json!({ "name": name });
+    };
+    let inflight = ExtInflight {
+        last_event_id: prepared.ack.last_event_id,
+        status_context: prepared.ack.status_context,
+        msg_ts: prepared.ack.msg_ts,
+        text: prepared.formatted,
+        sent_at: crate::shared::time::now_epoch_i64(),
+        // The extension's own session: before SessionStart binds one (Copilot
+        // creates it lazily) the instance has none to record.
+        session_id: flag(argv, "--session-id")
+            .map(str::to_string)
+            .or_else(|| instance.session_id.clone()),
+        confirmed_at: None,
+    };
+    // Without the record nothing could ack this batch, so it is not handed out.
+    if let Err(e) = db.kv_set(&ext_inflight_key(name), Some(&json!(inflight).to_string())) {
+        return json!({ "error": format!("record in-flight batch: {e}") });
+    }
+    json!({
+        "name": name,
+        "count": prepared.messages.len(),
+        "event_id": inflight.last_event_id,
+        "text": inflight.text,
+    })
+}
+
+/// The extension's report on the prompt carrying the batch ending at
+/// `--event-id`. Without `--failed`: Copilot accepted it and, if it is waiting
+/// behind a user turn that won the race to an idle session, still has it
+/// queued; the batch belongs to that prompt until UserPromptSubmit. The
+/// extension repeats this while the prompt stays queued. `--failed`: the send
+/// failed or the prompt left the queue without running; the record is dropped
+/// so the next hook or poll delivers the batch again.
+fn handle_ext_sent(db: &HcomDb, ctx: &HcomContext, argv: &[String]) -> Value {
+    let Some(instance) = bound_instance(db, ctx) else {
+        return json!({ "error": "no instance bound to this process" });
+    };
+    let name = instance.name.as_str();
+    let event_id = flag(argv, "--event-id").and_then(|id| id.parse::<i64>().ok());
+    let session = flag(argv, "--session-id");
+    // Only the session that was handed the batch speaks for it: a late report
+    // from the extension of a session since cleared must not touch a record
+    // the new session's extension owns.
+    let Some(mut inflight) = ExtInflight::load(db, name).filter(|inflight| {
+        Some(inflight.last_event_id) == event_id && inflight.session_id.as_deref() == session
+    }) else {
+        // Already acked (the prompt ran before this report) or superseded.
+        return json!({ "name": name });
+    };
+    let failed = argv.iter().any(|a| a == "--failed");
+    let record = if failed {
+        None
+    } else {
+        inflight.confirmed_at = Some(crate::shared::time::now_epoch_i64());
+        Some(json!(inflight).to_string())
+    };
+    if let Err(e) = db.kv_set(&ext_inflight_key(name), record.as_deref()) {
+        return json!({ "error": format!("update in-flight batch: {e}") });
+    }
+    if failed {
+        log::log_info(
+            "hooks",
+            "copilot.ext_send_failed",
+            &format!(
+                "instance={name} batch={}; redelivering",
+                inflight.last_event_id
+            ),
+        );
+    }
+    json!({ "name": name })
+}
+
+/// How long a batch handed to the extension, but not yet reported accepted,
+/// holds off redelivery. The extension reports within its hcom call timeout;
+/// past this it is taken to have died before sending.
+const EXT_INFLIGHT_LEASE_SECS: i64 = 60;
+
+/// How long an accepted batch stays with its queued prompt after the
+/// extension last confirmed it queued. The extension re-checks at least every
+/// 30s (its safety poll), so a lapse means it is gone and cannot vouch for the
+/// prompt any more.
+const EXT_QUEUED_CONFIRM_SECS: i64 = 90;
+
+fn ext_inflight_key(name: &str) -> String {
+    format!("copilot_ext_inflight:{name}")
+}
+
+/// A batch the extension was given, acked by the UserPromptSubmit hook when
+/// Copilot actually submits that prompt. Kept in the DB, not the extension, so
+/// the ack survives the extension restarting, and only a prompt Copilot ran
+/// counts as delivered.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExtInflight {
+    last_event_id: i64,
+    status_context: String,
+    msg_ts: String,
+    text: String,
+    sent_at: i64,
+    /// The Copilot session the prompt was sent to; a queued prompt does not
+    /// outlive a session switch (`/clear`).
+    session_id: Option<String>,
+    /// When the extension last reported the prompt accepted or still queued
+    /// (`copilot-ext-sent`); `None` until the send is reported.
+    confirmed_at: Option<i64>,
+}
+
+impl ExtInflight {
+    fn load(db: &HcomDb, name: &str) -> Option<Self> {
+        let raw = db.kv_get(&ext_inflight_key(name)).ok().flatten()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    /// The batch, if still owed to a prompt the extension sent: ahead of the
+    /// cursor (not delivered some other way), and either still being sent or
+    /// confirmed queued in the caller's session (`session`: the polling
+    /// extension's, else the instance's; a queued prompt does not survive
+    /// `/clear`).
+    fn live(db: &HcomDb, instance: &InstanceRow, session: Option<&str>) -> Option<Self> {
+        let now = crate::shared::time::now_epoch_i64();
+        Self::load(db, &instance.name).filter(|inflight| {
+            let session = session.or(instance.session_id.as_deref());
+            let same_session = match (inflight.session_id.as_deref(), session) {
+                (Some(owner), Some(caller)) => owner == caller,
+                _ => true,
+            };
+            inflight.last_event_id > instance.last_event_id
+                && same_session
+                && match inflight.confirmed_at {
+                    Some(confirmed) => now - confirmed < EXT_QUEUED_CONFIRM_SECS,
+                    None => now - inflight.sent_at < EXT_INFLIGHT_LEASE_SECS,
+                }
+        })
+    }
+}
+
+/// UserPromptSubmit for the extension's delivery prompt: commit its batch.
+/// Matched on the exact text, so a user prompt that happens to start with
+/// `<hcom>` is not mistaken for it.
+fn ack_ext_delivery(db: &HcomDb, name: &str, prompt: &str) -> bool {
+    let Some(inflight) = ExtInflight::load(db, name) else {
+        return false;
+    };
+    if inflight.text.trim() != prompt {
+        return false;
+    }
+    let _ = db.kv_set(&ext_inflight_key(name), None);
+    // A failed cursor write is logged and leaves the batch unread, so it is
+    // delivered again rather than lost.
+    common::commit_delivery_ack(
+        db,
+        &DeliveryAck {
+            instance_name: name.to_string(),
+            last_event_id: inflight.last_event_id,
+            status_context: inflight.status_context,
+            msg_ts: inflight.msg_ts,
+            mark_announced: false,
+        },
+    );
+    log::log_info(
+        "hooks",
+        "copilot.ext_acked",
+        &format!("instance={name} acked_to={}", inflight.last_event_id),
+    );
+    true
+}
+
+/// Argv entry point for the Copilot extension (`copilot-ext-*`), separate from
+/// the stdin-JSON hooks Copilot itself runs.
+pub fn dispatch_copilot_ext(hook_name: &str, argv: &[String]) -> (i32, String) {
+    let db = match HcomDb::open() {
+        Ok(db) => db,
+        Err(err) => return (0, json!({ "error": format!("db open: {err}") }).to_string()),
+    };
+    let ctx = HcomContext::from_os();
+    if !common::hook_gate_check(&ctx, &db) {
+        return (0, "{}".to_string());
+    }
+    let argv = match argv.split_first() {
+        Some((first, rest)) if first == hook_name => rest,
+        _ => argv,
+    };
+    let output = common::dispatch_with_panic_guard(
+        "copilot",
+        hook_name,
+        json!({ "error": "internal panic" }),
+        || match hook_name {
+            "copilot-ext-poll" => handle_ext_poll(&db, &ctx, argv),
+            "copilot-ext-sent" => handle_ext_sent(&db, &ctx, argv),
+            _ => json!({ "error": format!("unknown Copilot extension command: {hook_name}") }),
+        },
+    );
+    (0, output.to_string())
 }
 
 fn hook_type_for_command(hook_name: &str) -> &'static str {
@@ -953,6 +1293,272 @@ mod tests {
                 .iter()
                 .any(|hook| hook["command"] == build_copilot_hook_command("copilot-erroroccurred"))
         );
+    }
+
+    #[test]
+    #[serial]
+    fn per_run_extension_only_with_native_delivery() {
+        let (dir, workspace, _guard) = copilot_test_env();
+        let copilot_home = dir.path().join("copilot-home");
+        let launch = |delivery: &str| {
+            let mut ctx = LaunchCtx::ambient(crate::tool::Tool::Copilot, false);
+            ctx.cwd = workspace.clone();
+            ctx.env
+                .insert("HCOM_COPILOT_DELIVERY".into(), delivery.into());
+            ctx.env.insert(
+                "COPILOT_HOME".into(),
+                copilot_home.to_string_lossy().into_owned(),
+            );
+            let injection = prepare_per_run(&ctx).unwrap();
+            let plugin_dir = PathBuf::from(&injection.args[1]);
+            let manifest: Value =
+                serde_json::from_slice(&std::fs::read(plugin_dir.join("plugin.json")).unwrap())
+                    .unwrap();
+            (injection, plugin_dir, manifest)
+        };
+
+        let (injection, plugin_dir, manifest) = launch("inject");
+        assert!(manifest.get("extensions").is_none());
+        assert!(!plugin_dir.join(EXTENSION_PATH).exists());
+        assert!(injection.env.is_empty());
+        assert!(!copilot_home.join("settings.json").exists());
+
+        let (injection, plugin_dir, manifest) = launch("native");
+        assert_eq!(manifest["extensions"], "extensions");
+        assert_eq!(
+            injection.env,
+            [(EXTENSION_DELIVERY_ENV.to_string(), "1".to_string())]
+        );
+        let source = std::fs::read_to_string(plugin_dir.join(EXTENSION_PATH)).unwrap();
+        let prefix = serde_json::to_string(&crate::runtime_env::get_hcom_prefix()).unwrap();
+        assert!(source.contains(&format!("const HCOM = {prefix};")));
+        let settings: Value =
+            serde_json::from_slice(&std::fs::read(copilot_home.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["enabledFeatureFlags"]["EXTENSIONS"], true);
+
+        // Extensions explicitly turned off in Copilot, or unreadable settings:
+        // the launch fails instead of overriding the choice or degrading.
+        let fails_with = |settings: &str| {
+            std::fs::write(copilot_home.join("settings.json"), settings).unwrap();
+            let mut ctx = LaunchCtx::ambient(crate::tool::Tool::Copilot, false);
+            ctx.cwd = workspace.clone();
+            ctx.env
+                .insert("HCOM_COPILOT_DELIVERY".into(), "native".into());
+            ctx.env.insert(
+                "COPILOT_HOME".into(),
+                copilot_home.to_string_lossy().into_owned(),
+            );
+            assert!(prepare_per_run(&ctx).is_err());
+            assert_eq!(
+                std::fs::read_to_string(copilot_home.join("settings.json")).unwrap(),
+                settings
+            );
+        };
+        fails_with(r#"{"experimental": true, "extensions": {"mode": "disabled"}}"#);
+        fails_with("{ not json");
+    }
+
+    fn ext_test_db() -> (tempfile::TempDir, HcomDb, HcomContext, i64) {
+        let (dir, db, ctx) = stop_test_db();
+        let message_id = db
+            .conn()
+            .query_row("SELECT MAX(id) FROM events", [], |row| row.get(0))
+            .unwrap();
+        (dir, db, ctx, message_id)
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    fn submit(db: &HcomDb, ctx: &HcomContext, prompt: &str) -> InstanceRow {
+        handle_userpromptsubmit(
+            db,
+            ctx,
+            &HookPayload::from_copilot_native(
+                "UserPromptSubmit",
+                json!({"sessionId": "sid-fg", "prompt": prompt}),
+            ),
+        );
+        db.get_instance_full("memo").unwrap().unwrap()
+    }
+
+    #[test]
+    fn ext_poll_delivers_while_idle_and_prompt_submit_acks() {
+        let (_dir, db, ctx, message_id) = ext_test_db();
+
+        // Mid-turn: register the wake port, leave delivery to the hooks.
+        let busy = handle_ext_poll(&db, &ctx, &argv(&["--notify-port", "4555"]));
+        assert_eq!(busy, json!({ "name": "memo" }));
+        assert_eq!(db.get_notify_endpoint_port("memo", "plugin"), Some(4555));
+
+        db.set_status("memo", ST_LISTENING, "").unwrap();
+        let idle = handle_ext_poll(&db, &ctx, &argv(&["--session-id", "sid-fg"]));
+        let text = idle["text"].as_str().unwrap().to_string();
+        assert!(text.contains("hello"));
+        assert!(db.has_pending("memo"), "poll alone must not ack");
+
+        // Handed out, prompt not run yet (or the extension restarted): no resend.
+        let again = handle_ext_poll(&db, &ctx, &argv(&["--session-id", "sid-fg"]));
+        assert_eq!(again["inflight"], message_id);
+        assert!(again.get("text").is_none());
+
+        // A user prompt that merely starts with <hcom> is not the delivery.
+        let inst = submit(&db, &ctx, "<hcom> my own note");
+        assert_eq!(inst.status_context, "prompt");
+        assert!(db.has_pending("memo"));
+
+        // Copilot runs the delivery prompt: acked.
+        db.set_status("memo", ST_LISTENING, "").unwrap();
+        let inst = submit(&db, &ctx, &format!("{text}\n"));
+        assert!(!db.has_pending("memo"));
+        assert_eq!(inst.status, ST_ACTIVE);
+        assert_eq!(inst.status_context, "deliver:luna");
+        assert!(ExtInflight::load(&db, "memo").is_none());
+    }
+
+    #[test]
+    fn ext_inflight_batch_is_redelivered_after_lease() {
+        let (_dir, db, ctx, _) = ext_test_db();
+        db.set_status("memo", ST_LISTENING, "").unwrap();
+        let first = handle_ext_poll(&db, &ctx, &argv(&[]));
+        let mut inflight = ExtInflight::load(&db, "memo").unwrap();
+        inflight.sent_at -= EXT_INFLIGHT_LEASE_SECS;
+        db.kv_set(
+            &ext_inflight_key("memo"),
+            Some(&json!(inflight).to_string()),
+        )
+        .unwrap();
+        let second = handle_ext_poll(&db, &ctx, &argv(&[]));
+        assert_eq!(second["text"], first["text"]);
+    }
+
+    /// The extension's prompt queued behind a user turn that won the race:
+    /// hooks leave its batch alone, however long that turn runs, and the
+    /// queued prompt acks it when it finally runs.
+    #[test]
+    fn hooks_defer_to_batch_queued_by_extension() {
+        let (_dir, db, ctx, message_id) = ext_test_db();
+        db.set_status("memo", ST_LISTENING, "").unwrap();
+        let poll = handle_ext_poll(&db, &ctx, &argv(&["--session-id", "sid-fg"]));
+        let text = poll["text"].as_str().unwrap().to_string();
+        assert_eq!(poll["event_id"], message_id);
+        let event_id = message_id.to_string();
+        handle_ext_sent(
+            &db,
+            &ctx,
+            &argv(&["--event-id", &event_id, "--session-id", "sid-fg"]),
+        );
+
+        // The user's prompt runs first, for longer than the send lease.
+        submit(&db, &ctx, "my own task");
+        let mut inflight = ExtInflight::load(&db, "memo").unwrap();
+        assert!(inflight.confirmed_at.is_some());
+        inflight.sent_at -= EXT_INFLIGHT_LEASE_SECS * 2;
+        db.kv_set(
+            &ext_inflight_key("memo"),
+            Some(&json!(inflight).to_string()),
+        )
+        .unwrap();
+        let tool_use = HookPayload::from_copilot_native(
+            "PostToolUse",
+            json!({"sessionId": "sid-fg", "toolName": "bash"}),
+        );
+        let stop = HookPayload::from_copilot_native("Stop", json!({"sessionId": "sid-fg"}));
+        assert_eq!(handle_posttooluse(&db, &ctx, &tool_use), (json!({}), None));
+        let (out, ack) = handle_agentstop(&db, &ctx, &stop);
+        assert_eq!((out, ack.is_none()), (json!({ "decision": "allow" }), true));
+        assert!(db.has_pending("memo"));
+
+        // Then the queued delivery prompt runs.
+        submit(&db, &ctx, &text);
+        assert!(!db.has_pending("memo"));
+        assert!(ExtInflight::load(&db, "memo").is_none());
+    }
+
+    #[test]
+    fn ext_send_outcome_releases_batch() {
+        let (_dir, db, ctx, message_id) = ext_test_db();
+        let event_id = message_id.to_string();
+        let tool_use = HookPayload::from_copilot_native(
+            "PostToolUse",
+            json!({"sessionId": "sid-fg", "toolName": "bash"}),
+        );
+        let hooks_deliver = || handle_posttooluse(&db, &ctx, &tool_use).1.is_some();
+
+        // Failed send: the batch is free again at once.
+        db.set_status("memo", ST_LISTENING, "").unwrap();
+        handle_ext_poll(&db, &ctx, &argv(&["--session-id", "sid-fg"]));
+        assert!(!hooks_deliver());
+        handle_ext_sent(
+            &db,
+            &ctx,
+            &argv(&[
+                "--event-id",
+                &event_id,
+                "--session-id",
+                "sid-fg",
+                "--failed",
+            ]),
+        );
+        assert!(ExtInflight::load(&db, "memo").is_none());
+        assert!(hooks_deliver());
+
+        // Accepted, then the session switched (`/clear`): the queued prompt
+        // went with the old session.
+        handle_ext_poll(&db, &ctx, &argv(&["--session-id", "sid-fg"]));
+        handle_ext_sent(
+            &db,
+            &ctx,
+            &argv(&["--event-id", &event_id, "--session-id", "sid-fg"]),
+        );
+        assert!(!hooks_deliver());
+        db.conn()
+            .execute(
+                "UPDATE instances SET session_id = 'sid-new' WHERE name = 'memo'",
+                [],
+            )
+            .unwrap();
+        let tool_use = HookPayload::from_copilot_native(
+            "PostToolUse",
+            json!({"sessionId": "sid-new", "toolName": "bash"}),
+        );
+        assert!(handle_posttooluse(&db, &ctx, &tool_use).1.is_some());
+
+        // The new session's extension claims the batch; a late report from the
+        // old session's extension leaves that claim alone.
+        handle_ext_poll(&db, &ctx, &argv(&["--session-id", "sid-new"]));
+        let stale = argv(&[
+            "--event-id",
+            &event_id,
+            "--session-id",
+            "sid-fg",
+            "--failed",
+        ]);
+        handle_ext_sent(&db, &ctx, &stale);
+        let claim = ExtInflight::load(&db, "memo").unwrap();
+        assert_eq!(claim.session_id.as_deref(), Some("sid-new"));
+        assert!(claim.confirmed_at.is_none());
+    }
+
+    #[test]
+    fn ext_poll_ignores_other_sessions_and_trusts_copilot_idle() {
+        let (_dir, db, ctx, _) = ext_test_db();
+
+        let other = handle_ext_poll(
+            &db,
+            &ctx,
+            &argv(&["--notify-port", "4556", "--session-id", "sid-bg", "--idle"]),
+        );
+        assert_eq!(other["skipped"], "session_mismatch");
+        assert_eq!(db.get_notify_endpoint_port("memo", "plugin"), None);
+        assert!(!db.is_idle("memo"));
+
+        // Status stuck active (no Stop hook), Copilot says idle: deliver.
+        let idle = handle_ext_poll(&db, &ctx, &argv(&["--session-id", "sid-fg", "--idle"]));
+        assert!(db.is_idle("memo"));
+        assert!(idle["text"].as_str().unwrap().contains("hello"));
     }
 
     #[test]
