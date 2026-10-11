@@ -479,15 +479,16 @@ const START_HELP: &[HelpEntry] = &[
         "start --as <name>",
         "Reclaim identity (after compaction/resume/clear)",
     ),
-    (
-        "start --orphan <name|pid>",
-        "Recover orphaned PTY process from pidtrack",
-    ),
     ("", ""),
     ("", ""),
     (
         "",
         "Inside a sandbox? Prefix all hcom commands with: HCOM_DIR=$PWD/.hcom",
+    ),
+    ("", ""),
+    (
+        "",
+        "Tip: Do not truncate the hcom start output, it contains important information.",
     ),
 ];
 
