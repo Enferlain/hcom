@@ -328,6 +328,7 @@ impl Proxy {
         // a manual `hcom kill` is never recorded as a launch failure.
         if !EXIT_WAS_KILLED.load(Ordering::Acquire) {
             let tail = self.last_tail.read().ok().and_then(|g| g.clone());
+            crate::delivery::record_child_exit(exit_code, tail.clone());
             shared::finalize_launch_failure_after_exit(
                 self.config.instance_name.as_deref(),
                 tail.as_deref(),
@@ -647,7 +648,7 @@ impl Proxy {
                         }
                         if tail_stale && launch_phase.load(Ordering::Acquire) {
                             if let Ok(mut g) = last_tail.write() {
-                                *g = screen.visible_tail(8, 1000);
+                                *g = screen.visible_tail(20, 2000);
                             }
                             tail_stale = false;
                         }
@@ -684,7 +685,7 @@ impl Proxy {
                         // build the launch-failure diagnostic before the screen is
                         // gone, and render the final frame for a late `hcom term`.
                         if let Ok(mut g) = last_tail.write() {
-                            *g = screen.visible_tail(8, 1000);
+                            *g = screen.exit_tail(20, 2000);
                         }
                         refresh(&screen);
                         break; // child exited / PTY closed

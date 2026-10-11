@@ -673,6 +673,9 @@ pub(super) fn finalize_launch_failure_after_exit(
     );
 }
 
+/// How long after spawn a crash still counts as a failed launch.
+const EARLY_CRASH_WINDOW: Duration = Duration::from_secs(60);
+
 fn finalize_launch_failure_with_db(
     db: &mut HcomDb,
     instance_name: &str,
@@ -712,15 +715,33 @@ fn finalize_launch_failure_with_db(
     // (row pre-seeded with the prior session id) whose tool rejects the
     // session, or Claude's SessionEnd deleting the row before exit.
     let never_ready = launch_phase_active.load(Ordering::Acquire) && launched;
-    if !unbound && !never_ready {
+    // Ready means bound and accepting input, not that a model turn worked. A
+    // tool that dies on its first request has still failed to launch for
+    // whoever spawned it. Signal exits from a user quitting don't count.
+    let crashed_after_ready = launched
+        && !never_ready
+        && elapsed < EARLY_CRASH_WINDOW
+        && !matches!(exit_code, 0 | 129 | 130 | 143);
+    if !unbound && !never_ready && !crashed_after_ready {
         return;
     }
 
     let elapsed_secs = elapsed.as_secs();
-    let mut fallback = if unbound {
-        format!("exited {elapsed_secs}s after spawn before binding (exit code {exit_code})")
+    let (mut fallback, reason) = if unbound {
+        (
+            format!("exited {elapsed_secs}s after spawn before binding (exit code {exit_code})"),
+            "exited_before_bind",
+        )
+    } else if never_ready {
+        (
+            format!("exited {elapsed_secs}s after spawn before ready (exit code {exit_code})"),
+            "exited_before_ready",
+        )
     } else {
-        format!("exited {elapsed_secs}s after spawn before ready (exit code {exit_code})")
+        (
+            format!("crashed {elapsed_secs}s after spawn, after ready (exit code {exit_code})"),
+            "exited_after_ready",
+        )
     };
     if let Some(tail) = tail {
         fallback.push_str("\nPTY output:\n");
@@ -741,11 +762,7 @@ fn finalize_launch_failure_with_db(
         instance_name,
         crate::shared::ST_INACTIVE,
         "launch_failed",
-        if unbound {
-            "exited_before_bind"
-        } else {
-            "exited_before_ready"
-        },
+        reason,
         &detail,
     );
     launch_phase_active.store(false, Ordering::Release);
@@ -1430,6 +1447,57 @@ No session found matching 'never-saved'"
         if !process_id.is_empty() {
             assert!(db.get_process_binding(&process_id).unwrap().is_none());
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn early_crash_after_ready_is_a_launch_failure_but_quit_or_late_crash_is_not() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let mut db = HcomDb::open_at(&hcom_dir.join("test.db")).unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let failures = |db: &HcomDb| -> Vec<(String, String)> {
+            db.conn()
+                .prepare(
+                    "SELECT json_extract(data, '$.reason'), json_extract(data, '$.detail')
+                     FROM events WHERE json_extract(data, '$.action') = 'launch_failed'",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        for (exit_code, secs) in [(130, 2), (1, 120)] {
+            finalize_launch_failure_with_db(
+                &mut db,
+                "luna",
+                Some("bye"),
+                &ready,
+                Duration::from_secs(secs),
+                exit_code,
+                true,
+            );
+        }
+        assert!(failures(&db).is_empty());
+
+        finalize_launch_failure_with_db(
+            &mut db,
+            "luna",
+            Some("TypeError: zlib.createZstdDecompress is not a function"),
+            &ready,
+            Duration::from_secs(2),
+            1,
+            true,
+        );
+        let failures = failures(&db);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "exited_after_ready");
+        assert!(
+            failures[0]
+                .1
+                .starts_with("crashed 2s after spawn, after ready (exit code 1)")
+        );
+        assert!(failures[0].1.contains("PTY output:\nTypeError: zlib"));
     }
 
     #[test]

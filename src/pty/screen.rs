@@ -15,12 +15,36 @@ use std::time::Instant;
 
 use crate::config::Config;
 
+/// Rows kept after they scroll off, only read for a crashed tool's exit tail.
+const SCROLLBACK_ROWS: usize = 50;
+
 fn new_parser(rows: u16, cols: u16) -> vt100::Parser {
     vt100::Parser::new(
         NonZeroU16::new(rows).unwrap_or(NonZeroU16::MIN),
         NonZeroU16::new(cols).unwrap_or(NonZeroU16::MIN),
-        0,
+        SCROLLBACK_ROWS,
     )
+}
+
+/// Last non-empty trimmed lines, joined and capped at `max_chars`.
+fn compact_tail(lines: Vec<String>, max_lines: usize, max_chars: usize) -> Option<String> {
+    let mut lines: Vec<String> = lines
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    let mut text = lines.join("\n");
+    if text.chars().count() > max_chars {
+        text = text.chars().take(max_chars).collect::<String>();
+        text.push_str("...");
+    }
+    Some(text)
 }
 
 fn screen_size(screen: &vt100::Screen) -> (u16, u16) {
@@ -384,7 +408,7 @@ impl ScreenTracker {
                     self.instance_name.as_deref().unwrap_or("unknown")
                 ),
             );
-            self.parser = vt100::Parser::new(rows, cols, 0);
+            self.parser = vt100::Parser::new(rows, cols, SCROLLBACK_ROWS);
         }
         self.rows = rows.get();
         self.cols = cols.get();
@@ -769,24 +793,20 @@ impl ScreenTracker {
 
     /// Return a compact tail of visible screen content for launch-blocked diagnostics.
     pub fn visible_tail(&self, max_lines: usize, max_chars: usize) -> Option<String> {
-        let mut lines: Vec<String> = self
-            .get_screen_lines()
-            .into_iter()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-        if lines.is_empty() {
-            return None;
-        }
-        if lines.len() > max_lines {
-            lines = lines.split_off(lines.len() - max_lines);
-        }
-        let mut text = lines.join("\n");
-        if text.chars().count() > max_chars {
-            text = text.chars().take(max_chars).collect::<String>();
-            text.push_str("...");
-        }
-        Some(text)
+        compact_tail(self.get_screen_lines(), max_lines, max_chars)
+    }
+
+    /// Like `visible_tail`, but reaches into scrollback: a crash prints its error
+    /// above a stack trace that can push it off a short pane.
+    pub fn exit_tail(&mut self, max_lines: usize, max_chars: usize) -> Option<String> {
+        let screen = self.parser.screen_mut();
+        let (rows, cols) = screen_size(screen);
+        screen.set_scrollback(max_lines.min(rows.into()));
+        let scrolled = screen.scrollback();
+        let mut lines: Vec<String> = screen.rows(0, cols).take(scrolled).collect();
+        screen.set_scrollback(0);
+        lines.extend(screen.rows(0, cols));
+        compact_tail(lines, max_lines, max_chars)
     }
 
     /// Extract Claude input box text.
@@ -1340,6 +1360,21 @@ impl ScreenTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_tail_reaches_into_scrollback_but_visible_tail_does_not() {
+        let mut t = make_tracker(10, 40, "");
+        let out: String = (1..=30).map(|i| format!("line {i}\r\n")).collect();
+        t.process(out.as_bytes());
+        let visible = t.visible_tail(20, 2000).unwrap();
+        assert!(visible.starts_with("line 22\n"), "{visible}");
+        let tail = t.exit_tail(20, 2000).unwrap();
+        assert!(
+            tail.starts_with("line 12\n") && tail.ends_with("line 30"),
+            "{tail}"
+        );
+        assert_eq!(t.parser.screen().scrollback(), 0);
+    }
 
     /// Helper: create tracker without debug/config dependencies
     fn make_tracker(rows: u16, cols: u16, ready_pattern: &str) -> ScreenTracker {

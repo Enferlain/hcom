@@ -6,8 +6,8 @@ pub(crate) mod grok;
 
 use std::io::Write;
 use std::net::TcpStream;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -28,6 +28,18 @@ pub type TitleWake = Arc<dyn Fn() + Send + Sync>;
 /// choose the exit status context. Lives here rather than in `pty` so the
 /// delivery loop compiles on platforms without the PTY wrapper.
 pub static EXIT_WAS_KILLED: AtomicBool = AtomicBool::new(false);
+
+/// How the wrapped child exited: its code and, for a failure, the last screen
+/// lines. Set by the PTY proxy before it stops delivery, so cleanup can say why
+/// a tool that crashed after launch went away instead of a bare "closed".
+static CHILD_EXIT: Mutex<Option<(i32, Option<String>)>> = Mutex::new(None);
+
+pub fn record_child_exit(exit_code: i32, tail: Option<String>) {
+    let tail = tail.filter(|_| exit_code != 0);
+    if let Ok(mut exit) = CHILD_EXIT.lock() {
+        *exit = Some((exit_code, tail));
+    }
+}
 
 /// Safely truncate a string to at most `max_chars` characters.
 /// Unlike byte slicing `&s[..n]`, this won't panic on multi-byte UTF-8.
@@ -2623,6 +2635,15 @@ pub(crate) fn instance_owns_process_binding(
 /// Publishes through the same atomic delete gate as `stop_instance`, so a
 /// concurrent `hcom kill` and this cleanup produce exactly one stopped event.
 pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
+    let child_exit = CHILD_EXIT.lock().ok().and_then(|exit| exit.clone());
+    finalize_pty_stop(db, current_name, child_exit);
+}
+
+fn finalize_pty_stop(
+    db: &mut HcomDb,
+    current_name: &str,
+    child_exit: Option<(i32, Option<String>)>,
+) {
     let skip = |why: &str| {
         log_info(
             "native",
@@ -2673,6 +2694,12 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
         "by": by,
         "reason": exit_reason,
     });
+    if !was_killed && let Some((exit_code, tail)) = child_exit {
+        event_data["exit_code"] = exit_code.into();
+        if let Some(tail) = tail {
+            event_data["output"] = tail.into();
+        }
+    }
     if let Some(snapshot) = snapshot {
         event_data["snapshot"] = snapshot;
     }
@@ -2852,6 +2879,44 @@ mod tests {
             .collect();
 
         assert_eq!(events, vec![("samu".to_string(), "killed".to_string())]);
+    }
+
+    #[test]
+    fn pty_stop_records_child_exit_code_and_output_unless_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        for name in ["crsh", "kild"] {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, tool, status, status_context, status_time, created_at)
+                     VALUES (?1, 'pi', 'active', 'running', 0, 0)",
+                    [name],
+                )
+                .unwrap();
+        }
+        db.mark_killed("kild", "samu").unwrap();
+        let exit = Some((1, Some("TypeError: boom".to_string())));
+        finalize_pty_stop(&mut db, "crsh", exit.clone());
+        finalize_pty_stop(&mut db, "kild", exit);
+
+        let stop = |name: &str| -> (String, Option<i64>, Option<String>) {
+            db.conn()
+                .query_row(
+                    "SELECT json_extract(data, '$.reason'), json_extract(data, '$.exit_code'),
+                            json_extract(data, '$.output')
+                     FROM events WHERE type = 'life' AND instance = ?1
+                       AND json_extract(data, '$.action') = 'stopped'",
+                    [name],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            stop("crsh"),
+            ("closed".into(), Some(1), Some("TypeError: boom".into()))
+        );
+        assert_eq!(stop("kild"), ("killed".into(), None, None));
     }
 
     #[test]

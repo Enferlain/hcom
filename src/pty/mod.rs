@@ -1473,7 +1473,9 @@ impl Proxy {
         let exit_code = self.drain_and_wait_child()?;
 
         if !EXIT_WAS_KILLED.load(Ordering::Acquire) {
-            let tail = self.screen.visible_tail(8, 1000);
+            // A crash prints its error above the stack trace, so keep a long tail.
+            let tail = self.screen.exit_tail(20, 2000);
+            crate::delivery::record_child_exit(exit_code, tail.clone());
             shared::finalize_launch_failure_after_exit(
                 self.config.instance_name.as_deref(),
                 tail.as_deref(),

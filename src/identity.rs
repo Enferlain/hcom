@@ -204,6 +204,9 @@ pub struct StoppedAgent {
     pub directory: String,
     pub tag: String,
     pub session_id: String,
+    /// Child exit code when the tool exited on its own; output is set only for a failure.
+    pub exit_code: Option<i64>,
+    pub output: String,
 }
 
 impl StoppedAgent {
@@ -235,6 +238,9 @@ impl StoppedAgent {
             (reason, "") => out.push_str(&format!(" ({reason})")),
             ("", by) => out.push_str(&format!(" (by {by})")),
             (reason, by) => out.push_str(&format!(" ({reason} by {by})")),
+        }
+        if let Some(code) = self.exit_code.filter(|&code| code != 0) {
+            out.push_str(&format!(" · exit {code}"));
         }
         if !self.tool.is_empty() {
             out.push_str(&format!(" · {}", self.tool));
@@ -283,8 +289,23 @@ pub fn last_stopped(db: &HcomDb, input_name: &str) -> Option<StoppedAgent> {
         directory: field(&data["snapshot"]["directory"]),
         tag: field(&data["snapshot"]["tag"]),
         session_id: field(&data["snapshot"]["session_id"]),
+        exit_code: data["exit_code"].as_i64(),
+        output: field(&data["output"]),
         name,
     })
+}
+
+/// Indented `Last output:` block for a crashed tool, empty when there is none.
+pub fn last_output_block(output: &str) -> String {
+    if output.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from("\n  Last output:");
+    for line in output.lines() {
+        block.push_str("\n    ");
+        block.push_str(line);
+    }
+    block
 }
 
 fn parse_event_timestamp(ts: &str) -> Option<i64> {
@@ -336,8 +357,9 @@ pub fn known_agent_names(db: &HcomDb) -> Vec<String> {
 pub fn describe_missing_agent(db: &HcomDb, input_name: &str) -> String {
     if let Some(stopped) = last_stopped(db, input_name) {
         return format!(
-            "'{input_name}' {}\n  Resume: hcom r {name}  |  History: hcom transcript {name}",
+            "'{input_name}' {}{}\n  Resume: hcom r {name}  |  History: hcom transcript {name}",
             stopped.summary(),
+            last_output_block(&stopped.output),
             name = stopped.display_name()
         );
     }
@@ -1150,6 +1172,26 @@ mod tests {
         assert!(
             last_stopped(&db, "tuna").is_none(),
             "live agent is not stopped"
+        );
+    }
+
+    #[test]
+    fn describe_missing_agent_shows_crash_exit_code_and_output() {
+        let (db, _dir) = make_test_db();
+        let data = serde_json::json!({
+            "action": "stopped", "by": "pty", "reason": "closed", "exit_code": 1,
+            "output": "TypeError: boom\n    at onResponseStart",
+            "snapshot": {"tool": "pi"},
+        });
+        db.log_event("life", "tuna", &data).unwrap();
+
+        let msg = describe_missing_agent(&db, "tuna");
+        assert!(msg.contains("(closed by pty) · exit 1 · pi"), "{msg}");
+        assert!(
+            msg.contains(
+                "\n  Last output:\n    TypeError: boom\n        at onResponseStart\n  Resume:"
+            ),
+            "{msg}"
         );
     }
 

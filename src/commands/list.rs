@@ -931,6 +931,9 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
         if let Some(reason) = data["reason"].as_str() {
             println!("  Reason:     {reason}");
         }
+        if let Some(code) = data["exit_code"].as_i64() {
+            println!("  Exit code:  {code}");
+        }
         if let Some(tool) = snapshot["tool"].as_str() {
             println!("  Tool:       {tool}");
         }
@@ -952,6 +955,8 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
         {
             println!("  Transcript: {tp}");
         }
+        let output = data["output"].as_str().unwrap_or("");
+        print!("{}", crate::identity::last_output_block(output));
         println!("\n  Resume: hcom r {}", entry.instance);
 
         // Show history if multiple stop events
