@@ -236,6 +236,23 @@ fn attribute_disk_match(
     owner
 }
 
+/// "Recent conversation (2 exchanges, 3-4 of 4) - @name:". Positions count
+/// from the session's first exchange, and `--last` loads only the newest ones,
+/// so the total is the newest exchange's position, not how many were loaded.
+fn conversation_header(shown: &[&Exchange], loaded: &[Exchange], instance_name: &str) -> String {
+    let first = shown.first().map_or(0, |e| e.position);
+    let last = shown.last().map_or(0, |e| e.position);
+    let total = loaded.iter().map(|e| e.position).max().unwrap_or(0);
+    let count = shown.len();
+    let noun = if count == 1 { "exchange" } else { "exchanges" };
+    let span = if first == last {
+        first.to_string()
+    } else {
+        format!("{first}-{last}")
+    };
+    format!("Recent conversation ({count} {noun}, {span} of {total}) - @{instance_name}:")
+}
+
 /// Explain an empty range result against the exchanges that do exist.
 fn range_miss_message(
     exchanges: &[Exchange],
@@ -1183,16 +1200,9 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         return 0;
     }
 
-    // Header: "Recent conversation (N exchanges, X-Y of Z) - @instance:"
-    let first_pos = filtered.first().map(|e| e.position).unwrap_or(1);
-    let last_pos = filtered.last().map(|e| e.position).unwrap_or(1);
     println!(
-        "Recent conversation ({} exchanges, {}-{} of {}) - @{}:\n",
-        filtered.len(),
-        first_pos,
-        last_pos,
-        exchanges.len(),
-        instance_name,
+        "{}\n",
+        conversation_header(&filtered, &exchanges, &instance_name)
     );
 
     let owned: Vec<Exchange> = filtered.into_iter().cloned().collect();
@@ -1396,23 +1406,14 @@ fn render_instance_transcript_impl(
         return Ok("No exchanges found".to_string());
     }
 
-    let first_pos = filtered.first().map(|e| e.position).unwrap_or(1);
-    let last_pos = filtered.last().map(|e| e.position).unwrap_or(1);
+    let header = conversation_header(&filtered, &exchanges, &instance_name);
     let owned: Vec<Exchange> = filtered.into_iter().cloned().collect();
     let mut formatted = format_exchanges(&owned, opts.full_mode, opts.detailed);
     if let Some(hint) = transcript::flag_hint(opts.full_mode, opts.detailed) {
         formatted.push('\n');
         formatted.push_str(hint);
     }
-    Ok(format!(
-        "Recent conversation ({} exchanges, {}-{} of {}) - @{}:\n\n{}",
-        owned.len(),
-        first_pos,
-        last_pos,
-        exchanges.len(),
-        instance_name,
-        formatted
-    ))
+    Ok(format!("{header}\n\n{formatted}"))
 }
 
 /// Transcript `(path, tool, session_id)` for an exact agent name: the live row,
@@ -1940,7 +1941,7 @@ View transport messages with: hcom events --remote-fetch --device ABCD --partici
         )
         .unwrap();
 
-        assert!(rendered.contains("Recent conversation (1 exchanges, 2-2 of 2) - @luna:"));
+        assert!(rendered.contains("Recent conversation (1 exchange, 2 of 2) - @luna:"));
         assert!(rendered.contains("second user"));
         assert!(rendered.contains("second answer"));
         assert!(!rendered.contains("first user"));
