@@ -1337,16 +1337,15 @@ fn run_pty_test_plugin_family(tool: &str, read_hook: &str) {
 
     // Confirm the bootstrap path in hcom.log (non-fatal). The two plugin families
     // bootstrap differently, so we look for different events:
-    //   - opencode/kilo: session is created by the delivery thread's PTY inject,
-    //     logged as `delivery.bootstrap_inject`.
-    //   - pi/omp: the plugin binds a session at launch, so the delivery thread
-    //     takes `delivery.opencode_skip_inject` and the plugin injects the first
-    //     message itself, logged as `plugin.hidden_bootstrap`. The PTY inject event
-    //     never fires for this family — checking for it would always miss.
+    //   - opencode/kilo: the session is created by the plugin when the delivery
+    //     thread wakes it, logged as `delivery.session_start_wake` (OpenCode 2
+    //     still types a wake into the PTY: `delivery.bootstrap_inject`).
+    //   - pi/omp: the plugin binds a session at launch and injects the first
+    //     message itself, logged as `plugin.hidden_bootstrap`.
     let (bootstrap_event, bootstrap_desc) = if matches!(tool, "pi" | "omp") {
         ("plugin.hidden_bootstrap", "plugin hidden bootstrap")
     } else {
-        ("delivery.bootstrap_inject", "PTY bootstrap inject")
+        ("delivery.session_start_wake", "plugin session start")
     };
     let log_path = dirs::home_dir().unwrap().join(".hcom/.tmp/logs/hcom.log");
     if let Ok(content) = fs::read_to_string(&log_path) {

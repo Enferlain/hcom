@@ -1548,6 +1548,46 @@ const PHASE2_TIMEOUT: Duration = Duration::from_secs(2);
 /// Overall verification timeout for cursor advance.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Start an OpenCode/Kilo session for mail that arrived before one existed. The
+/// plugin creates the session and shows it in the TUI when woken on its
+/// `session_start` port. OpenCode 2's plugin cannot show one, so it registers no
+/// port, and a body-free wake typed into the TUI starts the session instead.
+/// Returns whether this thread is done: a typed wake was sent. A plugin wake is
+/// repeated each pass until the session binds, so a failed start is retried.
+fn start_plugin_session(db: &HcomDb, state: &DeliveryState, name: &str) -> bool {
+    use crate::notify::WakeKind;
+    if db.has_notify_endpoint_kind(name, WakeKind::SessionStart.as_str()) {
+        crate::notify::wake(db, name, &[WakeKind::SessionStart]);
+        log_info(
+            "native",
+            "delivery.session_start_wake",
+            &format!("{}: asked the plugin to start a session", name),
+        );
+        return false;
+    }
+    let cols = state.screen.read().map(|s| s.cols).unwrap_or(80);
+    let input_box_width = (cols as usize).saturating_sub(15).max(10);
+    let text = build_wake_inject_text(db, name, input_box_width);
+    if !inject_text(state.inject_port, &text) {
+        return false;
+    }
+    // No prompt-text parser here, so give the TUI time to render the text before Enter.
+    std::thread::sleep(Duration::from_millis(800));
+    if !inject_enter(state.inject_port) {
+        return false;
+    }
+    log_info(
+        "native",
+        "delivery.bootstrap_inject",
+        &format!(
+            "Bootstrap inject for {}: '{}'",
+            name,
+            truncate_chars(&text, 40)
+        ),
+    );
+    true
+}
+
 /// How long to wait in idle state before checking again.
 const IDLE_WAIT: Duration = Duration::from_secs(30);
 
@@ -1697,9 +1737,9 @@ pub fn run_delivery_loop(
     // push the initial label, subsequent iterations only push on change.
     let mut host_label = host_label::HostLabel::resolve();
 
-    // OpenCode: plugin handles delivery after session exists. The delivery thread
-    // only injects the FIRST message via PTY to bootstrap the session in the TUI.
-    // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
+    // Plugin tools (OpenCode, Kilo, Pi, OMP): the plugin delivers once it has a
+    // session. Pi and OMP bind theirs at startup; OpenCode and Kilo create one on
+    // the first prompt, so mail that waits before then needs a session started.
     use crate::tool::Tool;
     use std::str::FromStr;
     if let Some(launch) = state.grok_acp.as_ref() {
@@ -1718,22 +1758,23 @@ pub fn run_delivery_loop(
             &mut host_label,
             &mut launch_outcome,
         );
-    } else if matches!(
-        Tool::from_str(&config.tool),
-        Ok(Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp)
-    ) {
+    } else if let Ok(tool @ (Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp)) =
+        Tool::from_str(&config.tool)
+    {
         log_info(
             "native",
-            "delivery.opencode_mode",
+            "delivery.plugin_mode",
             &format!(
-                "OpenCode mode for {}: first-message PTY bootstrap, then plugin handles delivery",
+                "Plugin mode for {}: the plugin handles delivery",
                 current_name
             ),
         );
-        let mut first_message_injected = false;
+        let mut session_started = !matches!(tool, Tool::OpenCode | Tool::Kilo);
         // Mail sent before this thread registered its notify port never wakes
         // it, so the first pass checks for pending mail without waiting.
         let mut first_pass = true;
+        // Mail is waiting for the TUI to come up; poll its screen.
+        let mut awaiting_ready = false;
 
         // Status tracking for terminal title updates
         let mut current_status = ST_LISTENING.to_string();
@@ -1761,46 +1802,31 @@ pub fn run_delivery_loop(
 
             // Wait for notify or timeout
             if !std::mem::take(&mut first_pass) {
-                notify.wait(IDLE_WAIT);
+                notify.wait(if awaiting_ready {
+                    Duration::from_millis(250)
+                } else {
+                    IDLE_WAIT
+                });
             }
             if !running.load(Ordering::Acquire) {
                 break;
             }
 
-            // First-message bootstrap: inject via PTY to create session in TUI.
-            // Only fires once — after this, the plugin handles all delivery.
-            // Skip if plugin already has a session (e.g. user typed first, or session resumed).
-            if !first_message_injected && db.has_session(&current_name) {
-                first_message_injected = true;
+            // The user typed first, or the session was resumed.
+            if !session_started && db.has_session(&current_name) {
+                session_started = true;
                 log_info(
                     "native",
-                    "delivery.opencode_skip_inject",
-                    &format!(
-                        "{}: session already exists, plugin handles delivery",
-                        current_name
-                    ),
+                    "delivery.session_exists",
+                    &format!("{}: session exists, plugin handles delivery", current_name),
                 );
             }
-            if !first_message_injected && db.has_pending(&current_name) {
-                let cols = state.screen.read().map(|s| s.cols).unwrap_or(80);
-                let input_box_width = (cols as usize).saturating_sub(15).max(10);
-                let text = build_wake_inject_text(db, &current_name, input_box_width);
-                if inject_text(state.inject_port, &text) {
-                    // OpenCode has no prompt-text parser here, so give the TUI
-                    // enough time to render the injected bootstrap before Enter.
-                    std::thread::sleep(Duration::from_millis(800));
-                    if inject_enter(state.inject_port) {
-                        first_message_injected = true;
-                        log_info(
-                            "native",
-                            "delivery.bootstrap_inject",
-                            &format!(
-                                "Bootstrap inject for {}: '{}'",
-                                current_name,
-                                truncate_chars(&text, 40)
-                            ),
-                        );
-                    }
+            awaiting_ready = false;
+            if !session_started && db.has_pending(&current_name) {
+                let ready = state.screen.read().map(|s| s.ready).unwrap_or(false);
+                awaiting_ready = !ready;
+                if ready {
+                    session_started = start_plugin_session(db, state, &current_name);
                 }
             }
 

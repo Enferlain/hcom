@@ -40,10 +40,14 @@ pub enum WakeKind {
     LaunchWait,
     /// OpenCode plugin runtime.
     Plugin,
+    /// OpenCode/Kilo plugin with no session yet: a wake makes it create one and
+    /// show it in the TUI. Only the delivery thread wakes it, once the TUI is ready.
+    SessionStart,
 }
 
 impl WakeKind {
-    /// All wake kinds, including temporary launch confirmations.
+    /// Every kind a stopping instance wakes, including temporary launch
+    /// confirmations. Not `SessionStart`: waking it creates a session.
     pub const ALL: &'static [WakeKind] = &[
         WakeKind::Pty,
         WakeKind::Hook,
@@ -80,6 +84,7 @@ impl WakeKind {
             WakeKind::EventsWait => "events_wait",
             WakeKind::LaunchWait => "launch_wait",
             WakeKind::Plugin => "plugin",
+            WakeKind::SessionStart => "session_start",
         }
     }
 }

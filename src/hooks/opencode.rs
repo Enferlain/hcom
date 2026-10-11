@@ -242,6 +242,11 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
     if let Some(port) = notify_port {
         upsert_plugin_notify_endpoint(db, &instance_name, port);
     }
+    // The session exists now, so the plugin's standby port is spent.
+    let _ = db.delete_notify_endpoint(
+        &instance_name,
+        crate::notify::WakeKind::SessionStart.as_str(),
+    );
 
     let bootstrap_text = bootstrap::get_bootstrap(db, ctx, &instance_name, &tool);
 
@@ -261,6 +266,34 @@ fn handle_start(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String
         response["model"] = model;
     }
     (0, serde_json::to_string(&response).unwrap_or_default())
+}
+
+/// Handle opencode-standby: the plugin loaded with no session and can create
+/// one on request. Registers its port as the instance's `session_start`
+/// endpoint; the delivery thread wakes it once the TUI is ready and mail waits.
+///
+/// Expects: hcom opencode-standby --port <port>
+fn handle_standby(ctx: &HcomContext, db: &HcomDb, argv: &[String]) -> (i32, String) {
+    let Some(port) = parse_flag(argv, "--port").and_then(|s| s.parse::<u16>().ok()) else {
+        return (0, r#"{"error":"Missing --port"}"#.to_string());
+    };
+    let Some(process_id) = &ctx.process_id else {
+        return (0, r#"{"error":"HCOM_PROCESS_ID not set"}"#.to_string());
+    };
+    let Ok(Some(name)) = db.get_process_binding(process_id) else {
+        return (
+            0,
+            r#"{"error":"No instance bound to this process"}"#.to_string(),
+        );
+    };
+    let kind = crate::notify::WakeKind::SessionStart.as_str();
+    if let Err(e) = db.upsert_notify_endpoint(&name, kind, port) {
+        return (
+            0,
+            serde_json::json!({"error": format!("register failed: {e}")}).to_string(),
+        );
+    }
+    (0, serde_json::json!({"name": name}).to_string())
 }
 
 /// `opencode-status` carries both status changes and tool activity
@@ -330,6 +363,7 @@ pub fn dispatch_opencode_hook(hook_name: &str, argv: &[String]) -> (i32, String)
         ),
         || match hook_name_owned.as_str() {
             "opencode-start" => handle_start(&ctx, &db, &handler_argv),
+            "opencode-standby" => handle_standby(&ctx, &db, &handler_argv),
             "opencode-status" => handle_status(&db, &handler_argv),
             "opencode-read" => plugin_rpc::handle_read(&db, &handler_argv),
             "opencode-stop" => plugin_rpc::handle_stop(&db, &handler_argv),
@@ -1679,5 +1713,38 @@ mod tests {
         assert!(inst.last_event_id >= old_id, "cursor must skip the backlog");
         let unread = reply(plugin_rpc::handle_read(&db, &sv(&["--name", "luna"])));
         assert_eq!(unread["messages"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_standby_port_registers_until_session_binds() {
+        crate::config::Config::init();
+        let (_env_dir, hcom_dir, test_home, _guard) =
+            crate::hooks::test_helpers::isolated_test_env();
+        let (_db_dir, db) = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, created_at, last_event_id)
+                 VALUES ('luna', 'opencode', 'pending', 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("pid-1", "", "luna").unwrap();
+        let env = std::collections::HashMap::from([
+            (
+                "HCOM_DIR".to_string(),
+                hcom_dir.to_string_lossy().to_string(),
+            ),
+            ("HOME".to_string(), test_home.to_string_lossy().to_string()),
+            ("HCOM_PROCESS_ID".to_string(), "pid-1".to_string()),
+        ]);
+        let ctx = HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+        let kind = crate::notify::WakeKind::SessionStart.as_str();
+
+        let out = reply(handle_standby(&ctx, &db, &sv(&["--port", "4567"])));
+        assert_eq!(out["name"], "luna", "{out}");
+        assert!(db.has_notify_endpoint_kind("luna", kind));
+
+        reply(handle_start(&ctx, &db, &sv(&["--session-id", "ses_new"])));
+        assert!(!db.has_notify_endpoint_kind("luna", kind));
     }
 }

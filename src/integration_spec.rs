@@ -276,6 +276,7 @@ const CODEX_HOOKS: &[&str] = &[
 
 const OPENCODE_HOOKS: &[&str] = &[
     "opencode-start",
+    "opencode-standby",
     "opencode-status",
     "opencode-read",
     "opencode-stop",

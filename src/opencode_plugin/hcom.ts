@@ -232,6 +232,9 @@ type Transport = {
   // Answer a permission request "once"; null on success, or an error. OpenCode 2
   // approves hcom's commands through config rules instead, so it has none.
   allowOnce?: (sessionID: string, requestID: string) => Promise<string | null>
+  // Create a session and show it in the TUI; its ID, or null on failure.
+  // OpenCode 2's server plugin cannot show one, so it has none.
+  startSession?: () => Promise<string | null>
 }
 
 // A batch handed to OpenCode. It is acknowledged only once it is admitted to
@@ -267,6 +270,8 @@ function createCore(transport: Transport) {
   // not touch state after it resumes.
   let generation = 0
   let notifyServer: Server | null = null
+  let standbyServer: Server | null = null
+  let standbyStarting = false
   let reconcileTimer: ReturnType<typeof setInterval> | null = null
   let reconcileInFlight = false
   let delivery: Delivery | null = null
@@ -359,6 +364,11 @@ function createCore(transport: Transport) {
     notifyServer = null
   }
 
+  function stopStandby(): void {
+    try { standbyServer?.close() } catch {}
+    standbyServer = null
+  }
+
   function startReconcileTimer(): void {
     if (reconcileTimer) return
     reconcileTimer = setInterval(() => { void reconcile() }, RECONCILE_MS)
@@ -421,6 +431,7 @@ function createCore(transport: Transport) {
         if (boundModel) launchedModel = boundModel
         notifyServer = server
         server = null
+        stopStandby()
         instanceName = reply.name
         sessionId = typeof reply.session_id === "string" && reply.session_id ? reply.session_id : sid
         bootstrapText = typeof reply.bootstrap === "string" && reply.bootstrap ? reply.bootstrap : null
@@ -828,10 +839,44 @@ function createCore(transport: Transport) {
     })
   }
 
+  // Fresh launch: OpenCode creates no session until the first prompt. Stand by
+  // to create one: hcom wakes this port when mail waits and the TUI is ready.
+  async function standBy(startSession: () => Promise<string | null>): Promise<void> {
+    const server = await startNotifyServer(() => void onStandbyWake(startSession))
+    const port = serverPort(server)
+    if (!server || !port || disposed || instanceName || bindingPromise) {
+      server?.close()
+      return
+    }
+    standbyServer = server
+    if (!(await rpc(["opencode-standby", "--port", String(port)], null))) stopStandby()
+  }
+
+  // hcom wakes again until the session binds, so a failed start is retried.
+  // Binding closes the standby server.
+  async function onStandbyWake(startSession: () => Promise<string | null>): Promise<void> {
+    if (!standbyServer || standbyStarting || disposed || instanceName || bindingPromise) return
+    standbyStarting = true
+    try {
+      const sid = await startSession()
+      if (!sid) return
+      log("INFO", "plugin.session_started", null, { session_id: sid })
+      // session.created binds it too; whichever runs first does the binding.
+      await bindIdentity(sid)
+      if (instanceName && sessionId === sid) await deliverPending("session_start")
+    } finally {
+      standbyStarting = false
+    }
+  }
+
   // Resumed session (`hcom r`): OpenCode emits no session.created, and no
   // session.status until the first prompt, so bind now and deliver anything
   // already pending. Not awaited: plugin load must not wait on hcom.
   const resumeSessionId = process.env.HCOM_RESUME_SESSION_ID
+  const startSession = transport.startSession
+  if (!resumeSessionId && startSession && process.env.HCOM_LAUNCHED === "1") {
+    void standBy(startSession).catch((e) => log("ERROR", "plugin.standby_error", null, { error: String(e) }))
+  }
   if (resumeSessionId) {
     void (async () => {
       await bindIdentity(resumeSessionId)
@@ -874,6 +919,7 @@ function createCore(transport: Transport) {
       disposed = true
       generation++
       stopNotifyServer()
+      stopStandby()
       stopReconcileTimer()
     },
   }
@@ -884,8 +930,12 @@ function createCore(transport: Transport) {
 // each app's own `Plugin` type.
 type OpenCode1Client = {
   session: {
+    create(options?: any): Promise<any>
     promptAsync(options: any): Promise<any>
     status(options?: any): Promise<any>
+  }
+  tui: {
+    publish(options: any): Promise<any>
   }
   postSessionIdPermissionsPermissionId(options: any): Promise<any>
 }
@@ -920,6 +970,18 @@ export const HcomPlugin = async ({ client }: { client: OpenCode1Client }) => {
         body: { response: "once" },
       })
       return result?.error ? JSON.stringify(result.error) : null
+    },
+    async startSession() {
+      const created = await client.session.create({ body: {} })
+      const sessionID = created?.data?.id
+      if (typeof sessionID !== "string" || !sessionID) {
+        log("WARN", "plugin.session_create_failed", null, { error: JSON.stringify(created?.error ?? null) })
+        return null
+      }
+      // The SDK types leave this event out of /tui/publish, but the server takes it.
+      const shown = await client.tui.publish({ body: { type: "tui.session.select", properties: { sessionID } } as any })
+      if (shown?.error) log("WARN", "plugin.session_select_failed", null, { error: JSON.stringify(shown.error) })
+      return sessionID
     },
   })
   return {
