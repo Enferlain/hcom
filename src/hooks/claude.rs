@@ -2734,6 +2734,12 @@ fn merge_per_run_settings(settings: &mut Value, auto_approve: bool) -> Result<()
         }
         entries.push(group);
     }
+    // Each message hcom delivers through Stop/SubagentStop is one more block;
+    // past Claude's default cap of 8 in a row (reset only by a tool call), it
+    // ends the turn and drops the message hcom has already handed over.
+    object_field(settings, "env")?
+        .entry("CLAUDE_CODE_STOP_HOOK_BLOCK_CAP")
+        .or_insert_with(|| Value::String("0".to_string()));
     if auto_approve {
         let permissions = object_field(settings, "permissions")?;
         let allow = permissions
@@ -3180,6 +3186,7 @@ mod tests {
         );
         assert_eq!(settings["env"]["CALLER"], "yes");
         assert!(settings["env"].get("HCOM").is_none());
+        assert_eq!(settings["env"]["CLAUDE_CODE_STOP_HOOK_BLOCK_CAP"], "0");
         assert_eq!(
             settings["hooks"]["SessionStart"][1]["hooks"][0]["args"]
                 .as_array()
@@ -4503,6 +4510,7 @@ mod tests {
             }
         }
         let env = legacy["env"].as_object_mut().unwrap();
+        env.remove("CLAUDE_CODE_STOP_HOOK_BLOCK_CAP");
         env.insert("HCOM".into(), serde_json::json!("hcom"));
         std::fs::write(&settings_path, legacy.to_string()).unwrap();
         let after_setup = read_json(&settings_path);
