@@ -2770,41 +2770,21 @@ mod tests {
     use std::collections::BTreeMap;
 
     struct EnvVarGuard {
-        saved: BTreeMap<String, Option<String>>,
+        saved: BTreeMap<String, Option<std::ffi::OsString>>,
     }
 
     impl EnvVarGuard {
         fn clean_detection_env() -> Self {
-            let mut keys: Vec<String> = [
-                "CLAUDECODE",
-                "CLAUDE_ENV_FILE",
-                "ANTIGRAVITY_AGENT",
-                "GEMINI_CLI",
-                "CODEX_SANDBOX",
-                "CODEX_SANDBOX_NETWORK_DISABLED",
-                "CODEX_MANAGED_BY_NPM",
-                "CODEX_MANAGED_BY_BUN",
-                "CODEX_THREAD_ID",
-                "CODEX_SESSION_ID",
-                "OPENCODE",
-                "KILO",
-                "CURSOR_AGENT",
-                "CURSOR_PROJECT_DIR",
-                "KIMI_CODE_CLI",
-                "KIMI_SESSION_ID",
-                "HCOM_TOOL",
-                "HCOM_LAUNCHED",
-                "HCOM_PI",
-                "CI",
-                "GITHUB_ACTIONS",
-                "CARGO_TEST_PARENT",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+            let mut keys: Vec<String> = tool_marker_vars()
+                .iter()
+                .copied()
+                .chain(["HCOM_LAUNCHED", "CI", "GITHUB_ACTIONS", "CARGO_TEST_PARENT"])
+                .map(str::to_string)
+                .collect();
             keys.extend(
-                std::env::vars()
+                std::env::vars_os()
                     .map(|(key, _)| key)
+                    .filter_map(|key| key.into_string().ok())
                     .filter(|key| key.starts_with("CARGO_")),
             );
             Self::remove(keys)
@@ -2818,7 +2798,7 @@ mod tests {
             for key in keys {
                 saved
                     .entry(key.clone())
-                    .or_insert_with(|| std::env::var(&key).ok());
+                    .or_insert_with(|| std::env::var_os(&key));
                 unsafe { std::env::remove_var(key) };
             }
             Self { saved }
@@ -3248,21 +3228,60 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_clean_detection_env_clears_and_restores_all_markers() {
+        let _original = EnvVarGuard::clean_detection_env();
+        for var in tool_marker_vars() {
+            unsafe { std::env::set_var(var, "1") };
+        }
+        assert!(contaminated_parent());
+
+        {
+            let _clean = EnvVarGuard::clean_detection_env();
+            for var in tool_marker_vars() {
+                assert!(std::env::var_os(var).is_none(), "{var} was not cleared");
+            }
+            assert!(!contaminated_parent());
+        }
+
+        for var in tool_marker_vars() {
+            assert_eq!(
+                std::env::var(var).as_deref(),
+                Ok("1"),
+                "{var} was not restored"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
     fn test_contaminated_parent_detection() {
         let _guard = EnvVarGuard::clean_detection_env();
         assert!(!contaminated_parent());
 
-        unsafe { std::env::set_var("CLAUDECODE", "1") };
-        assert!(contaminated_parent());
-        unsafe { std::env::remove_var("CLAUDECODE") };
+        for rule in crate::shared::tool_detection::TOOL_DETECTION_RULES {
+            for predicate in rule.predicates {
+                let value = match predicate.condition {
+                    crate::shared::tool_detection::EnvMatch::Equals(value) => value,
+                    _ => "1",
+                };
+                unsafe { std::env::set_var(predicate.var, value) };
+                assert!(contaminated_parent(), "{}={value}", predicate.var);
+                unsafe { std::env::remove_var(predicate.var) };
+                assert!(!contaminated_parent(), "after removing {}", predicate.var);
+            }
+        }
 
-        unsafe { std::env::set_var("CODEX_THREAD_ID", "thread") };
+        unsafe { std::env::set_var("HCOM_LAUNCHED", "1") };
         assert!(contaminated_parent());
-        unsafe { std::env::remove_var("CODEX_THREAD_ID") };
+        unsafe { std::env::remove_var("HCOM_LAUNCHED") };
 
         unsafe { std::env::set_var("CI", "1") };
         assert!(contaminated_parent());
         unsafe { std::env::remove_var("CI") };
+
+        unsafe { std::env::set_var("GITHUB_ACTIONS", "true") };
+        assert!(contaminated_parent());
+        unsafe { std::env::remove_var("GITHUB_ACTIONS") };
 
         unsafe { std::env::set_var("CARGO_TEST_PARENT", "1") };
         assert!(contaminated_parent());
