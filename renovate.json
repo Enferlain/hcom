@@ -1,9 +1,9 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended",
-    ":pinDigests"
+    "config:recommended"
   ],
+  "pinDigests": true,
   "schedule": [
     "* 0-5 1 * *"
   ],
