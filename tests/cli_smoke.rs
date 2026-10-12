@@ -11,6 +11,33 @@ use support::{Hcom, parse_hcom_marker};
 
 #[cfg(unix)]
 #[test]
+fn fixture_pins_cargo_target_before_dev_root_reexec() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = Hcom::new();
+    let foreign_root = h.root_path().join("foreign-checkout");
+    let foreign_bin = foreign_root.join("target/debug/hcom");
+    std::fs::create_dir_all(foreign_bin.parent().unwrap()).unwrap();
+    std::fs::write(&foreign_bin, "#!/bin/sh\nprintf 'foreign binary\\n'\n").unwrap();
+    std::fs::set_permissions(&foreign_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = h
+        .cmd()
+        .env("HCOM_DEV_ROOT", &foreign_root)
+        .args(["config", "HCOM_DIR"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        h.hcom_dir.to_string_lossy(),
+    );
+    let log = std::fs::read_to_string(h.hcom_dir.join(".tmp/logs/hcom.log")).unwrap_or_default();
+    assert!(!log.contains("\"event\":\"dev_root_reexec\""), "{log}");
+}
+
+#[cfg(unix)]
+#[test]
 fn pty_defaults_missing_term_and_preserves_explicit_term() {
     let h = Hcom::new();
     for term in [None, Some("xterm-kitty"), Some("dumb"), Some("")] {

@@ -164,6 +164,16 @@ fn apply_isolated_env_ctx(
 
     command.env("HOME", &ctx.home);
     command.env("HCOM_DEV_ROOT", env!("CARGO_MANIFEST_DIR"));
+    // Keep dev-root re-exec in this binary's Cargo output directory. Clearing
+    // CARGO_TARGET_DIR used to redirect custom-target builds into the shared
+    // checkout's target/, which can contain another operating system's binary.
+    command.env(
+        "CARGO_TARGET_DIR",
+        ctx.bin
+            .parent()
+            .and_then(Path::parent)
+            .expect("hcom binary must live in a Cargo profile directory"),
+    );
     #[cfg(windows)]
     {
         // Windows PowerShell and cmd are OS components, not user state.
@@ -359,6 +369,16 @@ impl Hcom {
         // The scripted Codex shell call uses `hcom ...`; make the exact
         // CARGO_BIN_EXE_hcom binary discoverable before any ambient PATH.
         let path_env = pins::tool_path(bin.parent());
+        // CI-style launches rebuild their environment from a clean shell.
+        // Persist the target directory so child hooks keep the same binary too.
+        let launch_env = BTreeMap::from([(
+            "CARGO_TARGET_DIR".to_string(),
+            bin.parent()
+                .and_then(Path::parent)
+                .expect("hcom binary must live in a Cargo profile directory")
+                .to_string_lossy()
+                .into_owned(),
+        )]);
 
         let fixture = Self {
             root,
@@ -369,12 +389,28 @@ impl Hcom {
             workspace,
             bin,
             path_env,
-            launch_env: RefCell::new(BTreeMap::new()),
+            launch_env: RefCell::new(launch_env),
             cleanup_pids: RefCell::new(HashSet::new()),
             cleanup_children: RefCell::new(Vec::new()),
         };
-        install_diagnostics_panic_hook();
+        fixture.write_hcom_env_file();
         let ctx = fixture.diag_context();
+        // Check isolation with a read-only command before any test can send,
+        // launch, or clean up agents. A host executable bridge can discard env
+        // overrides rather than failing to execute a foreign binary.
+        let (code, stdout, stderr) = run_ctx(&ctx, ["config", "HCOM_DIR"]);
+        let log =
+            fs::read_to_string(fixture.hcom_dir.join(".tmp/logs/hcom.log")).unwrap_or_default();
+        assert!(
+            code == 0
+                && stdout.trim() == fixture.hcom_dir.to_string_lossy()
+                && fixture.hcom_dir.join("hcom.db").is_file()
+                && !log.contains("\"event\":\"dev_root_reexec\""),
+            "fixture isolation failed: expected binary={}, HCOM_DIR={}, exit={code}, stdout={stdout:?}, stderr={stderr:?}, log={log}",
+            fixture.bin.display(),
+            fixture.hcom_dir.display(),
+        );
+        install_diagnostics_panic_hook();
         ACTIVE_DIAG.with(|slot| *slot.borrow_mut() = Some(ctx));
         fixture
     }
