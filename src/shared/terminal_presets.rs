@@ -566,8 +566,9 @@ pub static TERMINAL_PRESETS: LazyLock<Vec<(&'static str, TerminalPreset)>> = Laz
         // `--label {instance_name}` labels the *tab* (e.g. `luna`) — herdr's
         // `tab create --label` sets the tab label, not the pane label, which
         // stays null until the delivery loop's first `pane.rename`. The styled
-        // status label (`◉ luna [claude]`) and the agent state are reported
-        // separately from the delivery loop (`pane.rename` / `pane.report_agent`).
+        // status label (`◉ luna [claude]`) is pushed separately from the
+        // delivery loop (`pane.rename`); herdr detects the agent and its state
+        // itself via the `HERDR_AGENT` hint on `hcom pty`.
         (
             "herdr",
             p(

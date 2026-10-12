@@ -849,9 +849,7 @@ impl Proxy {
         // under it. In `Off` we neither strip the tool's titles nor write our own;
         // in `Combined` we append the tool's live title (read from `self.screen`,
         // which this thread owns — no extra Arc needed).
-        let title_mode = crate::shared::TitleMode::from_config(
-            &crate::config::HcomConfig::load(None).title_mode,
-        );
+        let title_mode = shared::session_title_mode();
         let title_enabled = title_mode != crate::shared::TitleMode::Off;
         let mut last_written_child = String::new();
 

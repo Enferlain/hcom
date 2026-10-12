@@ -1245,7 +1245,7 @@ Usage:
   hcom config title_mode combined   # hcom status + live tool title (default)
   hcom config title_mode label      # hcom status label only
   hcom config title_mode off        # use the tool's title
-  hcom config title_mode <empty>     # reset to the default
+  hcom config title_mode <empty>    # reset to the default
 
 Notes:
   - This affects terminal/tab titles, not the visible PTY output.

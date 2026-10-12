@@ -202,7 +202,7 @@ pub(crate) const TERMINAL_CONTEXT_VARS: &[&str] = &[
     "WT_SESSION",
     // HERDR_* not stripped: the herdr preset's CLI (`herdr tab create` /
     // `herdr pane run ...`) resolves its server socket from $HERDR_SOCKET_PATH;
-    // the delivery loop also reuses it for `pane.rename` / `pane.report_agent`.
+    // the delivery loop also reuses it for `pane.rename`.
     // Other presets pass the socket via CLI flag (e.g. `kitty @ --to
     // {kitty_listen}`) and don't need their identity vars to survive in the
     // launcher env.

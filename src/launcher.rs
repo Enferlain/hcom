@@ -769,6 +769,11 @@ fn build_claude_command(args: &[String]) -> String {
 /// Tool-specific extra environment variables for PTY mode.
 fn tool_extra_env(tool: &str) -> HashMap<String, String> {
     let mut m = HashMap::new();
+    // herdr's wrapper hint: it reads this from the pane's foreground process
+    // (`hcom pty`, which hides the tool in its own PTY) to classify the pane
+    // and pick the tool's screen-detection manifest. hcom tool names are all
+    // valid herdr agent labels; outside herdr nothing reads it.
+    m.insert("HERDR_AGENT".to_string(), tool.to_string());
     // Claude is driven by the PTY wrapper (ConPTY on Windows, openpty on Unix),
     // which handles injection; HCOM_PTY_MODE tells the Stop hook to defer to it.
     if tool == "claude" {
@@ -3188,6 +3193,10 @@ mod tests {
             Some("pid-123")
         );
         assert!(!runner_env.contains_key("HCOM_PTY_MODE"));
+        assert_eq!(
+            runner_env.get("HERDR_AGENT").map(String::as_str),
+            Some("codex")
+        );
     }
 
     #[test]

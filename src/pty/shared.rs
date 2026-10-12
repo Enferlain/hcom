@@ -822,6 +822,17 @@ fn launch_was_killed(db: &HcomDb, name: &str, launch_event_id: Option<i64>) -> b
         .unwrap_or(false)
 }
 
+/// This session's terminal-title mode. Inside herdr it is always `Off`: herdr's
+/// chrome shows the label hcom pushes via `pane.rename`, while the OSC title
+/// only feeds herdr's agent detection, whose title rules expect the tool's own
+/// title (e.g. Claude's leading spinner) — a `▶ name -` prefix hides it.
+pub(super) fn session_title_mode() -> crate::shared::TitleMode {
+    if std::env::var("HERDR_ENV").as_deref() == Ok("1") {
+        return crate::shared::TitleMode::Off;
+    }
+    crate::shared::TitleMode::from_config(&crate::config::HcomConfig::load(None).title_mode)
+}
+
 /// Build the OSC 1/2 title-set escape for `name`/`status` under `tool_name`.
 ///
 /// - [`TitleMode::Label`] → `◉ luna [claude]` (hcom's status label only).
@@ -1845,6 +1856,16 @@ No session found matching 'never-saved'"
         assert!(f.title_write_safe());
 
         assert_eq!(out, b"\x1bPpayload\x1b\\\x1bNx\x1b(B");
+    }
+
+    #[test]
+    #[serial]
+    fn session_title_mode_is_off_inside_herdr() {
+        // SAFETY: tests are #[serial].
+        unsafe { std::env::set_var("HERDR_ENV", "1") };
+        let mode = session_title_mode();
+        unsafe { std::env::remove_var("HERDR_ENV") };
+        assert_eq!(mode, crate::shared::TitleMode::Off);
     }
 
     #[test]
