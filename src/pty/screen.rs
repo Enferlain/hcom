@@ -235,22 +235,28 @@ pub struct ScreenTracker {
     instance_name: Option<String>,
 }
 
-/// Codex (0.157+) draws its composer, ready pattern included, before startup
-/// finishes: input typed then is held as a draft ("Waiting for startup"), and a
-/// folder-trust screen can still take over the TUI. Its header reads
-/// `model: loading` until startup completes, and its onboarding screens, drawn
-/// over a composer whose ready-pattern row can survive underneath, end in an
-/// `enter continue · esc quit` footer. Either line means not ready.
-fn is_codex_startup_line(line: &str) -> bool {
-    is_codex_loading_header(line) || is_codex_onboarding_footer(line)
+/// Codex draws its composer, ready pattern included, before startup finishes:
+/// input typed then is held as a draft ("Waiting for startup"), and a
+/// full-screen prompt (folder trust, update available, startup hooks review)
+/// can still take over the TUI. Until startup completes, the directory line
+/// under its `>_ OpenAI Codex (vX)` header reads `loading`. Those prompts and
+/// in-session pickers are drawn over a composer whose ready-pattern row can
+/// survive underneath (the update prompt's own `› 1. Update now` row matches
+/// it too), and all end in an `enter <action> · esc <action>` footer. Either
+/// means not ready.
+fn is_codex_startup_screen(lines: &[String]) -> bool {
+    is_codex_loading(lines) || lines.iter().any(|line| is_codex_modal_footer(line))
 }
 
-fn is_codex_loading_header(line: &str) -> bool {
-    line.contains("model:") && line.contains("loading") && line.contains("/model to change")
+fn is_codex_loading(lines: &[String]) -> bool {
+    lines
+        .windows(2)
+        .any(|pair| pair[0].contains(">_ OpenAI Codex") && pair[1].trim() == "loading")
 }
 
-fn is_codex_onboarding_footer(line: &str) -> bool {
-    line.contains("enter continue") && line.contains("esc quit")
+fn is_codex_modal_footer(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("enter ") && line.contains(" \u{b7} esc ")
 }
 
 impl ScreenTracker {
@@ -435,30 +441,24 @@ impl ScreenTracker {
             return true;
         }
 
-        let screen = self.parser.screen();
-        let (_rows, cols) = screen_size(screen);
-
-        let mut pattern_visible = false;
-        for line in screen.rows(0, cols) {
-            if is_codex_startup_line(&line) {
-                return false;
-            }
-            pattern_visible |= self
-                .ready_patterns
-                .iter()
-                .any(|p| line.contains(p.as_str()));
+        let lines = self.get_screen_lines();
+        if is_codex_startup_screen(&lines) {
+            return false;
         }
-        pattern_visible
+        lines.iter().any(|line| {
+            self.ready_patterns
+                .iter()
+                .any(|p| line.contains(p.as_str()))
+        })
     }
 
     /// Codex is still starting and nothing needs answering yet: its header
-    /// says `model: loading` and no onboarding screen has taken over. Startup
+    /// says `loading` and no full-screen prompt has taken over. Startup
     /// can sit here for seconds (the folder-trust lookup runs first), which must
     /// not read as a launch that settled without becoming ready.
     pub fn is_codex_startup_loading(&self) -> bool {
         let lines = self.get_screen_lines();
-        lines.iter().any(|line| is_codex_loading_header(line))
-            && !lines.iter().any(|line| is_codex_onboarding_footer(line))
+        is_codex_loading(&lines) && !lines.iter().any(|line| is_codex_modal_footer(line))
     }
 
     /// Check if the latest complete OSC terminal title requires action.
@@ -1044,7 +1044,7 @@ impl ScreenTracker {
         // input there is held as a draft and an onboarding screen can still
         // take over. Unknown input keeps both launch readiness and delivery
         // waiting until startup is done.
-        if lines.iter().any(|line| is_codex_startup_line(line)) {
+        if is_codex_startup_screen(&lines) {
             return None;
         }
 
@@ -1976,9 +1976,9 @@ mod tests {
 
     #[test]
     fn codex_not_ready_while_startup_header_is_loading() {
-        let header = |model: &str| {
+        let header = |directory: &str| {
             format!(
-                "\u{2502} model:     {model}   /model to change \u{2502}\r\n\
+                "  >_ OpenAI Codex (v0.162.1)\r\n     {directory}\r\n\r\n\
                  \u{203a} \x1b[2mAsk Codex to do anything\x1b[0m\r\n  ? for shortcuts\r\n"
             )
         };
@@ -1993,7 +1993,7 @@ mod tests {
         );
 
         let mut t = make_tracker(24, 80, "? for shortcuts");
-        t.process(header("GPT-5.5 default").as_bytes());
+        t.process(header("~/Dev/hook-comms-public").as_bytes());
         assert!(t.is_ready());
         assert_eq!(t.get_codex_input_text(), Some(String::new()));
 
@@ -2007,6 +2007,24 @@ mod tests {
             !t.is_codex_startup_loading(),
             "a screen awaiting an answer is not loading"
         );
+        assert_eq!(t.get_codex_input_text(), None);
+    }
+
+    #[test]
+    fn codex_not_ready_on_update_prompt() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(
+            "  Update available \u{b7} 0.159.2 \u{2192} 0.162.1\r\n\r\n\
+             \u{203a} 1. Update now (runs `npm install -g @openai/codex`)\r\n\
+             \x20 2. Skip\r\n  3. Skip until next version\r\n\r\n\
+             \x20 enter continue \u{b7} esc skip\r\n"
+                .as_bytes(),
+        );
+        assert!(
+            !t.is_ready(),
+            "the update menu's `›` row is not the composer"
+        );
+        assert!(!t.is_codex_startup_loading());
         assert_eq!(t.get_codex_input_text(), None);
     }
 

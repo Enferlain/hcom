@@ -591,11 +591,12 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
         shared_hooks_with: None,
         invocation: HookInvocation::JsonStdin,
     },
-    // - require_ready_prompt=false: "? for shortcuts" hides in narrow terminals.
+    // - require_ready_prompt=true: no composer (or a startup prompt / picker
+    //   drawn over it) reads as not_ready, not as uncommitted text.
     // - require_prompt_empty=true: VT100 dim detection after `›` or `»`.
     gates: GatesSpec {
         require_idle: true,
-        require_ready_prompt: false,
+        require_ready_prompt: true,
         require_prompt_empty: true,
         block_on_user_activity: true,
         block_on_approval: true,

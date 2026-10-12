@@ -3440,8 +3440,8 @@ mod tests {
         assert!(gemini.require_ready_prompt);
         assert!(!gemini.require_prompt_empty);
 
-        // Codex: same as Claude (ready pattern unreliable in narrow terminals)
-        assert!(!codex.require_ready_prompt);
+        // Codex: composer glyph must be visible (a modal over it is not_ready)
+        assert!(codex.require_ready_prompt);
         assert!(codex.require_prompt_empty);
 
         // All require idle
