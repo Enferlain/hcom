@@ -2059,27 +2059,17 @@ fn test_relay_roundtrip() {
     );
 
     // Evidence the resume actually rebooted claude into hcom, not just
-    // flipped a DB row: the life event log records a "bootstrap" action.
-    let events_have_bootstrap = {
-        let out = hcom_with_dir(
-            &format!("events --agent {resumed_full_name} --last 40"),
-            &path_b,
-        );
-        String::from_utf8_lossy(&out.stdout).contains("bootstrap")
-    };
-    // Fallback evidence: hcom's hooks flip hooks_bound=true on first
-    // daemon contact after a resume.
+    // flipped a DB row: the new process's SessionStart hook bound its session.
     let hooks_bound = find_instance_by_base(&path_b, &resumed_name)
         .and_then(|inst| inst["hooks_bound"].as_bool())
         .unwrap_or(false);
     assert!(
-        events_have_bootstrap || hooks_bound,
-        "no evidence of hcom rebind on resumed {resumed_full_name} \
-         (events={events_have_bootstrap}, hooks_bound={hooks_bound})"
+        hooks_bound,
+        "resumed {resumed_full_name} is not bound to a session (hooks_bound=false)"
     );
     logln!(
         log,
-        "  OK: resumed instance is rebound to hcom (events={events_have_bootstrap}, hooks_bound={hooks_bound})"
+        "  OK: resumed instance is rebound to hcom (hooks_bound=true)"
     );
 
     let unexpected = claude_mock.unexpected();
