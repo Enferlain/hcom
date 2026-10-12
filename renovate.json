@@ -30,6 +30,19 @@
       "allowedVersions": "<23"
     },
     {
+      "description": [
+        "The ci.yml MSRV job must match rust-version in Cargo.toml; bump both together by hand."
+      ],
+      "matchFileNames": [
+        ".github/workflows/ci.yml"
+      ],
+      "matchDepNames": [
+        "rust"
+      ],
+      "matchCurrentValue": "1.89",
+      "enabled": false
+    },
+    {
       "matchUpdateTypes": [
         "minor",
         "patch",
