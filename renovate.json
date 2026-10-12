@@ -1,0 +1,107 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":pinDigests"
+  ],
+  "schedule": [
+    "* 0-5 1 * *"
+  ],
+  "lockFileMaintenance": {
+    "enabled": false
+  },
+  "packageRules": [
+    {
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "serial_test"
+      ],
+      "allowedVersions": "<4"
+    },
+    {
+      "matchManagers": [
+        "npm"
+      ],
+      "matchPackageNames": [
+        "@types/node"
+      ],
+      "allowedVersions": "<23"
+    },
+    {
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
+      "groupName": "monthly dependency updates"
+    },
+    {
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
+    },
+    {
+      "description": [
+        "These shared release-action pins require updating dist-workspace.toml and regenerating release.yml together."
+      ],
+      "matchPackageNames": [
+        "actions/checkout",
+        "actions/upload-artifact",
+        "actions/download-artifact",
+        "actions/setup-java",
+        "android-actions/setup-android"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "pep621"
+      ],
+      "matchPackageNames": [
+        "maturin"
+      ],
+      "rangeStrategy": "bump"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^scripts/mock-tools\\.pins$/"
+      ],
+      "matchStrings": [
+        "(?<depName>@[^\\s@]+/[^\\s@]+)@(?<currentValue>[^\\s]+)"
+      ],
+      "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/build-wheels\\.yml$/"
+      ],
+      "matchStrings": [
+        "(?:^|\\n)[ \\t]*version: \"(?<currentValue>[0-9.]+)\"[ \\t]*(?:\\r?\\n|$)",
+        "maturin==(?<currentValue>[0-9.]+)"
+      ],
+      "depNameTemplate": "maturin",
+      "datasourceTemplate": "pypi"
+    }
+  ],
+  "timezone": "Europe/London",
+  "prConcurrentLimit": 1,
+  "updateNotScheduled": false,
+  "automerge": false,
+  "vulnerabilityAlerts": {
+    "groupName": null
+  },
+  "branchConcurrentLimit": 1,
+  "ignorePaths": [
+    ".github/workflows/release.yml",
+    ".github/build-setup.yml"
+  ]
+}
