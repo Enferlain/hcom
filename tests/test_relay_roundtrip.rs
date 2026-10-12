@@ -144,15 +144,7 @@ fn hcom_with_dir(cmd: &str, hcom_dir: &str) -> Output {
             ),
         );
 
-    let mut path_entries = Vec::new();
-    if let Some(parent) = bin.parent() {
-        path_entries.push(parent.to_path_buf());
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        path_entries.extend(std::env::split_paths(&path));
-    }
-    let path = std::env::join_paths(path_entries).expect("construct hcom test PATH");
-    command.env("PATH", path);
+    command.env("PATH", pins::tool_path(bin.parent()));
 
     apply_env_passthrough(&mut command, hcom_dir);
 
@@ -371,7 +363,7 @@ fn parse_names(output: &str) -> Vec<String> {
 fn external_tool_command(tool: &str) -> Command {
     #[cfg(windows)]
     {
-        let path_var = std::env::var_os("PATH").unwrap_or_default();
+        let path_var = pins::tool_path(None);
         let resolved = std::env::split_paths(&path_var)
             .flat_map(|dir| {
                 [".COM", ".EXE", ".BAT", ".CMD", ""]
@@ -395,7 +387,9 @@ fn external_tool_command(tool: &str) -> Command {
     }
     #[cfg(not(windows))]
     {
-        Command::new(tool)
+        let mut command = Command::new(tool);
+        command.env("PATH", pins::tool_path(None));
+        command
     }
 }
 

@@ -356,16 +356,9 @@ impl Hcom {
                 .unwrap_or_else(|e| panic!("create isolated directory {}: {e}", dir.display()));
         }
 
-        let mut path_entries = Vec::new();
-        if let Some(parent) = bin.parent() {
-            // The scripted Codex shell call uses `hcom ...`; make the exact
-            // CARGO_BIN_EXE_hcom binary discoverable before any ambient PATH.
-            path_entries.push(parent.to_path_buf());
-        }
-        if let Some(inherited) = std::env::var_os("PATH") {
-            path_entries.extend(std::env::split_paths(&inherited));
-        }
-        let path_env = std::env::join_paths(path_entries).expect("construct isolated PATH");
+        // The scripted Codex shell call uses `hcom ...`; make the exact
+        // CARGO_BIN_EXE_hcom binary discoverable before any ambient PATH.
+        let path_env = pins::tool_path(bin.parent());
 
         let fixture = Self {
             root,

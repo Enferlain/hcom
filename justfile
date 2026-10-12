@@ -32,7 +32,6 @@ mock-prefix := env_var_or_default(
     default-mock-prefix,
 )
 mock-cache := env_var_or_default("HCOM_MOCK_TOOLS_NPM_CACHE", default-mock-cache)
-mock-bin := mock-prefix + "/bin"
 
 # The Windows recipes and scripts/ci-windows.ps1 keep their own copies of these
 # paths: the pinned tools install to the npm prefix root there, not prefix/bin.
@@ -170,10 +169,8 @@ ci *steps:
     # hard ceiling for these steps so the tests aren't flaky against a busy
     # machine.
     ulimit -Su "$(ulimit -Hu)" 2>/dev/null || true
+    # The tests put $HCOM_MOCK_TOOLS_PREFIX's pins ahead of PATH themselves.
     step mock-tools bash ./scripts/install-mock-tools.sh
-    # Only after mock-tools has populated it: the pinned CLIs must outrank any
-    # ambient install of the same tool for the steps below.
-    export PATH="{{ mock-bin }}:$PATH"
     step real_tool_codex      cargo test --locked --test real_tool_codex -- --ignored --nocapture --test-threads=1
     step real_tool_claude     cargo test --locked --test real_tool_claude -- --ignored --nocapture --test-threads=1
     step test_relay_roundtrip cargo test --locked --test test_relay_roundtrip -- --ignored --nocapture --test-threads=1
