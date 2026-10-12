@@ -13,7 +13,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Add compare link, update + PyPI install sections
+      - name: Strip title date, add compare link, update + PyPI install sections
         run: |
           TAG="$(printf '%s' '${{ inputs.plan }}' | jq -r '.announcement_tag')"
           REPO="$(printf '%s' '${{ inputs.plan }}' | jq -r '.releases[0].hosting.github | "\(.owner)/\(.repo)"')"
@@ -31,7 +31,10 @@ jobs:
             echo "No previous release found, skipping compare link"
           fi
 
-          CURRENT_BODY=$(gh release view "$TAG" --repo "$REPO" --json body -q '.body')
+          RELEASE=$(gh release view "$TAG" --repo "$REPO" --json body,name)
+          CURRENT_BODY=$(printf '%s' "$RELEASE" | jq -r '.body')
+          # Keep the changelog heading as the title, without its release date.
+          TITLE=$(printf '%s' "$RELEASE" | jq -r '.name | sub(" — [0-9]{4}-[0-9]{2}-[0-9]{2}$"; "")')
 
           # Inject, in a single pass:
           #   - "**Full Changelog**" before the first "## Install " header (if a prev tag exists)
@@ -65,5 +68,5 @@ jobs:
             }
           ')
 
-          gh release edit "$TAG" --repo "$REPO" --notes "$NEW_BODY"
+          gh release edit "$TAG" --repo "$REPO" --title "$TITLE" --notes "$NEW_BODY"
           echo "Enriched release notes for $TAG"
