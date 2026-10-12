@@ -2087,17 +2087,16 @@ fn cleanup_sessionend_scoped_state(db: &HcomDb, session_id: &str) {
     // it (see `subagent_stop_inflight_key`). Inflight stop records are
     // transient and self-recover when their owning process dies, but
     // sweeping them here avoids retaining unreachable session data.
-    for (label, prefix) in [(
-        "subagent_stop_inflight",
-        subagent_stop_inflight_prefix(session_id),
-    )] {
-        if let Err(e) = db.kv_delete_prefix(&prefix) {
-            log::log_warn(
-                "hooks",
-                "sessionend.kv_cleanup_failed",
-                &format!("kind={} session_id={} err={}", label, session_id, e),
-            );
-        }
+    let prefix = subagent_stop_inflight_prefix(session_id);
+    if let Err(e) = db.kv_delete_prefix(&prefix) {
+        log::log_warn(
+            "hooks",
+            "sessionend.kv_cleanup_failed",
+            &format!(
+                "kind=subagent_stop_inflight session_id={} err={}",
+                session_id, e
+            ),
+        );
     }
 }
 
