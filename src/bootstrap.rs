@@ -90,7 +90,7 @@ If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
 {active_instances}
 
-This is session context, not a task for immediate action. hcom does not replace native subagents."#;
+This is session context, not a task for immediate action. hcom does not replace native subagents. Never truncate/hide hcom listen output."#;
 
 const TAG_NOTICE: &str = r#"
 You are tagged '{tag}'. Message your group: send {target_tag} -- msg"#;
