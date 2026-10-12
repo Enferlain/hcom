@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::commands::config::{CONFIG_KEYS, config_help};
+use crate::commands::config::config_help;
 use crate::commands::help;
 use crate::db::HcomDb;
 use crate::paths::scripts_dir;
@@ -716,14 +716,14 @@ fn print_docs(show_cli: bool, show_config: bool, show_api: bool) -> i32 {
         println!("  hcom config <key> <val>     Set value");
         println!("  hcom config <key> --info    Detailed help for a setting");
         println!("  hcom config --edit          Open in $EDITOR\n");
-        for (key, desc, typ) in CONFIG_KEYS {
-            if *key == "HCOM_TERMINAL" {
+        for field in crate::config::user_fields() {
+            if field.name == "terminal" {
                 print_terminal_help();
                 println!();
-            } else if let Some(help_text) = config_help(key) {
+            } else if let Some(help_text) = config_help(field.env) {
                 println!("{help_text}\n");
             } else {
-                println!("{key} - {desc} ({typ})\n");
+                println!("{} - {} ({})\n", field.env, field.desc, field.kind.as_str());
             }
         }
         println!("Per-instance config: hcom config -i <name> <key> [value]");

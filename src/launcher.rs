@@ -1865,12 +1865,10 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
     // Load config before hook setup so auto_approve is authoritative for
     // wrapped launches as well as manual `hcom hooks add`.
-    let hcom_config = HcomConfig::load(None).unwrap_or_else(|e| {
-        eprintln!("[hcom] warn: config load failed, using defaults: {e}");
-        let mut c = HcomConfig::default();
-        c.normalize();
-        c
-    });
+    let (hcom_config, config_errors) = HcomConfig::load_with_errors(None);
+    for msg in config_errors.values() {
+        eprintln!("[hcom] warn: {msg} (using the default)");
+    }
 
     let inside_ai_tool = crate::shared::context::HcomContext::from_os().is_inside_ai_tool();
     let terminal_mode = params

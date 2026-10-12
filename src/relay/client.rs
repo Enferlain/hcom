@@ -624,10 +624,7 @@ impl MqttRelay {
     /// Re-read the active PSK from disk. This is a best-effort escape hatch for
     /// same-namespace config changes; full relay resets still restart the worker.
     fn reload_psk_if_changed(&self) {
-        let cfg = match HcomConfig::load(None) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
+        let cfg = HcomConfig::load(None);
         if let Ok(new) = load_psk(&cfg) {
             let mut psk = match self.psk.lock() {
                 Ok(psk) => psk,
@@ -711,7 +708,7 @@ impl MqttRelay {
         if super::backfill::devices_with_gaps(&db).is_empty() {
             return;
         }
-        let config = HcomConfig::load(None).unwrap_or_default();
+        let config = HcomConfig::load(None);
         let own_short_id = super::device_short_id_for_db(&db, &self.device_uuid);
         let now = crate::shared::time::now_epoch_f64();
         let summary =

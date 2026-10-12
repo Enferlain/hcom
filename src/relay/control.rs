@@ -355,7 +355,7 @@ pub fn dispatch_remote_raw(
     params: &Value,
     timeout: Duration,
 ) -> Result<Value, String> {
-    let config = HcomConfig::load(None).unwrap_or_default();
+    let config = HcomConfig::load(None);
     send_rpc_request_and_wait_with_db(
         db,
         &config,
@@ -932,7 +932,7 @@ fn handle_remote_config_set(
         // Flipping the flag alone leaves the worker running; relay_off stops it.
         return Err("relay_enabled is not remotely settable; use relay off".to_string());
     }
-    crate::commands::config::config_set(&normalized, value)?;
+    crate::commands::config::config_set_and_apply(&normalized, value)?;
     Ok(json!({"field": field, "value": value}))
 }
 
@@ -1305,7 +1305,7 @@ pub fn handle_control_events(
     own_short_id: &str,
     source_device: &str,
 ) -> bool {
-    let config = HcomConfig::load(None).unwrap_or_default();
+    let config = HcomConfig::load(None);
     let seen_key = format!("relay_ctrl_{}", source_device);
     let now = crate::shared::time::now_epoch_f64();
     // Keyed by the `ts` exactly as sent, mapped to its value for expiry. Keys stay
@@ -1790,13 +1790,13 @@ mod tests {
             relay_enabled: true,
             ..Default::default()
         };
-        crate::config::save_toml_config(&config, None).unwrap();
+        crate::config::save_toml_config(&config).unwrap();
 
         let db = test_db();
-        let loaded = HcomConfig::load(None).unwrap();
+        let loaded = HcomConfig::load(None);
         let result = handle_remote_relay_off(&db, &json!({}), "_:EFGH", &loaded).unwrap();
         assert_eq!(result["disabled"], true);
-        let updated = HcomConfig::load(None).unwrap();
+        let updated = HcomConfig::load(None);
         assert!(!updated.relay_enabled);
     }
 

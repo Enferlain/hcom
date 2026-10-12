@@ -563,11 +563,7 @@ pub(crate) fn is_background_from_args(tool: &LaunchTool, args: &[String]) -> boo
 }
 
 pub(crate) fn load_hcom_config() -> HcomConfig {
-    HcomConfig::load(None).unwrap_or_else(|_| {
-        let mut c = HcomConfig::default();
-        c.normalize();
-        c
-    })
+    HcomConfig::load(None)
 }
 
 pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<String>) {

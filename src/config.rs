@@ -2,10 +2,10 @@
 //!
 //! Two config layers:
 //! - `Config`: Runtime env vars (HCOM_DIR, HCOM_INSTANCE_NAME, etc.) — startup-only, used by router/client
-//! - `HcomConfig`: User config from TOML + env vars — all 20 user-facing settings with validation
+//! - `HcomConfig`: User config from TOML + env vars — the user-facing settings in [`FIELDS`]
 
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 
@@ -119,99 +119,120 @@ fn test_default_hcom_dir() -> PathBuf {
     .to_path_buf()
 }
 
-/// Bidirectional mapping: HcomConfig field name <-> TOML dotted path.
-pub(crate) const TOML_KEY_MAP: &[(&str, &str)] = &[
-    ("terminal", "terminal.active"),
-    ("tag", "launch.tag"),
-    ("hints", "launch.hints"),
-    ("notes", "launch.notes"),
-    ("subagent_timeout", "launch.subagent_timeout"),
-    ("auto_subscribe", "launch.auto_subscribe"),
-    ("claude_args", "launch.claude.args"),
-    ("claude_delivery", "launch.claude.delivery"),
-    ("gemini_args", "launch.gemini.args"),
-    ("gemini_system_prompt", "launch.gemini.system_prompt"),
-    ("codex_args", "launch.codex.args"),
-    ("codex_system_prompt", "launch.codex.system_prompt"),
-    ("opencode_args", "launch.opencode.args"),
-    ("kilo_args", "launch.kilo.args"),
-    ("pi_args", "launch.pi.args"),
-    ("omp_args", "launch.omp.args"),
-    ("cursor_args", "launch.cursor.args"),
-    ("kimi_args", "launch.kimi.args"),
-    ("copilot_args", "launch.copilot.args"),
-    ("qoder_args", "launch.qoder.args"),
-    ("grok_args", "launch.grok.args"),
-    ("relay", "relay.url"),
-    ("relay_id", "relay.id"),
-    ("relay_token", "relay.token"),
-    ("relay_psk", "relay.psk"),
-    ("relay_enabled", "relay.enabled"),
-    ("timeout", "preferences.timeout"),
-    ("auto_approve", "preferences.auto_approve"),
-    ("name_export", "preferences.name_export"),
-    ("auto_trust_workspace", "launch.auto_trust_workspace"),
-    ("copilot_delivery", "launch.copilot.delivery"),
-    ("title_mode", "terminal.title_mode"),
-];
-
-/// TOML dotted path for a config field, from TOML_KEY_MAP.
-pub(crate) fn toml_path_for_field(field_name: &str) -> Option<&'static str> {
-    TOML_KEY_MAP
-        .iter()
-        .find(|(field, _)| *field == field_name)
-        .map(|(_, path)| *path)
+/// Value type of a config field, as stored in config.toml.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FieldKind {
+    Str,
+    Int,
+    Bool,
 }
 
-/// Mapping: HcomConfig field name -> HCOM_* env var key.
-const FIELD_TO_ENV: &[(&str, &str)] = &[
-    ("timeout", "HCOM_TIMEOUT"),
-    ("subagent_timeout", "HCOM_SUBAGENT_TIMEOUT"),
-    ("terminal", "HCOM_TERMINAL"),
-    ("hints", "HCOM_HINTS"),
-    ("notes", "HCOM_NOTES"),
-    ("tag", "HCOM_TAG"),
-    ("claude_args", "HCOM_CLAUDE_ARGS"),
-    ("claude_delivery", "HCOM_CLAUDE_DELIVERY"),
-    ("gemini_args", "HCOM_GEMINI_ARGS"),
-    ("codex_args", "HCOM_CODEX_ARGS"),
-    ("gemini_system_prompt", "HCOM_GEMINI_SYSTEM_PROMPT"),
-    ("codex_system_prompt", "HCOM_CODEX_SYSTEM_PROMPT"),
-    ("opencode_args", "HCOM_OPENCODE_ARGS"),
-    ("kilo_args", "HCOM_KILO_ARGS"),
-    ("pi_args", "HCOM_PI_ARGS"),
-    ("omp_args", "HCOM_OMP_ARGS"),
-    ("cursor_args", "HCOM_CURSOR_ARGS"),
-    ("kimi_args", "HCOM_KIMI_ARGS"),
-    ("copilot_args", "HCOM_COPILOT_ARGS"),
-    ("qoder_args", "HCOM_QODER_ARGS"),
-    ("grok_args", "HCOM_GROK_ARGS"),
-    ("relay", "HCOM_RELAY"),
-    ("relay_id", "HCOM_RELAY_ID"),
-    ("relay_token", "HCOM_RELAY_TOKEN"),
-    // NOTE: `relay_psk` is deliberately NOT in FIELD_TO_ENV. `to_env_dict` feeds
-    // `build_launch_env`, which injects these vars into every spawned agent
-    // child. The PSK is forge/decrypt authority for the entire relay group —
-    // it must never cross a process boundary via environment. Relay fields are
-    // file-only on load already (see `is_relay_field` in `load_from_sources`),
-    // so env-var override was never the mechanism for configuring the PSK.
-    ("relay_enabled", "HCOM_RELAY_ENABLED"),
-    ("auto_approve", "HCOM_AUTO_APPROVE"),
-    ("auto_subscribe", "HCOM_AUTO_SUBSCRIBE"),
-    ("name_export", "HCOM_NAME_EXPORT"),
-    ("auto_trust_workspace", "HCOM_AUTO_TRUST_WORKSPACE"),
-    ("copilot_delivery", "HCOM_COPILOT_DELIVERY"),
-    ("title_mode", "HCOM_TITLE_MODE"),
+impl FieldKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            FieldKind::Str => "string",
+            FieldKind::Int => "integer",
+            FieldKind::Bool => "boolean",
+        }
+    }
+}
+
+/// One `HcomConfig` field. [`FIELDS`] is the only list of config fields:
+/// loading, saving, env export, `hcom config` display/set and help all
+/// derive from it.
+#[derive(Debug)]
+pub(crate) struct ConfigField {
+    /// `HcomConfig` field name, also the `hcom config <key>` short name.
+    pub name: &'static str,
+    /// `HCOM_*` env var. Relay fields are never read from or exported to env.
+    pub env: &'static str,
+    /// Dotted path in config.toml.
+    pub toml: &'static str,
+    pub kind: FieldKind,
+    pub desc: &'static str,
+}
+
+impl ConfigField {
+    /// Relay fields are file-only and managed by `hcom relay`.
+    pub(crate) fn is_relay(&self) -> bool {
+        self.name.starts_with("relay")
+    }
+}
+
+const fn f(
+    name: &'static str,
+    env: &'static str,
+    toml: &'static str,
+    kind: FieldKind,
+    desc: &'static str,
+) -> ConfigField {
+    ConfigField {
+        name,
+        env,
+        toml,
+        kind,
+        desc,
+    }
+}
+
+use FieldKind::{Bool, Int, Str};
+
+/// All config fields, in display order.
+#[rustfmt::skip]
+pub(crate) const FIELDS: &[ConfigField] = &[
+    f("terminal", "HCOM_TERMINAL", "terminal.active", Str, "Terminal preset for spawning agent panes"),
+    f("title_mode", "HCOM_TITLE_MODE", "terminal.title_mode", Str, "Terminal title mode (combined | label | off)"),
+    f("tag", "HCOM_TAG", "launch.tag", Str, "Group tag for launched instances"),
+    f("hints", "HCOM_HINTS", "launch.hints", Str, "Text injected with all messages"),
+    f("notes", "HCOM_NOTES", "launch.notes", Str, "One-time notes appended at bootstrap"),
+    f("subagent_timeout", "HCOM_SUBAGENT_TIMEOUT", "launch.subagent_timeout", Int, "Timeout for Claude subagents in seconds (default: 30)"),
+    f("auto_subscribe", "HCOM_AUTO_SUBSCRIBE", "launch.auto_subscribe", Str, "Auto-subscribe event presets (comma-separated)"),
+    f("auto_trust_workspace", "HCOM_AUTO_TRUST_WORKSPACE", "launch.auto_trust_workspace", Bool, "Auto-approve workspace trust at launch; may persist in tool config"),
+    f("claude_args", "HCOM_CLAUDE_ARGS", "launch.claude.args", Str, "Default args for claude on launch"),
+    f("claude_delivery", "HCOM_CLAUDE_DELIVERY", "launch.claude.delivery", Str, "Claude delivery for new launches (inject | native)"),
+    f("copilot_args", "HCOM_COPILOT_ARGS", "launch.copilot.args", Str, "Default args for copilot on launch"),
+    f("copilot_delivery", "HCOM_COPILOT_DELIVERY", "launch.copilot.delivery", Str, "Idle Copilot delivery for new launches (inject | native)"),
+    f("gemini_args", "HCOM_GEMINI_ARGS", "launch.gemini.args", Str, "Default args for gemini on launch"),
+    f("gemini_system_prompt", "HCOM_GEMINI_SYSTEM_PROMPT", "launch.gemini.system_prompt", Str, "System prompt for gemini on launch"),
+    f("codex_args", "HCOM_CODEX_ARGS", "launch.codex.args", Str, "Default args for codex on launch"),
+    f("codex_system_prompt", "HCOM_CODEX_SYSTEM_PROMPT", "launch.codex.system_prompt", Str, "System prompt for codex on launch"),
+    f("opencode_args", "HCOM_OPENCODE_ARGS", "launch.opencode.args", Str, "Default args for opencode on launch"),
+    f("kilo_args", "HCOM_KILO_ARGS", "launch.kilo.args", Str, "Default args for kilo on launch"),
+    f("pi_args", "HCOM_PI_ARGS", "launch.pi.args", Str, "Default args for pi on launch"),
+    f("omp_args", "HCOM_OMP_ARGS", "launch.omp.args", Str, "Default args for omp on launch"),
+    f("cursor_args", "HCOM_CURSOR_ARGS", "launch.cursor.args", Str, "Default args for cursor-agent on launch"),
+    f("kimi_args", "HCOM_KIMI_ARGS", "launch.kimi.args", Str, "Default args for kimi on launch"),
+    f("qoder_args", "HCOM_QODER_ARGS", "launch.qoder.args", Str, "Default args for qodercli on launch"),
+    f("grok_args", "HCOM_GROK_ARGS", "launch.grok.args", Str, "Default args for grok on launch"),
+    f("timeout", "HCOM_TIMEOUT", "preferences.timeout", Int, "Idle timeout in seconds (default: 86400)"),
+    f("auto_approve", "HCOM_AUTO_APPROVE", "preferences.auto_approve", Bool, "Auto-approve safe hcom commands"),
+    f("name_export", "HCOM_NAME_EXPORT", "preferences.name_export", Str, "Export instance name to custom env var"),
+    f("relay", "HCOM_RELAY", "relay.url", Str, "Relay MQTT broker URL (managed by hcom relay)"),
+    f("relay_id", "HCOM_RELAY_ID", "relay.id", Str, "Relay group identifier (managed by hcom relay)"),
+    f("relay_token", "HCOM_RELAY_TOKEN", "relay.token", Str, "Relay authentication token (managed by hcom relay)"),
+    f("relay_enabled", "HCOM_RELAY_ENABLED", "relay.enabled", Bool, "Enable relay sync (managed by hcom relay)"),
+    // Forge/decrypt authority for the whole relay group: never shown by
+    // `hcom config`, never settable through it, never exported to env.
+    f("relay_psk", "HCOM_RELAY_PSK", "relay.psk", Str, "Relay pre-shared key"),
 ];
 
-/// Relay fields — file-only, no env var override.
-const RELAY_FIELDS: &[&str] = &[
-    "relay",
-    "relay_id",
-    "relay_token",
-    "relay_psk",
-    "relay_enabled",
-];
+/// Fields `hcom config` shows and accepts (everything but the relay PSK).
+pub(crate) fn user_fields() -> impl Iterator<Item = &'static ConfigField> {
+    FIELDS.iter().filter(|f| f.name != "relay_psk")
+}
+
+/// Field for an `hcom config` key: `tag`, `HCOM_TAG` or `hcom_tag`.
+pub(crate) fn user_field(key: &str) -> Option<&'static ConfigField> {
+    let upper = key.to_ascii_uppercase();
+    let name = upper
+        .strip_prefix("HCOM_")
+        .unwrap_or(&upper)
+        .to_ascii_lowercase();
+    user_fields().find(|f| f.name == name)
+}
+
+/// Field → error message. Each invalid field falls back to its default.
+pub type ConfigErrors = BTreeMap<String, String>;
 
 /// Characters that are dangerous in terminal preset values (injection risk).
 const TERMINAL_DANGEROUS_CHARS: &[char] = &['`', '$', ';', '|', '&', '\n', '\r'];
@@ -238,49 +259,6 @@ fn get_nested(table: &toml::Value, dotted_path: &str) -> Option<toml::Value> {
     }
     Some(current.clone())
 }
-
-/// Set value in nested TOML table using dotted path, creating intermediates.
-fn set_nested(table: &mut toml::Value, dotted_path: &str, value: toml::Value) {
-    let parts: Vec<&str> = dotted_path.split('.').collect();
-    let mut current = table;
-    for &part in &parts[..parts.len() - 1] {
-        let Some(tbl) = current.as_table_mut() else {
-            return;
-        };
-        if !tbl.contains_key(part) {
-            tbl.insert(part.to_string(), toml::Value::Table(toml::map::Map::new()));
-        }
-        let Some(next) = tbl.get_mut(part) else {
-            return;
-        };
-        current = next;
-    }
-    if let Some(t) = current.as_table_mut() {
-        t.insert(parts[parts.len() - 1].to_string(), value);
-    }
-}
-
-/// Validation errors from HcomConfig construction.
-#[derive(Debug, Clone)]
-pub struct HcomConfigError {
-    pub errors: HashMap<String, String>,
-}
-
-impl std::fmt::Display for HcomConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.errors.is_empty() {
-            write!(f, "Invalid config")
-        } else {
-            writeln!(f, "Invalid config:")?;
-            for msg in self.errors.values() {
-                writeln!(f, "  - {msg}")?;
-            }
-            Ok(())
-        }
-    }
-}
-
-impl std::error::Error for HcomConfigError {}
 
 /// HCOM user configuration with validation.
 /// Load priority: env var → config.toml → defaults.
@@ -379,9 +357,9 @@ impl HcomConfig {
 
     /// Validate all fields, returning map of field → error message.
     /// Also normalizes fields (terminal case, etc.).
-    pub fn collect_errors(&mut self) -> HashMap<String, String> {
+    pub fn collect_errors(&mut self) -> ConfigErrors {
         self.normalize();
-        let mut errors: HashMap<String, String> = HashMap::new();
+        let mut errors = ConfigErrors::new();
 
         // Validate timeout
         if !(1..=86400).contains(&self.timeout) {
@@ -517,11 +495,6 @@ impl HcomConfig {
         errors
     }
 
-    /// Validate and return list of error messages.
-    pub fn validate(&mut self) -> Vec<String> {
-        self.collect_errors().into_values().collect()
-    }
-
     /// Get a field value by name (returns string representation).
     pub fn get_field(&self, field: &str) -> Option<String> {
         match field {
@@ -605,238 +578,116 @@ impl HcomConfig {
             "name_export" => self.name_export = value.to_string(),
             "auto_trust_workspace" => self.auto_trust_workspace = !is_falsy(value),
             "copilot_delivery" => self.copilot_delivery = value.to_string(),
-            // Stored leniently; `TitleMode::from_config` maps unknown → default.
-            // The CLI set path (`config_set_at_path`) validates against
-            // `VALID_TITLE_MODES` before this is ever written to the file.
+            // Validated in `collect_errors`, like the other enum-like fields.
             "title_mode" => self.title_mode = value.to_string(),
             _ => return Err(format!("unknown field: {field}")),
         }
         Ok(())
     }
 
-    /// Effective HCOM_TIMEOUT (idle poll timeout for non-PTY instances), falling
-    /// back to 120s if config can't be loaded. Used both by the Stop-hook poll
-    /// fallback and by registration so freshly created rows already carry the
-    /// resolved value instead of relying on the (never-NULL) schema default.
+    /// Effective HCOM_TIMEOUT (idle poll timeout for non-PTY instances). Used
+    /// both by the Stop-hook poll fallback and by registration so freshly
+    /// created rows already carry the resolved value instead of relying on
+    /// the (never-NULL) schema default.
     pub fn effective_timeout() -> i64 {
-        Self::load(None).ok().map(|c| c.timeout).unwrap_or(120)
+        Self::load(None).timeout
     }
 
-    /// Load config with precedence: env var → config.toml → defaults.
+    /// Load config with precedence: env var → config.toml → defaults. Invalid
+    /// values fall back to their defaults (see [`Self::load_with_errors`]).
     ///
     /// `env_override`: If Some, use this map for env var lookups instead of std::env.
     /// Used in daemon mode where os.environ is stale.
-    pub fn load(env_override: Option<&HashMap<String, String>>) -> Result<Self, HcomConfigError> {
-        let toml_path = paths::config_toml_path();
-
-        if !toml_path.exists() {
-            let hcom_dir = &Config::get().hcom_dir;
-            let config_env_path = hcom_dir.join("config.env");
-            if config_env_path.exists() {
-                // Legacy config.env exists — migration to config.toml not yet done.
-                // Don't write default config.toml here or we'd silently lose the
-                // user's settings. Load returns defaults for this invocation.
-            } else {
-                // No config at all — write defaults
-                let _ = write_default_config();
-            }
-        }
-
-        // Parse config.toml
-        let file_config = if toml_path.exists() {
-            load_toml_config(&toml_path)
-        } else {
-            HashMap::new()
-        };
-
-        Self::load_from_sources(&file_config, env_override)
+    pub fn load(env_override: Option<&HashMap<String, String>>) -> Self {
+        Self::load_with_errors(env_override).0
     }
 
-    /// Load from pre-parsed TOML values + env. Separated for testability.
-    fn load_from_sources(
-        file_config: &HashMap<String, TomlFieldValue>,
+    /// [`Self::load`], plus each value that was invalid and fell back to its default.
+    pub fn load_with_errors(
         env_override: Option<&HashMap<String, String>>,
-    ) -> Result<Self, HcomConfigError> {
-        let mut config = HcomConfig::default();
-
-        let is_relay_field = |field: &str| -> bool { RELAY_FIELDS.contains(&field) };
-
-        // Helper: get value with precedence env → file
-        let get_var = |field: &str| -> Option<TomlFieldValue> {
-            let env_key = FIELD_TO_ENV
+    ) -> (Self, ConfigErrors) {
+        let (file_values, mut errors) = read_toml_values(&ensure_config_file());
+        // A bad config.toml value doesn't matter while env overrides it.
+        errors.retain(|name, _| {
+            !FIELDS
                 .iter()
-                .find(|&&(f, _)| f == field)
-                .map(|&(_, e)| e);
-
-            // Relay fields are file-only (no env override)
-            if let Some(env_key) = env_key
-                && !is_relay_field(field)
-            {
-                let env_val = if let Some(overrides) = env_override {
-                    overrides.get(env_key).cloned()
-                } else {
-                    std::env::var(env_key).ok()
-                };
-                if let Some(val) = env_val {
-                    return Some(TomlFieldValue::Str(val));
-                }
-            }
-
-            file_config.get(field).cloned()
-        };
-
-        // Load integer fields
-        for int_field in &["timeout", "subagent_timeout"] {
-            if let Some(val) = get_var(int_field) {
-                match val {
-                    TomlFieldValue::Int(i) => {
-                        let _ = config.set_field(int_field, &i.to_string());
-                    }
-                    TomlFieldValue::Str(s) if !s.is_empty() => {
-                        if let Ok(i) = s.parse::<i64>() {
-                            let _ = config.set_field(int_field, &i.to_string());
-                        }
-                        // Invalid int: silently use default
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Load string fields
-        let str_fields = [
-            "terminal",
-            "hints",
-            "notes",
-            "tag",
-            "claude_args",
-            "claude_delivery",
-            "gemini_args",
-            "codex_args",
-            "opencode_args",
-            "kilo_args",
-            "pi_args",
-            "cursor_args",
-            "copilot_args",
-            "qoder_args",
-            "grok_args",
-            "gemini_system_prompt",
-            "codex_system_prompt",
-            "auto_subscribe",
-            "name_export",
-            "title_mode",
-            "copilot_delivery",
-        ];
-        for str_field in &str_fields {
-            if let Some(val) = get_var(str_field) {
-                let s = val.as_string();
-                // Empty terminal or delivery mode uses the default.
-                if matches!(
-                    *str_field,
-                    "terminal" | "claude_delivery" | "copilot_delivery"
-                ) && s.is_empty()
-                {
-                    continue;
-                }
-                let _ = config.set_field(str_field, &s);
-            }
-        }
-
-        // Load boolean fields
-        for bool_field in &["relay_enabled", "auto_approve", "auto_trust_workspace"] {
-            if let Some(val) = get_var(bool_field) {
-                match val {
-                    TomlFieldValue::Bool(b) => {
-                        let _ = config.set_field(bool_field, if b { "1" } else { "0" });
-                    }
-                    TomlFieldValue::Int(i) => {
-                        let _ = config.set_field(bool_field, if i == 0 { "0" } else { "1" });
-                    }
-                    TomlFieldValue::Str(s) => {
-                        let _ = config.set_field(bool_field, if is_falsy(&s) { "0" } else { "1" });
-                    }
-                }
-            }
-        }
-
-        // Load relay string fields (file-only, already handled by get_var)
-        for relay_field in &["relay", "relay_id", "relay_token", "relay_psk"] {
-            if let Some(val) = get_var(relay_field) {
-                let _ = config.set_field(relay_field, &val.as_string());
-            }
-        }
-
-        // Validate
-        let errors = config.collect_errors();
-        if !errors.is_empty() {
-            return Err(HcomConfigError { errors });
-        }
-
-        Ok(config)
+                .any(|f| f.name == name && env_value(f, env_override).is_some())
+        });
+        let (config, field_errors) = Self::load_from_sources(&file_values, env_override);
+        errors.extend(field_errors);
+        (config, errors)
     }
 
-    /// Convert to HCOM_* env var dict (for persistence/display). Relay secret
-    /// material (the PSK) is never emitted here — see `FIELD_TO_ENV` for why.
-    pub fn to_env_dict(&self) -> HashMap<String, String> {
-        let mut map = HashMap::new();
-        for &(field, env_key) in FIELD_TO_ENV {
-            if field == "relay_psk" {
+    /// Build from parsed config.toml values + env. An invalid value is
+    /// reported and falls back to its default, so one bad setting never
+    /// discards the others.
+    pub(crate) fn load_from_sources(
+        file_values: &HashMap<String, TomlFieldValue>,
+        env_override: Option<&HashMap<String, String>>,
+    ) -> (Self, ConfigErrors) {
+        let mut config = HcomConfig::default();
+        let mut errors = ConfigErrors::new();
+        let mut sources: HashMap<&str, String> = HashMap::new();
+
+        for field in FIELDS {
+            let (val, source) = match env_value(field, env_override) {
+                Some(v) => (TomlFieldValue::Str(v), format!("env {}", field.env)),
+                None => match file_values.get(field.name) {
+                    Some(v) => (v.clone(), format!("config.toml {}", field.toml)),
+                    None => continue,
+                },
+            };
+            // Empty means unset, except where "" is itself a choice: no
+            // auto_subscribe presets, or false for a switch (e.g. HCOM_AUTO_APPROVE=).
+            if val.as_string().is_empty()
+                && field.kind != FieldKind::Bool
+                && field.name != "auto_subscribe"
+            {
                 continue;
             }
-            if let Some(val) = self.get_field(field) {
-                map.insert(env_key.to_string(), val);
+            if let Err(e) = coerce(field, &val).and_then(|v| config.set_field(field.name, &v)) {
+                errors.insert(field.name.to_string(), format!("{e} [{source}]"));
             }
+            sources.insert(field.name, source);
         }
-        map
+
+        let defaults = HcomConfig::default();
+        for (field, msg) in config.collect_errors() {
+            if let Some(default) = defaults.get_field(&field) {
+                let _ = config.set_field(&field, &default);
+            }
+            let msg = match sources.get(field.as_str()) {
+                Some(source) => format!("{msg} [{source}]"),
+                None => msg,
+            };
+            errors.entry(field).or_insert(msg);
+        }
+        (config, errors)
     }
 
-    /// Build from HCOM_* env var dict. Returns validated config.
-    pub fn from_env_dict(data: &HashMap<String, String>) -> Result<Self, HcomConfigError> {
-        let mut config = HcomConfig::default();
-        let mut errors: HashMap<String, String> = HashMap::new();
-
-        // Build reverse map: HCOM_* key -> field name
-        let env_to_field: HashMap<&str, &str> = FIELD_TO_ENV.iter().map(|&(f, e)| (e, f)).collect();
-
-        for (env_key, value) in data {
-            if let Some(&field) = env_to_field.get(env_key.as_str())
-                && let Err(e) = config.set_field(field, value)
-            {
-                errors.insert(field.to_string(), e);
-            }
-        }
-
-        if !errors.is_empty() {
-            return Err(HcomConfigError { errors });
-        }
-
-        // Run validation
-        let validation_errors = config.collect_errors();
-        if !validation_errors.is_empty() {
-            return Err(HcomConfigError {
-                errors: validation_errors,
-            });
-        }
-
-        Ok(config)
+    /// HCOM_* env for launched agents. Relay fields are file-only on load, and
+    /// the PSK must never cross a process boundary, so none are exported.
+    pub fn to_env_dict(&self) -> HashMap<String, String> {
+        FIELDS
+            .iter()
+            .filter(|f| !f.is_relay())
+            .filter_map(|f| Some((f.env.to_string(), self.get_field(f.name)?)))
+            .collect()
     }
+}
 
-    /// Convert to nested TOML-ready table.
-    pub fn to_toml_table(&self) -> toml::Value {
-        let mut table = default_toml_structure();
-        for &(field, toml_path) in TOML_KEY_MAP {
-            if let Some(val) = self.get_field(field) {
-                // Determine TOML value type from the default structure
-                let default_val = get_nested(&table, toml_path);
-                let toml_val = match default_val {
-                    Some(toml::Value::Boolean(_)) => toml::Value::Boolean(!is_falsy(&val)),
-                    Some(toml::Value::Integer(_)) => toml::Value::Integer(val.parse().unwrap_or(0)),
-                    _ => toml::Value::String(val),
-                };
-                set_nested(&mut table, toml_path, toml_val);
-            }
-        }
-        table
+/// `field`'s env var, from `env_override` or the process env. Relay fields
+/// are file-only (no env override).
+fn env_value(
+    field: &ConfigField,
+    env_override: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    if field.is_relay() {
+        None
+    } else if let Some(overrides) = env_override {
+        overrides.get(field.env).cloned()
+    } else {
+        std::env::var(field.env).ok()
     }
 }
 
@@ -849,181 +700,224 @@ pub(crate) enum TomlFieldValue {
 }
 
 impl TomlFieldValue {
-    fn as_string(&self) -> String {
+    pub(crate) fn as_string(&self) -> String {
         match self {
             TomlFieldValue::Str(s) => s.clone(),
             TomlFieldValue::Int(i) => i.to_string(),
-            TomlFieldValue::Bool(b) => {
-                if *b {
-                    "1".to_string()
-                } else {
-                    "0".to_string()
-                }
-            }
+            TomlFieldValue::Bool(b) => b.to_string(),
         }
     }
 }
 
-/// Load config.toml and return flat map of field name → typed value.
-/// Includes terminal dangerous-char validation.
-pub fn load_toml_config(path: &std::path::Path) -> HashMap<String, TomlFieldValue> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return HashMap::new(),
-    };
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" | "" => Some(false),
+        _ => None,
+    }
+}
 
-    let raw: toml::Value = match content.parse::<toml::Table>() {
+/// Normalize a raw value to the string `set_field` takes for `field`'s kind.
+fn coerce(field: &ConfigField, val: &TomlFieldValue) -> Result<String, String> {
+    let as_bool = |b: bool| if b { "1" } else { "0" }.to_string();
+    let parsed = match (field.kind, val) {
+        (FieldKind::Str, v) => Some(v.as_string()),
+        (FieldKind::Int, TomlFieldValue::Int(i)) => Some(i.to_string()),
+        (FieldKind::Int, TomlFieldValue::Str(s)) => {
+            s.trim().parse::<i64>().ok().map(|i| i.to_string())
+        }
+        (FieldKind::Bool, TomlFieldValue::Bool(b)) => Some(as_bool(*b)),
+        (FieldKind::Bool, TomlFieldValue::Int(i)) => Some(as_bool(*i != 0)),
+        (FieldKind::Bool, TomlFieldValue::Str(s)) => parse_bool(s).map(as_bool),
+        _ => None,
+    };
+    parsed.ok_or_else(|| match field.kind {
+        FieldKind::Bool => format!(
+            "{} must be true or false, got '{}'",
+            field.name,
+            val.as_string()
+        ),
+        _ => format!(
+            "{} must be an integer, got '{}'",
+            field.name,
+            val.as_string()
+        ),
+    })
+}
+
+/// config.toml value for `field` from user input (`hcom config <key> <value>`).
+pub(crate) fn field_toml_value(field: &ConfigField, raw: &str) -> Result<toml_edit::Value, String> {
+    let v = coerce(field, &TomlFieldValue::Str(raw.to_string()))?;
+    Ok(match field.kind {
+        FieldKind::Str => v.into(),
+        FieldKind::Int => v.parse::<i64>().map_err(|e| e.to_string())?.into(),
+        FieldKind::Bool => (v == "1").into(),
+    })
+}
+
+/// Path to config.toml, writing defaults first if there is no config at all.
+/// A legacy config.env without config.toml is left alone: writing defaults
+/// there would silently drop the user's settings before migration.
+fn ensure_config_file() -> PathBuf {
+    let toml_path = paths::config_toml_path();
+    if !toml_path.exists() && !Config::get().hcom_dir.join("config.env").exists() {
+        let _ = write_default_config();
+    }
+    toml_path
+}
+
+/// Read config.toml into field name → typed value. Unreadable or invalid
+/// content is reported in the errors, never printed (hooks call this).
+pub(crate) fn read_toml_values(
+    path: &std::path::Path,
+) -> (HashMap<String, TomlFieldValue>, ConfigErrors) {
+    match std::fs::read_to_string(path) {
+        Ok(content) => toml_values_from_str(&content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), ConfigErrors::new()),
+        Err(e) => (
+            HashMap::new(),
+            ConfigErrors::from([(
+                "config.toml".to_string(),
+                format!("config.toml is unreadable, using defaults: {e}"),
+            )]),
+        ),
+    }
+}
+
+pub(crate) fn toml_values_from_str(
+    content: &str,
+) -> (HashMap<String, TomlFieldValue>, ConfigErrors) {
+    let mut values = HashMap::new();
+    let mut errors = ConfigErrors::new();
+
+    let raw = match content.parse::<toml::Table>() {
         Ok(t) => toml::Value::Table(t),
         Err(e) => {
-            eprintln!(
-                "Warning: Failed to parse {}: {e} — using defaults",
-                path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default()
+            errors.insert(
+                "config.toml".into(),
+                format!("config.toml is not valid TOML, using defaults: {e}"),
             );
-            return HashMap::new();
+            return (values, errors);
         }
     };
 
-    let mut result = HashMap::new();
-    for &(field_name, toml_path) in TOML_KEY_MAP {
-        if let Some(val) = get_nested(&raw, toml_path) {
-            let typed = match &val {
-                toml::Value::String(s) => TomlFieldValue::Str(s.clone()),
-                toml::Value::Integer(i) => TomlFieldValue::Int(*i),
-                toml::Value::Boolean(b) => TomlFieldValue::Bool(*b),
-                _ => continue,
-            };
-            result.insert(field_name.to_string(), typed);
+    for field in FIELDS {
+        let Some(val) = get_nested(&raw, field.toml) else {
+            continue;
+        };
+        let typed = match val {
+            toml::Value::String(s) => TomlFieldValue::Str(s),
+            toml::Value::Integer(i) => TomlFieldValue::Int(i),
+            toml::Value::Boolean(b) => TomlFieldValue::Bool(b),
+            other => {
+                errors.insert(
+                    field.name.into(),
+                    format!(
+                        "{} must be a {}, got {} [config.toml {}]",
+                        field.name,
+                        field.kind.as_str(),
+                        other.type_str(),
+                        field.toml
+                    ),
+                );
+                continue;
+            }
+        };
+        values.insert(field.name.to_string(), typed);
+    }
+
+    if let Some(TomlFieldValue::Str(terminal)) = values.get("terminal") {
+        let bad: Vec<String> = TERMINAL_DANGEROUS_CHARS
+            .iter()
+            .filter(|&&c| terminal.contains(c))
+            .map(|c| format!("{c:?}"))
+            .collect();
+        if !bad.is_empty() {
+            errors.insert(
+                "terminal".into(),
+                format!(
+                    "terminal contains unsafe characters ({}) [config.toml terminal.active]",
+                    bad.join(", ")
+                ),
+            );
+            values.remove("terminal");
         }
     }
 
-    // Terminal dangerous-char validation
-    if let Some(TomlFieldValue::Str(terminal_val)) = result.get("terminal")
-        && terminal_val
-            .chars()
-            .any(|c| TERMINAL_DANGEROUS_CHARS.contains(&c))
-    {
-        let bad_chars: Vec<String> = TERMINAL_DANGEROUS_CHARS
-            .iter()
-            .filter(|&&c| terminal_val.contains(c))
-            .map(|c| format!("{c:?}"))
-            .collect();
-        eprintln!(
-            "Warning: Unsafe characters in terminal.active ({}), ignoring custom terminal command",
-            bad_chars.join(", ")
-        );
-        result.remove("terminal");
-    }
-
-    result
+    (values, errors)
 }
 
-/// Write config.toml from HcomConfig using toml_edit to preserve comments and formatting.
-/// If the file already exists, parses it and surgically updates only changed keys.
-/// If the file doesn't exist, writes a fresh default with the header comment.
-pub fn save_toml_config(config: &HcomConfig, presets: Option<&toml::Value>) -> std::io::Result<()> {
-    use toml_edit::DocumentMut;
+/// The error the loader would report for `field` if config.toml held
+/// `content` (env ignored).
+pub(crate) fn file_field_error(content: &str, field: &str) -> Option<String> {
+    let (values, mut errors) = toml_values_from_str(content);
+    let (_, field_errors) = HcomConfig::load_from_sources(&values, Some(&HashMap::new()));
+    errors.extend(field_errors);
+    errors.remove(field)
+}
 
+/// Write every field of `config` to config.toml. An existing file keeps its
+/// comments and other keys (e.g. terminal presets).
+pub fn save_toml_config(config: &HcomConfig) -> std::io::Result<()> {
     let toml_path = paths::config_toml_path();
-
-    // Ensure parent dir exists
     if let Some(parent) = toml_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Load existing document or create fresh one with header
-    let mut doc: DocumentMut = if toml_path.exists() {
-        let existing = std::fs::read_to_string(&toml_path)?;
-        existing
-            .parse::<DocumentMut>()
-            .unwrap_or_else(|_| format!("{TOML_HEADER}\n").parse::<DocumentMut>().unwrap())
+    let existing = std::fs::read_to_string(&toml_path)
+        .ok()
+        .and_then(|c| c.parse::<toml_edit::DocumentMut>().ok());
+    let is_new = existing.is_none();
+    let mut doc = existing.unwrap_or_default();
+
+    for field in FIELDS {
+        if let Some(val) = config.get_field(field.name) {
+            let value = field_toml_value(field, &val).map_err(std::io::Error::other)?;
+            set_doc_path(&mut doc, field.toml, Some(value));
+        }
+    }
+
+    let content = if is_new {
+        format!("{TOML_HEADER}\n{doc}")
     } else {
-        format!("{TOML_HEADER}\n").parse::<DocumentMut>().unwrap()
+        doc.to_string()
     };
-
-    // Update each config key in the document
-    for &(field, toml_path_str) in TOML_KEY_MAP {
-        if let Some(val) = config.get_field(field) {
-            set_nested_edit(&mut doc, toml_path_str, &val);
-        }
-    }
-
-    // Merge terminal presets if provided
-    if let Some(presets_val) = presets {
-        // Convert toml::Value presets to toml_edit items
-        if let Some(presets_table) = presets_val.as_table() {
-            ensure_edit_table(&mut doc, "terminal");
-            let Some(terminal) = doc["terminal"].as_table_mut() else {
-                return Ok(());
-            };
-            // Parse via a wrapper doc so we get a proper nested table, not a document root
-            let wrapper_str = format!(
-                "[presets]\n{}",
-                toml::to_string_pretty(&toml::Value::Table(presets_table.clone()))
-                    .unwrap_or_default()
-            );
-            if let Ok(wrapper_doc) = wrapper_str.parse::<DocumentMut>()
-                && let Some(item) = wrapper_doc
-                    .as_item()
-                    .as_table()
-                    .and_then(|t| t.get("presets"))
-            {
-                terminal.insert("presets", item.clone());
-            }
-        }
-    }
-
-    write_config_toml_path(&toml_path, &doc.to_string())
+    write_config_toml_path(&toml_path, &content)
 }
 
-/// Set a value in a toml_edit document using a dotted path, creating intermediate tables.
-fn set_nested_edit(doc: &mut toml_edit::DocumentMut, dotted_path: &str, value: &str) {
-    let parts: Vec<&str> = dotted_path.split('.').collect();
-
-    // Build the default structure to determine expected type
-    let defaults = default_toml_structure();
-    let default_val = get_nested(&defaults, dotted_path);
-
-    // Convert string value to the correct toml_edit type
-    let edit_value: toml_edit::Value = match default_val {
-        Some(toml::Value::Boolean(_)) => toml_edit::value(!is_falsy(value)).into_value().unwrap(),
-        Some(toml::Value::Integer(_)) => toml_edit::value(value.parse::<i64>().unwrap_or(0))
-            .into_value()
-            .unwrap(),
-        _ => toml_edit::value(value).into_value().unwrap(),
-    };
-
-    // Navigate/create intermediate tables
-    match parts.len() {
-        1 => {
-            doc[parts[0]] = toml_edit::Item::Value(edit_value);
-        }
-        2 => {
-            ensure_edit_table(doc, parts[0]);
-            doc[parts[0]][parts[1]] = toml_edit::Item::Value(edit_value);
-        }
-        3 => {
-            ensure_edit_table(doc, parts[0]);
-            let Some(t) = doc[parts[0]].as_table_mut() else {
+/// Set (or with `None`, remove) the value at a dotted path in a config.toml
+/// document, creating parent tables as needed.
+pub(crate) fn set_doc_path(
+    doc: &mut toml_edit::DocumentMut,
+    dotted_path: &str,
+    value: Option<toml_edit::Value>,
+) {
+    let (parents, key) = dotted_path.rsplit_once('.').unwrap_or(("", dotted_path));
+    let mut table: &mut dyn toml_edit::TableLike = doc.as_table_mut();
+    for part in parents.split('.').filter(|p| !p.is_empty()) {
+        if !table.get(part).is_some_and(|item| item.is_table_like()) {
+            if value.is_none() {
                 return;
-            };
-            if t.get(parts[1]).is_none() || !t[parts[1]].is_table() {
-                t.insert(parts[1], toml_edit::Item::Table(toml_edit::Table::new()));
             }
-            doc[parts[0]][parts[1]][parts[2]] = toml_edit::Item::Value(edit_value);
+            table.insert(part, toml_edit::Item::Table(toml_edit::Table::new()));
         }
-        _ => {} // Deeper nesting not used in current config
+        let Some(next) = table
+            .get_mut(part)
+            .and_then(|item| item.as_table_like_mut())
+        else {
+            return;
+        };
+        table = next;
+    }
+    match value {
+        Some(v) => {
+            table.insert(key, toml_edit::Item::Value(v));
+        }
+        None => {
+            table.remove(key);
+        }
     }
 }
-
-/// Ensure a top-level key exists as a table in the document.
-fn ensure_edit_table(doc: &mut toml_edit::DocumentMut, key: &str) {
-    if doc.get(key).is_none() || !doc[key].is_table() {
-        doc[key] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-}
-
 /// Load terminal presets from config.toml [terminal.presets.*] section.
 pub fn load_toml_presets(path: &std::path::Path) -> Option<toml::Value> {
     let content = std::fs::read_to_string(path).ok()?;
@@ -1037,72 +931,6 @@ pub fn load_toml_presets(path: &std::path::Path) -> Option<toml::Value> {
     }
 }
 
-/// Build the canonical default TOML structure
-fn default_toml_structure() -> toml::Value {
-    let toml_str = r#"[terminal]
-active = "default"
-title_mode = "combined"
-
-[relay]
-url = ""
-id = ""
-token = ""
-psk = ""
-enabled = true
-
-[launch]
-tag = ""
-hints = ""
-notes = ""
-subagent_timeout = 30
-auto_subscribe = "collision"
-auto_trust_workspace = true
-
-[launch.claude]
-args = ""
-# "inject" (PTY typing) | "native" (experimental Claude mod); new launches only.
-delivery = "inject"
-
-[launch.gemini]
-args = ""
-system_prompt = ""
-
-[launch.codex]
-args = ""
-sandbox_mode = "workspace"
-system_prompt = ""
-
-[launch.opencode]
-args = ""
-
-[launch.kilo]
-args = ""
-
-[launch.pi]
-args = ""
-
-[launch.omp]
-args = ""
-
-[launch.cursor]
-args = ""
-
-[launch.copilot]
-args = ""
-delivery = "inject"
-
-[launch.qoder]
-args = ""
-
-[preferences]
-timeout = 86400
-auto_approve = true
-name_export = ""
-"#;
-    toml::Value::Table(toml_str.parse::<toml::Table>().unwrap())
-}
-
-/// Check if a string value is falsy
 /// Check if a terminal name matches a known built-in preset (case-insensitive).
 /// Public alias for use by status command.
 pub fn is_known_terminal_preset_pub(name: &str) -> bool {
@@ -1443,39 +1271,15 @@ pub struct ConfigSnapshot {
 
 /// Load config snapshot from files (no env overrides — file contents only).
 pub fn load_config_snapshot() -> ConfigSnapshot {
-    let toml_path = paths::config_toml_path();
-
-    if !toml_path.exists() {
-        // Check for legacy config.env before writing defaults — don't overwrite
-        // user settings that haven't been migrated yet.
-        let config_env_path = Config::get().hcom_dir.join("config.env");
-        if !config_env_path.exists() {
-            let _ = write_default_config();
-        }
+    ConfigSnapshot {
+        core: HcomConfig::load(Some(&HashMap::new())),
     }
-
-    let file_config = if toml_path.exists() {
-        load_toml_config(&toml_path)
-    } else {
-        HashMap::new()
-    };
-
-    // Build HcomConfig from file values only (no env)
-    let core = match HcomConfig::load_from_sources(&file_config, Some(&HashMap::new())) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{e}");
-            HcomConfig::default()
-        }
-    };
-
-    ConfigSnapshot { core }
 }
 
 /// Write default config.toml + env file.
 pub fn write_default_config() -> std::io::Result<()> {
     let config = HcomConfig::default();
-    save_toml_config(&config, None)?;
+    save_toml_config(&config)?;
     save_env_file(&HashMap::new())
 }
 
@@ -1664,16 +1468,10 @@ mod tests {
         let mut config = HcomConfig::default();
         assert_eq!(config.to_env_dict()["HCOM_CLAUDE_DELIVERY"], "inject");
         config.set_field("claude_delivery", "native").unwrap();
-        assert_eq!(
-            config.to_toml_table()["launch"]["claude"]["delivery"].as_str(),
-            Some("native")
-        );
-        assert_eq!(
-            HcomConfig::from_env_dict(&config.to_env_dict())
-                .unwrap()
-                .claude_delivery,
-            "native"
-        );
+        let (loaded, errors) =
+            HcomConfig::load_from_sources(&HashMap::new(), Some(&config.to_env_dict()));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(loaded.claude_delivery, "native");
         config.set_field("claude_delivery", "pty").unwrap();
         assert!(config.collect_errors().contains_key("claude_delivery"));
     }
@@ -2098,9 +1896,11 @@ mod tests {
         assert_eq!(dict.get("HCOM_TIMEOUT"), Some(&"86400".to_string()));
         assert_eq!(dict.get("HCOM_TERMINAL"), Some(&"default".to_string()));
         assert_eq!(dict.get("HCOM_AUTO_APPROVE"), Some(&"1".to_string()));
-        assert_eq!(dict.get("HCOM_RELAY_ENABLED"), Some(&"1".to_string()));
+        // Relay fields are file-only; exporting them would only leak them.
+        assert!(dict.keys().all(|k| !k.starts_with("HCOM_RELAY")));
 
-        let roundtrip = HcomConfig::from_env_dict(&dict).unwrap();
+        let (roundtrip, errors) = HcomConfig::load_from_sources(&HashMap::new(), Some(&dict));
+        assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(config, roundtrip);
     }
 
@@ -2129,7 +1929,7 @@ mod tests {
     fn test_load_from_sources_empty() {
         let file_config = HashMap::new();
         let env = HashMap::new();
-        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).0;
         assert_eq!(config, HcomConfig::default());
     }
 
@@ -2141,7 +1941,7 @@ mod tests {
         file_config.insert("relay_enabled".to_string(), TomlFieldValue::Bool(false));
 
         let env = HashMap::new();
-        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).0;
 
         assert_eq!(config.timeout, 3600);
         assert_eq!(config.tag, "test");
@@ -2158,14 +1958,14 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("HCOM_TITLE_MODE".to_string(), "off".to_string());
 
-        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).0;
         assert_eq!(config.title_mode, "off");
     }
 
     #[test]
     fn test_load_from_sources_copilot_delivery() {
         let none = HashMap::new();
-        let config = HcomConfig::load_from_sources(&none, None).unwrap();
+        let config = HcomConfig::load_from_sources(&none, Some(&HashMap::new())).0;
         assert_eq!(config.copilot_delivery, "inject");
 
         let mut file_config = HashMap::new();
@@ -2173,16 +1973,18 @@ mod tests {
             "copilot_delivery".to_string(),
             TomlFieldValue::Str("native".to_string()),
         );
-        let config = HcomConfig::load_from_sources(&file_config, None).unwrap();
+        let config = HcomConfig::load_from_sources(&file_config, Some(&HashMap::new())).0;
         assert_eq!(config.copilot_delivery, "native");
 
         let mut env = HashMap::new();
         env.insert("HCOM_COPILOT_DELIVERY".to_string(), "inject".to_string());
-        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).0;
         assert_eq!(config.copilot_delivery, "inject");
 
         env.insert("HCOM_COPILOT_DELIVERY".to_string(), "typo".to_string());
-        assert!(HcomConfig::load_from_sources(&none, Some(&env)).is_err());
+        let (config, errors) = HcomConfig::load_from_sources(&none, Some(&env));
+        assert!(errors["copilot_delivery"].contains("HCOM_COPILOT_DELIVERY"));
+        assert_eq!(config.copilot_delivery, DEFAULT_DELIVERY);
     }
 
     #[test]
@@ -2197,7 +1999,7 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("HCOM_TAG".to_string(), "env-tag".to_string());
 
-        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).0;
 
         assert_eq!(config.timeout, 3600); // From file (no env override)
         assert_eq!(config.tag, "env-tag"); // Env wins over file
@@ -2217,7 +2019,7 @@ mod tests {
             "mqtt://env.example.com".to_string(),
         );
 
-        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).0;
 
         // Relay fields should come from file, not env
         assert_eq!(config.relay, "mqtt://file.example.com");
@@ -2232,7 +2034,7 @@ mod tests {
         );
 
         let env = HashMap::new();
-        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).0;
         assert_eq!(config.timeout, 7200);
     }
 
@@ -2245,7 +2047,7 @@ mod tests {
         );
 
         let env = HashMap::new();
-        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).0;
         assert!(!config.auto_approve);
     }
 
@@ -2255,7 +2057,7 @@ mod tests {
         file_config.insert("terminal".to_string(), TomlFieldValue::Str("".to_string()));
 
         let env = HashMap::new();
-        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
+        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).0;
         assert_eq!(config.terminal, "default");
     }
 
@@ -2269,25 +2071,19 @@ mod tests {
             ..HcomConfig::default()
         };
 
-        let toml_table = config.to_toml_table();
-        let toml_str = toml::to_string_pretty(&toml_table).unwrap();
-
-        // Parse it back
-        let parsed: toml::Value = toml::Value::Table(toml_str.parse::<toml::Table>().unwrap());
-        let mut file_config = HashMap::new();
-        for &(field_name, toml_path) in TOML_KEY_MAP {
-            if let Some(val) = get_nested(&parsed, toml_path) {
-                let typed = match &val {
-                    toml::Value::String(s) => TomlFieldValue::Str(s.clone()),
-                    toml::Value::Integer(i) => TomlFieldValue::Int(*i),
-                    toml::Value::Boolean(b) => TomlFieldValue::Bool(*b),
-                    _ => continue,
-                };
-                file_config.insert(field_name.to_string(), typed);
-            }
+        let mut doc = toml_edit::DocumentMut::new();
+        for field in FIELDS {
+            let val = config.get_field(field.name).unwrap();
+            set_doc_path(
+                &mut doc,
+                field.toml,
+                Some(field_toml_value(field, &val).unwrap()),
+            );
         }
+        let (file_config, errors) = toml_values_from_str(&doc.to_string());
+        assert!(errors.is_empty(), "{errors:?}");
 
-        let roundtrip = HcomConfig::load_from_sources(&file_config, Some(&HashMap::new())).unwrap();
+        let roundtrip = HcomConfig::load_from_sources(&file_config, Some(&HashMap::new())).0;
         assert_eq!(config, roundtrip);
     }
 
@@ -2306,9 +2102,10 @@ timeout = 3600
         )
         .unwrap();
 
-        let result = load_toml_config(&path);
-        // Terminal with dangerous chars should be removed
+        let (result, errors) = read_toml_values(&path);
+        // Terminal with dangerous chars should be removed and reported
         assert!(!result.contains_key("terminal"));
+        assert!(errors["terminal"].contains("unsafe characters"));
         // Other values should load fine
         assert!(result.contains_key("timeout"));
     }
@@ -2337,7 +2134,8 @@ auto_approve = false
         )
         .unwrap();
 
-        let result = load_toml_config(&path);
+        let (result, errors) = read_toml_values(&path);
+        assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             result.get("terminal").map(|v| v.as_string()),
             Some("kitty".to_string())
@@ -2358,8 +2156,8 @@ auto_approve = false
 
     #[test]
     fn test_load_toml_config_missing_file() {
-        let result = load_toml_config(std::path::Path::new("/nonexistent/config.toml"));
-        assert!(result.is_empty());
+        let (result, errors) = read_toml_values(std::path::Path::new("/nonexistent/config.toml"));
+        assert!(result.is_empty() && errors.is_empty());
     }
 
     #[test]
@@ -2368,8 +2166,9 @@ auto_approve = false
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "this is not valid toml [[[[").unwrap();
 
-        let result = load_toml_config(&path);
+        let (result, errors) = read_toml_values(&path);
         assert!(result.is_empty());
+        assert!(errors.contains_key("config.toml"));
     }
 
     #[test]
@@ -2406,15 +2205,28 @@ auto_approve = false
 
     #[test]
     fn test_get_field_all_fields() {
-        let config = HcomConfig::default();
-        // All 20 fields should be gettable
-        for &(field, _) in FIELD_TO_ENV {
-            assert!(
-                config.get_field(field).is_some(),
-                "get_field('{field}') should return Some"
-            );
+        let mut config = HcomConfig::default();
+        for field in FIELDS {
+            let val = config
+                .get_field(field.name)
+                .unwrap_or_else(|| panic!("get_field('{}') should return Some", field.name));
+            config
+                .set_field(field.name, &val)
+                .unwrap_or_else(|e| panic!("set_field('{}'): {e}", field.name));
         }
+        assert_eq!(config, HcomConfig::default());
         assert!(config.get_field("nonexistent").is_none());
+
+        let unique = |key: fn(&ConfigField) -> &str| {
+            FIELDS
+                .iter()
+                .map(key)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        };
+        assert_eq!(unique(|f| f.name), FIELDS.len());
+        assert_eq!(unique(|f| f.env), FIELDS.len());
+        assert_eq!(unique(|f| f.toml), FIELDS.len());
     }
 
     #[test]
@@ -2423,9 +2235,9 @@ auto_approve = false
             .iter()
             .filter_map(|spec| spec.launch.args_env)
             .collect();
-        let actual: std::collections::HashSet<&str> = FIELD_TO_ENV
+        let actual: std::collections::HashSet<&str> = FIELDS
             .iter()
-            .filter_map(|(field, env_key)| field.ends_with("_args").then_some(*env_key))
+            .filter_map(|f| f.name.ends_with("_args").then_some(f.env))
             .collect();
 
         assert_eq!(
@@ -2434,29 +2246,114 @@ auto_approve = false
         );
     }
 
-    #[test]
-    fn test_hcom_config_validation_error_display() {
-        let errors = HashMap::from([
-            ("timeout".to_string(), "timeout must be 1-86400".to_string()),
-            ("tag".to_string(), "tag invalid chars".to_string()),
-        ]);
-        let err = HcomConfigError { errors };
-        let display = format!("{err}");
-        assert!(display.contains("Invalid config"));
-        assert!(display.contains("timeout must be 1-86400"));
-        assert!(display.contains("tag invalid chars"));
+    /// A valid non-default value for each field, as `get_field` returns it.
+    fn sample_value(field: &ConfigField) -> &'static str {
+        match (field.kind, field.name) {
+            (FieldKind::Int, _) => "123",
+            (FieldKind::Bool, _) => "0",
+            (_, "terminal") => "print",
+            (_, "title_mode") => "label",
+            (_, name) if name.ends_with("_delivery") => "native",
+            (_, "auto_subscribe") => "sample",
+            _ => "sample-value",
+        }
     }
 
     #[test]
-    fn test_default_toml_structure() {
-        let structure = default_toml_structure();
-        // Verify key paths exist
-        assert!(get_nested(&structure, "terminal.active").is_some());
-        assert!(get_nested(&structure, "terminal.title_mode").is_some());
-        assert!(get_nested(&structure, "launch.tag").is_some());
-        assert!(get_nested(&structure, "launch.claude.args").is_some());
-        assert!(get_nested(&structure, "relay.url").is_some());
-        assert!(get_nested(&structure, "preferences.timeout").is_some());
+    fn every_field_loads_from_config_toml_and_env() {
+        for field in FIELDS {
+            let expected = sample_value(field);
+            assert_ne!(
+                HcomConfig::default().get_field(field.name).unwrap(),
+                expected
+            );
+
+            let mut doc = toml_edit::DocumentMut::new();
+            let value = field_toml_value(field, expected).unwrap();
+            set_doc_path(&mut doc, field.toml, Some(value));
+            let (file_values, errors) = toml_values_from_str(&doc.to_string());
+            assert!(errors.is_empty(), "{}: {errors:?}", field.name);
+            let (config, errors) =
+                HcomConfig::load_from_sources(&file_values, Some(&HashMap::new()));
+            assert!(errors.is_empty(), "{}: {errors:?}", field.name);
+            assert_eq!(
+                config.get_field(field.name).unwrap(),
+                expected,
+                "{} must load from config.toml {}",
+                field.name,
+                field.toml
+            );
+
+            let env = HashMap::from([(field.env.to_string(), expected.to_string())]);
+            let (config, _) = HcomConfig::load_from_sources(&HashMap::new(), Some(&env));
+            let loaded = config.get_field(field.name).unwrap();
+            if field.is_relay() {
+                assert_ne!(loaded, expected, "{} must not load from env", field.name);
+            } else {
+                assert_eq!(
+                    loaded, expected,
+                    "{} must load from {}",
+                    field.name, field.env
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_value_falls_back_alone() {
+        let file_config = HashMap::from([
+            ("tag".to_string(), TomlFieldValue::Str("a b".to_string())),
+            ("timeout".to_string(), TomlFieldValue::Int(999_999)),
+            (
+                "claude_args".to_string(),
+                TomlFieldValue::Str("--model haiku".to_string()),
+            ),
+            (
+                "relay_id".to_string(),
+                TomlFieldValue::Str("group".to_string()),
+            ),
+        ]);
+        let env = HashMap::from([
+            ("HCOM_SUBAGENT_TIMEOUT".to_string(), "soon".to_string()),
+            ("HCOM_AUTO_APPROVE".to_string(), "maybe".to_string()),
+        ]);
+        let (config, errors) = HcomConfig::load_from_sources(&file_config, Some(&env));
+
+        let defaults = HcomConfig::default();
+        assert_eq!(config.tag, defaults.tag);
+        assert_eq!(config.timeout, defaults.timeout);
+        assert_eq!(config.subagent_timeout, defaults.subagent_timeout);
+        assert_eq!(config.auto_approve, defaults.auto_approve);
+        assert_eq!(config.claude_args, "--model haiku");
+        assert_eq!(config.relay_id, "group");
+        assert_eq!(
+            errors.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["auto_approve", "subagent_timeout", "tag", "timeout"]
+        );
+        assert!(errors["tag"].contains("[config.toml launch.tag]"));
+        assert!(errors["subagent_timeout"].contains("[env HCOM_SUBAGENT_TIMEOUT]"));
+    }
+
+    #[test]
+    fn empty_env_switch_means_off() {
+        let env = HashMap::from([
+            ("HCOM_AUTO_APPROVE".to_string(), String::new()),
+            ("HCOM_AUTO_TRUST_WORKSPACE".to_string(), String::new()),
+            ("HCOM_TIMEOUT".to_string(), String::new()),
+        ]);
+        let (config, errors) = HcomConfig::load_from_sources(&HashMap::new(), Some(&env));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!config.auto_approve);
+        assert!(!config.auto_trust_workspace);
+        assert_eq!(config.timeout, HcomConfig::default().timeout);
+    }
+
+    #[test]
+    fn toml_bool_in_string_field_reads_as_text() {
+        let file_config = HashMap::from([("hints".to_string(), TomlFieldValue::Bool(true))]);
+        let (config, errors) = HcomConfig::load_from_sources(&file_config, Some(&HashMap::new()));
+        assert!(errors.is_empty());
+        assert_eq!(config.hints, "true");
     }
 
     #[test]
@@ -2682,7 +2579,7 @@ active = "default"
             ..Default::default()
         };
 
-        save_toml_config(&config, None).unwrap();
+        save_toml_config(&config).unwrap();
 
         let mode = std::fs::metadata(paths::config_toml_path())
             .unwrap()

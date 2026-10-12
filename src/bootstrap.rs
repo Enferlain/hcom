@@ -457,7 +457,7 @@ pub fn get_bootstrap(
     instance_name: &str,
     tool: &str,
 ) -> String {
-    let config = crate::config::HcomConfig::load(None).unwrap_or_default();
+    let config = crate::config::HcomConfig::load(None);
     render_bootstrap(
         db,
         hcom_ctx,

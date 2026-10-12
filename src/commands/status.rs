@@ -228,18 +228,12 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     let launch_failures = recent_launch_failures(db, 5);
     let dev_root = crate::router::resolve_effective_dev_root(db.path());
 
-    // Check config validity
-    let mut config_errors: Vec<String> = Vec::new();
-    let config_valid = match std::fs::read_to_string(hcom_dir.join("config.toml")) {
-        Ok(c) => match c.parse::<toml::Table>() {
-            Ok(_) => true,
-            Err(e) => {
-                config_errors.push(e.to_string());
-                false
-            }
-        },
-        Err(_) => true, // No config file = valid (defaults)
-    };
+    // Check config validity: TOML syntax and every value the loader would reject
+    let config_errors: Vec<String> = crate::config::HcomConfig::load_with_errors(None)
+        .1
+        .into_values()
+        .collect();
+    let config_valid = config_errors.is_empty();
 
     // Terminal — read from config
     let config = crate::config::load_config_snapshot().core;
@@ -359,6 +353,9 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     let config_symbol = if config_valid { "✓" } else { "✗" };
     let config_desc = if config_valid { "valid" } else { "invalid" };
     println!("config:    {config_symbol} {config_desc}");
+    for msg in &config_errors {
+        println!("           {msg}");
+    }
 
     // Tools
     let tools_str: String = tools

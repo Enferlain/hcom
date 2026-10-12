@@ -2120,12 +2120,7 @@ fn mark_stale_subagents(db: &HcomDb, session_id: &str) {
         .flatten()
         .and_then(|name| db.get_instance_full(&name).ok().flatten())
         .and_then(|row| row.subagent_timeout)
-        .unwrap_or_else(|| {
-            HcomConfig::load(None)
-                .ok()
-                .map(|config| config.subagent_timeout)
-                .unwrap_or(120)
-        });
+        .unwrap_or_else(|| HcomConfig::load(None).subagent_timeout);
     let cutoff = crate::shared::time::now_epoch_i64().saturating_sub(timeout.saturating_mul(2));
 
     let _ = db.conn().execute(
@@ -2524,12 +2519,7 @@ fn subagent_stop(
         .as_ref()
         .and_then(|pn| db.get_instance_full(pn).ok().flatten())
         .and_then(|pd| pd.subagent_timeout)
-        .unwrap_or_else(|| {
-            HcomConfig::load(None)
-                .ok()
-                .map(|c| c.subagent_timeout)
-                .unwrap_or(120)
-        }) as u64;
+        .unwrap_or_else(|| HcomConfig::load(None).subagent_timeout) as u64;
 
     let mut result = common::poll_messages(db, &subagent_name, timeout, false);
 

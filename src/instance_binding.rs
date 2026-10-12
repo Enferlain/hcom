@@ -1090,11 +1090,11 @@ pub fn initialize_instance_in_position_file(
 
             if let Some(t) = tag {
                 data.insert("tag".into(), serde_json::json!(t));
-            } else if (session_id.is_some() || parent_session_id.is_some() || is_launched)
-                && let Ok(hcom_config) = crate::config::HcomConfig::load(None)
-                && !hcom_config.tag.is_empty()
-            {
-                data.insert("tag".into(), serde_json::json!(hcom_config.tag));
+            } else if session_id.is_some() || parent_session_id.is_some() || is_launched {
+                let config_tag = crate::config::HcomConfig::load(None).tag;
+                if !config_tag.is_empty() {
+                    data.insert("tag".into(), serde_json::json!(config_tag));
+                }
             }
 
             // Resolve HCOM_TIMEOUT explicitly rather than leaving the column
@@ -1260,10 +1260,7 @@ fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
 
     let _ = db.cleanup_subscriptions(instance_name);
     let _ = db.cleanup_thread_memberships_for_name_reuse(instance_name);
-    let config = match crate::config::HcomConfig::load(None) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    let config = crate::config::HcomConfig::load(None);
     if config.auto_subscribe.is_empty() {
         return;
     }

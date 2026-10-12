@@ -51,146 +51,6 @@ pub struct ConfigArgs {
     pub instance: Option<String>,
 }
 
-// ── Config Key Registry ──────────────────────────────────────────────────
-
-/// Known config keys with descriptions and types.
-pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
-    (
-        "HCOM_CLAUDE_DELIVERY",
-        "Claude delivery for new launches (native | inject, default: inject)",
-        "string",
-    ),
-    ("HCOM_TAG", "Group tag for launched instances", "string"),
-    ("HCOM_HINTS", "Text injected with all messages", "string"),
-    (
-        "HCOM_NOTES",
-        "One-time notes appended at bootstrap",
-        "string",
-    ),
-    (
-        "HCOM_TIMEOUT",
-        "Idle timeout in seconds (default: 86400)",
-        "integer",
-    ),
-    (
-        "HCOM_SUBAGENT_TIMEOUT",
-        "Timeout for Claude subagents in seconds (default: 30)",
-        "integer",
-    ),
-    (
-        "HCOM_CLAUDE_ARGS",
-        "Default args for claude on launch",
-        "string",
-    ),
-    (
-        "HCOM_GEMINI_ARGS",
-        "Default args for gemini on launch",
-        "string",
-    ),
-    (
-        "HCOM_CODEX_ARGS",
-        "Default args for codex on launch",
-        "string",
-    ),
-    (
-        "HCOM_OPENCODE_ARGS",
-        "Default args for opencode on launch",
-        "string",
-    ),
-    (
-        "HCOM_KILO_ARGS",
-        "Default args for kilo on launch",
-        "string",
-    ),
-    ("HCOM_PI_ARGS", "Default args for pi on launch", "string"),
-    ("HCOM_OMP_ARGS", "Default args for omp on launch", "string"),
-    (
-        "HCOM_CURSOR_ARGS",
-        "Default args for cursor-agent on launch",
-        "string",
-    ),
-    (
-        "HCOM_KIMI_ARGS",
-        "Default args for kimi on launch",
-        "string",
-    ),
-    (
-        "HCOM_COPILOT_ARGS",
-        "Default args for copilot on launch",
-        "string",
-    ),
-    (
-        "HCOM_QODER_ARGS",
-        "Default args for qodercli on launch",
-        "string",
-    ),
-    (
-        "HCOM_GEMINI_SYSTEM_PROMPT",
-        "System prompt for gemini on launch",
-        "string",
-    ),
-    (
-        "HCOM_CODEX_SYSTEM_PROMPT",
-        "System prompt for codex on launch",
-        "string",
-    ),
-    (
-        "HCOM_TERMINAL",
-        "Terminal preset for spawning agent panes",
-        "string",
-    ),
-    (
-        "HCOM_AUTO_APPROVE",
-        "Auto-approve safe hcom commands (true/false)",
-        "boolean",
-    ),
-    (
-        "HCOM_AUTO_SUBSCRIBE",
-        "Auto-subscribe event presets (comma-separated)",
-        "string",
-    ),
-    (
-        "HCOM_AUTO_TRUST_WORKSPACE",
-        "Auto-approve workspace trust at launch; may persist in tool config (true/false)",
-        "boolean",
-    ),
-    (
-        "HCOM_COPILOT_DELIVERY",
-        "Idle Copilot delivery: native (its CLI extension) or inject (PTY, default)",
-        "string",
-    ),
-    (
-        "HCOM_NAME_EXPORT",
-        "Export instance name to custom env var",
-        "string",
-    ),
-    (
-        "HCOM_TITLE_MODE",
-        "Terminal title mode (combined | label | off)",
-        "string",
-    ),
-    (
-        "HCOM_RELAY",
-        "Relay MQTT broker URL (read-only; managed by hcom relay)",
-        "string",
-    ),
-    (
-        "HCOM_RELAY_ID",
-        "Relay group identifier (read-only; managed by hcom relay)",
-        "string",
-    ),
-    (
-        "HCOM_RELAY_TOKEN",
-        "Relay authentication token (read-only; managed by hcom relay)",
-        "string",
-    ),
-    (
-        "HCOM_RELAY_ENABLED",
-        "Enable relay sync (read-only; managed by hcom relay)",
-        "boolean",
-    ),
-];
-
 /// Instance-level config keys.
 const INSTANCE_KEYS: &[(&str, &str)] = &[
     ("tag", "Instance-specific tag (changes display name)"),
@@ -202,94 +62,21 @@ const INSTANCE_KEYS: &[(&str, &str)] = &[
     ),
 ];
 
-// ── Flag Parsing ─────────────────────────────────────────────────────────
-
-// ── TOML Key Mapping ────────────────────
-
-/// Maps HCOM_ field name (lowercase, no prefix) to nested TOML dotted path.
-fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
-    // relay_psk is set through `hcom relay`, not `hcom config`.
-    if field_name == "relay_psk" {
-        return None;
-    }
-    crate::config::toml_path_for_field(field_name)
-}
-
 // ── Config File Operations ───────────────────────────────────────────────
 
 fn config_path() -> PathBuf {
     crate::paths::hcom_dir().join("config.toml")
 }
 
-/// Load raw TOML content from config file.
-fn load_config_content() -> String {
-    std::fs::read_to_string(config_path()).unwrap_or_default()
-}
-
-/// Set a value at a nested TOML dotted path (e.g. "preferences.timeout") using toml_edit.
-fn set_nested_toml(doc: &mut toml_edit::DocumentMut, dotted_path: &str, value: &str) {
-    let parts: Vec<&str> = dotted_path.split('.').collect();
-
-    // Ensure the top-level table exists (a 3-level path's second level is
-    // created inside it below, never at the top level)
-    if doc.get(parts[0]).is_none() || !doc[parts[0]].is_table_like() {
-        doc[parts[0]] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-
-    // For 2-level paths (e.g. "preferences.timeout")
-    if parts.len() == 2 {
-        if value.is_empty() {
-            if let Some(tbl) = doc[parts[0]].as_table_like_mut() {
-                tbl.remove(parts[1]);
-            }
-        } else if let Ok(n) = value.parse::<i64>() {
-            doc[parts[0]][parts[1]] = toml_edit::value(n);
-        } else if value == "true" || value == "false" {
-            doc[parts[0]][parts[1]] = toml_edit::value(value == "true");
-        } else {
-            doc[parts[0]][parts[1]] = toml_edit::value(value);
-        }
-    } else if parts.len() == 3 {
-        // For 3-level paths (e.g. "launch.claude.args")
-        // Ensure second-level table exists
-        if doc[parts[0]].get(parts[1]).is_none() || !doc[parts[0]][parts[1]].is_table_like() {
-            doc[parts[0]][parts[1]] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        if value.is_empty() {
-            if let Some(tbl) = doc[parts[0]][parts[1]].as_table_like_mut() {
-                tbl.remove(parts[2]);
-            }
-        } else if let Ok(n) = value.parse::<i64>() {
-            doc[parts[0]][parts[1]][parts[2]] = toml_edit::value(n);
-        } else if value == "true" || value == "false" {
-            doc[parts[0]][parts[1]][parts[2]] = toml_edit::value(value == "true");
-        } else {
-            doc[parts[0]][parts[1]][parts[2]] = toml_edit::value(value);
-        }
-    }
-}
-
-/// Get a value from a nested TOML dotted path.
-fn get_nested_toml(table: &toml::Table, dotted_path: &str) -> Option<toml::Value> {
-    let parts: Vec<&str> = dotted_path.split('.').collect();
-    let mut current: &toml::Value = &toml::Value::Table(table.clone());
-
-    for part in &parts {
-        match current {
-            toml::Value::Table(t) => {
-                current = t.get(*part)?;
-            }
-            _ => return None,
-        }
-    }
-    Some(current.clone())
-}
-
-/// Set a config key in the TOML file (preserving comments via toml_edit).
-/// Uses nested TOML paths
+/// Set a config key in config.toml (preserving comments via toml_edit).
+/// An empty value is a value: "" for text, false for a switch.
 pub fn config_set(key: &str, value: &str) -> Result<(), String> {
-    let path = config_path();
-    config_set_at_path(&path, key, value)
+    config_set_at_path(&config_path(), key, Some(value))
+}
+
+/// Remove a config key from config.toml, so it falls back to its default.
+pub fn config_unset(key: &str) -> Result<(), String> {
+    config_set_at_path(&config_path(), key, None)
 }
 
 fn launch_tool_for_args_field(field_name: &str) -> Option<LaunchTool> {
@@ -329,113 +116,71 @@ fn validate_config_args(field_name: &str, value: &str) -> Result<(), String> {
     }
 }
 
-fn config_set_at_path(path: &Path, key: &str, value: &str) -> Result<(), String> {
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+fn config_set_at_path(path: &Path, key: &str, value: Option<&str>) -> Result<(), String> {
+    let field =
+        crate::config::user_field(key).ok_or_else(|| format!("Unknown config key '{key}'"))?;
+    if let Some(value) = value {
+        validate_config_args(field.name, value)?;
+    }
 
+    let content = std::fs::read_to_string(path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = content
         .parse()
         .map_err(|e| format!("Failed to parse config.toml: {e}"))?;
+    let new_value = value
+        .map(|v| crate::config::field_toml_value(field, v))
+        .transpose()?;
+    crate::config::set_doc_path(&mut doc, field.toml, new_value);
+    let content = doc.to_string();
 
-    // Map HCOM_KEY to field name, then to nested TOML path
-    let field_name = key.strip_prefix("HCOM_").unwrap_or(key).to_lowercase();
-    validate_config_args(&field_name, value)?;
+    // Refuse what the loader would reject and replace with the default.
+    if let Some(err) = crate::config::file_field_error(&content, field.name) {
+        return Err(err);
+    }
 
-    if field_name.ends_with("_delivery")
-        && !value.is_empty()
-        && !crate::config::DELIVERY_MODES.contains(&value)
+    crate::config::write_config_toml_path(path, &content)
+        .map_err(|e| format!("Failed to write config.toml: {e}"))
+}
+
+/// Set a key the way `hcom config <key> <value>` does, including side effects.
+/// Shared by the CLI and remote (relay) config set.
+pub fn config_set_and_apply(key: &str, value: &str) -> Result<(), String> {
+    config_set(key, value)?;
+    if crate::config::user_field(key).is_some_and(|f| f.name == "auto_approve")
+        && !update_auto_approve_permissions()
     {
-        return Err(format!(
-            "{field_name} must be one of: {}. Got '{value}'",
-            crate::config::DELIVERY_MODES.join(", ")
-        ));
+        return Err("failed to update auto-approve permissions".into());
     }
-
-    if field_name == "title_mode"
-        && !value.is_empty()
-        && !crate::shared::VALID_TITLE_MODES.contains(&value)
-    {
-        return Err(format!(
-            "title_mode must be one of: {}. Got '{value}'",
-            crate::shared::VALID_TITLE_MODES.join(", ")
-        ));
-    }
-
-    if let Some(dotted_path) = toml_path_for_key(&field_name) {
-        set_nested_toml(&mut doc, dotted_path, value);
-    } else {
-        // Unknown key — fall back to flat key for forward compat
-        if value.is_empty() {
-            doc.remove(&field_name);
-        } else if let Ok(n) = value.parse::<i64>() {
-            doc[&field_name] = toml_edit::value(n);
-        } else if value == "true" || value == "false" {
-            doc[&field_name] = toml_edit::value(value == "true");
-        } else {
-            doc[&field_name] = toml_edit::value(value);
-        }
-    }
-
-    crate::config::write_config_toml_path(path, &doc.to_string())
-        .map_err(|e| format!("Failed to write config.toml: {e}"))?;
-
     Ok(())
 }
 
-/// Get a config value (checks env var, then TOML nested path, then default).
-/// Relay fields skip the env var: the loader reads them from config.toml only,
-/// and agents inherit them in env from their launch, so env would misreport them.
+/// Get a config value and its source: env var, config.toml, or default.
+/// Relay fields skip the env var: the loader reads them from config.toml only.
+/// Keys that are not config fields (e.g. HCOM_DIR) are read from env only.
 pub fn config_get(key: &str) -> (String, &'static str) {
-    if !key.starts_with("HCOM_RELAY")
-        && let Ok(val) = std::env::var(key)
+    let Some(field) = crate::config::user_field(key) else {
+        return match std::env::var(key) {
+            Ok(val) => (val, "env"),
+            Err(_) => (String::new(), "default"),
+        };
+    };
+    if !field.is_relay()
+        && let Ok(val) = std::env::var(field.env)
     {
         return (val, "env");
     }
-
-    // Map to field name and nested TOML path
-    let field_name = key.strip_prefix("HCOM_").unwrap_or(key).to_lowercase();
-
-    let content = load_config_content();
-    if let Ok(table) = content.parse::<toml::Table>() {
-        // Try nested path first
-        if let Some(dotted_path) = toml_path_for_key(&field_name)
-            && let Some(val) = get_nested_toml(&table, dotted_path)
-        {
-            let val_str = match &val {
-                toml::Value::String(s) => s.clone(),
-                toml::Value::Integer(n) => n.to_string(),
-                toml::Value::Boolean(b) => b.to_string(),
-                toml::Value::Float(f) => f.to_string(),
-                other => other.to_string(),
-            };
-            return (val_str, "toml");
-        }
-        // Fallback: try flat key (for legacy configs) — skip non-scalar values
-        // (e.g. table.get("terminal") returns the whole [terminal] section when
-        // terminal.active is not set; returning that would be a display bug)
-        if let Some(val) = table.get(&field_name) {
-            let val_str = match val {
-                toml::Value::String(s) => s.clone(),
-                toml::Value::Integer(n) => n.to_string(),
-                toml::Value::Boolean(b) => b.to_string(),
-                toml::Value::Float(f) => f.to_string(),
-                _ => return ("".to_string(), "toml"), // table/array — treat as unset
-            };
-            return (val_str, "toml");
-        }
+    let (values, _) = crate::config::read_toml_values(&config_path());
+    if let Some(val) = values.get(field.name) {
+        return (val.as_string(), "toml");
     }
-
-    // Default
-    let default = match key {
-        "HCOM_TIMEOUT" => "86400",
-        "HCOM_SUBAGENT_TIMEOUT" => "30",
-        "HCOM_AUTO_APPROVE" => "true",
-        "HCOM_AUTO_TRUST_WORKSPACE" => "true",
-        "HCOM_COPILOT_DELIVERY" => crate::config::DEFAULT_DELIVERY,
-        "HCOM_TITLE_MODE" => "combined",
-        "HCOM_CLAUDE_DELIVERY" => crate::config::DEFAULT_DELIVERY,
-        _ => "",
+    let default = crate::config::HcomConfig::default()
+        .get_field(field.name)
+        .unwrap_or_default();
+    let default = match field.kind {
+        crate::config::FieldKind::Bool => (default == "1").to_string(),
+        _ => default,
     };
-    (default.to_string(), "default")
+    (default, "default")
 }
 
 fn config_dev_root(
@@ -609,129 +354,29 @@ fn config_instance(
 
     // No value: show current
     let Some(value) = value else {
-        let current = match key {
-            "tag" => serde_json::json!({"value": instance.tag.as_deref().unwrap_or("")}),
-            "timeout" => serde_json::json!({"value": instance.wait_timeout.unwrap_or(86400)}),
-            "hints" => serde_json::json!({"value": instance.hints.as_deref().unwrap_or("")}),
-            "subagent_timeout" => match instance.subagent_timeout {
-                Some(value) => serde_json::json!({"value": value}),
-                None => serde_json::json!({"value": serde_json::Value::Null}),
-            },
-            _ => serde_json::json!({"value": ""}),
+        return match config_instance_get(db, inst_name, Some(key)) {
+            Ok(current) => {
+                println!(
+                    "{}",
+                    render_config_instance_get(&current, Some(key), json_mode)
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                1
+            }
         };
-        println!(
-            "{}",
-            render_config_instance_get(&current, Some(key), json_mode)
-        );
-        return 0;
     };
 
-    // Set value
-    match key {
-        "tag" => {
-            let tag = if value.is_empty() { "" } else { value };
-            // Validate: alphanumeric, hyphens, underscores only
-            if !tag.is_empty()
-                && !tag
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-            {
-                eprintln!("Error: Tag must be alphanumeric (hyphens and underscores allowed)");
-                return 1;
-            }
-            let _ = db.conn().execute(
-                "UPDATE instances SET tag = ? WHERE name = ?",
-                rusqlite::params![tag, inst_name],
-            );
-            println!(
-                "{}",
-                render_config_instance_set_feedback(inst_name, "tag", tag)
-            );
-            // Notify for display update
-            crate::notify::wake_all(db);
-        }
-        "timeout" => {
-            if value.is_empty() || value.eq_ignore_ascii_case("default") {
-                let _ = db.conn().execute(
-                    "UPDATE instances SET wait_timeout = 86400 WHERE name = ?",
-                    rusqlite::params![inst_name],
-                );
-                println!(
-                    "{}",
-                    render_config_instance_set_feedback(inst_name, "timeout", value)
-                );
-            } else {
-                match value.parse::<i64>() {
-                    Ok(secs) if secs > 0 => {
-                        let _ = db.conn().execute(
-                            "UPDATE instances SET wait_timeout = ? WHERE name = ?",
-                            rusqlite::params![secs, inst_name],
-                        );
-                        println!(
-                            "{}",
-                            render_config_instance_set_feedback(
-                                inst_name,
-                                "timeout",
-                                &secs.to_string()
-                            )
-                        );
-                    }
-                    _ => {
-                        eprintln!("Error: timeout must be a positive integer (seconds)");
-                        return 1;
-                    }
-                }
-            }
-        }
-        "hints" => {
-            let mut updates = serde_json::Map::new();
-            if value.is_empty() {
-                updates.insert("hints".into(), serde_json::Value::Null);
-                instances::update_instance_position(db, inst_name, &updates);
-            } else {
-                updates.insert("hints".into(), serde_json::json!(value));
-                instances::update_instance_position(db, inst_name, &updates);
-            }
-            println!(
-                "{}",
-                render_config_instance_set_feedback(inst_name, "hints", value)
-            );
-        }
-        "subagent_timeout" => {
-            let mut updates = serde_json::Map::new();
-            if value.is_empty() || value.eq_ignore_ascii_case("default") {
-                updates.insert("subagent_timeout".into(), serde_json::Value::Null);
-                instances::update_instance_position(db, inst_name, &updates);
-                println!(
-                    "{}",
-                    render_config_instance_set_feedback(inst_name, "subagent_timeout", value)
-                );
-            } else {
-                match value.parse::<i64>() {
-                    Ok(secs) if secs > 0 => {
-                        updates.insert("subagent_timeout".into(), serde_json::json!(secs));
-                        instances::update_instance_position(db, inst_name, &updates);
-                        println!(
-                            "{}",
-                            render_config_instance_set_feedback(
-                                inst_name,
-                                "subagent_timeout",
-                                &secs.to_string()
-                            )
-                        );
-                    }
-                    _ => {
-                        eprintln!("Error: subagent_timeout must be a positive integer (seconds)");
-                        return 1;
-                    }
-                }
-            }
-        }
-        _ => {
-            eprintln!("Error: Unknown key '{key}'");
-            return 1;
-        }
+    if let Err(e) = config_instance_set(db, inst_name, key, value) {
+        eprintln!("Error: {e}");
+        return 1;
     }
+    println!(
+        "{}",
+        render_config_instance_set_feedback(inst_name, key, value)
+    );
 
     // C4 fix: push config changes to relay
     crate::relay::spawn_background_push();
@@ -896,27 +541,20 @@ pub fn config_instance_set(
                 .map_err(|e| e.to_string())?;
         }
         "timeout" => {
-            if value.is_empty() || value.eq_ignore_ascii_case("default") {
-                db.conn()
-                    .execute(
-                        "UPDATE instances SET wait_timeout = 86400 WHERE name = ?",
-                        rusqlite::params![inst_name],
-                    )
-                    .map_err(|e| e.to_string())?;
+            let secs = if value.is_empty() || value.eq_ignore_ascii_case("default") {
+                crate::config::HcomConfig::load(None).timeout
             } else {
-                let secs = value
-                    .parse::<i64>()
-                    .map_err(|_| "timeout must be a positive integer (seconds)".to_string())?;
-                if secs <= 0 {
-                    return Err("timeout must be a positive integer (seconds)".to_string());
+                match value.parse::<i64>() {
+                    Ok(secs) if secs > 0 => secs,
+                    _ => return Err("timeout must be a positive integer (seconds)".to_string()),
                 }
-                db.conn()
-                    .execute(
-                        "UPDATE instances SET wait_timeout = ? WHERE name = ?",
-                        rusqlite::params![secs, inst_name],
-                    )
-                    .map_err(|e| e.to_string())?;
-            }
+            };
+            db.conn()
+                .execute(
+                    "UPDATE instances SET wait_timeout = ? WHERE name = ?",
+                    rusqlite::params![secs, inst_name],
+                )
+                .map_err(|e| e.to_string())?;
         }
         "hints" => {
             let mut updates = serde_json::Map::new();
@@ -1093,10 +731,15 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
             print_terminal_info();
             return 0;
         }
-        if unset_mode {
-            return config_terminal(&["default".to_string()], setup_mode);
+        let rc = if unset_mode {
+            config_terminal(&["default".to_string()], setup_mode)
+        } else {
+            config_terminal(&argv[1..], setup_mode)
+        };
+        if rc == 0 && (unset_mode || argv.len() > 1) {
+            note_env_override("HCOM_TERMINAL");
         }
-        return config_terminal(&argv[1..], setup_mode);
+        return rc;
     }
 
     // Check for info request: `config key --info` or `config key info` or `config key ?`
@@ -1116,11 +759,10 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
     // is actually set (e.g. HCOM_DIR) stays allowed.
     let is_set_mode = argv.len() >= 2 || unset_mode;
     let env_readable = !is_set_mode && std::env::var(&key).is_ok();
-    if !CONFIG_KEYS.iter().any(|(k, _, _)| *k == key) && !env_readable {
+    if crate::config::user_field(&key).is_none() && !env_readable {
         let typed = key_arg.to_lowercase();
-        let short: Vec<String> = CONFIG_KEYS
-            .iter()
-            .map(|(k, _, _)| k.trim_start_matches("HCOM_").to_lowercase())
+        let short: Vec<String> = crate::config::user_fields()
+            .map(|f| f.name.to_string())
             .chain(["dev_root".to_string()])
             .collect();
         eprintln!(
@@ -1151,36 +793,26 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
         // Join all remaining args with spaces
         let value = argv[1..].join(" ");
 
-        match config_set(&key, &value) {
-            Ok(()) => {
-                if unset_mode {
-                    println!("Unset {key}");
-                } else {
-                    println!("Set {key} = {value}");
-                }
-
-                // Side effect: auto_approve changes must update tool permissions
-                // (after --unset, to whatever the key now falls back to)
-                if key == "HCOM_AUTO_APPROVE" {
-                    let effective = if unset_mode {
-                        config_get(&key).0
-                    } else {
-                        value
-                    };
-                    return if update_auto_approve_permissions(&effective) {
-                        0
-                    } else {
-                        1
-                    };
-                }
-
-                return 0;
-            }
-            Err(e) => {
-                eprintln!("Error: {e}");
-                return 1;
-            }
+        // Validate and write first; side effects run after the confirmation.
+        let result = if unset_mode {
+            config_unset(&key)
+        } else {
+            config_set(&key, &value)
+        };
+        if let Err(e) = result {
+            eprintln!("Error: {e}");
+            return 1;
         }
+        if unset_mode {
+            println!("Unset {key}");
+        } else {
+            println!("Set {key} = {value}");
+        }
+        note_env_override(&key);
+        if key == "HCOM_AUTO_APPROVE" && !update_auto_approve_permissions() {
+            return 1;
+        }
+        return 0;
     }
 
     // Get mode: config KEY
@@ -1194,8 +826,26 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
     } else {
         println!("{value}");
     }
+    // The raw value is shown as set; say when the loader replaces it.
+    if let Some(field) = crate::config::user_field(&key)
+        && let (config, errors) = crate::config::HcomConfig::load_with_errors(None)
+        && let Some(msg) = errors.get(field.name)
+    {
+        let effective = config.get_field(field.name).unwrap_or_default();
+        eprintln!("Invalid, using the default ({effective}): {msg}");
+    }
 
     0
+}
+
+/// An env var wins over config.toml. Agents launched by hcom carry every
+/// setting in env as of their launch, so this is common there.
+fn note_env_override(key: &str) {
+    if let Ok(env_val) = std::env::var(key) {
+        eprintln!(
+            "Note: {key}={env_val} in this environment overrides config.toml here and for agents launched from here"
+        );
+    }
 }
 
 /// Normalize a key argument to HCOM_* format.
@@ -1268,13 +918,14 @@ fn get_runtime_overrides(
 fn show_all_config(db: &HcomDb, ctx: Option<&CommandContext>, json_mode: bool) -> i32 {
     let runtime_overrides = get_runtime_overrides(db, ctx);
     let dev_root = crate::router::resolve_effective_dev_root(db.path());
+    let (_, config_errors) = crate::config::HcomConfig::load_with_errors(None);
 
     if json_mode {
         let mut result = serde_json::Map::new();
-        for (key, _, _) in CONFIG_KEYS {
+        for key in crate::config::user_fields().map(|f| f.env) {
             let (value, _source) = config_get(key);
             // {KEY: value} — mask relay token
-            let display = if *key == "HCOM_RELAY_TOKEN" && value.len() > 4 {
+            let display = if key == "HCOM_RELAY_TOKEN" && value.len() > 4 {
                 format!("{}***", &value[..4])
             } else {
                 value
@@ -1291,6 +942,9 @@ fn show_all_config(db: &HcomDb, ctx: Option<&CommandContext>, json_mode: bool) -
                 serde_json::Value::String(source.to_string()),
             );
         }
+        if !config_errors.is_empty() {
+            result.insert("config_errors".to_string(), json!(config_errors));
+        }
         println!(
             "{}",
             serde_json::to_string(&Value::Object(result)).unwrap_or_default()
@@ -1298,7 +952,7 @@ fn show_all_config(db: &HcomDb, ctx: Option<&CommandContext>, json_mode: bool) -
     } else {
         println!("hcom configuration ({})\n", config_path().display());
         println!("hcom Settings:");
-        for (key, _desc, _) in CONFIG_KEYS {
+        for key in crate::config::user_fields().map(|f| f.env) {
             // Check runtime override first
             let (display, source) = if let Some(val) = runtime_overrides.get(key) {
                 (val.clone(), "runtime")
@@ -1306,7 +960,7 @@ fn show_all_config(db: &HcomDb, ctx: Option<&CommandContext>, json_mode: bool) -
                 let (value, source) = config_get(key);
                 let display = if value.is_empty() {
                     "(not set)".to_string()
-                } else if *key == "HCOM_RELAY_TOKEN" && !value.is_empty() {
+                } else if key == "HCOM_RELAY_TOKEN" && !value.is_empty() {
                     let visible = value.len().min(4);
                     format!("{}...", &value[..visible])
                 } else {
@@ -1319,8 +973,14 @@ fn show_all_config(db: &HcomDb, ctx: Option<&CommandContext>, json_mode: bool) -
         if let Some((path, source)) = dev_root {
             println!("  {:<28} {:<30} [{}]", "dev_root", path.display(), source);
         }
+        if !config_errors.is_empty() {
+            println!("\nInvalid, using the default instead:");
+            for msg in config_errors.values() {
+                println!("  {msg}");
+            }
+        }
         println!(
-            "\n[env] = environment, [toml] = config.toml, [file] = env file, [runtime] = agent override, [kv] = hcom.db key-value, (blank) = default"
+            "\n[env] = environment, [toml] = config.toml, [runtime] = agent override, [kv] = hcom.db key-value, [default] = default"
         );
         println!("\nEdit: hcom config --edit");
     }
@@ -1970,50 +1630,45 @@ fn print_terminal_info() {
 }
 
 fn show_key_info(key: &str) -> i32 {
-    if CONFIG_KEYS.iter().any(|(k, _, _)| *k == key) {
-        // HCOM_TERMINAL: dynamic help from TERMINAL_PRESETS
-        if key == "HCOM_TERMINAL" {
-            print_terminal_info();
-            return 0;
-        }
-        // If rich help text exists, show it with current value appended
-        if let Some(help) = config_help(key) {
-            let (value, source) = config_get(key);
-            println!("{help}");
-            println!();
-            if value.is_empty() {
-                println!("Current value: (not set)");
-            } else {
-                println!("Current value: {value} [{source}]");
-            }
-            return 0;
-        }
-        // Fallback: basic info from CONFIG_KEYS
-        let (_, desc, typ) = CONFIG_KEYS.iter().find(|(k, _, _)| *k == key).unwrap();
-        let (value, source) = config_get(key);
-        println!("{key}");
-        println!("  Description: {desc}");
-        println!("  Type: {typ}");
-        if value.is_empty() {
-            println!("  Value: (not set)");
-        } else {
-            println!("  Value: {value} [{source}]");
-        }
-        println!("  Set via: hcom config {key} <value>");
-        println!("  Or env: export {key}=<value>");
-        0
-    } else {
+    let Some(field) = crate::config::user_field(key) else {
         eprintln!("Unknown config key: {key}");
         eprintln!(
             "Valid keys: {}",
-            CONFIG_KEYS
-                .iter()
-                .map(|(k, _, _)| *k)
+            crate::config::user_fields()
+                .map(|f| f.name)
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        1
+        return 1;
+    };
+    // HCOM_TERMINAL: dynamic help from TERMINAL_PRESETS
+    if field.name == "terminal" {
+        print_terminal_info();
+        return 0;
     }
+    let (value, source) = config_get(field.env);
+    // If rich help text exists, show it with current value appended
+    if let Some(help) = config_help(field.env) {
+        println!("{help}");
+        println!();
+        if value.is_empty() {
+            println!("Current value: (not set)");
+        } else {
+            println!("Current value: {value} [{source}]");
+        }
+        return 0;
+    }
+    println!("{}", field.env);
+    println!("  Description: {}", field.desc);
+    println!("  Type: {}", field.kind.as_str());
+    if value.is_empty() {
+        println!("  Value: (not set)");
+    } else {
+        println!("  Value: {value} [{source}]");
+    }
+    println!("  Set via: hcom config {} <value>", field.name);
+    println!("  Or env: export {}=<value>", field.env);
+    0
 }
 
 /// Handle terminal preset configuration.
@@ -2064,7 +1719,7 @@ fn config_terminal(argv: &[String], setup_mode: bool) -> i32 {
     }
 
     if preset_name == "default" || preset_name == "auto" {
-        match config_set("HCOM_TERMINAL", "") {
+        match config_unset("HCOM_TERMINAL") {
             Ok(()) => {
                 println!("Terminal reset to auto-detect");
                 return 0;
@@ -2098,7 +1753,9 @@ fn config_terminal(argv: &[String], setup_mode: bool) -> i32 {
     let builtin = TERMINAL_PRESETS
         .iter()
         .find(|(name, _)| *name == preset_name.as_str());
-    let valid = builtin.is_some() || crate::config::is_user_defined_preset(preset_name);
+    let valid = builtin.is_some()
+        || matches!(preset_name.as_str(), "here" | "print")
+        || crate::config::is_user_defined_preset(preset_name);
 
     if !valid {
         let mut available: Vec<&str> = TERMINAL_PRESETS.iter().map(|(name, _)| *name).collect();
@@ -2113,15 +1770,8 @@ fn config_terminal(argv: &[String], setup_mode: bool) -> i32 {
         eprintln!("Available: {}", available.join(", "));
         return 1;
     }
-    let platform = crate::shared::platform::platform_name();
-    if let Some((_, preset)) = builtin
-        && !preset.platforms.is_empty()
-        && !preset.platforms.contains(&platform)
-    {
-        eprintln!("Error: Terminal preset '{preset_name}' is not available on {platform}");
-        return 1;
-    }
-
+    // config_set refuses a built-in preset for another platform, unless a
+    // user preset of the same name overrides it.
     match config_set("HCOM_TERMINAL", preset_name) {
         Ok(()) => {
             println!("Terminal set to: {preset_name}");
@@ -2289,9 +1939,10 @@ fn kitty_setup() -> i32 {
 }
 
 /// Update tool permissions when auto_approve changes.
-fn update_auto_approve_permissions(value: &str) -> bool {
-    let normalized = value.to_ascii_lowercase();
-    let enabled = !matches!(normalized.as_str(), "0" | "false" | "no" | "off" | "");
+/// Sync installed hook permissions with `auto_approve` in config.toml. Those
+/// permission files are shared like config.toml, so env overrides don't apply.
+fn update_auto_approve_permissions() -> bool {
+    let enabled = crate::config::load_config_snapshot().core.auto_approve;
     let failures = super::hooks::refresh_installed_hook_permissions(enabled);
 
     if enabled {
@@ -2312,20 +1963,6 @@ fn update_auto_approve_permissions(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_mapped_field_is_set_where_the_loader_reads_it() {
-        for (field, path) in crate::config::TOML_KEY_MAP {
-            if *field == "relay_psk" {
-                continue;
-            }
-            assert_eq!(
-                toml_path_for_key(field),
-                Some(*path),
-                "`hcom config {field}` must write {path}"
-            );
-        }
-    }
 
     #[test]
     fn test_normalize_key() {
@@ -2410,11 +2047,11 @@ mod tests {
     #[test]
     fn test_config_key_info_exists() {
         // All keys should have descriptions
-        for (key, desc, typ) in CONFIG_KEYS {
-            assert!(!key.is_empty());
-            assert!(!desc.is_empty());
-            assert!(!typ.is_empty());
+        for field in crate::config::user_fields() {
+            assert!(!field.desc.is_empty(), "{}", field.name);
         }
+        assert!(crate::config::user_field("relay_psk").is_none());
+        assert!(crate::config::user_field("HCOM_GROK_ARGS").is_some());
     }
 
     #[test]
@@ -2445,7 +2082,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[launch.claude]\nargs = \"--model keep\"\n").unwrap();
 
-        config_set_at_path(&path, "HCOM_CLAUDE_ARGS", "--future-upstream-flag").unwrap();
+        config_set_at_path(&path, "HCOM_CLAUDE_ARGS", Some("--future-upstream-flag")).unwrap();
         assert!(
             std::fs::read_to_string(&path)
                 .unwrap()
@@ -2458,7 +2095,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
 
-        config_set_at_path(&path, "HCOM_PI_ARGS", "--model safe-model").unwrap();
+        config_set_at_path(&path, "HCOM_PI_ARGS", Some("--model safe-model")).unwrap();
 
         let parsed: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
         assert_eq!(
@@ -2474,16 +2111,66 @@ mod tests {
         let path = dir.path().join("config.toml");
         let read = || -> toml::Table { std::fs::read_to_string(&path).unwrap().parse().unwrap() };
 
-        config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", "native").unwrap();
+        config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", Some("native")).unwrap();
         assert_eq!(
             read()["launch"]["copilot"]["delivery"].as_str(),
             Some("native")
         );
-        assert!(config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", "pty").is_err());
+        assert!(config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", Some("pty")).is_err());
 
         // --unset writes "", which removes the key (back to the default).
-        config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", "").unwrap();
+        config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", None).unwrap();
         assert!(read()["launch"]["copilot"].get("delivery").is_none());
+    }
+
+    #[test]
+    fn config_set_refuses_what_the_loader_would_reject() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (key, value) in [
+            ("HCOM_TIMEOUT", "999999"),
+            ("HCOM_TIMEOUT", "soon"),
+            ("HCOM_SUBAGENT_TIMEOUT", "0"),
+            ("HCOM_TAG", "a b"),
+            ("HCOM_AUTO_APPROVE", "maybe"),
+            ("HCOM_AUTO_SUBSCRIBE", "a b"),
+            ("HCOM_TITLE_MODE", "loud"),
+            ("HCOM_TERMINAL", "kitty; rm -rf ~"),
+            ("HCOM_RELAY_PSK", "secret"),
+            ("HCOM_NOT_A_KEY", "1"),
+        ] {
+            assert!(
+                config_set_at_path(&path, key, Some(value)).is_err(),
+                "{key}={value} must be refused"
+            );
+        }
+        assert!(!path.exists() || std::fs::read_to_string(&path).unwrap().trim().is_empty());
+    }
+
+    #[test]
+    fn config_set_writes_the_field_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let read = || -> toml::Table { std::fs::read_to_string(&path).unwrap().parse().unwrap() };
+
+        config_set_at_path(&path, "hints", Some("true")).unwrap();
+        config_set_at_path(&path, "tag", Some("123")).unwrap();
+        config_set_at_path(&path, "timeout", Some("600")).unwrap();
+        config_set_at_path(&path, "auto_approve", Some("no")).unwrap();
+        config_set_at_path(&path, "grok_args", Some("--model x")).unwrap();
+        let t = read();
+        assert_eq!(t["launch"]["hints"].as_str(), Some("true"));
+        assert_eq!(t["launch"]["tag"].as_str(), Some("123"));
+        assert_eq!(t["preferences"]["timeout"].as_integer(), Some(600));
+        assert_eq!(t["preferences"]["auto_approve"].as_bool(), Some(false));
+        assert_eq!(t["launch"]["grok"]["args"].as_str(), Some("--model x"));
+
+        // Explicit "" is a value (no auto-subscribe presets); unset removes the key.
+        config_set_at_path(&path, "auto_subscribe", Some("")).unwrap();
+        assert_eq!(read()["launch"]["auto_subscribe"].as_str(), Some(""));
+        config_set_at_path(&path, "auto_subscribe", None).unwrap();
+        assert!(read()["launch"].get("auto_subscribe").is_none());
+        assert!(config_set_at_path(&path, "timeout", Some("")).is_err());
     }
 
     #[test]

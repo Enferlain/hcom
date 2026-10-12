@@ -1023,7 +1023,7 @@ mod tests {
             relay_enabled: true,
             ..Default::default()
         };
-        crate::config::save_toml_config(&cfg, None).unwrap();
+        crate::config::save_toml_config(&cfg).unwrap();
 
         let db = HcomDb::open().unwrap();
         let args = RelayArgs {
@@ -1031,7 +1031,7 @@ mod tests {
         };
         assert_eq!(cmd_relay(&db, &args, None), 0);
 
-        let updated = crate::config::HcomConfig::load(None).unwrap();
+        let updated = crate::config::HcomConfig::load(None);
         assert!(!updated.relay_enabled);
     }
 
@@ -1063,7 +1063,7 @@ mod tests {
         };
         assert_eq!(cmd_relay(&db, &args, None), 1);
 
-        let updated = crate::config::HcomConfig::load(None).unwrap();
+        let updated = crate::config::HcomConfig::load(None);
         assert!(!updated.relay_enabled);
     }
 }

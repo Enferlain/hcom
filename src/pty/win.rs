@@ -602,9 +602,9 @@ impl Proxy {
             // Terminal-title behavior. Read once; the child title comes from the
             // reader-owned `screen`, no extra lock needed. In `Off` the filter
             // passes the tool's own titles through and we write nothing.
-            let title_mode = crate::config::HcomConfig::load(None)
-                .map(|c| crate::shared::TitleMode::from_config(&c.title_mode))
-                .unwrap_or(crate::shared::TitleMode::Combined);
+            let title_mode = crate::shared::TitleMode::from_config(
+                &crate::config::HcomConfig::load(None).title_mode,
+            );
             let title_enabled = title_mode != crate::shared::TitleMode::Off;
             filter.set_passthrough_titles(!title_enabled);
             // A relay reading input records can't receive the terminal's

@@ -207,13 +207,7 @@ pub fn run() -> i32 {
     );
 
     // Load config
-    let config = match HcomConfig::load(None) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error: Failed to load config: {e}");
-            return 1;
-        }
-    };
+    let config = HcomConfig::load(None);
 
     if !super::is_relay_enabled(&config) {
         eprintln!("Error: Relay not configured or disabled");
@@ -382,9 +376,7 @@ fn binary_replaced(path: &std::path::Path, started_with: ExeFingerprint) -> bool
 
 /// Check if relay is enabled in the current config (non-empty relay_id + relay_enabled flag).
 fn relay_enabled_in_config() -> bool {
-    HcomConfig::load(None)
-        .map(|c| super::is_relay_enabled(&c))
-        .unwrap_or(false)
+    super::is_relay_enabled(&HcomConfig::load(None))
 }
 
 // ── Auto-spawn ──────────────────────────────────────────────────────
@@ -507,10 +499,7 @@ fn do_spawn_with(binary: Option<PathBuf>) -> bool {
 ///
 /// Returns true if the worker is running and port-ready.
 pub fn ensure_worker() -> bool {
-    let config = match HcomConfig::load(None) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+    let config = HcomConfig::load(None);
 
     if !super::is_relay_enabled(&config) {
         return false;
@@ -546,10 +535,7 @@ pub fn try_spawn_worker() {
     if is_relay_worker_running() {
         return;
     }
-    let config = match HcomConfig::load(None) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    let config = HcomConfig::load(None);
     if super::is_relay_enabled(&config) {
         do_spawn();
     }

@@ -86,8 +86,7 @@ fn extension_source() -> Result<String> {
 
 /// `copilot_delivery = "native"`, resolved with the launch env (HCOM_* overrides).
 fn native_delivery_configured(ctx: &LaunchCtx) -> bool {
-    crate::config::HcomConfig::load(Some(&ctx.env))
-        .is_ok_and(|config| config.copilot_delivery == "native")
+    crate::config::HcomConfig::load(Some(&ctx.env)).copilot_delivery == "native"
 }
 
 /// Copilot's settings.json for this launch's `COPILOT_HOME`.

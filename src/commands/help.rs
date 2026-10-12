@@ -572,7 +572,7 @@ const CONFIG_HELP: &[HelpEntry] = &[
     ),
 ];
 
-/// Keys a user sets by hand. Every CONFIG_KEYS entry must appear here or in
+/// Keys a user sets by hand. Every config field must appear here or in
 /// CONFIG_KEYS_NOT_IN_HELP (enforced by `config_help_covers_registry_keys`).
 const CONFIG_KEYS_HELP: &[HelpEntry] = &[
     ("", ""),
@@ -586,12 +586,12 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_delivery",
-        "Claude delivery: inject (PTY, default) | native (experimental mod)",
-    ),
-    (
         "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / qoder_args / grok_args",
         "Default launch args per tool",
+    ),
+    (
+        "  claude_delivery / copilot_delivery",
+        "Idle delivery: inject (PTY, default) | native (claude: experimental mod, copilot: CLI extension)",
     ),
     (
         "  gemini_system_prompt / codex_system_prompt",
@@ -602,10 +602,6 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
     (
         "  auto_trust_workspace",
         "Auto-trust launch dir (skip folder-trust prompt)",
-    ),
-    (
-        "  copilot_delivery",
-        "Idle Copilot delivery: native (CLI extension) or inject",
     ),
     ("  name_export", "Export agent name to custom env var"),
     (
@@ -1600,14 +1596,10 @@ mod tests {
     #[test]
     fn config_help_covers_registry_keys() {
         let help = get_command_help("config");
-        for (key, _, _) in crate::commands::config::CONFIG_KEYS {
-            let key = key
-                .strip_prefix("HCOM_")
-                .unwrap_or(key)
-                .to_ascii_lowercase();
-            let shown = help.contains(&key) || key.ends_with("_args");
+        for key in crate::config::user_fields().map(|f| f.name) {
+            let shown = help.contains(key) || key.ends_with("_args");
             assert!(
-                shown || CONFIG_KEYS_NOT_IN_HELP.contains(&key.as_str()),
+                shown || CONFIG_KEYS_NOT_IN_HELP.contains(&key),
                 "config key {key} is neither in help nor CONFIG_KEYS_NOT_IN_HELP"
             );
         }

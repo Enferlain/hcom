@@ -176,9 +176,7 @@ pub(crate) fn message_to_value(m: &Message) -> Value {
 /// Load config hints string (from instance-level or global config).
 /// Call once per hook invocation and pass to format functions.
 pub(crate) fn load_config_hints() -> String {
-    crate::config::HcomConfig::load(None)
-        .map(|c| c.hints.clone())
-        .unwrap_or_default()
+    crate::config::HcomConfig::load(None).hints
 }
 
 /// Build instance-data lookup function for message formatting.
