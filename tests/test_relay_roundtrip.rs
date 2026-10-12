@@ -908,6 +908,10 @@ fn safe_relay_status(hcom_dir: &str) -> String {
     command
         .args(["relay", "status"])
         .env("HCOM_DIR", hcom_dir)
+        // Not the outer agent's identity: it isn't in this test's DB.
+        .env_remove("HCOM_PROCESS_ID")
+        .env_remove("HCOM_INSTANCE_NAME")
+        .env_remove("HCOM_NAME")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1952,6 +1956,8 @@ fn test_relay_roundtrip() {
 
     // Model pinned via HCOM_CLAUDE_ARGS in hcom_with_dir (haiku).
     ensure_relay_worker(&path_a);
+    // The first launch's ready event is still in Device B's log; wait for a new one.
+    let resume_baseline_b = last_event_id(&path_b);
     let resume_out = hcom_with_dir(&format!("r {remote_name}"), &path_a);
     let resume_stdout = String::from_utf8_lossy(&resume_out.stdout).to_string();
     let resume_stderr = String::from_utf8_lossy(&resume_out.stderr).to_string();
@@ -2043,7 +2049,7 @@ fn test_relay_roundtrip() {
     let _resume_ready_id = wait_for_ready_event_any(
         &path_b,
         &[&resumed_full_name, &resumed_name],
-        baseline_event_b,
+        resume_baseline_b,
         Duration::from_secs(90),
     );
     wait_for_screen_drawn(&path_b, &resumed_full_name, Duration::from_secs(30));
