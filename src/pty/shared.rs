@@ -542,7 +542,15 @@ pub(super) fn start_delivery_thread(
         };
 
         // Get tool config
-        let config = ToolConfig::for_tool(target.delivery_tool());
+        let mut config = ToolConfig::for_tool(target.delivery_tool());
+        // Native Claude delivery is only usable once the mod polls, and a poll
+        // only registers its plugin endpoint after SessionStart bound the
+        // session. The prompt draws before either, so the screen alone would
+        // report ready for a launch that cannot receive messages yet (or ever,
+        // when Claude does not load the mod).
+        if config.tool == "claude" && crate::hooks::claude_mod::launched_native() {
+            config.launch_ready_on_plugin_bind = true;
+        }
 
         // Run delivery loop (pass shared state for main loop's OSC override)
         run_delivery_loop(

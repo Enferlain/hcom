@@ -1109,10 +1109,11 @@ Default: inject
 native  bundled Claude mod (loaded with --plugin-dir) submits the wake
 inject  PTY wrapper types the wake into Claude's prompt
 
-Native needs Claude Code mod support. Managed disableSideloadFlags rejects
---plugin-dir and the launch fails; allowManagedModsOnly or a disabled mod
-rollout leave the mod unloaded, shown as unavailable in list/TUI. Use inject
-in both cases. Applies to new launches; kill and resume to change an agent.
+Native needs Claude Code 2.1.287+ (mod support). Managed disableSideloadFlags
+rejects --plugin-dir and the launch fails; an older Claude, allowManagedModsOnly
+or a disabled mod rollout leave the mod unloaded, so the launch never reports
+ready and the agent shows as unavailable in list/TUI. Use inject in both cases.
+Applies to new launches; kill and resume to change an agent.
 Print (-p) sessions use hook delivery either way.",
         ),
 

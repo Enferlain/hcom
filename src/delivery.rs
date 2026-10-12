@@ -855,7 +855,8 @@ pub struct ToolConfig {
     /// still demand the ready pattern at launch time (opencode).
     pub launch_requires_ready: bool,
     /// Launch readiness is proven by the plugin's extension bind rather than the
-    /// on-screen ready pattern. See [`GatesSpec::launch_ready_on_plugin_bind`].
+    /// on-screen ready pattern. See [`GatesSpec::launch_ready_on_plugin_bind`];
+    /// the PTY runtime also sets it for native Claude delivery (the mod's poll).
     pub launch_ready_on_plugin_bind: bool,
 }
 
@@ -1250,9 +1251,9 @@ fn launch_ready_observed(
         return true;
     }
     if config.launch_ready_on_plugin_bind {
-        // Authoritative readiness for plugin-driven tools (Pi, OMP): the extension's
-        // bind (a kind='plugin' notify endpoint) proves both TUI construction
-        // and extension load. It deliberately REPLACES on-screen scraping rather
+        // Authoritative readiness for plugin-driven tools (Pi, OMP, native
+        // Claude): the extension's bind (a kind='plugin' notify endpoint)
+        // proves both TUI construction and extension load. It deliberately REPLACES on-screen scraping rather
         // than OR-ing with it — their visible chrome is configurable (Pi's
         // header, OMP's status-line presets), and a syntactically broken /
         // non-running extension could still render default chrome and be falsely
@@ -1426,8 +1427,13 @@ fn maybe_emit_launch_blocked(
         return;
     };
 
+    let reason = if config.launch_ready_on_plugin_bind {
+        "screen settled but the hcom plugin never connected"
+    } else {
+        "screen settled before readiness"
+    };
     let detail = format!(
-        "launch blocked: screen settled before readiness; run `hcom term {}`\n{}",
+        "launch blocked: {reason}; run `hcom term {}`\n{}",
         current_name, tail
     );
     drop(screen);

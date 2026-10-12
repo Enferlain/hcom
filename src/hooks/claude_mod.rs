@@ -139,7 +139,7 @@ pub fn report_health(db: &HcomDb, process: &str, name: &str) -> Result<()> {
         None => (
             "tui:mod-unavailable",
             format!(
-                "Claude mod never connected (Claude Code without mod support, \
+                "Claude mod never connected (Claude Code older than 2.1.287, \
                  allowManagedModsOnly, or mods switched off by Anthropic); {}",
                 opt_out(name)
             ),

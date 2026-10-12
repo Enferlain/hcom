@@ -7,4 +7,6 @@
 # Claude must stay >= 2.1.198: the first release with both `prompt_id` and
 # backgrounded Agent/Task calls (tool_response.status="async_launched"), which
 # hcom's hook routing has to handle. Below that, CI never exercises either.
-@anthropic-ai/claude-code@2.1.283
+# And >= 2.1.286 for native delivery: earlier builds gate mods on a remote flag
+# the mock env (DISABLE_GROWTHBOOK etc.) never fetches, so the mod never loads.
+@anthropic-ai/claude-code@2.1.296
