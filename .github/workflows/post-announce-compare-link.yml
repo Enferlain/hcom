@@ -12,11 +12,13 @@ jobs:
     runs-on: ubuntu-22.04
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Via env, not inline: the plan embeds release notes, whose quotes would break the shell.
+      PLAN: ${{ inputs.plan }}
     steps:
       - name: Strip title date, add compare link, update + PyPI install sections
         run: |
-          TAG="$(printf '%s' '${{ inputs.plan }}' | jq -r '.announcement_tag')"
-          REPO="$(printf '%s' '${{ inputs.plan }}' | jq -r '.releases[0].hosting.github | "\(.owner)/\(.repo)"')"
+          TAG="$(printf '%s' "$PLAN" | jq -r '.announcement_tag')"
+          REPO="$(printf '%s' "$PLAN" | jq -r '.releases[0].hosting.github | "\(.owner)/\(.repo)"')"
 
           # Get the previous release tag (skip the current one)
           PREV_TAG=$(gh release list --repo "$REPO" --limit 10 --json tagName \
