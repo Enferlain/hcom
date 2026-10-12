@@ -1,4 +1,4 @@
-//! Broker discovery — parallel TLS handshake to find a working MQTT broker.
+//! Broker discovery — parallel MQTT handshake to find a working MQTT broker.
 //!
 //! Used by `hcom relay new` to pick the highest-priority reachable public broker.
 
@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Outcome of probing one broker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrokerProbe {
-    /// TCP (+TLS) handshake completed in this many ms.
+    /// MQTT handshake completed in this many ms.
     Reachable(u64),
-    Failed,
+    Failed(String),
     /// Not waited for: a higher-priority broker already answered.
     Skipped,
 }
@@ -70,23 +70,73 @@ pub fn ping_broker(host: &str, port: u16, use_tls: bool) -> Option<u64> {
     Some(t0.elapsed().as_millis() as u64)
 }
 
+/// Test MQTT acceptance, including TLS and credentials, without joining a group.
+/// Uses the same connector, roots and overall deadline as the relay worker.
+pub fn ping_mqtt_broker(
+    host: &str,
+    port: u16,
+    use_tls: bool,
+    password: Option<&str>,
+) -> Result<u64, String> {
+    use rumqttc::Packet;
+    use rumqttc::{Client, Event, MqttOptions};
+
+    let start = Instant::now();
+    let mut options =
+        MqttOptions::new(format!("hcom-probe-{}", uuid::Uuid::new_v4()), (host, port));
+    options.set_keep_alive(30);
+    options.set_clean_start(true);
+    options.set_max_packet_size(Some(128 * 1024));
+    if use_tls {
+        options.set_transport(rumqttc::Transport::tls_with_config(
+            super::client::relay_tls_config(),
+        ));
+    }
+    if let Some(password) = password.filter(|p| !p.is_empty()) {
+        options.set_credentials("hcom", password.to_owned());
+    }
+    let (client, mut connection) = Client::builder(options).capacity(1).build();
+    loop {
+        let remaining = CONNECT_TIMEOUT
+            .checked_sub(start.elapsed())
+            .ok_or("MQTT handshake timed out")?;
+        match connection.recv_timeout(remaining) {
+            Ok(Ok(Event::Incoming(Packet::ConnAck(_)))) => {
+                // Drive the nonblocking disconnect before dropping the connection.
+                let _ = client.try_disconnect();
+                let _ = connection.recv_timeout(Duration::from_millis(100));
+                return Ok(start.elapsed().as_millis() as u64);
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => return Err(err.to_string()),
+            Err(err) => return Err(format!("MQTT handshake: {err:?}")),
+        }
+    }
+}
+
 /// Probe brokers in parallel, returning results in input (priority) order.
 ///
 /// Returns as soon as the pick is settled — every broker ahead of the first
 /// reachable one has failed — rather than waiting out slower lower-priority
-/// probes, which can each take up to 10s to fail. Those report `Skipped`.
-pub fn test_brokers_parallel(brokers: &[(&str, u16)]) -> Vec<BrokerTestResult> {
-    test_brokers_with(brokers, ping_broker)
+/// probes, which have a five-second MQTT deadline. Those report `Skipped`.
+pub fn test_brokers_parallel(
+    brokers: &[(&str, u16)],
+    password: Option<&str>,
+) -> Vec<BrokerTestResult> {
+    let password = password.map(str::to_owned);
+    test_brokers_with(brokers, move |host, port, use_tls| {
+        ping_mqtt_broker(host, port, use_tls, password.as_deref())
+    })
 }
 
 fn test_brokers_with(
     brokers: &[(&str, u16)],
-    ping: fn(&str, u16, bool) -> Option<u64>,
+    ping: impl Fn(&str, u16, bool) -> Result<u64, String> + Clone + Send + 'static,
 ) -> Vec<BrokerTestResult> {
     let mut outcomes: Vec<Option<BrokerProbe>> = vec![None; brokers.len()];
     let (tx, rx) = mpsc::channel();
     for (i, (host, port)) in brokers.iter().enumerate() {
-        let (tx, host, port) = (tx.clone(), host.to_string(), *port);
+        let (tx, host, port, ping) = (tx.clone(), host.to_string(), *port, ping.clone());
         // Detached: an abandoned probe finishes (or times out) on its own.
         std::thread::spawn(move || {
             let use_tls = port == 8883 || port == 8886;
@@ -107,7 +157,7 @@ fn test_brokers_with(
     };
     while !settled(&outcomes) {
         let Ok((i, ping_ms)) = rx.recv() else { break };
-        outcomes[i] = Some(ping_ms.map_or(BrokerProbe::Failed, BrokerProbe::Reachable));
+        outcomes[i] = Some(ping_ms.map_or_else(BrokerProbe::Failed, BrokerProbe::Reachable));
     }
 
     brokers
@@ -150,7 +200,7 @@ mod tests {
 
     #[test]
     fn test_test_brokers_parallel_empty() {
-        let results = test_brokers_parallel(&[]);
+        let results = test_brokers_parallel(&[], None);
         assert!(results.is_empty());
     }
 
@@ -177,11 +227,78 @@ mod tests {
         assert_eq!(results, [None, None]);
     }
 
-    fn fake_ping(host: &str, _port: u16, _tls: bool) -> Option<u64> {
+    /// Minimal MQTT 5 peer: TCP/TLS reachability alone must not count as success.
+    fn mqtt_peer(reason: u8) -> (u16, std::thread::JoinHandle<Vec<u8>>) {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            assert_eq!(byte[0], 0x10);
+            let mut len = 0;
+            let mut multiplier = 1;
+            loop {
+                stream.read_exact(&mut byte).unwrap();
+                len += usize::from(byte[0] & 0x7f) * multiplier;
+                if byte[0] & 0x80 == 0 {
+                    break;
+                }
+                multiplier *= 128;
+            }
+            let mut connect = vec![0; len];
+            stream.read_exact(&mut connect).unwrap();
+            stream.write_all(&[0x20, 3, 0, reason, 0]).unwrap();
+            if reason == 0 {
+                let _ = stream.read(&mut byte);
+            }
+            connect
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn mqtt_probe_requires_connack_acceptance() {
+        let (port, peer) = mqtt_peer(0x89); // Server busy / throttled.
+        let err = ping_mqtt_broker("127.0.0.1", port, false, None).unwrap_err();
+        assert!(err.contains("ServerBusy"), "{err}");
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn mqtt_probe_sends_private_broker_credentials() {
+        let (port, peer) = mqtt_peer(0);
+        assert!(ping_mqtt_broker("127.0.0.1", port, false, Some("test-secret")).is_ok());
+        let connect = peer.join().unwrap();
+        assert_eq!(connect[7] & 0xc0, 0xc0); // Username + password flags.
+        assert!(connect.ends_with(b"\x00\x04hcom\x00\x0btest-secret"));
+    }
+
+    #[test]
+    fn discovery_skips_a_broker_that_accepts_tcp_but_rejects_mqtt() {
+        let (rejected, peer_a) = mqtt_peer(0x89);
+        let (accepted, peer_b) = mqtt_peer(0);
+        let results =
+            test_brokers_parallel(&[("127.0.0.1", rejected), ("127.0.0.1", accepted)], None);
+        assert!(matches!(results[0].2, BrokerProbe::Failed(_)));
+        assert!(matches!(results[1].2, BrokerProbe::Reachable(_)));
+        peer_a.join().unwrap();
+        peer_b.join().unwrap();
+    }
+
+    fn fake_ping(host: &str, _port: u16, _tls: bool) -> Result<u64, String> {
         // host encodes "<delay_ms>:<ok|fail>"
         let (delay, ok) = host.split_once(':').unwrap();
         std::thread::sleep(Duration::from_millis(delay.parse().unwrap()));
-        (ok == "ok").then_some(1)
+        if ok == "ok" {
+            Ok(1)
+        } else {
+            Err("unreachable".into())
+        }
     }
 
     #[test]
@@ -200,7 +317,7 @@ mod tests {
     fn brokers_wait_for_higher_priority_before_picking_lower() {
         let results =
             test_brokers_with(&[("200:fail", 1), ("10:ok", 2), ("3000:ok", 3)], fake_ping);
-        assert_eq!(results[0].2, BrokerProbe::Failed);
+        assert!(matches!(results[0].2, BrokerProbe::Failed(_)));
         assert_eq!(results[1].2, BrokerProbe::Reachable(1));
         assert_eq!(results[2].2, BrokerProbe::Skipped);
     }
@@ -208,7 +325,11 @@ mod tests {
     #[test]
     fn brokers_all_failed() {
         let results = test_brokers_with(&[("10:fail", 1), ("20:fail", 2)], fake_ping);
-        assert!(results.iter().all(|r| r.2 == BrokerProbe::Failed));
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r.2, BrokerProbe::Failed(_)))
+        );
     }
 
     #[test]

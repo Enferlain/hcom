@@ -4,10 +4,10 @@
 //! Manual exponential backoff on connection errors pauses that polling thread
 //! so reconnect attempts do not hammer public brokers.
 
+use rumqttc::Packet;
+use rumqttc::QoS;
 use rumqttc::TlsConfiguration;
-use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::mqttbytes::v5::Packet;
-use rumqttc::v5::{Client, Connection, Event, MqttOptions};
+use rumqttc::{Client, Connection, Event, MqttOptions, PublishOptions};
 use rustls::RootCertStore;
 use rustls_native_certs::load_native_certs;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -28,7 +28,7 @@ use super::{
 /// Build a TLS config that combines webpki-roots (bundled Mozilla CAs for Android/Termux
 /// compatibility) with native system certs (for private broker support).
 /// This ensures public brokers work everywhere while preserving user-installed CA support.
-fn relay_tls_config() -> TlsConfiguration {
+pub(super) fn relay_tls_config() -> TlsConfiguration {
     let mut root_store = RootCertStore::empty();
 
     // Add webpki-roots as the base — fixes Android/Termux where rustls-native-certs fails
@@ -149,8 +149,8 @@ impl MqttRelay {
             read_device_uuid().ok_or_else(|| "failed to create device_id file".to_string())?;
         let client_id = format!("hcom-{}", super::device_id_prefix(&device_uuid));
 
-        let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
-        mqttoptions.set_keep_alive(Duration::from_secs(30));
+        let mut mqttoptions = MqttOptions::new(&client_id, (&host, port));
+        mqttoptions.set_keep_alive(30);
         mqttoptions.set_clean_start(true);
         mqttoptions.set_max_packet_size(Some(128 * 1024));
 
@@ -161,14 +161,14 @@ impl MqttRelay {
 
         // Auth
         if !config.relay_token.is_empty() {
-            mqttoptions.set_credentials("hcom", &config.relay_token);
+            mqttoptions.set_credentials("hcom", config.relay_token.clone());
         }
 
         // An LWT cannot be freshly sealed when the broker emits it. Use an
         // empty retained payload to clear the broker snapshot; peers ignore
         // the unauthenticated payload and fall back to stale-device detection.
         let lwt_topic = state_topic(&relay_id, &device_uuid);
-        let lwt = rumqttc::v5::mqttbytes::v5::LastWill {
+        let lwt = rumqttc::LastWill {
             topic: lwt_topic.clone().into(),
             message: bytes::Bytes::new(),
             qos: QoS::AtLeastOnce,
@@ -178,7 +178,7 @@ impl MqttRelay {
         mqttoptions.set_last_will(lwt);
 
         // Create client + connection (cap=10 for outgoing message buffer)
-        let (client, connection) = Client::new(mqttoptions, 10);
+        let (client, connection) = Client::builder(mqttoptions).capacity(10).build();
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
 
@@ -299,17 +299,21 @@ impl MqttRelay {
             match self.cmd_rx.try_recv() {
                 Ok(RelayCommand::Shutdown) => {
                     log::log_info("relay", "relay.shutdown", "shutdown requested");
-                    self.shutdown_graceful(&event_rx);
+                    self.shutdown_graceful(&event_rx, connected);
                     return;
                 }
                 Ok(RelayCommand::Push) => {
-                    self.do_push_cycle(connected);
-                    last_push = Instant::now();
-                    pending_push_at = None;
+                    // While disconnected the cursor cannot advance, so a push would
+                    // only queue duplicate snapshots; ConnAck pushes on reconnect.
+                    if connected {
+                        self.do_push_cycle();
+                        last_push = Instant::now();
+                        pending_push_at = None;
+                    }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     log::log_info("relay", "relay.shutdown", "command channel closed");
-                    self.shutdown_graceful(&event_rx);
+                    self.shutdown_graceful(&event_rx, connected);
                     return;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -317,13 +321,13 @@ impl MqttRelay {
 
             // Periodic push
             if connected && last_push.elapsed() >= self.push_interval {
-                self.do_push_cycle(connected);
+                self.do_push_cycle();
                 last_push = Instant::now();
                 pending_push_at = None;
             }
 
             if connected && pending_push_at.is_some_and(|deadline| Instant::now() >= deadline) {
-                self.do_push_cycle(connected);
+                self.do_push_cycle();
                 last_push = Instant::now();
                 pending_push_at = None;
             }
@@ -362,7 +366,7 @@ impl MqttRelay {
                 if let Ok(db) = HcomDb::open() {
                     set_relay_status(&db, "error", Some("liveness timeout"), true);
                 }
-                self.shutdown_graceful(&event_rx);
+                // The network is dead; do not enqueue shutdown traffic.
                 return;
             }
 
@@ -435,7 +439,7 @@ impl MqttRelay {
             }
             if channel_disconnected {
                 log::log_info("relay", "relay.shutdown", "connection thread ended");
-                self.shutdown_graceful(&event_rx);
+                self.shutdown_graceful(&event_rx, connected);
                 return;
             }
 
@@ -500,7 +504,7 @@ impl MqttRelay {
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         log::log_info("relay", "relay.shutdown", "connection thread ended");
-                        self.shutdown_graceful(&event_rx);
+                        self.shutdown_graceful(&event_rx, connected);
                         return;
                     }
                 }
@@ -523,7 +527,7 @@ impl MqttRelay {
                         log::log_warn("relay", "relay.subscribe_err", &e);
                     }
                     // Push immediately on connect to sync state
-                    self.do_push_cycle(true);
+                    self.do_push_cycle();
                     false
                 }
                 Packet::Publish(publish) => {
@@ -550,7 +554,7 @@ impl MqttRelay {
                 }
                 _ => false, // PingResp, SubAck, PubAck — ignore
             },
-            Event::Outgoing(_) => false, // Outgoing events — ignore
+            Event::Outgoing(_) | Event::Auth(_) => false, // Outgoing/enhanced-auth events — ignore
         }
     }
 
@@ -648,7 +652,7 @@ impl MqttRelay {
     }
 
     /// Execute a push cycle: build state + events, publish to MQTT.
-    fn do_push_cycle(&self, mqtt_connected: bool) {
+    fn do_push_cycle(&self) {
         let db = match HcomDb::open() {
             Ok(db) => db,
             Err(e) => {
@@ -676,7 +680,6 @@ impl MqttRelay {
                 &self.device_uuid,
                 &psk,
                 true,
-                mqtt_connected,
             ) {
                 Ok((true, has_more)) => {
                     if has_more && Instant::now() < deadline {
@@ -725,7 +728,7 @@ impl MqttRelay {
                 };
                 // try_publish never blocks the worker loop on a full request queue.
                 self.client
-                    .try_publish(topic, QoS::AtLeastOnce, false, payload)
+                    .try_publish(topic, payload, PublishOptions::at_least_once())
                     .is_ok()
             });
         if summary.requests_sent > 0 || summary.events_imported > 0 || summary.gaps_abandoned > 0 {
@@ -748,7 +751,8 @@ impl MqttRelay {
     /// PUBACK, then disconnect.
     fn shutdown_graceful(
         &self,
-        event_rx: &mpsc::Receiver<Result<Event, rumqttc::v5::ConnectionError>>,
+        event_rx: &mpsc::Receiver<Result<Event, rumqttc::ConnectionError>>,
+        connected: bool,
     ) {
         let topic = state_topic(&self.relay_id, &self.device_uuid);
         log::log_info(
@@ -764,8 +768,11 @@ impl MqttRelay {
             .and_then(|psk| seal_state_tombstone(&psk, &self.relay_id, &topic));
 
         let publish_result = tombstone.and_then(|payload| {
+            if !connected {
+                return Err("MQTT connection is not live".to_string());
+            }
             self.client
-                .publish(&topic, QoS::AtLeastOnce, true, payload)
+                .try_publish(&topic, payload, PublishOptions::at_least_once().retained())
                 .map_err(|e| e.to_string())
         });
         if let Err(e) = publish_result {
@@ -783,7 +790,7 @@ impl MqttRelay {
             }
         }
 
-        if let Err(e) = self.client.disconnect() {
+        if let Err(e) = self.client.try_disconnect() {
             log::log_warn("relay", "relay.disconnect_err", &format!("{}", e));
         }
 
@@ -854,7 +861,11 @@ impl EphemeralClient {
         payload: Vec<u8>,
         timeout: Duration,
     ) -> bool {
-        if self.client.publish(topic, qos, retain, payload).is_err() {
+        if self
+            .client
+            .publish(topic, payload, PublishOptions::new(qos).retain(retain))
+            .is_err()
+        {
             return false;
         }
 
@@ -890,8 +901,8 @@ impl EphemeralClient {
 pub fn create_ephemeral_client(config: &HcomConfig) -> Option<EphemeralClient> {
     let (host, port, use_tls) = super::get_broker_from_config(config)?;
     let client_id = format!("hcom-ephemeral-{}", std::process::id());
-    let mut mqttoptions = MqttOptions::new(&client_id, &host, port);
-    mqttoptions.set_keep_alive(Duration::from_secs(10));
+    let mut mqttoptions = MqttOptions::new(&client_id, (&host, port));
+    mqttoptions.set_keep_alive(10);
     mqttoptions.set_clean_start(true);
 
     if use_tls {
@@ -899,10 +910,10 @@ pub fn create_ephemeral_client(config: &HcomConfig) -> Option<EphemeralClient> {
     }
 
     if !config.relay_token.is_empty() {
-        mqttoptions.set_credentials("hcom", &config.relay_token);
+        mqttoptions.set_credentials("hcom", config.relay_token.clone());
     }
 
-    let (client, connection) = Client::new(mqttoptions, 10);
+    let (client, connection) = Client::builder(mqttoptions).capacity(10).build();
 
     // Shared state for CONNACK wait
     let connected = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1040,9 +1051,46 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn shutdown_does_not_block_on_a_full_outgoing_queue() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let options = MqttOptions::new("shutdown-test", ("127.0.0.1", 1883));
+        let (client, connection) = Client::builder(options).capacity(1).build();
+        client
+            .try_publish(
+                "shutdown-test/device-a",
+                "queued",
+                PublishOptions::at_least_once().retained(),
+            )
+            .unwrap();
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+        let (_event_tx, event_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            // Hold the unpolled receiver open: a blocking send would wait forever.
+            let _connection = connection;
+            let relay = MqttRelay {
+                client,
+                relay_id: "shutdown-test".to_string(),
+                device_uuid: "device-a".to_string(),
+                psk: Mutex::new([0x42; 32]),
+                replay_guard: Mutex::new(ReplayGuard::default()),
+                cmd_rx,
+                push_interval: Duration::from_secs(5),
+            };
+            relay.shutdown_graceful(&event_rx, true);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown blocked on the full MQTT queue");
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn inbound_publish_reasserts_connected_state() {
-        let options = MqttOptions::new("relay-unit-test", "127.0.0.1", 1883);
-        let (client, _connection) = Client::new(options, 10);
+        let options = MqttOptions::new("relay-unit-test", ("127.0.0.1", 1883));
+        let (client, _connection) = Client::builder(options).capacity(10).build();
         let (_cmd_tx, cmd_rx) = mpsc::channel();
         let relay = MqttRelay {
             client,
@@ -1053,12 +1101,8 @@ mod tests {
             cmd_rx,
             push_interval: Duration::from_secs(5),
         };
-        let publish = rumqttc::v5::mqttbytes::v5::Publish::new(
-            "other-relay/device-b",
-            QoS::AtMostOnce,
-            Vec::new(),
-            None,
-        );
+        let publish =
+            rumqttc::Publish::new("other-relay/device-b", QoS::AtMostOnce, Vec::new(), None);
         let mut connected = false;
 
         assert!(!relay.handle_event(Event::Incoming(Packet::Publish(publish)), &mut connected));

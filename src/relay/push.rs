@@ -3,8 +3,7 @@
 //! Batches up to 100 events per publish with a 10s drain budget.
 //! Tracks progress via KV cursor `relay_last_push_id`.
 
-use rumqttc::v5::Client;
-use rumqttc::v5::mqttbytes::QoS;
+use rumqttc::{Client, PublishOptions};
 use serde_json::{Value, json};
 use std::time::Instant;
 
@@ -394,10 +393,7 @@ fn more_to_send(
 
 /// Push state and events via MQTT. Returns (success, has_more).
 /// `is_worker` should be true when called from the daemon relay thread.
-/// `mqtt_connected` indicates whether the MQTT connection is known to be live.
-/// When false, events are still published (rumqttc may buffer and deliver on
-/// reconnect) but the cursor is NOT advanced — events will be re-sent on the
-/// next push after the connection recovers, preventing silent event loss.
+/// Only call while the MQTT connection is live: the cursor advances on enqueue.
 pub fn push(
     db: &HcomDb,
     client: &Client,
@@ -405,7 +401,6 @@ pub fn push(
     device_uuid: &str,
     psk: &[u8; 32],
     is_worker: bool,
-    mqtt_connected: bool,
 ) -> Result<(bool, bool), String> {
     let last_push_id = safe_kv_get(db, "relay_last_push_id")
         .and_then(|value| value.parse().ok())
@@ -434,27 +429,19 @@ pub fn push(
 
     let t0 = Instant::now();
 
-    // Enqueue into rumqttc's internal channel. With QoS::AtLeastOnce rumqttc
-    // handles retransmission if the connection is live. When disconnected,
-    // the message may sit in the internal buffer and be delivered on reconnect,
-    // but we cannot guarantee it — so we only advance the cursor when
-    // mqtt_connected is true.
+    // Never block the worker loop: a full queue means the connection is
+    // stalled, and the loop must stay free to observe its error event.
     client
-        .publish(&topic, QoS::AtLeastOnce, true, sealed)
+        .try_publish(&topic, sealed, PublishOptions::at_least_once().retained())
         .map_err(|e| format!("publish: {}", e))?;
 
     let publish_ms = t0.elapsed().as_millis();
 
-    if mqtt_connected {
-        // Connection is live — advance cursor so these events aren't re-sent.
-        let now = crate::shared::time::now_epoch_f64();
-        safe_kv_set(db, "relay_last_push", Some(&now.to_string()));
-        safe_kv_set(db, "relay_last_push_id", Some(&max_id.to_string()));
-        safe_kv_set(db, "relay_last_sync", Some(&now.to_string()));
-        set_relay_status(db, "ok", None, is_worker);
-    }
-    // When disconnected: publish is best-effort (rumqttc may buffer), but
-    // cursor stays put so events are re-sent after reconnect.
+    let now = crate::shared::time::now_epoch_f64();
+    safe_kv_set(db, "relay_last_push", Some(&now.to_string()));
+    safe_kv_set(db, "relay_last_push_id", Some(&max_id.to_string()));
+    safe_kv_set(db, "relay_last_sync", Some(&now.to_string()));
+    set_relay_status(db, "ok", None, is_worker);
 
     log::log_with_fields(
         "INFO",
@@ -746,5 +733,22 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("exceeds safe MQTT payload budget"));
+    }
+
+    #[test]
+    fn push_fails_fast_on_a_full_queue_instead_of_blocking_the_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let options = rumqttc::MqttOptions::new("push-test", ("127.0.0.1", 1883));
+        // Unpolled connection: the one-slot queue never drains.
+        let (client, _connection) = Client::builder(options).capacity(1).build();
+        client
+            .try_publish("relay/device", "queued", PublishOptions::at_least_once())
+            .unwrap();
+
+        let start = Instant::now();
+        let error = push(&db, &client, "relay", "device", &[0x42; 32], false).unwrap_err();
+        assert!(error.starts_with("publish:"), "{error}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 }

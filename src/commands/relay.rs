@@ -653,14 +653,14 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
         // Private broker — test connectivity
         if let Some((host, port, use_tls)) = relay::parse_broker_url(broker) {
             println!("Testing {host}:{port}...");
-            match ping_broker(&host, port, use_tls) {
-                Some(ms) => {
+            match relay::broker::ping_mqtt_broker(&host, port, use_tls, auth_token.as_deref()) {
+                Ok(ms) => {
                     println!("  {host}:{port} — {ms}ms");
                     broker.clone()
                 }
-                None => {
-                    eprintln!("  {host}:{port} — failed");
-                    eprintln!("\nBroker unreachable. Check host, port, and network.");
+                Err(err) => {
+                    eprintln!("  {host}:{port} — {err}");
+                    eprintln!("\nBroker connection failed. Check network and credentials.");
                     return 1;
                 }
             }
@@ -671,7 +671,7 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
     } else {
         // Public broker — test all in parallel
         println!("Testing brokers...");
-        let results = relay::broker::test_brokers_parallel(DEFAULT_BROKERS);
+        let results = relay::broker::test_brokers_parallel(DEFAULT_BROKERS, auth_token.as_deref());
         let mut best = None;
         for (host, port, probe) in &results {
             match probe {
@@ -681,14 +681,14 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
                         best = Some(format!("mqtts://{host}:{port}"));
                     }
                 }
-                BrokerProbe::Failed => println!("  {host}:{port} — failed"),
+                BrokerProbe::Failed(err) => println!("  {host}:{port} — failed ({err})"),
                 BrokerProbe::Skipped => println!("  {host}:{port} — skipped"),
             }
         }
         match best {
             Some(b) => b,
             None => {
-                eprintln!("\nNo broker reachable. Check your network.");
+                eprintln!("\nNo broker accepted an MQTT connection. Check your network.");
                 eprintln!("Or use a private broker: hcom relay new --broker mqtts://host:port");
                 return 1;
             }

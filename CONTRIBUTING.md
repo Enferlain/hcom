@@ -4,7 +4,7 @@ Issues and pull requests are welcome. Thanks for contributing!
 
 ## Development
 
-Prerequisites: Rust 1.88+. See pinned [Rust toolchain](rust-toolchain.toml).
+Prerequisites: Rust 1.89+. See pinned [Rust toolchain](rust-toolchain.toml).
 
 ```bash
 git clone https://github.com/aannoo/hcom.git

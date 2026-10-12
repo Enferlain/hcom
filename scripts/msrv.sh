@@ -21,7 +21,7 @@ if ! command -v rustup > /dev/null 2>&1; then
   exit 0
 fi
 
-# Entries are listed as e.g. `1.88.0-aarch64-unknown-linux-gnu`, so a prefix
+# Entries are listed as e.g. `1.89.0-aarch64-unknown-linux-gnu`, so a prefix
 # match is what answers "is the MSRV series installed".
 if ! rustup toolchain list | grep -q "^$msrv"; then
   echo "msrv: SKIPPED ($msrv is not installed; run: rustup toolchain install $msrv)"

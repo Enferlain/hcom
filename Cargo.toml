@@ -7,7 +7,7 @@ description = "Connect Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Pi, 
 license = "MIT"
 homepage = "https://github.com/aannoo/hcom"
 repository = "https://github.com/aannoo/hcom"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [[bin]]
 name = "hcom"
@@ -38,7 +38,7 @@ rand = "0.10.0"
 glob = "0.3"
 uuid = { version = "1.23.0", features = ["v4"] }
 # Relay (MQTT) dependencies
-rumqttc = { version = "0.25.1", default-features = false, features = ["use-rustls"] }
+rumqttc = { package = "rumqttc-v5-next", version = "0.34.0", default-features = false, features = ["use-rustls"] }
 base64 = "0.22"
 sha2 = "0.11.0"
 chacha20poly1305 = "0.11.0"

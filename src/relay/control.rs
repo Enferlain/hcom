@@ -3,7 +3,7 @@
 //! Control messages are published to `{relay_id}/control` (non-retained) and
 //! currently carry request/response style remote actions.
 
-use rumqttc::v5::mqttbytes::QoS;
+use rumqttc::QoS;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
