@@ -18,8 +18,8 @@ pub struct LaunchTipsContext<'a> {
 pub fn get_tip(key: &str) -> Option<&'static str> {
     match key {
         "list:status" => Some(
-            "[tip] Statuses: \u{25b6} active (will read new msgs very soon)  \u{25c9} listening (will read new msgs in <1s)\
-              \u{25a0} blocked (needs human user approval)  \u{25cb} inactive (dead)  \u{25e6} unknown (neutral)",
+            "[tip] Statuses: \u{25b6} active (will read new msgs very soon)  \u{25c9} listening (will read new msgs in <1s)  \
+             \u{25a0} blocked (needs human user approval)  \u{25cb} inactive (dead)  \u{25e6} unknown (neutral)",
         ),
         "list:types" => Some(
             "[tip] Tool labels: [CLAUDE] etc. get messages automatically; a * means not bound yet or lost (hcom list <name>); [AD-HOC] checks manually with hcom listen.",

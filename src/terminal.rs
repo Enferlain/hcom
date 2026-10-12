@@ -731,13 +731,30 @@ fn is_native_termux_runtime() -> bool {
     )
 }
 
-fn proot_termux_launch_error() -> &'static str {
-    "Cannot open a native Termux window from this PRoot runtime:\n\
-     the generated command uses PRoot paths and Linux/glibc binaries that cannot run\n\
-     in host Termux.\n\n\
-     Use one of:\n\
-       hcom <tool> --headless\n\
-       hcom <tool> --terminal tmux"
+/// Alternatives to a new GUI window, appended to errors when none can be opened.
+fn no_window_alternatives(tool: &str) -> String {
+    let tool = if tool.is_empty() { "<tool>" } else { tool };
+    format!(
+        "Use one of:\n  \
+         hcom {tool} --headless         run in the background, no window\n  \
+         hcom {tool} --terminal tmux    run in a detached tmux session"
+    )
+}
+
+fn proot_termux_launch_error(tool: &str) -> String {
+    format!(
+        "Cannot open a native Termux window from this PRoot runtime:\n\
+         the generated command uses PRoot paths and Linux/glibc binaries that cannot run\n\
+         in host Termux.\n\n{}",
+        no_window_alternatives(tool)
+    )
+}
+
+fn no_terminal_emulator_error(tool: &str) -> String {
+    format!(
+        "No terminal emulator found to open a new window (no GUI session?).\n\n{}",
+        no_window_alternatives(tool)
+    )
 }
 
 fn validate_termux_dispatch_status(status: std::process::ExitStatus) -> Result<()> {
@@ -1716,28 +1733,35 @@ pub fn get_default_fallback_terminal_name() -> &'static str {
     }
     match platform::platform_name() {
         "Darwin" => "Terminal.app",
-        "Linux" => {
-            if platform::is_wsl() {
-                if which_bin("wt.exe").is_some() {
+        // Derived from the argv launch actually uses, so the two can't drift.
+        "Linux" => match get_linux_terminal_argv() {
+            None => "none",
+            Some(argv) if argv[0] == "cmd.exe" => {
+                if argv.iter().any(|a| a == "wt.exe") {
                     "Windows Terminal"
                 } else {
                     "cmd.exe"
                 }
-            } else if which_bin("gnome-terminal").is_some() {
-                "gnome-terminal"
-            } else if which_bin("ptyxis").is_some() {
-                "ptyxis"
-            } else if which_bin("konsole").is_some() {
-                "konsole"
-            } else if which_bin("xterm").is_some() {
-                "xterm"
-            } else {
-                "none"
             }
-        }
+            Some(argv) => match argv[0].as_str() {
+                "gnome-terminal" => "gnome-terminal",
+                "ptyxis" => "ptyxis",
+                "konsole" => "konsole",
+                "xterm" => "xterm",
+                _ => "unknown",
+            },
+        },
         "Windows" => windows_default_terminal_display_name(which_bin("wt").is_some()),
         _ => "unknown",
     }
+}
+
+/// Whether a GUI session is reachable. Over SSH or on a server, an installed
+/// gnome-terminal/xterm would only fail with "cannot open display".
+fn linux_has_display() -> bool {
+    ["DISPLAY", "WAYLAND_DISPLAY"]
+        .iter()
+        .any(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()))
 }
 
 /// Get first available standard Linux terminal.
@@ -1755,13 +1779,15 @@ fn get_linux_terminal_argv() -> Option<Vec<String>> {
         ("xterm", &["xterm", "-e", "bash", "{script}"]),
     ];
 
-    for (term_name, argv) in &terminals {
-        if which_bin(term_name).is_some() {
-            return Some(argv.iter().map(|s| s.to_string()).collect());
+    if linux_has_display() {
+        for (term_name, argv) in &terminals {
+            if which_bin(term_name).is_some() {
+                return Some(argv.iter().map(|s| s.to_string()).collect());
+            }
         }
     }
 
-    // WSL fallback
+    // WSL fallback (Windows-side terminal, needs no X/Wayland display)
     if platform::is_wsl() && which_bin("cmd.exe").is_some() {
         if which_bin("wt.exe").is_some() {
             return Some(
@@ -2574,7 +2600,12 @@ pub fn launch_terminal(
         // Platform default
         if termux_host_visible() {
             if !is_native_termux_runtime() {
-                bail!("{}", proot_termux_launch_error());
+                bail!(
+                    "{}",
+                    proot_termux_launch_error(
+                        env.get("HCOM_TOOL").map(|s| s.as_str()).unwrap_or("")
+                    )
+                );
             }
 
             let am_argv = vec![
@@ -2616,8 +2647,11 @@ pub fn launch_terminal(
                     pane_title: None,
                 },
             )?,
-            "Linux" => get_linux_terminal_argv()
-                .ok_or_else(|| anyhow::anyhow!("No supported terminal emulator found"))?,
+            "Linux" => get_linux_terminal_argv().ok_or_else(|| {
+                anyhow::anyhow!(no_terminal_emulator_error(
+                    env.get("HCOM_TOOL").map(|s| s.as_str()).unwrap_or("")
+                ))
+            })?,
             "Windows" => get_windows_terminal_argv(),
             other => bail!("Unsupported platform: {}", other),
         };
@@ -3108,9 +3142,12 @@ mod tests {
 
     #[test]
     fn test_proot_termux_launch_error_is_actionable() {
-        let message = proot_termux_launch_error();
-        assert!(message.contains("--headless"));
-        assert!(message.contains("--terminal tmux"));
+        let message = proot_termux_launch_error("codex");
+        assert!(message.contains("hcom codex --headless"));
+        assert!(message.contains("hcom codex --terminal tmux"));
+        let message = no_terminal_emulator_error("");
+        assert!(message.contains("hcom <tool> --headless"));
+        assert!(message.contains("hcom <tool> --terminal tmux"));
     }
 
     #[test]

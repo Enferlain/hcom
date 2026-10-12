@@ -17,7 +17,7 @@ use anyhow::{Result, bail};
 use serde_json::json;
 use std::time::Instant;
 
-pub(crate) const INLINE_SINGLE_LAUNCH_WAIT_SECS: u64 = 10;
+pub(crate) const INLINE_SINGLE_LAUNCH_WAIT_SECS: u64 = 15;
 
 /// Run the launch command. `argv` is the full argv[1..] including count/tool.
 pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
@@ -715,7 +715,10 @@ pub(crate) fn print_launch_feedback(
     }
     println!("Batch id: {}", result.batch_id);
     if ctx.inline_readiness_wait_secs.is_none() {
-        println!("To block until ready or fail (30s timeout), run: hcom events launch");
+        println!(
+            "To block until ready or fail (30s timeout), run: hcom events launch {}",
+            result.batch_id
+        );
     }
 
     let launcher_participating = db
@@ -846,10 +849,18 @@ fn format_inline_launch_readiness(
             };
             format!("Launch blocked: {detail} (batch: {}).", result.batch_id)
         }
-        InlineLaunchReadiness::Launching => format!(
-            "Still launching after {elapsed}: {target} ({progress}, batch: {}). Check `hcom list -v` or `hcom events launch {} --timeout 30`.",
-            result.batch_id, result.batch_id
-        ),
+        InlineLaunchReadiness::Launching => {
+            let list_cmd = match names.as_slice() {
+                [name] => format!("hcom list {name}"),
+                _ => "hcom list -v".to_string(),
+            };
+            format!(
+                "Still launching after {elapsed}: {target} ({progress}).\n  \
+                 hcom events launch {batch}   blocks until ready, failed, or blocked on approval (30s, --timeout N)\n  \
+                 {list_cmd}   current status",
+                batch = result.batch_id,
+            )
+        }
     }
 }
 
@@ -1173,12 +1184,13 @@ mod tests {
             InlineLaunchReadiness::Launching,
             &result,
             &[],
-            10.0,
+            15.0,
             &[],
         );
 
-        assert!(line.contains("Still launching after 10.0s: mari (0/1 ready"));
-        assert!(line.contains("hcom events launch batch-2 --timeout 30"));
+        assert!(line.contains("Still launching after 15.0s: mari (0/1 ready)."));
+        assert!(line.contains("hcom events launch batch-2   blocks until ready"));
+        assert!(line.contains("hcom list mari   current status"));
     }
 
     #[test]
