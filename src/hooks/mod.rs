@@ -176,9 +176,12 @@ pub use family::extract_tool_detail;
 pub use utils::{HOOK_REGISTRY, HookCategory, HookInfo};
 
 /// Delivery cursor/status update to apply after hook output is written.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeliveryAck {
     pub instance_name: String,
+    /// Row the batch was read from, when it was read by a hook whose output
+    /// may block. A stop + resume recreates the row and voids the ack.
+    pub created_at: Option<f64>,
     pub last_event_id: i64,
     pub status_context: String,
     pub msg_ts: String,

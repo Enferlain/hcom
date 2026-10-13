@@ -147,13 +147,6 @@ fn resolve_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Op
     {
         return None;
     }
-    // Validate both owners: process resolution takes precedence over session
-    // resolution and must not hide a session belonging to another tool.
-    if instance_binding::resolve_instance_from_binding(db, payload.session_id.as_deref(), None)
-        .is_some_and(|instance| instance.tool != "qoder")
-    {
-        return None;
-    }
     instance_binding::resolve_instance_from_binding(
         db,
         payload.session_id.as_deref(),
@@ -547,7 +540,7 @@ pub fn dispatch_qoder_hook_native(hook_name: &str) -> i32 {
         }
     };
     let ctx = HcomContext::from_os();
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::hook_gate_check(&ctx) {
         return 0;
     }
     let payload = HookPayload::from_qoder(hook_type_for_command(hook_name), raw);

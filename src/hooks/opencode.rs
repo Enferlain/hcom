@@ -339,7 +339,7 @@ pub fn dispatch_opencode_hook(hook_name: &str, argv: &[String]) -> (i32, String)
     };
 
     // Pre-gate: non-participants with empty DB → exit 0, no output
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::hook_gate_check(&ctx) {
         return (0, String::new());
     }
 
@@ -350,6 +350,14 @@ pub fn dispatch_opencode_hook(hook_name: &str, argv: &[String]) -> (i32, String)
     } else {
         argv.to_vec()
     };
+
+    if matches!(
+        hook_name,
+        "opencode-status" | "opencode-read" | "opencode-stop"
+    ) && let Err(reply) = plugin_rpc::require_attached(&ctx, &db, &handler_argv)
+    {
+        return reply;
+    }
 
     let handler_start = Instant::now();
     let hook_name_owned = hook_name.to_string();

@@ -577,6 +577,22 @@ pub(crate) fn process_logged_event(
             .and_then(|v| v.as_str())
             .unwrap_or(key.as_str());
 
+        // Carry the reaction chain so a subscription never reacts to output it
+        // caused, directly or through other subscriptions. Independent
+        // subscriptions still react.
+        let reaction_chain: Vec<String> = data
+            .get("reaction_subscriptions")
+            .and_then(|v| v.as_array())
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if reaction_chain.iter().any(|id| id == sub_id) {
+            continue;
+        }
+
         let last_id = sub.get("last_id").and_then(|v| v.as_i64()).unwrap_or(0);
         if event_id <= last_id {
             continue;
@@ -737,7 +753,9 @@ pub(crate) fn process_logged_event(
                 .get("caller_kind")
                 .and_then(|v| v.as_str())
                 .unwrap_or("external");
-            if let Err(e) = send_message_as(db, caller, caller_kind, on_hit_text) {
+            let mut chain = reaction_chain.clone();
+            chain.push(sub_id.to_string());
+            if let Err(e) = send_reaction_message(db, caller, caller_kind, on_hit_text, &chain) {
                 crate::log::log_error("db", "check_event_subscriptions.on_hit", &format!("{e}"));
             }
         }
@@ -876,6 +894,16 @@ pub(crate) fn send_message_as(
     sender_kind: &str,
     message: &str,
 ) -> Result<Vec<String>> {
+    send_reaction_message(db, sender_name, sender_kind, message, &[])
+}
+
+fn send_reaction_message(
+    db: &HcomDb,
+    sender_name: &str,
+    sender_kind: &str,
+    message: &str,
+    reaction_chain: &[String],
+) -> Result<Vec<String>> {
     let mut stmt = db.conn.prepare_cached("SELECT name, tag FROM instances")?;
     let instances: Vec<InstanceInfo> = stmt
         .query_map([], |row| {
@@ -924,6 +952,10 @@ pub(crate) fn send_message_as(
     });
     if !mention_list.is_empty() {
         event_data["mentions"] = serde_json::json!(mention_list);
+    }
+
+    if !reaction_chain.is_empty() {
+        event_data["reaction_subscriptions"] = json!(reaction_chain);
     }
 
     let routing_instance = match sender_kind {
@@ -1809,6 +1841,94 @@ mod tests {
         assert!(db.kv_get("events_sub:once-test").unwrap().is_none());
 
         cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_on_hit_does_not_consume_its_own_output() {
+        for once in [false, true] {
+            for kind in ["instance", "external"] {
+                let (db, path) = setup_full_test_db();
+                db.conn
+                    .execute(
+                        "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0)",
+                        [],
+                    )
+                    .unwrap();
+                let sub = json!({
+                    "id": "reaction", "caller": "luna", "caller_kind": kind,
+                    "sql": "type = 'message'", "last_id": 0, "once": once,
+                    "on_hit_text": "reaction output",
+                });
+                db.kv_set("events_sub:reaction", Some(&sub.to_string()))
+                    .unwrap();
+                let data = json!({"from": "nova", "sender_kind": "instance", "text": "trigger"});
+                for expected in 1..=2 {
+                    let id = db.log_event("message", "nova", &data).unwrap();
+                    let count: i64 = db.conn.query_row(
+                        "SELECT COUNT(*) FROM events WHERE json_extract(data, '$.text') = 'reaction output'",
+                        [], |r| r.get(0),
+                    ).unwrap();
+                    assert_eq!(count, if once { 1 } else { expected });
+                    if once {
+                        assert!(db.kv_get("events_sub:reaction").unwrap().is_none());
+                    } else {
+                        let stored: serde_json::Value = serde_json::from_str(
+                            &db.kv_get("events_sub:reaction").unwrap().unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(stored["last_id"], id);
+                        // Replay from a different processor must also skip our output.
+                        let (output_id, output): (i64, String) = db.conn.query_row(
+                            "SELECT id, data FROM events WHERE json_extract(data, '$.text') = 'reaction output' ORDER BY id DESC LIMIT 1",
+                            [], |r| Ok((r.get(0)?, r.get(1)?)),
+                        ).unwrap();
+                        process_logged_event(
+                            &db,
+                            output_id,
+                            "message",
+                            "luna",
+                            &serde_json::from_str(&output).unwrap(),
+                        );
+                        assert_eq!(db.get_last_event_id(), output_id);
+                    }
+                }
+                cleanup_test_db(path);
+            }
+        }
+    }
+
+    #[test]
+    fn test_on_hit_reaction_chain_stops_indirect_recursion() {
+        let (db, path) = setup_full_test_db();
+        for (id, sender) in [("first", "nova"), ("second", "luna")] {
+            let sub = json!({
+                "id": id, "caller": if id == "first" { "luna" } else { "nova" },
+                "caller_kind": "external", "sql": format!("type = 'message' AND msg_from = '{sender}'"),
+                "last_id": 0, "on_hit_text": id,
+            });
+            db.kv_set(&format!("events_sub:{id}"), Some(&sub.to_string()))
+                .unwrap();
+        }
+        db.log_event(
+            "message",
+            "nova",
+            &json!({"from": "nova", "text": "trigger"}),
+        )
+        .unwrap();
+        assert_eq!(db.get_last_event_id(), 3);
+        let chain: String = db
+            .conn
+            .query_row(
+                "SELECT json_extract(data, '$.reaction_subscriptions') FROM events WHERE id = 3",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&chain).unwrap(),
+            json!(["first", "second"])
+        );
+        cleanup_test_db(path);
     }
 
     #[test]

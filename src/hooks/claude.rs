@@ -4628,7 +4628,12 @@ mod tests {
         (dir, guard, db)
     }
 
+    /// Bind like a launched Claude: session plus `make_ctx`'s process token.
     fn bind_validated_session(db: &HcomDb, session_id: &str, instance_name: &str) {
+        if db.get_process_binding("process-test").unwrap().is_none() {
+            db.set_process_binding("process-test", session_id, instance_name)
+                .unwrap();
+        }
         db.set_session_binding(session_id, instance_name).unwrap();
         db.mark_claude_session_validated(session_id, instance_name)
             .unwrap();

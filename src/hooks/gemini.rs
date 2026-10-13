@@ -156,9 +156,16 @@ fn try_capture_transcript_path(db: &HcomDb, instance_name: &str, payload: &HookP
     }
 }
 
-/// Resolve instance using process binding or session binding.
-fn resolve_instance_gemini(db: &HcomDb, payload: &HookPayload) -> Option<InstanceRow> {
-    instance_binding::resolve_instance_from_binding(db, payload.session_id.as_deref(), None)
+fn resolve_instance_gemini(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    payload: &HookPayload,
+) -> Option<InstanceRow> {
+    instance_binding::resolve_instance_from_binding(
+        db,
+        payload.session_id.as_deref(),
+        ctx.process_id.as_deref(),
+    )
 }
 
 /// Resolve the directory value to record on this hook fire.
@@ -319,7 +326,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
 /// Fallback bootstrap if SessionStart injection failed.
 /// Also delivers pending messages and binds session_id for fresh instances.
 fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let instance = match resolve_instance_gemini(db, payload) {
+    let instance = match resolve_instance_gemini(db, ctx, payload) {
         Some(inst) => inst,
         None => return hook_noop(),
     };
@@ -399,8 +406,8 @@ fn handle_beforeagent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
 }
 
 /// Handle AfterAgent hook - fires when agent turn completes.
-fn handle_afteragent(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let instance = match resolve_instance_gemini(db, payload) {
+fn handle_afteragent(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+    let instance = match resolve_instance_gemini(db, ctx, payload) {
         Some(inst) => inst,
         None => return hook_noop(),
     };
@@ -418,8 +425,8 @@ fn handle_afteragent(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
 }
 
 /// Handle BeforeTool hook - fires before tool execution.
-fn handle_beforetool(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let instance = match resolve_instance_gemini(db, payload) {
+fn handle_beforetool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+    let instance = match resolve_instance_gemini(db, ctx, payload) {
         Some(inst) => inst,
         None => return hook_noop(),
     };
@@ -449,7 +456,7 @@ fn handle_beforetool(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
 ///
 /// Bootstrap injection and message delivery via additionalContext.
 fn handle_aftertool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let instance = match resolve_instance_gemini(db, payload) {
+    let instance = match resolve_instance_gemini(db, ctx, payload) {
         Some(inst) => inst,
         None => return hook_noop(),
     };
@@ -485,8 +492,8 @@ fn handle_aftertool(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Ho
 }
 
 /// Handle Notification hook - fires on approval prompts, etc.
-fn handle_notification(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let instance = match resolve_instance_gemini(db, payload) {
+fn handle_notification(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+    let instance = match resolve_instance_gemini(db, ctx, payload) {
         Some(inst) => inst,
         None => return hook_noop(),
     };
@@ -505,8 +512,8 @@ fn handle_notification(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -
 }
 
 /// Handle SessionEnd hook - fires when a session ends.
-fn handle_sessionend(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let instance = match resolve_instance_gemini(db, payload) {
+fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+    let instance = match resolve_instance_gemini(db, ctx, payload) {
         Some(inst) => inst,
         None => return hook_noop(),
     };
@@ -755,7 +762,7 @@ pub fn dispatch_gemini_hook(hook_name: &str) -> i32 {
     };
 
     // Pre-gate: non-participants with empty DB → exit 0, no output
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::hook_gate_check(&ctx) {
         return 0;
     }
 
@@ -1552,6 +1559,16 @@ fn remove_hooks_from_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Context of a launched process attached to `name`.
+    fn launched_ctx(db: &HcomDb, name: &str) -> HcomContext {
+        db.set_process_binding("pid-launched", "", name).unwrap();
+        let env = std::collections::HashMap::from([(
+            "HCOM_PROCESS_ID".to_string(),
+            "pid-launched".to_string(),
+        )]);
+        HcomContext::from_env(&env, std::env::temp_dir())
+    }
 
     #[test]
     fn test_hook_command_platform_specific() {
@@ -2947,7 +2964,7 @@ mod tests {
             raw: serde_json::Value::Null,
         };
 
-        let result = handle_afteragent(&db, &HcomContext::from_os(), &payload);
+        let result = handle_afteragent(&db, &launched_ctx(&db, "vago"), &payload);
         assert_eq!(result.exit_code(), 0);
         let instance = db.get_instance_full("vago").unwrap().unwrap();
         assert_eq!(instance.status, "active");
@@ -2974,7 +2991,7 @@ mod tests {
             }),
         };
 
-        let result = handle_sessionend(&db, &HcomContext::from_os(), &payload);
+        let result = handle_sessionend(&db, &launched_ctx(&db, "vago"), &payload);
         assert_eq!(result.exit_code(), 0);
         let instance = db.get_instance_full("vago").unwrap().unwrap();
         assert_eq!(instance.status, ST_LISTENING);
@@ -2998,7 +3015,7 @@ mod tests {
             raw: serde_json::Value::Null,
         };
 
-        let result = handle_beforetool(&db, &HcomContext::from_os(), &payload);
+        let result = handle_beforetool(&db, &launched_ctx(&db, "vago"), &payload);
         assert_eq!(result.exit_code(), 0);
 
         let detail: String = db

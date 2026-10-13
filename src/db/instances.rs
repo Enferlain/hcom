@@ -998,15 +998,22 @@ impl HcomDb {
     }
 
     /// Forward-only cursor advance, optionally marking the name announced, in
-    /// one statement.
-    pub fn ack_hook_delivery(&self, name: &str, event_id: i64, announce: bool) -> Result<()> {
-        self.conn.execute(
+    /// one statement. With `created_at`, only that row incarnation advances;
+    /// returns whether a row was updated.
+    pub fn ack_hook_delivery(
+        &self,
+        name: &str,
+        event_id: i64,
+        announce: bool,
+        created_at: Option<f64>,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
             "UPDATE instances SET last_event_id = MAX(COALESCE(last_event_id, 0), ?),
              name_announced = CASE WHEN ? THEN 1 ELSE name_announced END
-             WHERE name = ?",
-            params![event_id, announce, name],
+             WHERE name = ? AND (? IS NULL OR created_at = ?)",
+            params![event_id, announce, name, created_at, created_at],
         )?;
-        Ok(())
+        Ok(changed > 0)
     }
 
     /// Update specific fields on an instance row.

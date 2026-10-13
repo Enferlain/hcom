@@ -1710,6 +1710,13 @@ pub fn run_delivery_loop(
                 tool: &config.tool,
                 host_label: &mut host_label,
             });
+            // Stopped (or mid session switch): the name may now belong to
+            // another launch, so leave its row, endpoints and terminal alone.
+            if !instance_owns_process_binding(db, &process_id, &current_name) {
+                notify.wait(RETRY_DELAY);
+                db.reconnect_if_stale();
+                continue;
+            }
             drive_launch_outcome(
                 db,
                 state,
@@ -1741,6 +1748,10 @@ pub fn run_delivery_loop(
             }
             if !running.load(Ordering::Acquire) {
                 break;
+            }
+            // A stop + resume may have happened during the wait.
+            if !instance_owns_process_binding(db, &process_id, &current_name) {
+                continue;
             }
             if copilot_extension {
                 watch_extension_stall(db, &current_name, &mut stall_since, &mut stall_warned);
@@ -1840,6 +1851,15 @@ pub fn run_delivery_loop(
                 tool: &config.tool,
                 host_label: &mut host_label,
             });
+            // Stopped (or mid session switch): the name may now belong to
+            // another launch, so leave its row, endpoints and terminal alone.
+            if !instance_owns_process_binding(db, &process_id, &current_name) {
+                delivery_state = State::Idle;
+                endpoints_name.clear();
+                notify.wait(RETRY_DELAY);
+                db.reconnect_if_stale();
+                continue;
+            }
             drive_launch_outcome(
                 db,
                 state,
@@ -1911,6 +1931,11 @@ pub fn run_delivery_loop(
 
                     // Detect DB file replacement (hcom reset / schema bump) and reconnect
                     db.reconnect_if_stale();
+
+                    // A stop + resume may have happened during the wait.
+                    if !instance_owns_process_binding(db, &process_id, &current_name) {
+                        continue;
+                    }
 
                     // Heartbeat (also re-asserts tcp_mode=true) + wake state.
                     refresh_liveness(db, &current_name);

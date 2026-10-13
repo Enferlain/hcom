@@ -971,6 +971,7 @@ fn ack_ext_delivery(db: &HcomDb, name: &str, prompt: &str) -> bool {
         db,
         &DeliveryAck {
             instance_name: name.to_string(),
+            created_at: None,
             last_event_id: inflight.last_event_id,
             status_context: inflight.status_context,
             msg_ts: inflight.msg_ts,
@@ -993,7 +994,7 @@ pub fn dispatch_copilot_ext(hook_name: &str, argv: &[String]) -> (i32, String) {
         Err(err) => return (0, json!({ "error": format!("db open: {err}") }).to_string()),
     };
     let ctx = HcomContext::from_os();
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::hook_gate_check(&ctx) {
         return (0, "{}".to_string());
     }
     let argv = match argv.split_first() {
@@ -1045,7 +1046,7 @@ pub fn dispatch_copilot_hook_native(hook_name: &str) -> i32 {
         }
     };
     let ctx = HcomContext::from_os();
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::hook_gate_check(&ctx) {
         return 0;
     }
     let payload = HookPayload::from_copilot_native(hook_type_for_command(hook_name), raw);

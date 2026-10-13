@@ -323,12 +323,14 @@ pub(super) fn publish_approval_status(
     };
 
     let config = Config::get();
-    let instance_name = config
-        .process_id
-        .as_deref()
-        .and_then(|process_id| db.get_process_binding(process_id).ok().flatten())
-        .or_else(|| instance_name_cfg.map(str::to_string))
-        .or(config.instance_name);
+    // A launched PTY speaks only for its current binding; after a stop the
+    // configured name may belong to a resumed launch.
+    let instance_name = match config.process_id.as_deref() {
+        Some(process_id) => db.get_process_binding(process_id).ok().flatten(),
+        None => instance_name_cfg
+            .map(str::to_string)
+            .or(config.instance_name),
+    };
     let Some(instance_name) = instance_name.filter(|name| !name.is_empty()) else {
         return;
     };

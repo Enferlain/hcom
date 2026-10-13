@@ -449,7 +449,7 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
         }
     };
 
-    if !common::hook_gate_check(&ctx, &db) {
+    if !common::hook_gate_check(&ctx) {
         return 0;
     }
 

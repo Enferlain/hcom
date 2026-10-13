@@ -118,33 +118,12 @@ pub(crate) fn is_safe_hcom_command(command: &str) -> bool {
         .is_none_or(|command| SAFE_HCOM_COMMANDS.contains(&command.as_str()))
 }
 
-/// Pre-gate check: should hooks proceed?
-///
-///
-/// - HCOM-launched (process_id or is_launched) → always proceed
-/// - Otherwise: check if DB has any instances → if not, skip (exit 0, empty output)
-///
-/// This prevents outputting hints/errors when hcom is installed but not actively used.
-pub fn hook_gate_check(ctx: &HcomContext, db: &HcomDb) -> bool {
-    if ctx.process_id.is_some() || ctx.is_launched {
-        return true;
-    }
-    // Check if any instances exist — distinguish "no rows" from DB error
-    match db
-        .conn()
-        .query_row("SELECT 1 FROM instances LIMIT 1", [], |_| Ok(()))
-    {
-        Ok(()) => true,
-        Err(rusqlite::Error::QueryReturnedNoRows) => false,
-        Err(e) => {
-            log::log_warn(
-                "hooks",
-                "gate.db_error",
-                &format!("hook gate DB check failed: {e}, proceeding anyway"),
-            );
-            true // On DB error, proceed rather than silently disabling hooks
-        }
-    }
+/// Only hooks in a process hcom launched participate. Global hooks also fire in
+/// plain tool windows, which must stay inert even on a session hcom has bound.
+pub fn hook_gate_check(ctx: &HcomContext) -> bool {
+    ctx.process_id
+        .as_deref()
+        .is_some_and(|token| !token.is_empty())
 }
 
 /// Convert a db::Message to a serde_json::Value object.
@@ -335,9 +314,23 @@ pub fn prepare_pending_messages(db: &HcomDb, instance_name: &str) -> Option<Prep
 pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
     // Forward-only: a delayed ack must not rewind a newer concurrent delivery.
     // Cursor and announcement move together so a partial ack can't re-announce.
-    if let Err(e) = db.ack_hook_delivery(&ack.instance_name, ack.last_event_id, ack.mark_announced)
-    {
-        crate::log::log_error("hooks", "commit_delivery_ack", &format!("{e}"));
+    // A batch read from a row that stop + resume has since replaced is void.
+    match db.ack_hook_delivery(
+        &ack.instance_name,
+        ack.last_event_id,
+        ack.mark_announced,
+        ack.created_at,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            log::log_info(
+                "hooks",
+                "commit_delivery_ack.row_replaced",
+                &format!("instance={} up_to={}", ack.instance_name, ack.last_event_id),
+            );
+            return;
+        }
+        Err(e) => crate::log::log_error("hooks", "commit_delivery_ack", &format!("{e}")),
     }
 
     lifecycle::set_status(
@@ -388,6 +381,11 @@ fn prepare_raw_messages(
         formatted,
         ack: super::DeliveryAck {
             instance_name: instance_name.to_string(),
+            created_at: db
+                .get_instance_full(instance_name)
+                .ok()
+                .flatten()
+                .map(|row| row.created_at),
             last_event_id: last_id,
             status_context: format!("deliver:{}", sender_display),
             msg_ts,
@@ -513,7 +511,9 @@ fn poll_messages_inner(
 
     // Cleanup: close socket, remove notify endpoint
     drop(notify_server);
-    delete_hook_notify_endpoint(db, instance_name);
+    if let Some(port) = notify_port {
+        delete_hook_notify_endpoint(db, instance_name, port);
+    }
 
     result
 }
@@ -533,10 +533,14 @@ fn poll_loop(
         ack: None,
     };
     let mut waited = false;
+    let mut created_at = None;
     while start.elapsed() < timeout {
-        // Check if instance still exists (stopped = row deleted)
-        let instance_data = db.get_instance_full(instance_name)?;
-        if instance_data.is_none() {
+        // Stopped (row deleted) or stopped and resumed (row recreated): the
+        // waiting process no longer speaks for this name.
+        let Some(instance_data) = db.get_instance_full(instance_name)? else {
+            return Ok(empty());
+        };
+        if *created_at.get_or_insert(instance_data.created_at) != instance_data.created_at {
             return Ok(empty());
         }
 
@@ -663,10 +667,11 @@ fn register_hook_notify_port(db: &HcomDb, instance_name: &str, port: u16) {
 }
 
 /// Remove hook notify endpoint from DB.
-fn delete_hook_notify_endpoint(db: &HcomDb, instance_name: &str) {
+/// Remove only this poll's port: a resumed launch may have registered its own.
+fn delete_hook_notify_endpoint(db: &HcomDb, instance_name: &str, port: u16) {
     let _ = db.conn().execute(
-        "DELETE FROM notify_endpoints WHERE instance = ? AND kind = 'hook'",
-        params![instance_name],
+        "DELETE FROM notify_endpoints WHERE instance = ? AND kind = 'hook' AND port = ?",
+        params![instance_name, port],
     );
 }
 
@@ -996,6 +1001,20 @@ pub fn init_hook_context(
         );
         return (None, serde_json::Map::new(), false);
     };
+
+    // Session evidence picks among this process's identities; it never lets a
+    // stopped process act for a name now attached to another launch.
+    if evidence.process_owner.as_deref() != Some(name.as_str()) {
+        log::log_info(
+            "hooks",
+            "init_hook_context.not_attached",
+            &format!(
+                "name={} process_owner={:?} session_id={}",
+                name, evidence.process_owner, session_id
+            ),
+        );
+        return (None, serde_json::Map::new(), false);
+    }
 
     let mut updates = serde_json::Map::new();
     updates.insert(
@@ -1769,6 +1788,71 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn delayed_ack_does_not_advance_a_resumed_row() {
+        let (_dir, db) = make_test_db();
+        insert_test_instance(&db, "nova");
+        db.send_message_as("bigboss", "external", "@nova hi")
+            .unwrap();
+        let prepared = prepare_pending_messages(&db, "nova").expect("pending");
+
+        // Output blocked across stop + resume: the batch went to the old process.
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = 1 WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+        commit_delivery_ack(&db, &prepared.ack);
+        assert_eq!(db.get_unread_messages("nova").len(), 1);
+
+        let prepared = prepare_pending_messages(&db, "nova").expect("pending");
+        commit_delivery_ack(&db, &prepared.ack);
+        assert!(db.get_unread_messages("nova").is_empty());
+    }
+
+    #[test]
+    fn waiting_poll_does_not_deliver_to_a_resumed_row() {
+        let (dir, db) = make_test_db();
+        insert_test_instance(&db, "nova");
+        let path = dir.path().join("test.db");
+        let waiter = std::thread::spawn(move || {
+            let db = crate::db::HcomDb::open_raw(&path).unwrap();
+            let started = Instant::now();
+            (poll_messages(&db, "nova", 10, true), started.elapsed())
+        });
+        let hook_port = || -> Option<i64> {
+            db.conn()
+                .query_row(
+                    "SELECT port FROM notify_endpoints WHERE instance='nova' AND kind='hook'",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while hook_port().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let port = hook_port().expect("poll registered its port") as u16;
+
+        // Stop + resume: the row is recreated, then mail arrives for the new launch.
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = 1 WHERE name = 'nova'",
+                [],
+            )
+            .unwrap();
+        db.send_message_as("bigboss", "external", "@nova for the resumed launch")
+            .unwrap();
+        let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+
+        let (result, elapsed) = waiter.join().unwrap();
+        assert!(!result.delivered && result.ack.is_none());
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        assert_eq!(db.get_unread_messages("nova").len(), 1);
+    }
+
     fn insert_bound_claude_instance(
         db: &crate::db::HcomDb,
         name: &str,
@@ -2004,16 +2088,20 @@ mod tests {
     }
 
     #[test]
-    fn hook_context_prefers_session_owner_over_conflicting_process_owner() {
+    fn hook_context_never_acts_for_a_session_owned_by_another_launch() {
         let (dir, db) = make_test_db();
         insert_bound_claude_instance(&db, "niza", "session-niza", "");
         insert_bound_claude_instance(&db, "lava", "session-lava", "");
         db.set_process_binding("process-restored", "session-lava", "lava")
             .unwrap();
-        let ctx = context_with_process_id(dir.path(), Some("process-restored"));
 
-        let (owner, _, _) = init_hook_context(&db, &ctx, "session-niza", "");
-        assert_eq!(owner.as_deref(), Some("niza"));
+        // Attached elsewhere, or stopped and still running (binding deleted):
+        // niza's session evidence must not let this process act as niza.
+        for token in ["process-restored", "process-stopped"] {
+            let ctx = context_with_process_id(dir.path(), Some(token));
+            let (owner, _, _) = init_hook_context(&db, &ctx, "session-niza", "");
+            assert_eq!(owner, None, "{token}");
+        }
     }
 
     #[test]

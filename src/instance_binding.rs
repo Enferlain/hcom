@@ -1223,27 +1223,24 @@ pub fn resolve_process_binding(db: &HcomDb, process_id: Option<&str>) -> Option<
     db.get_process_binding(pid).ok()?
 }
 
-/// Resolve instance via process or session binding.
+/// Resolve the instance this launched process is attached to. A session alone
+/// never selects an instance: stopped or plain tool processes share sessions
+/// with live agents. An incoming session bound elsewhere rejects the hook.
 pub fn resolve_instance_from_binding(
     db: &HcomDb,
     session_id: Option<&str>,
     process_id: Option<&str>,
 ) -> Option<InstanceRow> {
-    if let Some(pid) = process_id
-        && let Ok(Some(name)) = db.get_process_binding(pid)
-        && let Ok(Some(instance)) = db.get_instance_full(&name)
+    let name = db.get_process_binding(process_id?).ok()??;
+    if let Some(sid) = session_id.filter(|s| !s.is_empty())
+        && db
+            .get_session_binding(sid)
+            .ok()?
+            .is_some_and(|owner| owner != name)
     {
-        return Some(instance);
+        return None;
     }
-
-    if let Some(sid) = session_id
-        && let Some(name) = db.get_session_binding(sid).ok().flatten()
-        && let Ok(Some(instance)) = db.get_instance_full(&name)
-    {
-        return Some(instance);
-    }
-
-    None
+    db.get_instance_full(&name).ok()?
 }
 
 /// Auto-subscribe instance to default event subscriptions from config.
@@ -1652,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_from_binding_session_binding() {
+    fn test_resolve_from_binding_session_alone_resolves_nothing() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
         let now = now_epoch_i64();
@@ -1665,15 +1662,14 @@ mod tests {
         db.save_instance_named("nova", &data).unwrap();
         db.rebind_session("sess-2", "nova").unwrap();
 
-        let result = resolve_instance_from_binding(&db, Some("sess-2"), None);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().name, "nova");
+        assert!(resolve_instance_from_binding(&db, Some("sess-2"), None).is_none());
+        assert!(resolve_instance_from_binding(&db, Some("sess-2"), Some("stopped")).is_none());
 
         cleanup(path);
     }
 
     #[test]
-    fn test_resolve_from_binding_process_over_session() {
+    fn test_resolve_from_binding_rejects_session_owned_elsewhere() {
         crate::config::Config::init();
         let (db, path) = setup_test_db();
         let now = now_epoch_i64();
@@ -1693,8 +1689,9 @@ mod tests {
         db.save_instance_named("nova", &d2).unwrap();
         db.rebind_session("sess-2", "nova").unwrap();
 
-        let result = resolve_instance_from_binding(&db, Some("sess-2"), Some("pid-1"));
-        assert_eq!(result.unwrap().name, "luna");
+        assert!(resolve_instance_from_binding(&db, Some("sess-2"), Some("pid-1")).is_none());
+        let unbound = resolve_instance_from_binding(&db, Some("sess-new"), Some("pid-1"));
+        assert_eq!(unbound.unwrap().name, "luna");
 
         cleanup(path);
     }

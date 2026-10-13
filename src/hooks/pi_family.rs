@@ -168,7 +168,7 @@ impl PiFamily {
                 return plugin_rpc::error(format!("DB open failed: {}", e));
             }
         };
-        if !common::hook_gate_check(&ctx, &db) {
+        if !common::hook_gate_check(&ctx) {
             return (0, String::new());
         }
         let handler_argv = argv.strip_prefix(&[hook_name.to_string()]).unwrap_or(argv);
@@ -176,6 +176,11 @@ impl PiFamily {
             .strip_prefix(self.name())
             .and_then(|s| s.strip_prefix('-'))
             .unwrap_or("");
+        if matches!(hook, "status" | "read" | "beforetool" | "stop")
+            && let Err(reply) = plugin_rpc::require_attached(&ctx, &db, handler_argv)
+        {
+            return reply;
+        }
         let handler_start = Instant::now();
         let (exit_code, output) = common::dispatch_with_panic_guard(
             self.name(),

@@ -4050,7 +4050,8 @@ mod tests {
             assert_eq!(unread.len(), 1);
             assert_eq!(unread[0].event_id, Some(queued_id));
 
-            db.ack_hook_delivery("luna", queued_id, false).unwrap();
+            db.ack_hook_delivery("luna", queued_id, false, None)
+                .unwrap();
             assert!(db.get_unread_messages("luna").is_empty());
         }
     }

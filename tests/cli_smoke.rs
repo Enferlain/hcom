@@ -1689,7 +1689,7 @@ fn pi_e2e_hook_dispatch() {
     let status = run_argv_hook(
         &h,
         "pi-status",
-        None,
+        Some(pid),
         &[
             "--name",
             &me,
@@ -1711,7 +1711,7 @@ fn pi_e2e_hook_dispatch() {
     let before_tool = run_argv_hook(
         &h,
         "pi-beforetool",
-        None,
+        Some(pid),
         &[
             "--name",
             &me,
@@ -1749,13 +1749,14 @@ fn pi_e2e_hook_dispatch() {
     ]);
     assert_eq!(send_code, 0, "send stderr={send_stderr}");
 
-    let check = h.run(["pi-read", "--name", &me, "--check"]);
-    assert_eq!(check.0, 0, "pi-read --check stderr={}", check.2);
-    assert_eq!(check.1.trim(), "true");
+    let check = run_argv_hook(&h, "pi-read", Some(pid), &["--name", &me, "--check"]);
+    assert_eq!(check, serde_json::json!(true));
 
-    let read = h.run(["pi-read", "--name", &me]);
-    assert_eq!(read.0, 0, "pi-read stderr={}", read.2);
-    let batch: serde_json::Value = serde_json::from_str(&read.1).expect("pi-read json");
+    // Another launch (e.g. this one after stop + resume elsewhere) cannot read the inbox.
+    let stale = run_argv_hook(&h, "pi-read", Some("pid-stale"), &["--name", &me]);
+    assert!(stale.get("error").is_some(), "stale read: {stale}");
+
+    let batch = run_argv_hook(&h, "pi-read", Some(pid), &["--name", &me]);
     assert_eq!(batch["has_more"], false, "pi-read batch: {batch}");
     let ping = batch["messages"]
         .as_array()
@@ -1766,16 +1767,20 @@ fn pi_e2e_hook_dispatch() {
     let ack = run_argv_hook(
         &h,
         "pi-read",
-        None,
+        Some(pid),
         &["--name", &me, "--ack", "--up-to", &ping_id],
     );
     assert_eq!(ack["acked_to"].to_string(), ping_id);
-    let check = h.run(["pi-read", "--name", &me, "--check"]);
-    assert_eq!(check.0, 0, "pi-read --check after ack stderr={}", check.2);
-    assert_eq!(check.1.trim(), "false");
+    let check = run_argv_hook(&h, "pi-read", Some(pid), &["--name", &me, "--check"]);
+    assert_eq!(check, serde_json::json!(false));
 
     // 5. pi-stop finalizes the session.
-    let stop = run_argv_hook(&h, "pi-stop", None, &["--name", &me, "--reason", "done"]);
+    let stop = run_argv_hook(
+        &h,
+        "pi-stop",
+        Some(pid),
+        &["--name", &me, "--reason", "done"],
+    );
     assert_eq!(stop, serde_json::json!({ "ok": true }));
     let (code, stdout, _) = h.run([
         "events", "--agent", &me, "--action", "stopped", "--last", "5",

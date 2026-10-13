@@ -43,6 +43,24 @@ fn require_instance(db: &HcomDb, argv: &[String]) -> Result<String, (i32, String
     }
 }
 
+/// Plugin RPCs act for `--name` only while this launch is attached to it, so a
+/// stopped plugin process cannot read, ack, or stop a resumed participant.
+pub(crate) fn require_attached(
+    ctx: &crate::shared::context::HcomContext,
+    db: &HcomDb,
+    argv: &[String],
+) -> Result<(), (i32, String)> {
+    let name = parse_flag(argv, "--name").ok_or_else(|| error("Missing --name"))?;
+    let owner = ctx
+        .process_id
+        .as_deref()
+        .and_then(|token| db.get_process_binding(token).ok().flatten());
+    if owner.as_deref() != Some(name.as_str()) {
+        return Err(error(format!("{name} is not attached to this process")));
+    }
+    Ok(())
+}
+
 /// New instances start reading from their launch event (or the current tail),
 /// never from 0, which would replay the whole broadcast backlog.
 pub(crate) fn initialize_last_event_id(db: &HcomDb, instance_name: &str) {
@@ -214,6 +232,22 @@ mod tests {
         row.insert("last_event_id".into(), json!(last_event_id));
         row.insert("created_at".into(), json!(1.0));
         db.save_instance_named(name, &row).unwrap();
+    }
+
+    #[test]
+    fn rpc_requires_this_launch_to_hold_the_name() {
+        let (_dir, db) = test_db();
+        save_instance(&db, "luna", 0);
+        db.set_process_binding("current", "", "luna").unwrap();
+        let argv = sv(&["--name", "luna"]);
+        let ctx = |token: &str| {
+            let env = std::collections::HashMap::from([("HCOM_PROCESS_ID".into(), token.into())]);
+            crate::shared::context::HcomContext::from_env(&env, std::env::temp_dir())
+        };
+        assert!(require_attached(&ctx("current"), &db, &argv).is_ok());
+        // A stopped launch whose name was resumed elsewhere.
+        assert!(require_attached(&ctx("stopped"), &db, &argv).is_err());
+        assert!(require_attached(&ctx("current"), &db, &sv(&["--name", "nova"])).is_err());
     }
 
     fn send(db: &HcomDb, to: &str, text: &str) -> i64 {
