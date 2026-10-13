@@ -5,7 +5,10 @@ let submitting = false;
 let submittingSession;
 let generation = 0;
 let command;
-let failed = false;
+// Consecutive failed polls. A single failure is usually host sleep: the poll's
+// timeout keeps counting while the process is suspended, so it aborts on wake.
+let failures = 0;
+const FAILURES_BEFORE_REPORT = 3;
 // Ticks to skip after a failed poll, so a broken hcom is not respawned 4x/s.
 let backoff = 0;
 
@@ -39,7 +42,7 @@ async function poll($) {
     );
     if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout || 'hcom poll failed');
     const state = JSON.parse(result.stdout);
-    failed = false;
+    failures = 0;
     if (currentGeneration !== generation || !state.wake || submitting) return;
     submitting = true;
     submittingSession = session;
@@ -66,14 +69,17 @@ async function poll($) {
       await report($, session, 'submission-failed', String(error));
     }
   } catch (error) {
-    // Record every failure: hcom clears the error after one good cycle, so a
-    // repeat failure must set it again. Backoff limits this to one per ~5s.
-    if (session) await report($, session, 'poll-failed', String(error));
-    if (!failed) {
-      await $.ui.log('hcom mod poll failed; messages remain queued: ' + String(error)).catch(() => {});
-    }
-    failed = true;
+    failures++;
     backoff = 20;
+    // Record every failure past the threshold: hcom clears the error after one
+    // good cycle, so a repeat failure must set it again. Backoff limits this to
+    // one per ~5s.
+    if (failures >= FAILURES_BEFORE_REPORT) {
+      if (session) await report($, session, 'poll-failed', String(error));
+      if (failures === FAILURES_BEFORE_REPORT) {
+        await $.ui.log('hcom mod poll failed; messages remain queued: ' + String(error)).catch(() => {});
+      }
+    }
   } finally {
     probing = false;
   }
@@ -86,7 +92,7 @@ export function register(on) {
   submitting = false;
   submittingSession = undefined;
   generation = 0;
-  failed = false;
+  failures = 0;
   backoff = 0;
   on('session.start', async ($, e, next) => {
     if (!e.isInteractive || !await $.env.get('HCOM_PROCESS_ID') || await $.env.get('HCOM_PTY_MODE') !== '1'
