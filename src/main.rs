@@ -45,6 +45,14 @@ use std::panic;
 use std::str::FromStr;
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("__update-check") {
+        let mut args = std::env::args_os().skip(2);
+        if let (Some(flag), Some(current)) = (args.next(), args.next()) {
+            update::run_background_check(std::path::Path::new(&flag), &current.to_string_lossy());
+        }
+        return Ok(());
+    }
+
     // Hooks of an agent nested under an hcom-launched one must not act as it.
     // Runs first: every later env reader should see only the child's view.
     let nested = std::env::args()
