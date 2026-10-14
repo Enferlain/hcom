@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use crate::db::HcomDb;
 use crate::shared::CommandContext;
 use crate::tool::Tool;
-use crate::transcript::{self, Exchange, ReadOptions, format_exchanges, summarize_action};
+use crate::transcript::{self, Exchange, ReadOptions, format_exchanges, summarize_exchange};
 
 fn run_search_tool(program: &str, args: &[&str]) -> Result<Option<std::process::Output>, String> {
     match std::process::Command::new(program).args(args).output() {
@@ -80,7 +80,7 @@ pub enum TranscriptSubcmd {
 pub struct TranscriptSearchArgs {
     /// Search pattern (regex)
     pub pattern: String,
-    /// Live-watch mode
+    /// Only currently live agents
     #[arg(long)]
     pub live: bool,
     /// Search all transcripts on disk (not just tracked instances)
@@ -92,7 +92,7 @@ pub struct TranscriptSearchArgs {
     /// Exclude own transcript from search results
     #[arg(long)]
     pub exclude_self: bool,
-    /// Max results (default: 20)
+    /// Max matching exchanges shown (default: 20)
     #[arg(long, default_value = "20")]
     pub limit: usize,
     /// Filter by exact agent type (canonical name or declared alias)
@@ -112,7 +112,7 @@ pub struct TranscriptTimelineArgs {
     /// Detailed output
     #[arg(long)]
     pub detailed: bool,
-    /// Last N exchanges per agent
+    /// Number of exchanges to show, newest first (default: 10)
     #[arg(long)]
     pub last: Option<usize>,
 }
@@ -165,31 +165,17 @@ fn centered_snippet(line_text: &str, col: usize, width: usize) -> String {
     out
 }
 
-/// Parse one search-tool output line into `(line_number, centered_snippet)`.
-///
-/// `has_column` is true for ripgrep run with `--column` (`LINE:COL:TEXT`) and
-/// false for the `grep` fallback (`LINE:TEXT`), where we locate the pattern
-/// literally to center on it and fall back to the line start otherwise.
-fn parse_match_line(raw: &str, has_column: bool, pattern: &str) -> (usize, String) {
-    let Some((line_str, rest)) = raw.split_once(':') else {
-        return (0, centered_snippet(raw, 1, SEARCH_SNIPPET_WIDTH));
-    };
-    let line_num = line_str.parse::<usize>().unwrap_or(0);
-
-    if has_column
-        && let Some((col_str, text)) = rest.split_once(':')
-        && let Ok(col) = col_str.parse::<usize>()
-    {
-        return (line_num, centered_snippet(text, col, SEARCH_SNIPPET_WIDTH));
+/// Parse one `rg -n --column` output line (`LINE:COL:TEXT`) into
+/// `(line_number, centered_snippet)`.
+fn parse_match_line(raw: &str) -> (usize, String) {
+    let mut parts = raw.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(line), Some(col), Some(text)) => (
+            line.parse().unwrap_or(0),
+            centered_snippet(text, col.parse().unwrap_or(1), SEARCH_SNIPPET_WIDTH),
+        ),
+        _ => (0, centered_snippet(raw, 1, SEARCH_SNIPPET_WIDTH)),
     }
-
-    // grep fallback (or malformed rg line): best-effort literal locate.
-    let col = rest
-        .to_lowercase()
-        .find(&pattern.to_lowercase())
-        .map(|byte| byte + 1)
-        .unwrap_or(1);
-    (line_num, centered_snippet(rest, col, SEARCH_SNIPPET_WIDTH))
 }
 
 // ── Transcript Path Discovery ────────────────────────────────────────────
@@ -254,16 +240,16 @@ fn conversation_header(shown: &[&Exchange], loaded: &[Exchange], instance_name: 
 }
 
 /// Explain an empty range result against the exchanges that do exist.
-fn range_miss_message(
-    exchanges: &[Exchange],
-    range_start: Option<usize>,
-    range_end: Option<usize>,
-) -> Option<String> {
-    let start = range_start?;
-    let end = range_end.unwrap_or(start);
+fn range_miss_message(exchanges: &[Exchange], range: Option<ExchangeRange>) -> Option<String> {
+    let (start, end) = range?;
     let last = exchanges.iter().map(|e| e.position).max()?;
+    let asked = match end {
+        Some(end) if end == start => start.to_string(),
+        Some(end) => format!("{start}-{end}"),
+        None => format!("{start}-"),
+    };
     Some(format!(
-        "No exchanges in range {start}-{end}; this transcript has 1-{last} (e.g. --last 5 or {}-{last})",
+        "No exchanges in range {asked}; this transcript has 1-{last} (e.g. --last 5 or {}-{last})",
         last.saturating_sub(4).max(1)
     ))
 }
@@ -337,6 +323,103 @@ pub(crate) fn get_exchanges(
     transcript::read(Path::new(path), backend, &opts)
 }
 
+// ── Tracked transcripts ──────────────────────────────────────────────────
+
+/// One hcom-tracked transcript: a live agent's, or a stopped agent's snapshot.
+struct TrackedTranscript {
+    name: String,
+    path: String,
+    tool: String,
+    session_id: Option<String>,
+    /// When the agent stopped; `None` while it is live.
+    stopped_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Live agents first, then stopped snapshots newest first, one entry per agent
+/// name: the session `hcom transcript <name>` opens, so every reference printed
+/// for a result leads back to it. Empty paths are skipped so a transcript-less
+/// snapshot can't shadow a real one.
+fn tracked_transcripts(db: &HcomDb, live_only: bool) -> Vec<TrackedTranscript> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |t: TrackedTranscript| {
+        if seen.insert(t.name.clone()) {
+            out.push(t);
+        }
+    };
+
+    if let Ok(mut stmt) = db.conn().prepare(
+        "SELECT name, transcript_path, tool, session_id FROM instances
+         WHERE transcript_path IS NOT NULL AND transcript_path != ''",
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        Ok(TrackedTranscript {
+            name: row.get(0)?,
+            path: row.get(1)?,
+            tool: row.get(2)?,
+            session_id: row.get(3)?,
+            stopped_at: None,
+        })
+    }) {
+        rows.flatten().for_each(&mut push);
+    }
+
+    if live_only {
+        return out;
+    }
+
+    if let Ok(mut stmt) = db.conn().prepare(
+        "SELECT instance,
+                json_extract(data, '$.snapshot.transcript_path') AS tp,
+                json_extract(data, '$.snapshot.tool'),
+                json_extract(data, '$.snapshot.session_id'),
+                timestamp
+         FROM events WHERE type = 'life'
+         AND json_extract(data, '$.action') = 'stopped'
+         AND tp IS NOT NULL AND tp != ''
+         ORDER BY id DESC",
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        let path: String = row.get(1)?;
+        let tool = row
+            .get::<_, Option<String>>(2)?
+            .unwrap_or_else(|| detect_agent_type(&path).to_string());
+        Ok(TrackedTranscript {
+            name: row.get(0)?,
+            path,
+            tool,
+            session_id: row.get(3)?,
+            stopped_at: parse_timestamp(&row.get::<_, String>(4)?),
+        })
+    }) {
+        rows.flatten().for_each(&mut push);
+    }
+
+    out
+}
+
+/// Parse a transcript or event timestamp (RFC 3339, or epoch seconds/millis).
+fn parse_timestamp(ts: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    let n: f64 = ts.parse().ok()?;
+    let millis = if n > 1e12 { n } else { n * 1000.0 };
+    chrono::DateTime::from_timestamp_millis(millis as i64)
+}
+
+/// Local "HH:MM" for today, "Mon D HH:MM" otherwise.
+fn format_local_time(ts: &str) -> String {
+    let Some(dt) = parse_timestamp(ts) else {
+        return "??:??".to_string();
+    };
+    let local = dt.with_timezone(&chrono::Local);
+    let fmt = if local.date_naive() == chrono::Local::now().date_naive() {
+        "%H:%M"
+    } else {
+        "%b %-d %H:%M"
+    };
+    local.format(fmt).to_string()
+}
+
 // ── Search ───────────────────────────────────────────────────────────────
 
 /// Correlate transcript file paths to hcom agent names via DB queries.
@@ -399,16 +482,119 @@ fn correlate_paths_to_hcom(
     result
 }
 
+/// A search hit in one exchange of a tracked transcript.
+struct SearchHit<'a> {
+    source: &'a TrackedTranscript,
+    agent: &'static str,
+    position: usize,
+    timestamp: String,
+    /// Where the match is: "user", "assistant", or "tool" (commands/files).
+    field: &'static str,
+    snippet: String,
+}
+
+/// First match in an exchange, checked in reading order: prompt, response,
+/// then tool calls (commands, files, captured output, errors). Tool output is
+/// the parser's capped capture, so text deep in a long output is not seen.
+fn match_exchange(ex: &Exchange, re: &regex::Regex) -> Option<(&'static str, String)> {
+    let tool_text = ex
+        .tools
+        .iter()
+        .flat_map(|t| t.command.iter().chain(t.file.iter()).chain(t.output.iter()))
+        .chain(ex.files.iter())
+        .map(String::as_str)
+        .chain(
+            ex.errors
+                .iter()
+                .filter_map(|e| e.get("content").and_then(Value::as_str)),
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
+    [
+        ("user", ex.user.as_str()),
+        ("assistant", ex.action.as_str()),
+        ("tool", tool_text.as_str()),
+    ]
+    .into_iter()
+    .find_map(|(field, text)| {
+        let m = re.find(text)?;
+        let snippet = centered_snippet(text, m.start() + 1, SEARCH_SNIPPET_WIDTH);
+        Some((
+            field,
+            snippet.split_whitespace().collect::<Vec<_>>().join(" "),
+        ))
+    })
+}
+
+/// Every exchange of one transcript that matches `re`.
+fn search_transcript<'a>(
+    source: &'a TrackedTranscript,
+    tool: Tool,
+    re: &regex::Regex,
+) -> Vec<SearchHit<'a>> {
+    let Ok(exchanges) = get_exchanges(
+        &source.path,
+        &source.tool,
+        usize::MAX,
+        true,
+        source.session_id.as_deref(),
+        false,
+    ) else {
+        return Vec::new();
+    };
+    exchanges
+        .iter()
+        .filter_map(|ex| {
+            let (field, snippet) = match_exchange(ex, re)?;
+            Some(SearchHit {
+                source,
+                agent: tool.as_str(),
+                position: ex.position,
+                timestamp: ex.timestamp.clone(),
+                field,
+                snippet,
+            })
+        })
+        .collect()
+}
+
+/// Transcript files that contain `pattern` on disk, or `None` when that can't
+/// be decided from the raw bytes. Files hold JSON-escaped text, so most regex
+/// constructs (`.`, classes, anchors, `\s`) match the decoded text differently
+/// than the escaped bytes. Only a plain literal free of characters JSON may
+/// escape is checked; everything else (and a missing `rg`) parses every
+/// transcript.
+fn prefilter_files(
+    pattern: &str,
+    files: &[&str],
+) -> Result<Option<std::collections::HashSet<String>>, String> {
+    let plain_literal = !pattern.is_empty()
+        && pattern.chars().all(|c| c.is_ascii_graphic() || c == ' ')
+        && !pattern.contains(|c| "\\\".^$*+?()[]{}|".contains(c));
+    if files.is_empty() || !plain_literal {
+        return Ok(None);
+    }
+    let mut args = vec!["-l", "-F", "-e", pattern, "--"];
+    args.extend_from_slice(files);
+    match run_search_tool("rg", &args) {
+        Ok(Some(out)) => Ok(Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+        )),
+        Ok(None) => Ok(Some(Default::default())),
+        Err(err) if err.contains("was not found on PATH") => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 /// Search across transcripts: `hcom transcript search "pattern" [--live] [--all] [--limit N] [--exclude-self]`
 fn cmd_transcript_search(
     db: &HcomDb,
     args: &TranscriptSearchArgs,
     ctx: Option<&CommandContext>,
 ) -> i32 {
-    let live_mode = args.live;
-    let all_mode = args.all;
-    let json_mode = args.json;
-    let limit = args.limit;
     let agent_filter = match args.agent.as_deref() {
         Some(value) => match transcript::parse_tool_filter(value) {
             Ok(tool) => Some(tool),
@@ -420,8 +606,19 @@ fn cmd_transcript_search(
         None => None,
     };
 
-    // Resolve self name for --exclude-self
-    let ctx_name = if args.exclude_self {
+    if args.all {
+        return cmd_transcript_search_all(db, args, agent_filter);
+    }
+
+    let re = match regex::Regex::new(&args.pattern) {
+        Ok(re) => re,
+        Err(err) => {
+            eprintln!("Error: invalid pattern: {err}");
+            return 1;
+        }
+    };
+
+    let self_name = if args.exclude_self {
         ctx.and_then(|c| c.identity.as_ref())
             .filter(|id| matches!(id.kind, crate::shared::SenderKind::Instance))
             .map(|id| id.name.clone())
@@ -429,418 +626,365 @@ fn cmd_transcript_search(
         None
     };
 
-    let pattern = &args.pattern;
+    // (source, tool, backend) for every transcript in scope.
+    let sources: Vec<TrackedTranscript> = tracked_transcripts(db, args.live)
+        .into_iter()
+        .filter(|t| self_name.as_deref() != Some(t.name.as_str()))
+        .filter(|t| Path::new(&t.path).exists())
+        .collect();
+    let resolved: Vec<(&TrackedTranscript, Tool, transcript::TranscriptBackend)> = sources
+        .iter()
+        .filter_map(|t| {
+            let tool = transcript::tool_from_agent_or_path(&t.tool, &t.path).ok()?;
+            let backend = transcript::backend_for_tool(tool)?;
+            Some((t, tool, backend))
+        })
+        .filter(|(_, tool, _)| agent_filter.is_none_or(|f| f == *tool))
+        .collect();
 
-    // Collect transcript paths: (name, path, agent)
-    let mut paths: Vec<(String, String, String)> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    if all_mode {
-        // --all: derive file roots and database sources from canonical tools.
-        let selected_tools = agent_filter
-            .map(|tool| vec![tool])
-            .unwrap_or_else(transcript::transcript_tools);
-        let mut search_dirs: Vec<PathBuf> = Vec::new();
-        // Remember which tool each search root belongs to so matches found under
-        // an override root with no content signature (e.g. pi's bare
-        // `<uuid>.jsonl` under a custom PI_CODING_AGENT_SESSION_DIR) can still be
-        // attributed. A path can map to more than one tool — gemini and
-        // antigravity share `~/.gemini` — which `attribute_disk_match` treats as
-        // ambiguous and defers to content detection.
-        let mut root_owners: Vec<(PathBuf, Tool)> = Vec::new();
-        for tool in &selected_tools {
-            for path in transcript::disk_search_roots(*tool) {
-                if path.exists() {
-                    if !search_dirs.contains(&path) {
-                        search_dirs.push(path.clone());
-                    }
-                    root_owners.push((path, *tool));
-                }
-            }
+    // A shared database holds every session, so a raw byte match says nothing
+    // about this agent's; only per-session files can be prefiltered.
+    let files: Vec<&str> = resolved
+        .iter()
+        .filter(|(_, _, backend)| !backend.is_shared_database())
+        .map(|(t, _, _)| t.path.as_str())
+        .collect();
+    let candidates = match prefilter_files(&args.pattern, &files) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            return 1;
         }
-        let database_sources: Vec<(Tool, PathBuf)> = selected_tools
-            .iter()
-            .filter_map(|tool| transcript::database_search_path(*tool).map(|path| (*tool, path)))
+    };
+
+    let to_parse: Vec<_> = resolved
+        .iter()
+        .filter(|(source, _, backend)| {
+            backend.is_shared_database()
+                || candidates.as_ref().is_none_or(|c| c.contains(&source.path))
+        })
+        .collect();
+    // Parsing dominates (transcripts run to megabytes), so spread it over cores.
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(to_parse.len().max(1));
+    let mut hits: Vec<SearchHit> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                let (to_parse, re) = (&to_parse, &re);
+                scope.spawn(move || {
+                    to_parse
+                        .iter()
+                        .skip(w)
+                        .step_by(workers)
+                        .flat_map(|(source, tool, _)| search_transcript(source, *tool, re))
+                        .collect::<Vec<_>>()
+                })
+            })
             .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
 
-        if search_dirs.is_empty() && database_sources.is_empty() {
-            println!("No transcript directories or databases found on disk.");
-            return 0;
-        }
+    let total = hits.len();
+    hits.sort_by_key(|h| std::cmp::Reverse(parse_timestamp(&h.timestamp)));
+    hits.truncate(args.limit);
 
-        // Phase 1: find matching files with rg -l (recursive, *.jsonl/*.json).
-        // Avoid invoking rg without a path when only SQLite sources exist; that
-        // would make it read stdin and potentially block an interactive command.
-        let matching_files: Vec<String> = if search_dirs.is_empty() {
-            Vec::new()
-        } else {
-            let mut cmd = std::process::Command::new("rg");
-            cmd.args(["-l", "--glob", "*.jsonl", "--glob", "*.json", pattern]);
-            for d in &search_dirs {
-                cmd.arg(d);
-            }
-            match cmd.output() {
-                Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-                Ok(out) if out.status.code() == Some(1) => Vec::new(),
-                Ok(out) => {
-                    eprintln!(
-                        "Error: ripgrep failed: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                    return 1;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!("Error: transcript search --all requires `rg` (ripgrep) on PATH");
-                    return 1;
-                }
-                Err(err) => {
-                    eprintln!("Error: could not run `rg`: {err}");
-                    return 1;
-                }
-            }
-        };
-
-        let mut database_matches = Vec::new();
-        for (tool, db_path) in &database_sources {
-            if database_matches.len() >= limit {
-                break;
-            }
-            match transcript::search_database_sessions(
-                *tool,
-                db_path,
-                pattern,
-                limit - database_matches.len(),
-            ) {
-                Ok(matches) => database_matches.extend(matches),
-                Err(err) => {
-                    eprintln!("Error: {err}");
-                    return 1;
-                }
-            }
-        }
-
-        if matching_files.is_empty() && database_matches.is_empty() {
-            if json_mode {
-                println!("{}", json!({"count": 0, "results": [], "scope": "all"}));
-            } else {
-                println!("No matches for \"{pattern}\"");
-            }
-            return 0;
-        }
-
-        // Correlate transcript paths/session IDs to hcom names via DB.
-        let mut targets: Vec<(String, Option<String>)> = matching_files
+    let scope = if args.live { "live" } else { "hcom" };
+    if args.json {
+        let results: Vec<Value> = hits
             .iter()
-            .cloned()
-            .map(|path| (path, None))
+            .map(|h| {
+                json!({
+                    "hcom_name": h.source.name,
+                    "agent": h.agent,
+                    "position": h.position,
+                    "timestamp": h.timestamp,
+                    "field": h.field,
+                    "text": h.snippet,
+                    "path": h.source.path,
+                    "session_id": h.source.session_id,
+                })
+            })
             .collect();
-        targets.extend(
-            database_matches
-                .iter()
-                .filter_map(|m| m.session_id.clone().map(|sid| (m.path.clone(), Some(sid)))),
+        println!(
+            "{}",
+            json!({"count": results.len(), "total": total, "results": results, "scope": scope})
         );
-        let path_to_hcom = correlate_paths_to_hcom(db, &targets);
-
-        // Extract line-level matches from each file
-        let mut results = Vec::new();
-        for file_path in &matching_files {
-            if results.len() >= limit {
-                break;
-            }
-            let Some(detected_tool) =
-                attribute_disk_match(file_path, &selected_tools, &root_owners)
-            else {
-                continue;
-            };
-            let agent = detected_tool.as_str();
-            let hcom_name = path_to_hcom
-                .get(&transcript_search_key(file_path, None))
-                .cloned()
-                .unwrap_or_default();
-
-            let remaining = limit - results.len();
-            let max_count = remaining.to_string();
-            let out = match run_search_tool(
-                "rg",
-                &[
-                    "-n",
-                    "--column",
-                    "--max-count",
-                    &max_count,
-                    pattern,
-                    file_path,
-                ],
-            ) {
-                Ok(output) => output,
-                Err(err) => {
-                    eprintln!("Error: {err}");
-                    return 1;
-                }
-            };
-            if let Some(out) = out {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let lines: Vec<&str> = stdout.lines().collect();
-                let match_count = lines.len();
-                if match_count > 0 {
-                    let (line_num, snippet) = parse_match_line(lines[0], true, pattern);
-
-                    results.push(json!({
-                            "hcom_name": if hcom_name.is_empty() { serde_json::Value::Null } else { json!(hcom_name) },
-                            "agent": agent,
-                            "path": file_path,
-                            "line": line_num,
-                            "text": snippet,
-                            "matches": match_count,
-                        }));
-                }
-            }
-        }
-
-        for database_match in &database_matches {
-            if results.len() >= limit {
-                break;
-            }
-            let hcom_name = path_to_hcom
-                .get(&transcript_search_key(
-                    &database_match.path,
-                    database_match.session_id.as_deref(),
-                ))
-                .cloned()
-                .unwrap_or_default();
-            results.push(json!({
-                "hcom_name": if hcom_name.is_empty() { serde_json::Value::Null } else { json!(hcom_name) },
-                "agent": database_match.agent,
-                "path": database_match.path,
-                "line": database_match.line,
-                "text": database_match.text,
-                "matches": database_match.matches,
-                "session_id": database_match.session_id,
-                "label": database_match.label,
-            }));
-        }
-
-        if json_mode {
-            println!(
-                "{}",
-                json!({"count": results.len(), "results": results, "scope": "all"})
-            );
-        } else if results.is_empty() {
-            println!("No matches for \"{pattern}\"");
-        } else {
-            println!(
-                "Found matches in {} transcripts (all on disk):",
-                results.len()
-            );
-            for r in &results {
-                let path = r["path"].as_str().unwrap_or("");
-                let agent = r["agent"].as_str().unwrap_or("?");
-                let line = r["line"].as_u64().unwrap_or(0);
-                let matches = r["matches"].as_u64().unwrap_or(0);
-                let snippet = r["text"].as_str().unwrap_or("");
-                let label = r["label"].as_str().unwrap_or("");
-                let session_id = r["session_id"].as_str().unwrap_or("");
-                let short_path = path
-                    .split('/')
-                    .rev()
-                    .take(3)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("/");
-                let name_part = r["hcom_name"]
-                    .as_str()
-                    .map(|n| format!(" ({n})"))
-                    .unwrap_or_default();
-                println!("  [{agent}]{name_part} .../{short_path}:{line}  ({matches} matches)");
-                if !label.is_empty() || !session_id.is_empty() {
-                    let mut details = Vec::new();
-                    if !label.is_empty() {
-                        details.push(label.to_string());
-                    }
-                    if !session_id.is_empty() {
-                        details.push(session_id.to_string());
-                    }
-                    println!("    {}", details.join(" | "));
-                }
-                if !snippet.is_empty() {
-                    println!("    {snippet}");
-                }
-            }
-        }
         return 0;
-    } else {
-        // Active instances
-        if let Ok(mut stmt) = db.conn().prepare(
-            "SELECT name, transcript_path, tool FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''"
-        )
-            && let Ok(rows) = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            }) {
-                for (name, path, tool) in rows.flatten() {
-                    if let Some(filter_tool) = agent_filter
-                        && transcript::tool_from_agent_or_path(&tool, &path).ok() != Some(filter_tool)
-                    {
-                        continue;
-                    }
-                    if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
-                    seen.insert(name.clone());
-                    paths.push((name, path, tool));
-                }
-            }
-
-        // Stopped instances from life event snapshots (C2/C3 fix)
-        if !live_mode
-            && let Ok(mut stmt) = db.conn().prepare(
-                "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL"
-            )
-                && let Ok(rows) = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                }) {
-                    for (name, path, tool) in rows.flatten() {
-                        if seen.contains(&name) { continue; }
-                        if let Some(filter_tool) = agent_filter
-                            && transcript::tool_from_agent_or_path(&tool, &path).ok() != Some(filter_tool)
-                        {
-                            continue;
-                        }
-                        if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
-                        seen.insert(name.clone());
-                        paths.push((name, path, tool));
-                    }
-                }
     }
 
-    // Search using ripgrep (with line-level matches + snippets) — hcom-tracked/live paths
-    let mut results = Vec::new();
-    for (name, path, agent) in &paths {
-        if !Path::new(path).exists() {
-            continue;
-        }
-
-        // Use rg for line-level matches with context. `--column` gives us the
-        // match offset so the snippet can be centered on the hit; the grep
-        // fallback has no column, so parse_match_line locates the pattern itself.
-        let remaining = limit - results.len();
-        let max_count = remaining.to_string();
-        let mut has_column = true;
-        let output = match run_search_tool(
-            "rg",
-            &["-n", "--column", "--max-count", &max_count, pattern, path],
-        ) {
-            Ok(output) => Ok(output),
-            Err(rg_err) if rg_err.contains("was not found on PATH") => {
-                has_column = false;
-                run_search_tool("grep", &["-n", "-m", &max_count, pattern, path]).map_err(
-                    |grep_err| {
-                        format!(
-                            "transcript search requires `rg` or `grep` on PATH ({rg_err}; {grep_err})"
-                        )
-                    },
-                )
-            }
-            Err(err) => Err(err),
+    if hits.is_empty() {
+        println!("No matches for \"{}\"", args.pattern);
+        return 0;
+    }
+    let scope_label = if args.live {
+        "live agents"
+    } else {
+        "hcom-tracked"
+    };
+    let noun = if total == 1 { "exchange" } else { "exchanges" };
+    if hits.len() < total {
+        println!(
+            "{} of {total} matching {noun} ({scope_label}, newest first; --limit for more):\n",
+            hits.len()
+        );
+    } else {
+        println!("{total} matching {noun} ({scope_label}, newest first):\n");
+    }
+    for h in &hits {
+        let flag = if h.field == "tool" {
+            "--detailed"
+        } else {
+            "--full"
         };
+        println!(
+            "[{}:{} #{}] {} {}",
+            h.agent,
+            h.source.name,
+            h.position,
+            format_local_time(&h.timestamp),
+            h.field
+        );
+        println!("    {}", h.snippet);
+        println!(
+            "    hcom transcript {} {} {flag}\n",
+            h.source.name, h.position
+        );
+    }
+    0
+}
 
-        let output = match output {
-            Ok(output) => output,
+/// `transcript search --all`: raw ripgrep over every transcript on disk,
+/// including sessions hcom never tracked.
+fn cmd_transcript_search_all(
+    db: &HcomDb,
+    args: &TranscriptSearchArgs,
+    agent_filter: Option<Tool>,
+) -> i32 {
+    let pattern = args.pattern.as_str();
+    let limit = args.limit;
+    let selected_tools = agent_filter
+        .map(|tool| vec![tool])
+        .unwrap_or_else(transcript::transcript_tools);
+    let mut search_dirs: Vec<PathBuf> = Vec::new();
+    // Remember which tool each search root belongs to so matches found under
+    // an override root with no content signature (e.g. pi's bare
+    // `<uuid>.jsonl` under a custom PI_CODING_AGENT_SESSION_DIR) can still be
+    // attributed. A path can map to more than one tool — gemini and
+    // antigravity share `~/.gemini` — which `attribute_disk_match` treats as
+    // ambiguous and defers to content detection.
+    let mut root_owners: Vec<(PathBuf, Tool)> = Vec::new();
+    for tool in &selected_tools {
+        for path in transcript::disk_search_roots(*tool) {
+            if path.exists() {
+                if !search_dirs.contains(&path) {
+                    search_dirs.push(path.clone());
+                }
+                root_owners.push((path, *tool));
+            }
+        }
+    }
+    let database_sources: Vec<(Tool, PathBuf)> = selected_tools
+        .iter()
+        .filter_map(|tool| transcript::database_search_path(*tool).map(|path| (*tool, path)))
+        .collect();
+
+    if search_dirs.is_empty() && database_sources.is_empty() {
+        println!("No transcript directories or databases found on disk.");
+        return 0;
+    }
+
+    // Phase 1: matching files with per-file matching-line counts.
+    // Avoid invoking rg without a path when only SQLite sources exist; that
+    // would make it read stdin and potentially block an interactive command.
+    let file_counts: Vec<(String, u64)> = if search_dirs.is_empty() {
+        Vec::new()
+    } else {
+        let mut cmd = std::process::Command::new("rg");
+        cmd.args([
+            "-c", "--glob", "*.jsonl", "--glob", "*.json", "-e", pattern, "--",
+        ])
+        .args(&search_dirs);
+        match cmd.output() {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let (path, count) = line.rsplit_once(':')?;
+                    Some((path.to_string(), count.parse().ok()?))
+                })
+                .collect(),
+            Ok(out) if out.status.code() == Some(1) => Vec::new(),
+            Ok(out) => {
+                eprintln!(
+                    "Error: ripgrep failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return 1;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("Error: transcript search --all requires `rg` (ripgrep) on PATH");
+                return 1;
+            }
+            Err(err) => {
+                eprintln!("Error: could not run `rg`: {err}");
+                return 1;
+            }
+        }
+    };
+
+    let mut database_matches = Vec::new();
+    for (tool, db_path) in &database_sources {
+        if database_matches.len() >= limit {
+            break;
+        }
+        match transcript::search_database_sessions(
+            *tool,
+            db_path,
+            pattern,
+            limit - database_matches.len(),
+        ) {
+            Ok(matches) => database_matches.extend(matches),
+            Err(err) => {
+                eprintln!("Error: {err}");
+                return 1;
+            }
+        }
+    }
+
+    if file_counts.is_empty() && database_matches.is_empty() {
+        if args.json {
+            println!("{}", json!({"count": 0, "results": [], "scope": "all"}));
+        } else {
+            println!("No matches for \"{pattern}\"");
+        }
+        return 0;
+    }
+
+    // Correlate transcript paths/session IDs to hcom names via DB.
+    let mut targets: Vec<(String, Option<String>)> = file_counts
+        .iter()
+        .map(|(path, _)| (path.clone(), None))
+        .collect();
+    targets.extend(
+        database_matches
+            .iter()
+            .filter_map(|m| m.session_id.clone().map(|sid| (m.path.clone(), Some(sid)))),
+    );
+    let path_to_hcom = correlate_paths_to_hcom(db, &targets);
+
+    // Phase 2: first matching line of each file, for the snippet.
+    let mut results = Vec::new();
+    for (file_path, match_count) in &file_counts {
+        if results.len() >= limit {
+            break;
+        }
+        let Some(detected_tool) = attribute_disk_match(file_path, &selected_tools, &root_owners)
+        else {
+            continue;
+        };
+        let out = match run_search_tool(
+            "rg",
+            &["-n", "--column", "-m", "1", "-e", pattern, "--", file_path],
+        ) {
+            Ok(Some(out)) => out,
+            Ok(None) => continue,
             Err(err) => {
                 eprintln!("Error: {err}");
                 return 1;
             }
         };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let Some(first) = stdout.lines().next() else {
+            continue;
+        };
+        let (line_num, snippet) = parse_match_line(first);
+        let hcom_name = path_to_hcom.get(&transcript_search_key(file_path, None));
+        results.push(json!({
+            "hcom_name": hcom_name,
+            "agent": detected_tool.as_str(),
+            "path": file_path,
+            "line": line_num,
+            "text": snippet,
+            "matches": match_count,
+        }));
+    }
 
-        if let Some(out) = output {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let lines: Vec<&str> = stdout.lines().collect();
-            let match_count = lines.len();
-            if match_count > 0 {
-                let (line_num, snippet) = parse_match_line(lines[0], has_column, pattern);
-
-                results.push(json!({
-                    "hcom_name": name,
-                    "agent": agent,
-                    "path": path,
-                    "line": line_num,
-                    "text": snippet,
-                    "matches": match_count,
-                }));
-            }
-        }
-
+    for database_match in &database_matches {
         if results.len() >= limit {
             break;
         }
+        let hcom_name = path_to_hcom.get(&transcript_search_key(
+            &database_match.path,
+            database_match.session_id.as_deref(),
+        ));
+        results.push(json!({
+            "hcom_name": hcom_name,
+            "agent": database_match.agent,
+            "path": database_match.path,
+            "line": database_match.line,
+            "text": database_match.text,
+            "matches": database_match.matches,
+            "session_id": database_match.session_id,
+            "label": database_match.label,
+        }));
     }
 
-    let scope_label = if live_mode {
-        " (live agents)"
-    } else if all_mode {
-        ""
-    } else {
-        " (hcom-tracked)"
-    };
-
-    if json_mode {
+    if args.json {
         println!(
             "{}",
-            json!({"count": results.len(), "results": results, "scope": if live_mode {"live"} else if all_mode {"all"} else {"hcom"}})
+            json!({"count": results.len(), "results": results, "scope": "all"})
+        );
+        return 0;
+    }
+    if results.is_empty() {
+        println!("No matches for \"{pattern}\"");
+        return 0;
+    }
+    let total = file_counts.len() + database_matches.len();
+    if results.len() < total {
+        println!(
+            "Matches in {} of {total} transcripts (all on disk; --limit for more):",
+            results.len()
         );
     } else {
-        if results.is_empty() {
-            println!("No matches for \"{pattern}\"");
-            return 0;
+        println!("Matches in {total} transcripts (all on disk):");
+    }
+    for r in &results {
+        let path = r["path"].as_str().unwrap_or("");
+        let agent = r["agent"].as_str().unwrap_or("?");
+        let line = r["line"].as_u64().unwrap_or(0);
+        let matches = r["matches"].as_u64().unwrap_or(0);
+        let snippet = r["text"].as_str().unwrap_or("");
+        let label = r["label"].as_str().unwrap_or("");
+        let session_id = r["session_id"].as_str().unwrap_or("");
+        let short_path = path
+            .rsplit('/')
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("/");
+        let name_part = r["hcom_name"]
+            .as_str()
+            .map(|n| format!(" ({n})"))
+            .unwrap_or_default();
+        let noun = if matches == 1 { "line" } else { "lines" };
+        println!("  [{agent}]{name_part} .../{short_path}:{line}  ({matches} matching {noun})");
+        if !label.is_empty() || !session_id.is_empty() {
+            let details: Vec<&str> = [label, session_id]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect();
+            println!("    {}", details.join(" | "));
         }
-        let limit_hit = results.len() >= limit;
-        if limit_hit {
-            println!(
-                "Showing {} matches (limit {}){scope_label}:\n",
-                results.len(),
-                limit
-            );
-        } else {
-            println!("Found {} matches{scope_label}:\n", results.len());
-        }
-        for result in &results {
-            let hcom_name = result
-                .get("hcom_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let agent = result.get("agent").and_then(|v| v.as_str()).unwrap_or("");
-            let path = result.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let line = result.get("line").and_then(|v| v.as_u64()).unwrap_or(0);
-            let snippet = result.get("text").and_then(|v| v.as_str()).unwrap_or("");
-
-            let path_display = if path.len() > 60 {
-                let mut start = path.len() - 57;
-                while start < path.len() && !path.is_char_boundary(start) {
-                    start += 1;
-                }
-                format!("...{}", &path[start..])
-            } else {
-                path.to_string()
-            };
-
-            println!("[{agent}:{hcom_name}] {path_display}:{line}");
-            // Snippet is already bounded and centered on the match by
-            // parse_match_line; just flatten newlines for single-line display.
-            let snippet_clean = snippet.replace('\n', " ");
-            println!("    {snippet_clean}\n");
+        if !snippet.is_empty() {
+            println!("    {snippet}");
         }
     }
-
     0
 }
 
@@ -848,87 +992,52 @@ fn cmd_transcript_search(
 fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
     let json_mode = args.json;
     let full_mode = args.full;
-    let detailed = args.detailed;
     let last_n = args.last.unwrap_or(10);
 
-    // Collect all transcript paths (active + stopped sessions, C3 fix)
-    let mut all_entries: Vec<Value> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    // Active instances
-    if let Ok(mut stmt) = db.conn().prepare(
-        "SELECT name, transcript_path, tool, session_id FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''"
-    )
-        && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        }) {
-            for (name, path, tool, sid) in rows.flatten() {
-                seen.insert(name.clone());
-                if let Ok(exchanges) =
-                    get_exchanges(&path, &tool, last_n, detailed, sid.as_deref(), true)
-                {
-                    for ex in exchanges {
-                        all_entries.push(json!({
-                            "instance": name,
-                            "position": ex.position,
-                            "user": ex.user,
-                            "action": if full_mode { ex.action.clone() } else { summarize_action(&ex.action) },
-                            "timestamp": ex.timestamp,
-                            "files": ex.files,
-                        }));
-                    }
-                }
+    // Sources come live first, then stopped newest first. A stopped transcript
+    // has nothing newer than its stop time, so once `last_n` entries are all
+    // newer than the next stop time, no remaining source can contribute.
+    let mut entries: Vec<(Option<chrono::DateTime<chrono::Utc>>, Value)> = Vec::new();
+    for source in tracked_transcripts(db, false) {
+        if let Some(stopped_at) = source.stopped_at
+            && entries.len() >= last_n
+        {
+            entries.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
+            entries.truncate(last_n);
+            if entries
+                .last()
+                .is_some_and(|(ts, _)| *ts >= Some(stopped_at))
+            {
+                break;
             }
         }
-
-    // Stopped instances from life event snapshots
-    if let Ok(mut stmt) = db.conn().prepare(
-        "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL"
-    )
-        && let Ok(rows) = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        }) {
-            for (name, path, tool, sid) in rows.flatten() {
-                if seen.contains(&name) { continue; }
-                seen.insert(name.clone());
-                if let Ok(exchanges) =
-                    get_exchanges(&path, &tool, last_n, detailed, sid.as_deref(), true)
-                {
-                    for ex in exchanges {
-                        all_entries.push(json!({
-                            "instance": name,
-                            "position": ex.position,
-                            "user": ex.user,
-                            "action": if full_mode { ex.action.clone() } else { summarize_action(&ex.action) },
-                            "timestamp": ex.timestamp,
-                            "files": ex.files,
-                        }));
-                    }
-                }
-            }
+        let Ok(exchanges) = get_exchanges(
+            &source.path,
+            &source.tool,
+            last_n,
+            args.detailed,
+            source.session_id.as_deref(),
+            true,
+        ) else {
+            continue;
+        };
+        for ex in exchanges {
+            entries.push((
+                parse_timestamp(&ex.timestamp),
+                json!({
+                    "instance": source.name,
+                    "position": ex.position,
+                    "user": ex.user,
+                    "action": if full_mode { ex.action.clone() } else { summarize_exchange(&ex) },
+                    "timestamp": ex.timestamp,
+                    "files": ex.files,
+                }),
+            ));
         }
-
-    // Sort by timestamp (most recent first)
-    all_entries.sort_by(|a, b| {
-        let ts_a = a.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
-        let ts_b = b.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
-        ts_b.cmp(ts_a) // Reverse order
-    });
-
-    // Limit
-    if all_entries.len() > last_n {
-        all_entries.truncate(last_n);
     }
+    entries.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
+    entries.truncate(last_n);
+    let all_entries: Vec<Value> = entries.into_iter().map(|(_, v)| v).collect();
 
     if json_mode {
         println!(
@@ -943,7 +1052,6 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
         return 0;
     }
 
-    //
     println!("Timeline ({} exchanges):\n", all_entries.len());
     for entry in &all_entries {
         let inst = entry.get("instance").and_then(|v| v.as_str()).unwrap_or("");
@@ -955,21 +1063,13 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
         let action = entry.get("action").and_then(|v| v.as_str()).unwrap_or("");
         let files = entry.get("files").and_then(|v| v.as_array());
 
-        let ts_short = if ts.contains('T') {
-            ts.get(11..16).unwrap_or("??:??")
-        } else if ts.len() >= 5 {
-            ts.get(..5).unwrap_or("??:??")
-        } else {
-            "??:??"
-        };
-
         let user_display = if user.len() > 80 {
             format!("{}...", truncate_str(user, 77))
         } else {
             user.to_string()
         };
 
-        println!("[{ts_short}] \"{user_display}\"");
+        println!("[{}] \"{user_display}\"", format_local_time(ts));
 
         if full_mode {
             for action_line in action.lines().take(10) {
@@ -980,11 +1080,10 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
                 println!("  ... (+{} lines)", line_count - 10);
             }
         } else {
-            let action_short = summarize_action(action);
-            let action_display = if action_short.len() > 100 {
-                format!("{}...", truncate_str(&action_short, 97))
+            let action_display = if action.len() > 100 {
+                format!("{}...", truncate_str(action, 97))
             } else {
-                action_short
+                action.to_string()
             };
             println!("  → {action_display}");
         }
@@ -996,7 +1095,6 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
             }
         }
 
-        // Command line (instance reference for navigation)
         println!(
             "  hcom transcript @{inst} {}",
             entry.get("position").and_then(|v| v.as_u64()).unwrap_or(1)
@@ -1055,163 +1153,49 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         }
     }
 
-    // Resolve target and range from positional args
+    // A lone numeric positional is a range for the caller's own transcript.
     let mut target = None;
-    let mut range_str: Option<String> = args.range_flag.clone();
-
+    let mut range = args.range_flag.clone();
     if let Some(ref name) = args.name {
         let stripped = name.strip_prefix('@').unwrap_or(name);
-        // Check if it looks like a range (digits and hyphens)
         if stripped.chars().all(|c| c.is_ascii_digit() || c == '-')
             && stripped.chars().any(|c| c.is_ascii_digit())
         {
-            if range_str.is_none() {
-                range_str = Some(stripped.to_string());
-            }
+            range.get_or_insert_with(|| stripped.to_string());
         } else {
             target = Some(stripped.to_string());
         }
     }
-
-    if let Some(ref range_pos) = args.range_positional
-        && range_str.is_none()
-    {
-        range_str = Some(range_pos.clone());
+    if range.is_none() {
+        range = args.range_positional.clone();
     }
 
-    // Resolve target to transcript path
-    let (instance_name, transcript_path, agent_type, session_id) = if let Some(ref name) = target {
-        // Try direct match
-        let resolved = resolve_instance_transcript(db, name);
-        match resolved {
-            Some(r) => r,
-            None => {
-                eprintln!("Error: {}", no_transcript_error(db, name, name, None));
-                return 1;
-            }
-        }
-    } else if let Some(id) = ctx.and_then(|c| c.identity.as_ref()) {
-        // Default to self
-        match resolve_instance_transcript(db, &id.name) {
-            Some(r) => r,
-            None => {
-                eprintln!("Error: No transcript available for current instance");
-                return 1;
-            }
-        }
-    } else {
+    let Some(name) = target.or_else(|| {
+        ctx.and_then(|c| c.identity.as_ref())
+            .map(|id| id.name.clone())
+    }) else {
         eprintln!("Usage: hcom transcript @instance [N | N-M] [--full] [--json]");
         return 1;
     };
 
-    // Parse range
-    let (range_start, range_end) = if let Some(ref r) = range_str {
-        parse_range(r)
-    } else {
-        (None, None)
-    };
-
-    // Get exchanges
-    let effective_last = if range_start.is_some() {
-        usize::MAX
-    } else {
-        last_n
-    };
-    let exchanges = match get_exchanges(
-        &transcript_path,
-        &agent_type,
-        effective_last,
+    let opts = TranscriptRenderOpts {
+        range: range.as_deref(),
+        last_n,
+        json_mode,
+        full_mode,
         detailed,
-        session_id.as_deref(),
-        true,
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return 1;
+        retry_codex: true,
+    };
+    match render_instance_transcript_impl(db, &name, &opts, &name, None) {
+        Ok(out) => {
+            println!("{out}");
+            0
         }
-    };
-
-    // Apply range filter
-    let filtered: Vec<&Exchange> = if let Some(start) = range_start {
-        let end = range_end.unwrap_or(start);
-        exchanges
-            .iter()
-            .filter(|e| e.position >= start && e.position <= end)
-            .collect()
-    } else {
-        exchanges.iter().collect()
-    };
-
-    // Checked before output-mode branching so --json callers see the same error.
-    if filtered.is_empty()
-        && let Some(msg) = range_miss_message(&exchanges, range_start, range_end)
-    {
-        eprintln!("Error: {msg}");
-        return 1;
+        Err(err) => {
+            eprintln!("Error: {err}");
+            1
+        }
     }
-
-    if json_mode {
-        let json_output: Vec<Value> = filtered
-            .iter()
-            .map(|ex| {
-                let mut obj = json!({
-                    "position": ex.position,
-                    "user": ex.user,
-                    "action": ex.action,
-                    "files": ex.files,
-                    "timestamp": ex.timestamp,
-                });
-                if detailed {
-                    obj["tools"] = json!(
-                        ex.tools
-                            .iter()
-                            .map(|t| {
-                                let mut tool = json!({
-                                    "name": t.name,
-                                    "is_error": t.is_error,
-                                });
-                                if let Some(ref f) = t.file {
-                                    tool["file"] = json!(f);
-                                }
-                                if let Some(ref c) = t.command {
-                                    tool["command"] = json!(c);
-                                }
-                                tool
-                            })
-                            .collect::<Vec<_>>()
-                    );
-                    obj["edits"] = json!(ex.edits);
-                    obj["errors"] = json!(ex.errors);
-                    obj["ended_on_error"] = json!(ex.ended_on_error);
-                }
-                obj
-            })
-            .collect();
-        println!(
-            "{}",
-            serde_json::to_string(&json_output).unwrap_or_default()
-        );
-        return 0;
-    }
-
-    if filtered.is_empty() {
-        println!("No exchanges found");
-        return 0;
-    }
-
-    println!(
-        "{}\n",
-        conversation_header(&filtered, &exchanges, &instance_name)
-    );
-
-    let owned: Vec<Exchange> = filtered.into_iter().cloned().collect();
-    println!("{}", format_exchanges(&owned, full_mode, detailed));
-    if let Some(hint) = transcript::flag_hint(full_mode, detailed) {
-        println!("{hint}");
-    }
-
-    0
 }
 
 /// Display options for transcript rendering.
@@ -1326,12 +1310,8 @@ fn render_instance_transcript_impl(
     let (instance_name, transcript_path, agent_type, session_id) =
         resolve_instance_transcript(db, name)
             .ok_or_else(|| no_transcript_error(db, name, display_name, device))?;
-    let (range_start, range_end) = if let Some(r) = opts.range {
-        parse_range(r)
-    } else {
-        (None, None)
-    };
-    let effective_last = if range_start.is_some() {
+    let range = opts.range.map(parse_range).transpose()?;
+    let effective_last = if range.is_some() {
         usize::MAX
     } else {
         opts.last_n
@@ -1343,21 +1323,18 @@ fn render_instance_transcript_impl(
         opts.detailed,
         session_id.as_deref(),
         opts.retry_codex,
-    )
-    .map_err(|e| e.to_string())?;
+    )?;
 
-    let filtered: Vec<&Exchange> = if let Some(start) = range_start {
-        let end = range_end.unwrap_or(start);
-        exchanges
+    let filtered: Vec<&Exchange> = match range {
+        Some((start, end)) => exchanges
             .iter()
-            .filter(|e| e.position >= start && e.position <= end)
-            .collect()
-    } else {
-        exchanges.iter().collect()
+            .filter(|e| e.position >= start && end.is_none_or(|end| e.position <= end))
+            .collect(),
+        None => exchanges.iter().collect(),
     };
 
     if filtered.is_empty()
-        && let Some(msg) = range_miss_message(&exchanges, range_start, range_end)
+        && let Some(msg) = range_miss_message(&exchanges, range)
     {
         return Err(msg);
     }
@@ -1493,22 +1470,20 @@ fn resolve_instance_transcript(
     None
 }
 
-/// Parse range string "N-M" or "N".
-fn parse_range(s: &str) -> (Option<usize>, Option<usize>) {
-    if let Some(dash_pos) = s.find('-') {
-        let start: Option<usize> = s[..dash_pos].parse().ok().filter(|&v: &usize| v >= 1);
-        let end: Option<usize> = s[dash_pos + 1..].parse().ok().filter(|&v: &usize| v >= 1);
-        // Validate start <= end
-        if let (Some(s), Some(e)) = (start, end)
-            && s > e
-        {
-            eprintln!("Error: invalid range '{s}-{e}' (start must be <= end)");
-            return (None, None);
-        }
-        (start, end)
-    } else {
-        let pos: Option<usize> = s.parse().ok().filter(|&v: &usize| v >= 1);
-        (pos, pos)
+/// Inclusive exchange range; an open end runs to the last exchange.
+type ExchangeRange = (usize, Option<usize>);
+
+/// Parse "N", "N-M" or "N-" (N to the end). Positions start at 1.
+fn parse_range(s: &str) -> Result<ExchangeRange, String> {
+    let invalid = || format!("invalid range '{s}' (expected N, N-M or N-)");
+    let position = |v: &str| v.parse::<usize>().ok().filter(|&v| v >= 1);
+    match s.split_once('-') {
+        None => position(s).map(|n| (n, Some(n))).ok_or_else(invalid),
+        Some((start, "")) => position(start).map(|n| (n, None)).ok_or_else(invalid),
+        Some((start, end)) => match (position(start), position(end)) {
+            (Some(start), Some(end)) if start <= end => Ok((start, Some(end))),
+            _ => Err(invalid()),
+        },
     }
 }
 
@@ -1517,8 +1492,8 @@ fn parse_range(s: &str) -> (Option<usize>, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcript::ToolUse;
     use crate::transcript::shared::finalize_action_text;
+    use crate::transcript::{ToolUse, summarize_action};
     use std::fs;
 
     fn test_db() -> HcomDb {
@@ -1571,9 +1546,12 @@ View transport messages with: hcom events --remote-fetch --device ABCD --partici
 
     #[test]
     fn test_parse_range() {
-        assert_eq!(parse_range("5"), (Some(5), Some(5)));
-        assert_eq!(parse_range("3-10"), (Some(3), Some(10)));
-        assert_eq!(parse_range("abc"), (None, None));
+        assert_eq!(parse_range("5"), Ok((5, Some(5))));
+        assert_eq!(parse_range("3-10"), Ok((3, Some(10))));
+        assert_eq!(parse_range("3-"), Ok((3, None)));
+        for bad in ["abc", "0", "5-3", "-3", "1-x", ""] {
+            assert!(parse_range(bad).is_err(), "{bad:?} should be rejected");
+        }
     }
 
     #[test]
@@ -1615,23 +1593,9 @@ View transport messages with: hcom events --remote-fetch --device ABCD --partici
         let text = format!("{head}FINDME{head}");
         let col = 301; // 1-based, right after the 300-char head
         let raw = format!("44:{col}:{text}");
-        let (line, snip) = parse_match_line(&raw, true, "FINDME");
+        let (line, snip) = parse_match_line(&raw);
         assert_eq!(line, 44);
         assert!(snip.contains("FINDME"), "centered on rg column: {snip}");
-    }
-
-    #[test]
-    fn test_parse_match_line_grep_fallback_locates_pattern() {
-        // grep format: LINE:TEXT (no column) — pattern located case-insensitively.
-        let head = "y".repeat(300);
-        let text = format!("{head}findME{head}");
-        let raw = format!("7:{text}");
-        let (line, snip) = parse_match_line(&raw, false, "FINDME");
-        assert_eq!(line, 7);
-        assert!(
-            snip.contains("findME"),
-            "grep fallback centers on match: {snip}"
-        );
     }
 
     #[test]
@@ -2465,5 +2429,146 @@ View transport messages with: hcom events --remote-fetch --device ABCD --partici
         assert_eq!(path, p_stopped.to_str().unwrap());
         assert_eq!(tool, "codex");
         assert_eq!(sid.as_deref(), Some("sess-pico-stopped"));
+    }
+
+    fn insert_stopped(db: &HcomDb, name: &str, ts: &str, path: &str, session_id: &str) {
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', ?2, ?3)",
+                rusqlite::params![
+                    ts,
+                    name,
+                    json!({"action": "stopped", "snapshot": {
+                        "transcript_path": path, "tool": "claude", "session_id": session_id
+                    }})
+                    .to_string()
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn tracked_transcripts_skip_empty_paths_and_order_stopped_newest_first() {
+        let db = test_db();
+        insert_test_instance(&db, "live", "/t/live.jsonl", "claude");
+        insert_stopped(&db, "oldy", "2026-01-01T00:00:00Z", "/t/old.jsonl", "s-old");
+        // A transcript-less snapshot must not hide the same agent's real one.
+        insert_stopped(
+            &db,
+            "peso",
+            "2026-01-02T00:00:00Z",
+            "/t/peso.jsonl",
+            "s-peso",
+        );
+        insert_stopped(&db, "peso", "2026-01-03T00:00:00Z", "", "");
+        // One transcript per name: the newest, which is what `hcom transcript
+        // newy` opens, so result references never point at another session.
+        insert_stopped(
+            &db,
+            "newy",
+            "2026-01-04T00:00:00Z",
+            "/t/older.jsonl",
+            "s-older",
+        );
+        insert_stopped(&db, "newy", "2026-01-05T00:00:00Z", "/t/new.jsonl", "s-new");
+
+        let found: Vec<(String, String)> = tracked_transcripts(&db, false)
+            .into_iter()
+            .map(|t| (t.name, t.path))
+            .collect();
+        let expected = [
+            ("live", "/t/live.jsonl"),
+            ("newy", "/t/new.jsonl"),
+            ("peso", "/t/peso.jsonl"),
+            ("oldy", "/t/old.jsonl"),
+        ]
+        .map(|(n, p)| (n.to_string(), p.to_string()));
+        assert_eq!(found, expected);
+
+        let live: Vec<String> = tracked_transcripts(&db, true)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(live, ["live"]);
+    }
+
+    #[test]
+    fn match_exchange_checks_prompt_then_response_then_tools() {
+        let mut ex = Exchange {
+            position: 3,
+            user: "please fix the parser".to_string(),
+            action: "Fixed the parser in claude.rs.".to_string(),
+            final_text: String::new(),
+            files: vec!["src/transcript/claude.rs".to_string()],
+            timestamp: String::new(),
+            tools: vec![ToolUse {
+                name: "Bash".to_string(),
+                is_error: false,
+                file: None,
+                command: Some("cargo test --bin hcom".to_string()),
+                output: Some("test result: FAILED. 1 failed".to_string()),
+            }],
+            edits: Vec::new(),
+            errors: vec![json!({"tool": "Bash", "content": "exit status 101"})],
+            ended_on_error: false,
+        };
+        let re = |p: &str| regex::Regex::new(p).unwrap();
+        assert_eq!(match_exchange(&ex, &re("parser")).unwrap().0, "user");
+        assert_eq!(
+            match_exchange(&ex, &re("claude\\.rs")).unwrap().0,
+            "assistant"
+        );
+        assert_eq!(match_exchange(&ex, &re("cargo test")).unwrap().0, "tool");
+        assert_eq!(match_exchange(&ex, &re("1 failed")).unwrap().0, "tool");
+        assert_eq!(match_exchange(&ex, &re("status 101")).unwrap().0, "tool");
+        assert!(match_exchange(&ex, &re("nowhere")).is_none());
+
+        // Snippets are single-line even when the matched text spans lines.
+        ex.user = "line one\nline two".to_string();
+        assert_eq!(
+            match_exchange(&ex, &re("two")).unwrap().1,
+            "line one line two"
+        );
+    }
+
+    #[test]
+    fn prefilter_is_skipped_for_patterns_json_escaping_could_hide() {
+        assert!(
+            prefilter_files(r#"say "hi""#, &["/x.jsonl"])
+                .unwrap()
+                .is_none()
+        );
+        assert!(prefilter_files(r"a\nb", &["/x.jsonl"]).unwrap().is_none());
+        assert!(prefilter_files("^Fix", &["/x.jsonl"]).unwrap().is_none());
+        assert!(prefilter_files("done$", &["/x.jsonl"]).unwrap().is_none());
+        assert!(
+            prefilter_files("(?s)alpha.beta", &["/x.jsonl"])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            prefilter_files(r"foo\s+bar", &["/x.jsonl"])
+                .unwrap()
+                .is_none()
+        );
+        assert!(prefilter_files("naïve", &["/x.jsonl"]).unwrap().is_none());
+        assert!(prefilter_files("anything", &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_timestamp_accepts_rfc3339_and_epochs() {
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-10-14T17:00:00Z").unwrap();
+        assert_eq!(
+            parse_timestamp("2026-10-14T17:00:00Z"),
+            Some(expected.into())
+        );
+        assert_eq!(
+            parse_timestamp("2026-10-14T18:00:00+01:00"),
+            Some(expected.into())
+        );
+        assert_eq!(parse_timestamp("1791997200"), Some(expected.into()));
+        assert_eq!(parse_timestamp("1791997200000"), Some(expected.into()));
+        assert_eq!(parse_timestamp("not a time"), None);
+        assert_eq!(format_local_time("garbage"), "??:??");
     }
 }

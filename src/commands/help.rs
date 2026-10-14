@@ -659,23 +659,29 @@ const RELAY_PAGE: &[&[HelpEntry]] = &[RELAY_MAIN, RELAY_DAEMON];
 const TRANSCRIPT_HELP: &[HelpEntry] = &[
     ("transcript <name>", "View agent's conversation (last 10)"),
     ("transcript <name> N", "Show exchange N"),
-    ("transcript <name> N-M", "Show exchanges N through M"),
+    (
+        "transcript <name> N-M",
+        "Show exchanges N through M (N- = to the end)",
+    ),
     (
         "transcript timeline",
         "User prompts across all agents by time",
     ),
-    ("  --last N", "Limit to last N exchanges (default: 10)"),
+    ("  --last N", "Show the last N exchanges (default: 10)"),
     ("  --full", "Show complete assistant responses"),
     ("  --detailed", "Show tool I/O, file edits, errors"),
     ("  --json", "JSON output"),
     ("", ""),
     (
         "transcript search \"pattern\"",
-        "Search hcom-tracked transcripts (rg/grep)",
+        "Search hcom agents' conversations (regex), newest first",
     ),
     ("  --live", "Only currently alive agents"),
-    ("  --all", "All transcripts (includes non-hcom sessions)"),
-    ("  --limit N", "Max results (default: 20)"),
+    (
+        "  --all",
+        "Raw search of all transcripts on disk (needs rg)",
+    ),
+    ("  --limit N", "Max matching exchanges shown (default: 20)"),
     ("  --agent TYPE", "Filter: {transcript_agents}"),
     (
         "  --exclude-self",
