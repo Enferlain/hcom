@@ -1,6 +1,6 @@
-//! Hook RPC dispatch shared by Pi and its fork Oh My Pi. Both extensions call
-//! `hcom <tool>-{start,status,read,beforetool,stop}` with the same argv shape;
-//! only the tool name and OMP's soft-stop recovery differ.
+//! Hook RPC dispatch shared by Pi, its fork Oh My Pi, and Hermes. Their plugins
+//! call `hcom <tool>-{start,status,read,beforetool,stop}` with the same argv
+//! shape; only the tool name and OMP's soft-stop recovery differ.
 
 use std::time::Instant;
 
@@ -33,6 +33,11 @@ pub(crate) const PI: PiFamily = PiFamily {
 pub(crate) const OMP: PiFamily = PiFamily {
     tool: Tool::Omp,
     recover_soft_stopped: true,
+};
+
+pub(crate) const HERMES: PiFamily = PiFamily {
+    tool: Tool::Hermes,
+    recover_soft_stopped: false,
 };
 
 impl PiFamily {

@@ -16,7 +16,7 @@ Start an agent with `hcom` in front, then prompt normally.
 
 Use it to coordinate multi-agent pipelines, run different AI CLIs as each other's subagents, or just to avoid copy-pasting.
 
-Works with: `claude`, `codex`, `opencode`, `copilot`, `qoder`, `grok`, `pi`, `omp`, `agy`, `cursor`, `kimi`, `kilo`, `gemini`
+Works with: `claude`, `codex`, `opencode`, `copilot`, `qoder`, `grok`, `hermes`, `pi`, `omp`, `agy`, `cursor`, `kimi`, `kilo`, `gemini`
 
 https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 
@@ -230,6 +230,7 @@ brew uninstall hcom
 | Copilot CLI | automatic | `hcom copilot` |
 | Qoder CLI | automatic | `hcom qoder` |
 | Grok Build | automatic | `hcom grok` |
+| Hermes Agent | automatic | `hcom hermes` |
 | Anything else | manual via `hcom listen` | `hcom start` (run inside tool) |
 
 ```bash
@@ -250,6 +251,18 @@ For subagents, run `hcom claude`, then prompt:
 
 > run 2x task tool and get them to talk to each other in hcom
 
+#### Hermes chats
+
+A Hermes gateway chat (Telegram, Discord, etc) can join hcom:
+
+```bash
+hcom hooks add hermes   # plugin into the active profile (HERMES_HOME picks another); a running gateway loads it
+```
+
+In the chat: `/hcom start` connects, `/hcom stop` disconnects.
+
+`hcom hooks remove hermes` disconnects and removes its plugin.
+
 </details>
 
 <details>
@@ -262,7 +275,7 @@ What you might type from a shell. Agents run their own commands that they learn 
 #### Spawn
 
 ```bash
-hcom [N] claude|gemini|codex|agy|opencode|kilo|pi|omp|cursor-agent|kimi|copilot|qoder|grok   # launch N agents
+hcom [N] claude|gemini|codex|agy|opencode|kilo|pi|omp|cursor-agent|kimi|copilot|qoder|grok|hermes   # launch N agents
 hcom r <name|session_id>     # resume agent
 hcom f <name|session_id>     # fork session
 hcom kill <name|tag:T|all>   # kill + close terminal pane
@@ -326,7 +339,7 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `terminal` | Where new agent windows open (`hcom config terminal --info`) |
 | `timeout` | Idle timeout for headless Claude (seconds) |
 | `subagent_timeout` | Keep-alive for Claude subagents (seconds) |
-| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` / `pi_args` / `omp_args` / `cursor_args` / `kimi_args` / `copilot_args` / `qoder_args` / `grok_args` | Default args passed to the tool |
+| `claude_args` / `gemini_args` / `codex_args` / `opencode_args` / `kilo_args` / `pi_args` / `omp_args` / `cursor_args` / `kimi_args` / `copilot_args` / `qoder_args` / `grok_args` / `hermes_args` | Default args passed to the tool |
 
 #### Scope
 

@@ -1,0 +1,15 @@
+name: hcom
+version: "1"
+description: "hcom: message other AI agents (Claude, Codex, ...) from Hermes. Written by hcom; inert unless Hermes was launched with `hcom hermes`."
+author: hcom
+provides_hooks:
+  - on_session_reset
+  - on_session_start
+  - pre_llm_call
+  - transform_tool_result
+  - post_llm_call
+  - pre_tool_call
+  - on_human_input_request
+  - on_human_input_resolved
+  - on_session_end
+  - on_session_finalize

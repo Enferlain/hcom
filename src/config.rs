@@ -204,6 +204,7 @@ pub(crate) const FIELDS: &[ConfigField] = &[
     f("kimi_args", "HCOM_KIMI_ARGS", "launch.kimi.args", Str, "Default args for kimi on launch"),
     f("qoder_args", "HCOM_QODER_ARGS", "launch.qoder.args", Str, "Default args for qodercli on launch"),
     f("grok_args", "HCOM_GROK_ARGS", "launch.grok.args", Str, "Default args for grok on launch"),
+    f("hermes_args", "HCOM_HERMES_ARGS", "launch.hermes.args", Str, "Default args for hermes chat on launch"),
     f("timeout", "HCOM_TIMEOUT", "preferences.timeout", Int, "Idle timeout in seconds (default: 86400)"),
     f("auto_approve", "HCOM_AUTO_APPROVE", "preferences.auto_approve", Bool, "Auto-approve safe hcom commands"),
     f("name_export", "HCOM_NAME_EXPORT", "preferences.name_export", Str, "Export instance name to custom env var"),
@@ -285,6 +286,7 @@ pub struct HcomConfig {
     pub copilot_args: String,
     pub qoder_args: String,
     pub grok_args: String,
+    pub hermes_args: String,
     pub gemini_system_prompt: String,
     pub codex_system_prompt: String,
     pub relay: String,
@@ -329,6 +331,7 @@ impl Default for HcomConfig {
             copilot_args: String::new(),
             qoder_args: String::new(),
             grok_args: String::new(),
+            hermes_args: String::new(),
             gemini_system_prompt: String::new(),
             codex_system_prompt: String::new(),
             relay: String::new(),
@@ -466,6 +469,7 @@ impl HcomConfig {
             ("copilot_args", &self.copilot_args),
             ("qoder_args", &self.qoder_args),
             ("grok_args", &self.grok_args),
+            ("hermes_args", &self.hermes_args),
         ] {
             if !value.is_empty()
                 && let Err(e) = shell_words::split(value)
@@ -517,6 +521,7 @@ impl HcomConfig {
             "copilot_args" => Some(self.copilot_args.clone()),
             "qoder_args" => Some(self.qoder_args.clone()),
             "grok_args" => Some(self.grok_args.clone()),
+            "hermes_args" => Some(self.hermes_args.clone()),
             "gemini_system_prompt" => Some(self.gemini_system_prompt.clone()),
             "codex_system_prompt" => Some(self.codex_system_prompt.clone()),
             "relay" => Some(self.relay.clone()),
@@ -566,6 +571,7 @@ impl HcomConfig {
             "copilot_args" => self.copilot_args = value.to_string(),
             "qoder_args" => self.qoder_args = value.to_string(),
             "grok_args" => self.grok_args = value.to_string(),
+            "hermes_args" => self.hermes_args = value.to_string(),
             "gemini_system_prompt" => self.gemini_system_prompt = value.to_string(),
             "codex_system_prompt" => self.codex_system_prompt = value.to_string(),
             "relay" => self.relay = value.to_string(),

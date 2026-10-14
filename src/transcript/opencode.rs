@@ -178,11 +178,28 @@ fn search_family_sessions(
     let conn =
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| format!("Cannot open OpenCode DB: {e}"))?;
+    Ok(group_matches(
+        db_path,
+        agent,
+        &re,
+        family_text_rows(&conn)?,
+        limit,
+    ))
+}
 
+/// One search hit per session (first matching text, match count), in the
+/// order sessions first matched. Rows are `(session_id, title, text)`.
+pub(crate) fn group_matches(
+    db_path: &Path,
+    agent: &str,
+    re: &Regex,
+    rows: impl IntoIterator<Item = (String, String, String)>,
+    limit: usize,
+) -> Vec<TranscriptSearchMatch> {
     let mut by_session: std::collections::HashMap<String, TranscriptSearchMatch> =
         std::collections::HashMap::new();
     let mut order = Vec::new();
-    for (session_id, title, text) in family_text_rows(&conn)? {
+    for (session_id, title, text) in rows {
         if text.is_empty() || !re.is_match(&text) {
             continue;
         }
@@ -202,11 +219,11 @@ fn search_family_sessions(
         entry.matches += 1;
     }
 
-    Ok(order
+    order
         .into_iter()
         .filter_map(|session_id| by_session.remove(&session_id))
         .take(limit)
-        .collect())
+        .collect()
 }
 
 pub(crate) fn search_opencode_sessions(

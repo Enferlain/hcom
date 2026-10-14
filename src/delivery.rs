@@ -1648,9 +1648,10 @@ pub fn run_delivery_loop(
     // push the initial label, subsequent iterations only push on change.
     let mut host_label = host_label::HostLabel::resolve();
 
-    // Plugin tools (OpenCode, Kilo, Pi, OMP): the plugin delivers once it has a
-    // session. Pi and OMP bind theirs at startup; OpenCode and Kilo create one on
-    // the first prompt, so mail that waits before then needs a session started.
+    // Plugin tools (OpenCode, Kilo, Pi, OMP, Hermes): the plugin delivers once it
+    // has a session. Pi, OMP and Hermes bind theirs at startup; OpenCode and Kilo
+    // create one on the first prompt, so mail that waits before then needs a
+    // session started.
     use crate::tool::Tool;
     use std::str::FromStr;
     if let Some(launch) = state.grok_acp.as_ref() {
@@ -1670,8 +1671,10 @@ pub fn run_delivery_loop(
             &mut launch_outcome,
         );
     } else if let Ok(tool) = Tool::from_str(&config.tool)
-        && (matches!(tool, Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp)
-            || claude_mod
+        && (matches!(
+            tool,
+            Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp | Tool::Hermes
+        ) || claude_mod
             || copilot_extension)
     {
         log_info(

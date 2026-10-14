@@ -92,23 +92,117 @@ fn get_tool_status() -> Vec<(Tool, bool, String)> {
         .collect()
 }
 
-/// Show hook mode and, for persistent tools, installation status.
-fn cmd_hooks_status() -> i32 {
+/// Show hook mode and, for persistent tools, installation status. Naming
+/// Hermes confirms its install through Hermes's CLI, which the plain listing
+/// skips (seconds per call).
+fn cmd_hooks_status(argv: &[String]) -> i32 {
+    let only = match argv.first().map(|arg| (arg, parse_hook_tool(arg))) {
+        None => None,
+        Some((_, Some(tool))) => Some(tool),
+        Some((arg, None)) => {
+            eprintln!("Error: Unknown tool: {arg}");
+            eprintln!("Valid options: {}", hook_tool_names().join(", "));
+            return 1;
+        }
+    };
+    if only == Some(Tool::Hermes) {
+        let code = hermes_status_checked();
+        print_hermes_gateways();
+        return code;
+    }
     let status = get_tool_status();
-    for tool in hook_tools() {
+    for tool in hook_tools()
+        .into_iter()
+        .filter(|t| only.is_none_or(|o| o == *t))
+    {
         let label = tool.spec().label;
+        let persistent = HookMode::Persistent.label();
         match status.iter().find(|(t, _, _)| *t == tool) {
             None => println!("{label}:  {}", HookMode::of(tool).label()),
-            Some((_, true, path)) => println!(
-                "{label}:  {}, installed    ({path})",
-                HookMode::Persistent.label()
-            ),
-            Some((_, false, _)) => {
-                println!("{label}:  {}, not installed", HookMode::Persistent.label())
+            Some((_, true, path)) => println!("{label}:  {persistent}, installed    ({path})"),
+            Some((Tool::Hermes, false, path))
+                if crate::hooks::hermes::install_state()
+                    == crate::hooks::hermes::InstallState::Unverified =>
+            {
+                println!(
+                    "{label}:  {persistent}, installed, unverified    ({path})\n  \
+                     Hermes config changed since hcom last checked it; \
+                     `hcom hooks status hermes` checks"
+                )
             }
+            Some((Tool::Hermes, false, path))
+                if crate::hooks::hermes::install_state()
+                    == crate::hooks::hermes::InstallState::Outdated =>
+            {
+                println!(
+                    "{label}:  {persistent}, installed, outdated    ({path})\n  \
+                     `hcom hooks add hermes` updates it"
+                )
+            }
+            Some((_, false, _)) => println!("{label}:  {persistent}, not installed"),
+        }
+        if tool == Tool::Hermes {
+            print_hermes_gateways();
         }
     }
     0
+}
+
+/// Connected gateway chats, and gateways still running an older plugin.
+fn print_hermes_gateways() {
+    let Ok(db) = crate::db::HcomDb::open() else {
+        return;
+    };
+    let chats: Vec<String> = crate::hooks::hermes_bridge::bridges(&db)
+        .into_iter()
+        .map(|b| match b.chat.as_str() {
+            "" => format!("{} ({})", b.name, b.platform),
+            chat => format!("{} ({} {chat})", b.name, b.platform),
+        })
+        .collect();
+    if !chats.is_empty() {
+        println!("  gateway chats: {}", chats.join(", "));
+    }
+    for note in crate::hooks::hermes::stale_gateway_notes(&db) {
+        println!("  {note}");
+    }
+}
+
+fn hermes_status_checked() -> i32 {
+    let label = Tool::Hermes.spec().label;
+    let persistent = HookMode::Persistent.label();
+    let path = Tool::Hermes.hooks_settings_path();
+    match crate::hooks::hermes::check_enabled() {
+        Ok(Some(true)) => {
+            println!("{label}:  {persistent}, installed, enabled    ({path})");
+            0
+        }
+        Ok(Some(false)) => {
+            println!(
+                "{label}:  {persistent}, installed, disabled in Hermes    ({path})\n  \
+                 `hcom hooks add hermes` enables it"
+            );
+            1
+        }
+        Ok(None)
+            if crate::hooks::hermes::install_state()
+                == crate::hooks::hermes::InstallState::Outdated =>
+        {
+            println!(
+                "{label}:  {persistent}, installed, outdated    ({path})\n  \
+                 `hcom hooks add hermes` updates it"
+            );
+            1
+        }
+        Ok(None) => {
+            println!("{label}:  {persistent}, not installed");
+            1
+        }
+        Err(e) => {
+            eprintln!("{label}: cannot check through Hermes: {e:#}");
+            1
+        }
+    }
 }
 
 fn no_hooks_message(tool: Tool, action: &str) -> String {
@@ -148,6 +242,8 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
         Failed(Option<String>),
     }
     let mut results: Vec<(Tool, AddResult)> = Vec::new();
+    // What a running Hermes gateway needs, instead of the generic restart line.
+    let mut hermes_note: Option<String> = None;
     for tool in &tools {
         if HookMode::of(*tool) == HookMode::None {
             if tools.len() == 1 {
@@ -166,8 +262,25 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
             }
             continue;
         }
+        // Hermes installs into one profile through its own CLI and hot-loads
+        // into a running gateway: only on request (`hcom hooks add hermes`), or
+        // by `hcom hermes` for the profile it launches.
+        if *tool == Tool::Hermes && tools.len() > 1 {
+            continue;
+        }
         if tool.verify_hooks_installed(include_permissions) {
             results.push((*tool, AddResult::Already));
+            continue;
+        }
+        if *tool == Tool::Hermes {
+            let outcome = match crate::hooks::hermes::add_ambient() {
+                Ok(note) => {
+                    hermes_note = Some(note);
+                    AddResult::Added
+                }
+                Err(e) => AddResult::Failed(Some(format!("{e:#}"))),
+            };
+            results.push((*tool, outcome));
             continue;
         }
         let outcome = match tool.try_setup_hooks(include_permissions) {
@@ -206,13 +319,18 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
         }
     }
 
-    if added_count > 0 {
-        println!();
-        if tools.len() == 1 {
-            println!("Restart {} to activate hooks.", tools[0].spec().label);
-        } else {
-            println!("Restart the tool(s) to activate hooks.");
+    match hermes_note {
+        Some(note) if !note.is_empty() => println!("\n{note}"),
+        Some(_) => {}
+        None if added_count > 0 => {
+            println!();
+            if tools.len() == 1 {
+                println!("Restart {} to activate hooks.", tools[0].spec().label);
+            } else {
+                println!("Restart the tool(s) to activate hooks.");
+            }
         }
+        None => {}
     }
 
     if fail_count > 0 { 1 } else { 0 }
@@ -280,7 +398,7 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
     let argv = &args.args;
     if argv.is_empty() {
         // No args = show status
-        return cmd_hooks_status();
+        return cmd_hooks_status(&[]);
     }
 
     let first = argv[0].as_str();
@@ -293,7 +411,7 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
     let sub_argv = argv[1..].to_vec();
 
     match first {
-        "status" => cmd_hooks_status(),
+        "status" => cmd_hooks_status(&sub_argv),
         "add" | "install" => cmd_hooks_add(&sub_argv),
         "remove" | "uninstall" => cmd_hooks_remove(&sub_argv),
         _ => {

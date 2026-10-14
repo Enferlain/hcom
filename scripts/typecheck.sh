@@ -56,3 +56,5 @@ elif [[ ! node_modules/.package-lock.json -nt package-lock.json \
 fi
 npm run typecheck
 npm run test:plugins
+# The Hermes plugin is Python (stdlib only); its fake-Hermes regressions.
+python3 -I "$repo_root/tests/hermes_plugin.py"

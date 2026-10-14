@@ -11,6 +11,7 @@ pub mod copilot;
 pub mod cursor;
 pub mod gemini;
 pub mod grok;
+pub mod hermes;
 pub mod kimi;
 pub mod opencode;
 pub mod pi;
@@ -42,13 +43,14 @@ pub enum TranscriptBackend {
     CopilotJsonl,
     PiJsonl,
     GrokUpdatesJsonl,
+    HermesSqlite,
 }
 
 impl TranscriptBackend {
     /// One database file holds every session, so a transcript is the
     /// (path, session_id) pair rather than the path alone.
     pub fn is_shared_database(self) -> bool {
-        matches!(self, Self::OpenCodeSqlite)
+        matches!(self, Self::OpenCodeSqlite | Self::HermesSqlite)
     }
 }
 
@@ -71,6 +73,7 @@ enum TranscriptDiscovery {
     PiSessions,
     OmpSessions,
     GrokSessions,
+    HermesDatabase,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,6 +118,11 @@ static TRANSCRIPT_PROFILES: &[TranscriptProfile] = &[
         tool: Tool::Omp,
         backend: TranscriptBackend::PiJsonl,
         discovery: TranscriptDiscovery::OmpSessions,
+    },
+    TranscriptProfile {
+        tool: Tool::Hermes,
+        backend: TranscriptBackend::HermesSqlite,
+        discovery: TranscriptDiscovery::HermesDatabase,
     },
     TranscriptProfile {
         tool: Tool::Antigravity,
@@ -250,6 +258,13 @@ pub fn read(
             }
             opencode::parse_opencode_sqlite(path, sid, opts.last)
         }
+        TranscriptBackend::HermesSqlite => {
+            let sid = opts.session_id.as_deref().unwrap_or("");
+            if sid.is_empty() {
+                return Err("Hermes transcript requires a session_id".to_string());
+            }
+            hermes::parse_hermes_sqlite(path, sid, opts.last)
+        }
     }?;
 
     if backend == TranscriptBackend::CodexJsonl
@@ -285,6 +300,10 @@ pub fn detect_tool_from_path(path: &str) -> Option<Tool> {
         // Only Grok writes `updates.jsonl` (`$GROK_HOME/sessions/<cwd>/<id>/`,
         // and GROK_HOME may be anywhere).
         Some(Tool::Grok)
+    } else if file_name == "state.db" && lower.contains("/.hermes/") {
+        // The default root and `profiles/<name>/` under it; a custom
+        // HERMES_HOME is attributed by persisted agent identity instead.
+        Some(Tool::Hermes)
     } else if lower.contains("/agent-transcripts/") {
         Some(Tool::Cursor)
     } else if lower.contains("/.copilot/session-state/")
@@ -601,7 +620,9 @@ pub fn disk_search_roots(tool: Tool) -> Vec<PathBuf> {
         TranscriptDiscovery::GrokSessions => {
             vec![crate::transcript::grok::grok_config_dir().join("sessions")]
         }
-        TranscriptDiscovery::OpenCodeDatabase | TranscriptDiscovery::KiloDatabase => Vec::new(),
+        TranscriptDiscovery::OpenCodeDatabase
+        | TranscriptDiscovery::KiloDatabase
+        | TranscriptDiscovery::HermesDatabase => Vec::new(),
     }
 }
 
@@ -610,6 +631,7 @@ pub(crate) fn database_search_path(tool: Tool) -> Option<PathBuf> {
     match profile_for_tool(tool)?.discovery {
         TranscriptDiscovery::OpenCodeDatabase => opencode::get_opencode_db_path(),
         TranscriptDiscovery::KiloDatabase => opencode::get_kilo_db_path(),
+        TranscriptDiscovery::HermesDatabase => hermes::get_hermes_db_path(),
         _ => None,
     }
 }
@@ -628,6 +650,9 @@ pub(crate) fn search_database_sessions(
         }
         Some(TranscriptDiscovery::KiloDatabase) => {
             opencode::search_kilo_sessions(db_path, pattern, limit)
+        }
+        Some(TranscriptDiscovery::HermesDatabase) => {
+            hermes::search_hermes_sessions(db_path, pattern, limit)
         }
         _ => Err(format!("Tool '{}' is not database-backed", tool)),
     }
@@ -658,6 +683,10 @@ mod tests {
         assert_eq!(
             detect_tool_from_path("/h/.omp/agent/sessions/r/u.jsonl"),
             Some(Tool::Omp)
+        );
+        assert_eq!(
+            detect_tool_from_path("/h/.hermes/profiles/work/state.db"),
+            Some(Tool::Hermes)
         );
         assert_eq!(
             detect_tool_from_path("/h/.kimi-code/sessions/wd/u/agents/main/wire.jsonl"),
@@ -737,7 +766,7 @@ mod tests {
     fn every_transcript_tool_has_a_disk_or_database_discovery_source() {
         for tool in transcript_tools() {
             let roots = disk_search_roots(tool);
-            if matches!(tool, Tool::OpenCode | Tool::Kilo) {
+            if matches!(tool, Tool::OpenCode | Tool::Kilo | Tool::Hermes) {
                 assert!(
                     roots.is_empty(),
                     "database tool {tool} should not expose disk roots"

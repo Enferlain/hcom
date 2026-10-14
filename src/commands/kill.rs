@@ -620,7 +620,14 @@ fn kill_single(
             // by whom instead of failing, so retries don't look like errors.
             if let Some(stopped) = identity::last_stopped(db, target) {
                 println!("'{target}' {}", stopped.summary());
-                println!("  To resume: hcom r {}", stopped.display_name());
+                if stopped.reason == crate::hooks::hermes_bridge::DISCONNECTED {
+                    println!(
+                        "  {}",
+                        crate::hooks::hermes_bridge::reconnect_hint(&stopped.name)
+                    );
+                } else {
+                    println!("  To resume: hcom r {}", stopped.display_name());
+                }
                 return Ok(0);
             }
             bail!("{}", identity::describe_missing_agent(db, target));
@@ -645,6 +652,13 @@ fn kill_single(
         bail!("Cannot kill remote '{name}' - missing device suffix");
     }
 
+    // A Hermes bridge is a chat, not a process: kill disconnects it, like stop.
+    if inst.pid.is_none()
+        && let Some(note) = crate::hooks::hermes_bridge::disconnect(db, &name, initiator)
+    {
+        println!("{note}");
+        return Ok(0);
+    }
     if inst.pid.is_none() {
         bail!(
             "No tracked PID for '{}' — use 'hcom stop {}' instead",

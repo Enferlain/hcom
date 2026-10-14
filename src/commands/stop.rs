@@ -79,7 +79,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
 
         // Confirmation gate: inside AI tools, require --go
         if is_inside_ai_tool() && !ctx.map(|c| c.go).unwrap_or(false) {
-            print_stop_preview("ALL", "all", &instances);
+            print_stop_preview(db, "ALL", "all", &instances);
             return 0;
         }
 
@@ -92,10 +92,11 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
 
         let mut stopped_names = Vec::new();
         let mut bg_logs = Vec::new();
+        let mut notes = Vec::new();
 
         for inst in &instances {
             let display = get_full_name(inst);
-            stop_instance(db, &inst.name, &launcher, "stop_all");
+            notes.extend(stop_one(db, &inst.name, &launcher, "stop_all"));
             stopped_names.push(display.clone());
 
             if inst.background != 0 && !inst.background_log_file.is_empty() {
@@ -107,6 +108,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
             println!("Nothing to stop");
         } else {
             println!("Stopped: {}", stopped_names.join(", "));
+            print_notes(&notes);
             if !bg_logs.is_empty() {
                 println!("\nHeadless logs:");
                 for (name, log_file) in &bg_logs {
@@ -154,7 +156,12 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
 
         // Confirmation gate
         if is_inside_ai_tool() && !ctx.map(|c| c.go).unwrap_or(false) {
-            print_stop_preview(&format!("tag:{tag}"), &format!("tag:{tag}"), &tag_matches);
+            print_stop_preview(
+                db,
+                &format!("tag:{tag}"),
+                &format!("tag:{tag}"),
+                &tag_matches,
+            );
             return 0;
         }
 
@@ -170,10 +177,11 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
 
         let mut stopped_names = Vec::new();
         let mut bg_logs = Vec::new();
+        let mut notes = Vec::new();
 
         for inst in &tag_matches {
             let display = get_full_name(inst);
-            stop_instance(db, &inst.name, &launcher, "tag_stop");
+            notes.extend(stop_one(db, &inst.name, &launcher, "tag_stop"));
             stopped_names.push(display.clone());
             if inst.background != 0 && !inst.background_log_file.is_empty() {
                 bg_logs.push((display, inst.background_log_file.clone()));
@@ -181,6 +189,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         }
 
         println!("Stopped tag:{tag}: {}", stopped_names.join(", "));
+        print_notes(&notes);
         if !bg_logs.is_empty() {
             println!("\nHeadless logs:");
             for (name, log_file) in &bg_logs {
@@ -227,13 +236,14 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
 
         // Confirmation gate
         if is_inside_ai_tool() && !ctx.map(|c| c.go).unwrap_or(false) {
-            print_stop_preview("", &targets.join(" "), &instances_to_stop);
+            print_stop_preview(db, "", &targets.join(" "), &instances_to_stop);
             return 0;
         }
 
         let launcher = resolve_initiator(db, ctx, explicit_name);
         let mut stopped_names = Vec::new();
         let mut bg_logs = Vec::new();
+        let mut notes = Vec::new();
 
         for inst in &instances_to_stop {
             if is_remote_instance(inst) {
@@ -241,7 +251,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
                 continue;
             }
             let display = get_full_name(inst);
-            stop_instance(db, &inst.name, &launcher, "multi_stop");
+            notes.extend(stop_one(db, &inst.name, &launcher, "multi_stop"));
             stopped_names.push(display.clone());
             if inst.background != 0 && !inst.background_log_file.is_empty() {
                 bg_logs.push((display, inst.background_log_file.clone()));
@@ -251,6 +261,7 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         if !stopped_names.is_empty() {
             println!("Stopped: {}", stopped_names.join(", "));
         }
+        print_notes(&notes);
         if !bg_logs.is_empty() {
             println!("\nHeadless logs:");
             for (name, log_file) in &bg_logs {
@@ -331,7 +342,10 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
         &format!("name={instance_name} reason={reason} initiated_by={launcher}"),
     );
 
-    stop_instance(db, &instance_name, &launcher, reason);
+    if let Some(note) = stop_one(db, &instance_name, &launcher, reason) {
+        println!("{note}");
+        return 0;
+    }
 
     if is_subagent_instance(&position) {
         println!("Stopped hcom for subagent {display}.");
@@ -346,12 +360,42 @@ pub fn cmd_stop(db: &HcomDb, args: &StopArgs, ctx: Option<&CommandContext>) -> i
     0
 }
 
+/// Stop one instance. A Hermes chat bridge is disconnected instead (an
+/// instance stop alone would be undone by its gateway's next sync); returns
+/// what that did, to print.
+fn stop_one(db: &HcomDb, name: &str, launcher: &str, reason: &str) -> Option<String> {
+    let note = crate::hooks::hermes_bridge::disconnect(db, name, launcher);
+    if note.is_none() {
+        stop_instance(db, name, launcher, reason);
+    }
+    note
+}
+
+fn print_notes(notes: &[String]) {
+    for note in notes {
+        println!("\n{note}");
+    }
+}
+
 /// Print a stop preview for any scope (all, tag, or named targets).
-fn print_stop_preview(scope: &str, cmd_suffix: &str, instances: &[crate::db::InstanceRow]) {
+fn print_stop_preview(
+    db: &HcomDb,
+    scope: &str,
+    cmd_suffix: &str,
+    instances: &[crate::db::InstanceRow],
+) {
     let count = instances.len();
     let names: Vec<String> = instances.iter().map(get_full_name).collect();
+    let bridge_names: std::collections::HashSet<String> = crate::hooks::hermes_bridge::bridges(db)
+        .into_iter()
+        .map(|b| b.name)
+        .collect();
+    let bridged = instances
+        .iter()
+        .filter(|i| bridge_names.contains(&i.name))
+        .count();
     let headless = instances.iter().filter(|i| i.background != 0).count();
-    let interactive = count - headless;
+    let interactive = count - headless - bridged;
     let instance_list = if count <= 8 {
         names.join(", ")
     } else {
@@ -369,6 +413,11 @@ fn print_stop_preview(scope: &str, cmd_suffix: &str, instances: &[crate::db::Ins
         "  • Headless instances ({headless}): process killed (SIGTERM, then SIGKILL after 2s)"
     );
     println!("  • Interactive instances ({interactive}): notified via TCP (graceful)");
+    if bridged > 0 {
+        println!(
+            "  • Hermes chat bridges ({bridged}): disconnected, nothing killed; /hcom start <name> in the chat reconnects"
+        );
+    }
     println!("  • All: stopped event logged with snapshot, instance rows deleted");
     println!("  • Subagents: recursively stopped when parent stops\n");
     println!("Instance data preserved in events table (life.stopped with snapshot).\n");
@@ -382,6 +431,13 @@ fn print_already_stopped(target: &str, stopped: &identity::StoppedAgent) {
     println!("'{target}' {}", stopped.summary());
     // Match by session, not name: a reused base name must not attribute
     // another incarnation's process to the stop described above.
+    if stopped.reason == crate::hooks::hermes_bridge::DISCONNECTED {
+        println!(
+            "  {}",
+            crate::hooks::hermes_bridge::reconnect_hint(&stopped.name)
+        );
+        return;
+    }
     let display = stopped.display_name();
     match crate::commands::kill::find_orphan_for_session(&stopped.session_id) {
         Some(orphan) => println!(

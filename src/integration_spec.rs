@@ -175,6 +175,8 @@ pub struct ResumeSpec {
 pub struct HelpSpec {
     pub unique_examples: &'static [HelpEntry],
     pub extra_env: &'static [HelpEntry],
+    /// Extra section printed after Environment.
+    pub notes: &'static [&'static str],
 }
 
 /// Tool-input field mappings used by `extract_tool_detail` for status display.
@@ -292,6 +294,15 @@ const PI_HOOKS: &[&str] = &[
     "pi-stop",
 ];
 
+const HERMES_HOOKS: &[&str] = &[
+    "hermes-start",
+    "hermes-status",
+    "hermes-read",
+    "hermes-beforetool",
+    "hermes-stop",
+    "hermes-bridge",
+];
+
 const OMP_HOOKS: &[&str] = &[
     "omp-start",
     "omp-status",
@@ -395,6 +406,27 @@ const KILO_HELP_EXAMPLES: &[HelpEntry] = &[(
 )];
 
 const PI_HELP_EXAMPLES: &[HelpEntry] = &[("hcom pi --thinking high", "Flags forwarded to pi")];
+
+const HERMES_HELP_EXAMPLES: &[HelpEntry] = &[
+    ("hcom hermes -p work", "Run in a Hermes profile"),
+    ("hcom hermes --tui", "Flags forwarded to hermes chat"),
+];
+
+const HERMES_HELP_NOTES: &[&str] = &[
+    "Profile: -p NAME, else HERMES_HOME, else Hermes's active profile.",
+    "    Needs plugins.isolation: in_process.",
+    "",
+    "Gateway chats (Telegram, Discord, ...):",
+    "    hcom hooks add hermes              Install; a running gateway loads it (~20s)",
+    "    hcom hooks status hermes           Check install, list connected chats",
+    "    hcom hooks remove hermes           Disconnect the profile's chats, remove plugin",
+    "    /hcom                              In a chat: show its hcom name",
+    "    /hcom start [name]                 Connect (agents: hcom send @name)",
+    "    /hcom stop                         Disconnect (shell: hcom stop <name>)",
+    "    /hcom visibility off|preview|full  Show incoming messages in the chat",
+    "                                       (default preview: first 240 chars)",
+    "    Chats stay connected across gateway restarts.",
+];
 
 const OMP_HELP_EXAMPLES: &[HelpEntry] = &[("hcom omp --thinking high", "Flags forwarded to omp")];
 
@@ -508,6 +540,7 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
     help: HelpSpec {
         unique_examples: CLAUDE_HELP_EXAMPLES,
         extra_env: CLAUDE_HELP_EXTRA_ENV,
+        notes: &[],
     },
     status_detail: StatusDetailSpec {
         bash: &["Bash"],
@@ -562,6 +595,7 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
     help: HelpSpec {
         unique_examples: GEMINI_HELP_EXAMPLES,
         extra_env: GEMINI_HELP_EXTRA_ENV,
+        notes: &[],
     },
     status_detail: StatusDetailSpec {
         bash: &["run_shell_command"],
@@ -618,6 +652,7 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
     help: HelpSpec {
         unique_examples: CODEX_HELP_EXAMPLES,
         extra_env: CODEX_HELP_EXTRA_ENV,
+        notes: &[],
     },
     // Codex hooks report every shell/exec tool as `Bash` (HookToolName::bash).
     status_detail: StatusDetailSpec {
@@ -675,6 +710,7 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
     help: HelpSpec {
         unique_examples: OPENCODE_HELP_EXAMPLES,
         extra_env: &[],
+        notes: &[],
     },
     // Tool IDs from the plugin's execute.before hook: OpenCode 1 names first,
     // then OpenCode 2's (shell/patch/subagent). Kilo shares the plugin.
@@ -737,6 +773,7 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
     help: HelpSpec {
         unique_examples: KILO_HELP_EXAMPLES,
         extra_env: &[],
+        notes: &[],
     },
     status_detail: StatusDetailSpec {
         bash: &["bash", "shell"],
@@ -794,6 +831,7 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
         // the long-form alias as a forwarded flag.
         unique_examples: AGY_HELP_EXAMPLES,
         extra_env: &[],
+        notes: &[],
     },
     status_detail: StatusDetailSpec {
         bash: &["run_command"],
@@ -857,6 +895,7 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
     help: HelpSpec {
         unique_examples: CURSOR_HELP_EXAMPLES,
         extra_env: &[],
+        notes: &[],
     },
     // Empirically verified against real cursor transcripts: cursor's edit tool
     // is `StrReplace` (not `Edit`, which never appears) and its file/edit tools
@@ -924,6 +963,7 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
         // injection path (see hooks/kimi.rs — it's a future kimi feature), so
         // advertising it here was a ghost.
         extra_env: &[],
+        notes: &[],
     },
     // Tool names from kimi-code's built-in tools
     // (docs/reference/tools.md): shell is `Bash`, file writes are `Write`/`Edit`,
@@ -991,6 +1031,7 @@ pub static PI: IntegrationSpec = IntegrationSpec {
     help: HelpSpec {
         unique_examples: PI_HELP_EXAMPLES,
         extra_env: &[],
+        notes: &[],
     },
     // `file` lists mutating ops only (like every other tool); Pi's `read` is a
     // read-only op and was producing a path in the status bar on plain reads.
@@ -1068,6 +1109,7 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
     help: HelpSpec {
         unique_examples: OMP_HELP_EXAMPLES,
         extra_env: &[],
+        notes: &[],
     },
     // `ast_edit` is left out: it takes glob `paths`, not a file, which would
     // make `--file` filters match patterns instead of paths.
@@ -1075,6 +1117,64 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
         bash: &["bash"],
         file: &["edit", "write"],
         delegate: &["task"],
+    },
+};
+
+pub static HERMES: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Hermes,
+    name: "hermes",
+    label: "Hermes",
+    aliases: &[],
+    cli_binary: "hermes",
+    tui_prefix: "herm",
+    adhoc_icon: None,
+    released: true,
+    // Readiness is the plugin's bind: the classic REPL and the Ink TUI draw
+    // different chrome, and either can be up before the plugin can deliver.
+    ready_patterns: &[],
+    pty: PtySpec {
+        delivery_start_timeout_secs: 5,
+        console_input: ConsoleInput::Vt,
+    },
+    instance_state_env: &[],
+    hooks: HooksSpec {
+        names: HERMES_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::Argv,
+    },
+    // Runtime gates off: the Hermes plugin owns delivery.
+    gates: GatesSpec {
+        require_idle: false,
+        require_ready_prompt: false,
+        require_prompt_empty: false,
+        block_on_user_activity: false,
+        block_on_approval: true,
+        launch_requires_ready: true,
+        launch_ready_on_plugin_bind: true,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_HERMES_ARGS"),
+        config_dir_env: Some("HERMES_HOME"),
+        // A `chat` option: on a TTY it seeds the first interactive turn.
+        initial_prompt: InitialPromptShape::Flag("-q"),
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        // Hermes has no fork flag (only an interactive /branch).
+        fork: None,
+    }),
+    help: HelpSpec {
+        unique_examples: HERMES_HELP_EXAMPLES,
+        extra_env: &[],
+        notes: HERMES_HELP_NOTES,
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["terminal"],
+        file: &["write_file", "patch"],
+        delegate: &["delegate_task"],
     },
 };
 
@@ -1127,6 +1227,7 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     help: HelpSpec {
         unique_examples: COPILOT_HELP_EXAMPLES,
         extra_env: &[],
+        notes: &[],
     },
     status_detail: StatusDetailSpec {
         bash: &["bash", "powershell"],
@@ -1189,6 +1290,7 @@ pub static QODER: IntegrationSpec = IntegrationSpec {
     help: HelpSpec {
         unique_examples: QODER_HELP_EXAMPLES,
         extra_env: &[],
+        notes: &[],
     },
     status_detail: StatusDetailSpec {
         bash: &["Bash"],
@@ -1245,6 +1347,7 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
     help: HelpSpec {
         unique_examples: GROK_HELP_EXAMPLES,
         extra_env: &[],
+        notes: &[],
     },
     status_detail: StatusDetailSpec {
         bash: &["run_terminal_command", "Bash"],
@@ -1296,6 +1399,7 @@ pub static ADHOC: IntegrationSpec = IntegrationSpec {
     help: HelpSpec {
         unique_examples: &[],
         extra_env: &[],
+        notes: &[],
     },
     status_detail: StatusDetailSpec {
         bash: &[],
@@ -1314,6 +1418,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &KILO,
     &PI,
     &OMP,
+    &HERMES,
     &ANTIGRAVITY,
     &CURSOR,
     &KIMI,
@@ -1334,6 +1439,7 @@ impl Tool {
             Tool::Kilo => &KILO,
             Tool::Omp => &OMP,
             Tool::Pi => &PI,
+            Tool::Hermes => &HERMES,
             Tool::Antigravity => &ANTIGRAVITY,
             Tool::Cursor => &CURSOR,
             Tool::Kimi => &KIMI,
@@ -1391,6 +1497,7 @@ mod tests {
             Tool::Grok,
             Tool::Pi,
             Tool::Omp,
+            Tool::Hermes,
             Tool::Adhoc,
         ] {
             let spec = tool.spec();
@@ -1459,7 +1566,8 @@ mod tests {
         assert!(names.contains(&"qoder"));
         assert!(names.contains(&"grok"));
         assert!(names.contains(&"omp"));
-        assert_eq!(names.len(), 13);
+        assert!(names.contains(&"hermes"));
+        assert_eq!(names.len(), 14);
     }
 
     #[test]

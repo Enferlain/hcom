@@ -1365,6 +1365,16 @@ Clear:   hcom config grok_args \"\"
 Prepended to launch-time cli args.",
         ),
 
+        "HCOM_HERMES_ARGS" => Some(
+            "\
+HCOM_HERMES_ARGS - Default args passed to hermes chat on launch
+
+Example: hcom config hermes_args \"-p work\"
+Clear:   hcom config hermes_args \"\"
+
+Prepended to launch-time cli args.",
+        ),
+
         "HCOM_KIMI_ARGS" => Some(
             "\
 HCOM_KIMI_ARGS - Default args passed to kimi on launch

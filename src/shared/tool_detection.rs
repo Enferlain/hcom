@@ -121,6 +121,21 @@ const OMP_NATIVE: &[EnvPredicate] = &[EnvPredicate {
     var: "HCOM_OMP",
     condition: EnvMatch::Equals("1"),
 }];
+// Hermes sets these in its own process env, so its terminal children and the
+// hcom plugin's RPCs both carry them. Ranked after every other native marker:
+// an agent started from a Hermes terminal inherits them under its own.
+// Gateway terminals export HERMES_SESSION_ID empty, so HERMES_AGENT (set by
+// every Hermes terminal tool) is the marker that still identifies them.
+const HERMES_NATIVE: &[EnvPredicate] = &[
+    EnvPredicate {
+        var: "HERMES_SESSION_ID",
+        condition: EnvMatch::NonEmpty,
+    },
+    EnvPredicate {
+        var: "HERMES_AGENT",
+        condition: EnvMatch::NonEmpty,
+    },
+];
 
 macro_rules! hcom_tool_predicate {
     ($name:literal, $ident:ident) => {
@@ -144,6 +159,7 @@ hcom_tool_predicate!("qoder", HCOM_TOOL_QODER);
 hcom_tool_predicate!("grok", HCOM_TOOL_GROK);
 hcom_tool_predicate!("pi", HCOM_TOOL_PI);
 hcom_tool_predicate!("omp", HCOM_TOOL_OMP);
+hcom_tool_predicate!("hermes", HCOM_TOOL_HERMES);
 
 /// Detection precedence: native markers first, then hcom's explicit fallback.
 pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
@@ -221,6 +237,11 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
         clear_for_child: &["HCOM_OMP", "PI_CODING_AGENT", "PI_CODING_AGENT_SESSION_DIR"],
     },
     ToolDetectionRule {
+        tool: Tool::Hermes,
+        predicates: HERMES_NATIVE,
+        clear_for_child: &["HERMES_SESSION_ID", "HERMES_AGENT"],
+    },
+    ToolDetectionRule {
         tool: Tool::Claude,
         predicates: HCOM_TOOL_CLAUDE,
         clear_for_child: &["HCOM_TOOL"],
@@ -283,6 +304,11 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
     ToolDetectionRule {
         tool: Tool::Omp,
         predicates: HCOM_TOOL_OMP,
+        clear_for_child: &["HCOM_TOOL"],
+    },
+    ToolDetectionRule {
+        tool: Tool::Hermes,
+        predicates: HCOM_TOOL_HERMES,
         clear_for_child: &["HCOM_TOOL"],
     },
 ];
@@ -373,6 +399,34 @@ mod tests {
         );
         assert!(tool_marker_vars().contains(&"QODER_CLI"));
         assert!(tool_marker_vars().contains(&"QODER_PID"));
+    }
+
+    #[test]
+    fn hermes_yields_to_agents_started_from_its_terminal() {
+        let hermes = ("HERMES_SESSION_ID", "20261013_183101_ab25f9");
+        assert_eq!(detect_tool(&env(&[hermes])), Tool::Hermes);
+        assert_eq!(detect_tool(&env(&[("HCOM_TOOL", "hermes")])), Tool::Hermes);
+        assert_eq!(detect_tool(&env(&[("HERMES_SESSION_ID", "")])), Tool::Adhoc);
+        // Gateway terminals: empty session id, HERMES_AGENT still set.
+        assert_eq!(
+            detect_tool(&env(&[("HERMES_SESSION_ID", ""), ("HERMES_AGENT", "true")])),
+            Tool::Hermes
+        );
+        // Claude/Codex inside a Hermes terminal inherit HERMES_SESSION_ID.
+        assert_eq!(
+            detect_tool(&env(&[hermes, ("CLAUDECODE", "1")])),
+            Tool::Claude
+        );
+        assert_eq!(
+            detect_tool(&env(&[hermes, ("CODEX_THREAD_ID", "t")])),
+            Tool::Codex
+        );
+        // An hcom-launched agent's fallback marker loses to Hermes's own.
+        assert_eq!(
+            detect_tool(&env(&[hermes, ("HCOM_TOOL", "claude")])),
+            Tool::Hermes
+        );
+        assert!(tool_marker_vars().contains(&"HERMES_AGENT"));
     }
 
     #[test]

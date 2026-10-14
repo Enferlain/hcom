@@ -68,6 +68,9 @@ fn tool_label(bindings: Bindings, data: &InstanceRow) -> String {
     if data.tool == "adhoc" {
         return "AD-HOC".to_string();
     }
+    if let Some(platform) = data.launch_context_value("hermes_bridge", "platform") {
+        return format!("HERMES:{}", platform.to_uppercase());
+    }
     let tool = data.tool.to_uppercase();
     if is_remote_instance(data) || is_subagent_instance(data) {
         return tool;
@@ -499,7 +502,9 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     data
                 )
             );
-            format!("{padded:<10}")
+            // Long labels (HERMES:TELEGRAM) still get a separating space.
+            let width = padded.chars().count().max(9) + 1;
+            format!("{padded:<width$}")
         } else {
             String::new()
         };

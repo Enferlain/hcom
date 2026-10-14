@@ -49,6 +49,7 @@ pub enum LaunchTool {
     Qoder,
     Grok,
     Omp,
+    Hermes,
 }
 
 impl LaunchTool {
@@ -69,6 +70,7 @@ impl LaunchTool {
             "copilot" => Ok(LaunchTool::Copilot),
             "qoder" | "qodercli" => Ok(LaunchTool::Qoder),
             "grok" | "grok-build" => Ok(LaunchTool::Grok),
+            "hermes" => Ok(LaunchTool::Hermes),
             _ => bail!("Unknown tool: {}", s),
         }
     }
@@ -89,6 +91,7 @@ impl LaunchTool {
             LaunchTool::Copilot => "copilot",
             LaunchTool::Qoder => "qoder",
             LaunchTool::Grok => "grok",
+            LaunchTool::Hermes => "hermes",
         }
     }
 
@@ -111,6 +114,7 @@ impl LaunchTool {
             LaunchTool::Copilot => crate::tool::Tool::Copilot,
             LaunchTool::Qoder => crate::tool::Tool::Qoder,
             LaunchTool::Grok => crate::tool::Tool::Grok,
+            LaunchTool::Hermes => crate::tool::Tool::Hermes,
         }
     }
 
@@ -182,7 +186,8 @@ impl LaunchBackend {
             | LaunchTool::Kimi
             | LaunchTool::Copilot
             | LaunchTool::Qoder
-            | LaunchTool::Grok => LaunchBackend::HeadlessPty,
+            | LaunchTool::Grok
+            | LaunchTool::Hermes => LaunchBackend::HeadlessPty,
         }
     }
 }
@@ -747,6 +752,7 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
         LaunchTool::Copilot => unreachable!("Copilot uses per-run hooks"),
         LaunchTool::Qoder => unreachable!("Qoder uses per-run hooks"),
         LaunchTool::Grok => unreachable!("Grok has no hooks"),
+        LaunchTool::Hermes => unreachable!("Hermes installs into the launch's profile"),
     }
 }
 
@@ -1955,6 +1961,17 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             }
             Some(injection)
         }
+        None if normalized == LaunchTool::Hermes => {
+            // Installed per profile, so it needs the launch's args and env.
+            crate::hooks::hermes::ensure_installed(&crate::hooks::runtime::LaunchCtx {
+                tool: normalized.tool(),
+                env: base_env.clone(),
+                cwd: canonical_dir.clone(),
+                args: params.args.clone(),
+                auto_approve: hcom_config.auto_approve,
+            })?;
+            None
+        }
         None => {
             ensure_hooks_installed(&normalized, hcom_config.auto_approve)?;
             None
@@ -2045,6 +2062,12 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             Err(_) => "api".to_string(),
         }
     });
+
+    if normalized == LaunchTool::Hermes {
+        params.args = crate::tools::hermes_preprocessing::with_chat_subcommand(std::mem::take(
+            &mut params.args,
+        ));
+    }
 
     // Inject --hcom-prompt into tool args (translated per-tool).
     // When a real hcom participant launched us, append a reply instruction so
@@ -2420,7 +2443,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     )
                 }
 
-                LaunchTool::OpenCode | LaunchTool::Kilo | LaunchTool::Pi | LaunchTool::Omp => {
+                LaunchTool::OpenCode
+                | LaunchTool::Kilo
+                | LaunchTool::Pi
+                | LaunchTool::Omp
+                | LaunchTool::Hermes => {
                     opencode_preprocessing::preprocess_opencode_env(
                         &mut instance_env,
                         &instance_name,
@@ -2736,6 +2763,7 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
         LaunchTool::Kilo => validate_rejected_args("Kilo", "hcom kilo", args, KILO_REJECTED_ARGS),
         LaunchTool::Pi => validate_rejected_args("Pi", "hcom pi", args, PI_REJECTED_ARGS),
         LaunchTool::Omp => validate_rejected_args("Oh My Pi", "hcom omp", args, OMP_REJECTED_ARGS),
+        LaunchTool::Hermes => crate::tools::hermes_preprocessing::validate_hermes_args(args),
         LaunchTool::Antigravity => validate_rejected_args(
             "Antigravity",
             "hcom antigravity",

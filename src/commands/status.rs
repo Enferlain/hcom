@@ -103,7 +103,14 @@ fn get_tool_statuses() -> Vec<ToolStatus> {
                 key: spec.name,
                 name: spec.label,
                 installed: is_tool_installed(spec.tool),
-                hooks: !persistent || spec.tool.verify_hooks_installed(false),
+                // Hermes: unverified still counts; launching re-checks it.
+                hooks: !persistent
+                    || spec.tool.verify_hooks_installed(false)
+                    || (spec.tool == crate::tool::Tool::Hermes
+                        && matches!(
+                            crate::hooks::hermes::install_state(),
+                            crate::hooks::hermes::InstallState::Unverified
+                        )),
                 hook_mode,
                 settings_path: if persistent {
                     spec.tool.hooks_settings_path()
@@ -317,6 +324,10 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                 "entries": [],
             },
         });
+        let stale = crate::hooks::hermes::stale_gateways(db);
+        if !stale.is_empty() {
+            result["hermes_stale_gateways"] = json!(stale);
+        }
         if let Some((path, source)) = &dev_root {
             result["dev_root"] = json!({
                 "path": path.to_string_lossy(),
@@ -364,6 +375,9 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         .collect::<Vec<_>>()
         .join("  ");
     println!("tools:     {tools_str}");
+    for note in crate::hooks::hermes::stale_gateway_notes(db) {
+        println!("           ⚠ {note}");
+    }
 
     // Terminal — show preset name with availability
     if terminal_config == "default" {

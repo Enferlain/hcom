@@ -343,6 +343,7 @@ fn parse_tool(s: &str) -> Tool {
         Ok(crate::tool::Tool::Copilot) => Tool::Copilot,
         Ok(crate::tool::Tool::Qoder) => Tool::Qoder,
         Ok(crate::tool::Tool::Grok) => Tool::Grok,
+        Ok(crate::tool::Tool::Hermes) => Tool::Hermes,
         Ok(crate::tool::Tool::Adhoc) => Tool::Adhoc,
         Err(_) => Tool::Unknown(s.to_string()),
     }

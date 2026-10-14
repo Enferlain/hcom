@@ -586,7 +586,7 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / qoder_args / grok_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / omp_args / cursor_args / kimi_args / copilot_args / qoder_args / grok_args / hermes_args",
         "Default launch args per tool",
     ),
     (
@@ -749,7 +749,11 @@ const UPDATE_HELP: &[HelpEntry] = &[
 
 const HOOKS_STATUS: &[HelpEntry] = &[
     ("hooks", "Show how each tool loads hcom's hooks"),
-    ("hooks status", "Same as above"),
+    ("hooks status [tool]", "Same as above, for one tool"),
+    (
+        "",
+        "  hermes: also asks Hermes whether the plugin is enabled (slow)",
+    ),
 ];
 
 const HOOKS_ADD: &[HelpEntry] = &[
@@ -986,6 +990,10 @@ fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String
     for (u, d) in spec.help.extra_env {
         lines.push(format!("    {:<28} {}", u.trim(), d));
     }
+    if !spec.help.notes.is_empty() {
+        lines.push(String::new());
+        lines.extend(spec.help.notes.iter().map(|l| l.to_string()));
+    }
 
     // Resume / Fork
     lines.push(String::new());
@@ -1128,6 +1136,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "qodercli",
     "grok",
     "grok-build",
+    "hermes",
 ];
 
 fn forkable_tool_names() -> String {

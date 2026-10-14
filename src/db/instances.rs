@@ -139,6 +139,12 @@ pub(super) const INSTANCE_COLUMNS: &str =
      idle_since, pid, launch_context";
 
 impl InstanceRow {
+    /// `launch_context[section][field]` as a string, if present.
+    pub fn launch_context_value(&self, section: &str, field: &str) -> Option<String> {
+        let ctx: serde_json::Value = serde_json::from_str(self.launch_context.as_deref()?).ok()?;
+        ctx.get(section)?.get(field)?.as_str().map(str::to_string)
+    }
+
     /// Process identity recorded with this snapshot's PID, if any.
     pub fn pid_identity(&self) -> Option<String> {
         let ctx: serde_json::Value = serde_json::from_str(self.launch_context.as_deref()?).ok()?;

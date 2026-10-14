@@ -372,6 +372,7 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             "kimi" => preview.config.kimi_args.as_str(),
             "qoder" | "qodercli" => preview.config.qoder_args.as_str(),
             "grok" | "grok-build" => preview.config.grok_args.as_str(),
+            "hermes" => preview.config.hermes_args.as_str(),
             _ => "",
         }
     } else {
@@ -525,6 +526,7 @@ pub(crate) fn merge_tool_args(
         LaunchTool::Grok => append_config_args(&config.grok_args, cli_args),
         LaunchTool::Pi => append_config_args(&config.pi_args, cli_args),
         LaunchTool::Omp => append_config_args(&config.omp_args, cli_args),
+        LaunchTool::Hermes => append_config_args(&config.hermes_args, cli_args),
         LaunchTool::OpenCode => append_config_args(&config.opencode_args, cli_args),
         LaunchTool::Kilo => append_config_args(&config.kilo_args, cli_args),
         LaunchTool::Kimi => append_config_args(&config.kimi_args, cli_args),
@@ -558,7 +560,8 @@ pub(crate) fn is_background_from_args(tool: &LaunchTool, args: &[String]) -> boo
         | LaunchTool::Copilot
         | LaunchTool::Qoder
         | LaunchTool::Grok
-        | LaunchTool::Omp => false,
+        | LaunchTool::Omp
+        | LaunchTool::Hermes => false,
     }
 }
 
