@@ -950,6 +950,95 @@ fn splice_kitten_to_socket(argv: &mut Vec<String>, kitty_socket: &str) {
     }
 }
 
+/// Pin launches to the inherited Kitty window only while it still exists.
+/// Long-lived sessions can retain an ID for a window that has since closed.
+/// Without a match, Kitty launches in its active tab.
+fn splice_kitty_target(argv: &mut Vec<String>, window_id: &str) {
+    if !argv
+        .first()
+        .and_then(|arg| Path::new(arg).file_stem())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("kitten"))
+        || argv.get(1).map(String::as_str) != Some("@")
+    {
+        return;
+    }
+    let Some(launch) = argv.iter().position(|arg| arg == "launch") else {
+        return;
+    };
+    if argv
+        .iter()
+        .any(|arg| arg == "--match" || arg.starts_with("--match="))
+    {
+        return;
+    }
+    let Some(sep) = argv.iter().position(|arg| arg == "--") else {
+        return;
+    };
+    // Preserve the target if inspection fails; only a confirmed missing
+    // window should change which tab receives the launch.
+    let exists = kitty_window_listing(&argv[..launch])
+        .and_then(|json| kitty_window_exists(&json, window_id));
+    if exists != Some(false) {
+        argv.splice(
+            sep..sep,
+            ["--match".to_string(), format!("window_id:{window_id}")],
+        );
+    }
+}
+
+fn kitty_window_listing(prefix: &[String]) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek};
+    use std::process::Stdio;
+
+    // A file avoids filling a stdout pipe while waiting on a large listing.
+    let mut stdout = tempfile::tempfile().ok()?;
+    let mut child = Command::new(prefix.first()?)
+        .args(&prefix[1..])
+        .arg("ls")
+        .env_clear()
+        .envs(get_launcher_env())
+        .stdin(Stdio::null())
+        .stdout(stdout.try_clone().ok()?)
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    stdout.rewind().ok()?;
+    let mut json = Vec::new();
+    stdout.read_to_end(&mut json).ok()?;
+    Some(json)
+}
+
+fn kitty_window_exists(json: &[u8], window_id: &str) -> Option<bool> {
+    let id = window_id.parse::<u64>().ok()?;
+    let windows = serde_json::from_slice::<Vec<serde_json::Value>>(json).ok()?;
+    Some(windows.iter().any(|os_window| {
+        os_window["tabs"].as_array().is_some_and(|tabs| {
+            tabs.iter().any(|tab| {
+                tab["windows"].as_array().is_some_and(|windows| {
+                    windows
+                        .iter()
+                        .any(|window| window["id"].as_u64() == Some(id))
+                })
+            })
+        })
+    }))
+}
+
 /// Target the launcher's WezTerm tab and, for splits, choose placement.
 ///
 /// The launcher env strips `$WEZTERM_PANE`, and without it `wezterm cli`
@@ -2489,17 +2578,11 @@ pub fn launch_terminal(
         }
         let mut argv = resolve_terminal_open_argv(&terminal_mode).unwrap_or_default();
         splice_kitten_to_socket(&mut argv, &kitty_socket);
-        // Target launcher's tab for splits: insert `--match window_id:<wid>`
-        // before the `--` separator.
         if (terminal_mode == "kitty-tab" || terminal_mode == "kitty-split")
             && let Ok(wid) = std::env::var("KITTY_WINDOW_ID")
             && !wid.is_empty()
-            && let Some(sep) = argv.iter().position(|a| a == "--")
         {
-            argv.splice(
-                sep..sep,
-                ["--match".to_string(), format!("window_id:{wid}")],
-            );
+            splice_kitty_target(&mut argv, &wid);
         }
         if (terminal_mode == "wezterm-tab" || terminal_mode == "wezterm-split")
             && let Ok(pane) = std::env::var("WEZTERM_PANE")
@@ -3675,6 +3758,16 @@ mod tests {
                 "--type=window".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn kitty_target_rejects_stale_window_ids() {
+        let json = br#"[{"id":10,"tabs":[{"id":10,"windows":[{"id":52}]}]}]"#;
+        assert_eq!(kitty_window_exists(json, "52"), Some(true));
+        // OS window and tab IDs are separate from the inherited window ID.
+        assert_eq!(kitty_window_exists(json, "10"), Some(false));
+        assert_eq!(kitty_window_exists(json, "invalid"), None);
+        assert_eq!(kitty_window_exists(b"invalid json", "52"), None);
     }
 
     #[test]
