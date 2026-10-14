@@ -6,9 +6,10 @@ use serde_json::{Value, json};
 
 use super::shared::{
     Exchange, ToolUse, capture_tool_output, codex_is_error, collapse_codex_duplicate_exchanges,
-    dedup_sorted_capped, extract_codex_event_message_text, extract_text_content,
-    finalize_action_text, is_codex_system_injected_user_text, is_no_response_action,
-    normalize_tool_name, read_file_lossy, same_trimmed_text, truncate_str,
+    dedup_sorted_capped, display_path, extract_codex_event_message_text, extract_text_content,
+    final_segment, finalize_action_text, is_codex_system_injected_user_text, is_no_response_action,
+    normalize_tool_name, read_file_lossy, same_trimmed_text, tool_call_detail, tool_input_file,
+    truncate_str,
 };
 
 /// Extract plain text from a `function_call_output.output` value.
@@ -145,6 +146,10 @@ pub(crate) fn parse_codex_jsonl(
     let mut current_errors: Vec<Value> = Vec::new();
     let mut current_last_was_error = false;
     let mut current_assistant_chunks: Vec<String> = Vec::new();
+    // Where the text after the latest tool call starts in `current_action`.
+    let mut final_start = 0;
+    let mut tool_since_text = false;
+    let mut cwd: Option<String> = None;
     let mut position = 0;
     let mut in_exchange = false; // track whether we have a real user entry
 
@@ -158,7 +163,9 @@ pub(crate) fn parse_codex_jsonl(
                          tools: &mut Vec<ToolUse>,
                          errors: &mut Vec<Value>,
                          assistant_chunks: &mut Vec<String>,
-                         last_was_error: &mut bool| {
+                         last_was_error: &mut bool,
+                         final_start: &mut usize,
+                         tool_since_text: &mut bool| {
         if !user.is_empty() || !action.is_empty() {
             *position += 1;
             let final_action = finalize_action_text(action, tools, errors, *last_was_error);
@@ -166,6 +173,7 @@ pub(crate) fn parse_codex_jsonl(
                 position: *position,
                 user: std::mem::take(user),
                 action: final_action,
+                final_text: final_segment(action, *final_start),
                 files: dedup_sorted_capped(files, 5),
                 timestamp: std::mem::take(ts),
                 tools: std::mem::take(tools),
@@ -177,6 +185,8 @@ pub(crate) fn parse_codex_jsonl(
             files.clear();
             assistant_chunks.clear();
             *last_was_error = false;
+            *final_start = 0;
+            *tool_since_text = false;
         }
         *in_exchange = false;
     };
@@ -190,6 +200,12 @@ pub(crate) fn parse_codex_jsonl(
             .to_string();
         let payload = entry.get("payload").cloned().unwrap_or(entry.clone());
         let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        if matches!(entry_type, "session_meta" | "turn_context")
+            && let Some(entry_cwd) = payload.get("cwd").and_then(Value::as_str)
+        {
+            cwd = Some(entry_cwd.to_string());
+        }
 
         // Skip system entry types
         if matches!(
@@ -229,6 +245,8 @@ pub(crate) fn parse_codex_jsonl(
                             &mut current_errors,
                             &mut current_assistant_chunks,
                             &mut current_last_was_error,
+                            &mut final_start,
+                            &mut tool_since_text,
                         );
                         current_user = text;
                         current_ts = ts.clone();
@@ -244,6 +262,9 @@ pub(crate) fn parse_codex_jsonl(
                             }
                             if !current_action.is_empty() {
                                 current_action.push('\n');
+                            }
+                            if std::mem::take(&mut tool_since_text) {
+                                final_start = current_action.len();
                             }
                             current_action.push_str(&text);
                             current_assistant_chunks.push(text);
@@ -267,22 +288,13 @@ pub(crate) fn parse_codex_jsonl(
                         .unwrap_or("")
                         .to_string();
 
-                    // Extract files from args
-                    if let Some(obj) = args.as_object() {
-                        for field in &["file_path", "path", "file"] {
-                            if let Some(val) = obj.get(*field).and_then(|v| v.as_str())
-                                && !val.is_empty()
-                            {
-                                let fname = Path::new(val)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or(val)
-                                    .to_string();
-                                if !current_files.contains(&fname) {
-                                    current_files.push(fname);
-                                }
-                            }
-                        }
+                    tool_since_text = true;
+                    let file =
+                        tool_input_file(raw_name, &args).map(|f| display_path(f, cwd.as_deref()));
+                    if let Some(f) = &file
+                        && !current_files.contains(f)
+                    {
+                        current_files.push(f.clone());
                     }
 
                     // Determine is_error from call output
@@ -293,30 +305,7 @@ pub(crate) fn parse_codex_jsonl(
                         false
                     };
 
-                    let command = if tool_name == "Bash" {
-                        args.get("command").and_then(|v| v.as_str()).map(|s| {
-                            if s.len() > 80 {
-                                format!("{}...", truncate_str(s, 77))
-                            } else {
-                                s.to_string()
-                            }
-                        })
-                    } else {
-                        None
-                    };
-
-                    let file = args.as_object().and_then(|o| {
-                        o.get("file_path")
-                            .or(o.get("path"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| {
-                                Path::new(s)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or(s)
-                                    .to_string()
-                            })
-                    });
+                    let command = tool_call_detail(raw_name, &args);
 
                     current_tools.push(ToolUse {
                         name: tool_name.to_string(),
@@ -366,6 +355,8 @@ pub(crate) fn parse_codex_jsonl(
                         &mut current_errors,
                         &mut current_assistant_chunks,
                         &mut current_last_was_error,
+                        &mut final_start,
+                        &mut tool_since_text,
                     );
                     current_user = text;
                     current_ts = ts.clone();
@@ -382,6 +373,9 @@ pub(crate) fn parse_codex_jsonl(
                         }
                         if !current_action.is_empty() {
                             current_action.push('\n');
+                        }
+                        if std::mem::take(&mut tool_since_text) {
+                            final_start = current_action.len();
                         }
                         current_action.push_str(&text);
                         current_assistant_chunks.push(text);
@@ -405,6 +399,8 @@ pub(crate) fn parse_codex_jsonl(
         &mut current_errors,
         &mut current_assistant_chunks,
         &mut current_last_was_error,
+        &mut final_start,
+        &mut tool_since_text,
     );
 
     exchanges = collapse_codex_duplicate_exchanges(exchanges);

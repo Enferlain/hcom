@@ -6,7 +6,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, finalize_action_text, normalize_tool_name, truncate_str,
+    Exchange, ToolUse, capture_tool_output, display_path, finalize_action_text,
+    normalize_tool_name, tool_call_detail, tool_input_file, truncate_str,
 };
 use crate::log::log_warn;
 
@@ -433,6 +434,15 @@ pub(crate) fn parse_opencode_sqlite(
     if messages.is_empty() {
         return Ok(Vec::new());
     }
+    // Either schema may be absent, so a failed lookup just means no directory.
+    let cwd: Option<String> = ["session_v2", "session"].iter().find_map(|table| {
+        conn.query_row(
+            &format!("SELECT directory FROM {table} WHERE id = ?1"),
+            [session_id],
+            |row| row.get(0),
+        )
+        .ok()
+    });
 
     // Build exchanges: group by user messages
     let mut exchanges = Vec::new();
@@ -498,6 +508,9 @@ pub(crate) fn parse_opencode_sqlite(
         let mut tools: Vec<ToolUse> = Vec::new();
         let mut edits: Vec<Value> = Vec::new();
         let mut errors: Vec<Value> = Vec::new();
+        // First text part after the latest tool call.
+        let mut final_part = 0;
+        let mut tool_since_text = false;
 
         for msg in &messages[(user_idx + 1)..next_user_idx] {
             if msg.role != "assistant" {
@@ -516,6 +529,9 @@ pub(crate) fn parse_opencode_sqlite(
                         if let Some(text) = p.get("text").and_then(|v| v.as_str())
                             && !text.is_empty()
                         {
+                            if std::mem::take(&mut tool_since_text) {
+                                final_part = action_parts.len();
+                            }
                             action_parts.push(text.to_string());
                         }
                     }
@@ -531,44 +547,15 @@ pub(crate) fn parse_opencode_sqlite(
                             state.get("output").and_then(Value::as_str)
                         };
 
-                        // Extract file paths
-                        if let Some(obj) = input.as_object() {
-                            for field in &["file_path", "filePath", "path", "pattern", "file"] {
-                                if let Some(val) = obj.get(*field).and_then(|v| v.as_str())
-                                    && !val.is_empty()
-                                {
-                                    let fname = Path::new(val)
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or(val)
-                                        .to_string();
-                                    if !files.contains(&fname) {
-                                        files.push(fname);
-                                    }
-                                }
-                            }
+                        tool_since_text = true;
+                        let file = tool_input_file(tool_name, &input)
+                            .map(|f| display_path(f, cwd.as_deref()));
+                        if let Some(f) = &file
+                            && !files.contains(f)
+                        {
+                            files.push(f.clone());
                         }
-
-                        let command = if normalized == "Bash" {
-                            input
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        } else {
-                            None
-                        };
-                        let file = input
-                            .get("file_path")
-                            .or_else(|| input.get("filePath"))
-                            .or_else(|| input.get("path"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| {
-                                Path::new(s)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or(s)
-                                    .to_string()
-                            });
+                        let command = tool_call_detail(tool_name, &input);
 
                         if matches!(normalized, "Edit" | "Write") {
                             edits.extend(extract_opencode_edits(&state, &input));
@@ -600,10 +587,17 @@ pub(crate) fn parse_opencode_sqlite(
         let action =
             finalize_action_text(&action_parts.join("\n"), &tools, &errors, ended_on_error);
 
+        let final_text = if final_part == 0 {
+            String::new()
+        } else {
+            action_parts[final_part..].join("\n").trim().to_string()
+        };
+
         exchanges.push(Exchange {
             position,
             user: user_text,
             action,
+            final_text,
             files,
             timestamp,
             tools,
@@ -791,6 +785,7 @@ mod tests {
         assert_eq!(names, ["Bash", "Edit", "Bash"]);
         assert_eq!(first.tools[0].command.as_deref(), Some("echo hi"));
         assert_eq!(first.tools[0].output.as_deref(), Some("hi\n"));
+        // Relative to the session directory (/work).
         assert_eq!(first.tools[1].file.as_deref(), Some("a.rs"));
         assert_eq!(first.edits[0]["file"], "/work/a.rs");
         assert_eq!(first.edits[0]["diff"], "-a\n+b");

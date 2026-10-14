@@ -5,8 +5,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, extract_gemini_user_text, extract_text_content,
-    finalize_action_text, normalize_tool_name, read_file_lossy, truncate_str,
+    Exchange, ToolUse, capture_tool_output, display_path, extract_gemini_user_text,
+    extract_text_content, finalize_action_text, normalize_tool_name, read_file_lossy,
+    tool_call_detail, tool_input_file, truncate_str,
 };
 
 fn tool_output(tool_call: &Value) -> Option<String> {
@@ -99,6 +100,7 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
                         &current_errors,
                         current_last_was_error,
                     ),
+                    final_text: String::new(),
                     files: std::mem::take(&mut current_files),
                     timestamp: current_ts.clone(),
                     tools: std::mem::take(&mut current_tools),
@@ -142,49 +144,13 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
                         });
                     let output = tool_output(tc);
 
-                    // Extract file paths from tool args
-                    if let Some(obj) = args.as_object() {
-                        for field in &["file", "path", "file_path", "directory"] {
-                            if let Some(val) = obj.get(*field).and_then(|v| v.as_str())
-                                && !val.is_empty()
-                            {
-                                let fname = Path::new(val)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or(val)
-                                    .to_string();
-                                if !current_files.contains(&fname) {
-                                    current_files.push(fname.clone());
-                                }
-                            }
-                        }
+                    let file = tool_input_file(tool_name, &args).map(|f| display_path(f, None));
+                    if let Some(f) = &file
+                        && !current_files.contains(f)
+                    {
+                        current_files.push(f.clone());
                     }
-
-                    let command = if tool_name == "Bash" {
-                        args.get("command").and_then(|v| v.as_str()).map(|s| {
-                            if s.len() > 80 {
-                                format!("{}...", truncate_str(s, 77))
-                            } else {
-                                s.to_string()
-                            }
-                        })
-                    } else {
-                        None
-                    };
-
-                    let file = args.as_object().and_then(|o| {
-                        o.get("file_path")
-                            .or(o.get("path"))
-                            .or(o.get("file"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| {
-                                Path::new(s)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or(s)
-                                    .to_string()
-                            })
-                    });
+                    let command = tool_call_detail(tool_name, &args);
 
                     current_tools.push(ToolUse {
                         name: tool_name.to_string(),
@@ -218,6 +184,7 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
                 &current_errors,
                 current_last_was_error,
             ),
+            final_text: String::new(),
             files: current_files,
             timestamp: current_ts,
             tools: current_tools,

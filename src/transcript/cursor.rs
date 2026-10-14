@@ -24,8 +24,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::shared::{
-    Exchange, ToolUse, dedup_sorted_capped, finalize_action_text, normalize_tool_name,
-    read_file_lossy, same_trimmed_text, truncate_str,
+    Exchange, ToolUse, dedup_sorted_capped, display_path, final_segment, finalize_action_text,
+    normalize_tool_name, read_file_lossy, same_trimmed_text, tool_input_file, truncate_str,
 };
 
 /// Map cursor's tool names onto hcom's canonical (Claude) names. cursor uses
@@ -81,24 +81,6 @@ fn content_text(message: &Value) -> String {
 }
 
 /// Basename of a tool-input path field, if any of `path`/`file_path`/`file`.
-fn tool_file(input: &Value) -> Option<String> {
-    let obj = input.as_object()?;
-    for field in ["path", "file_path", "file"] {
-        if let Some(val) = obj.get(field).and_then(Value::as_str)
-            && !val.is_empty()
-        {
-            return Some(
-                Path::new(val)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(val)
-                    .to_string(),
-            );
-        }
-    }
-    None
-}
-
 /// Parse a cursor-agent JSONL transcript into the shared `Exchange` model.
 pub(crate) fn parse_cursor_jsonl(
     path: &Path,
@@ -115,6 +97,9 @@ pub(crate) fn parse_cursor_jsonl(
     let mut assistant_chunks: Vec<String> = Vec::new();
     let mut position = 0usize;
     let mut in_exchange = false;
+    // Where the text after the latest tool call starts in `current_action`.
+    let mut final_start = 0usize;
+    let mut tool_since_text = false;
 
     // Flush the in-progress exchange (if any user/assistant content accrued).
     let flush = |exchanges: &mut Vec<Exchange>,
@@ -124,7 +109,9 @@ pub(crate) fn parse_cursor_jsonl(
                  action: &mut String,
                  tools: &mut Vec<ToolUse>,
                  files: &mut Vec<String>,
-                 chunks: &mut Vec<String>| {
+                 chunks: &mut Vec<String>,
+                 final_start: &mut usize,
+                 tool_since_text: &mut bool| {
         if !user.is_empty() || !action.is_empty() {
             *position += 1;
             let final_action = finalize_action_text(action, tools, &[], false);
@@ -132,6 +119,7 @@ pub(crate) fn parse_cursor_jsonl(
                 position: *position,
                 user: std::mem::take(user),
                 action: final_action,
+                final_text: final_segment(action, *final_start),
                 files: dedup_sorted_capped(files, 5),
                 timestamp: String::new(),
                 tools: std::mem::take(tools),
@@ -142,6 +130,8 @@ pub(crate) fn parse_cursor_jsonl(
             action.clear();
             files.clear();
             chunks.clear();
+            *final_start = 0;
+            *tool_since_text = false;
         }
         *in_exchange = false;
     };
@@ -181,6 +171,8 @@ pub(crate) fn parse_cursor_jsonl(
                     &mut current_tools,
                     &mut current_files,
                     &mut assistant_chunks,
+                    &mut final_start,
+                    &mut tool_since_text,
                 );
                 current_user = text;
                 in_exchange = true;
@@ -194,6 +186,9 @@ pub(crate) fn parse_cursor_jsonl(
                 {
                     if !current_action.is_empty() {
                         current_action.push('\n');
+                    }
+                    if std::mem::take(&mut tool_since_text) {
+                        final_start = current_action.len();
                     }
                     current_action.push_str(&text);
                     assistant_chunks.push(text);
@@ -209,7 +204,8 @@ pub(crate) fn parse_cursor_jsonl(
                             .unwrap_or("unknown");
                         let name = normalize_cursor_tool(raw_name).to_string();
                         let input = block.get("input").cloned().unwrap_or(Value::Null);
-                        let file = tool_file(&input);
+                        tool_since_text = true;
+                        let file = tool_input_file(raw_name, &input).map(|f| display_path(f, None));
                         if let Some(ref f) = file
                             && !current_files.contains(f)
                         {
@@ -245,6 +241,8 @@ pub(crate) fn parse_cursor_jsonl(
         &mut current_tools,
         &mut current_files,
         &mut assistant_chunks,
+        &mut final_start,
+        &mut tool_since_text,
     );
 
     if exchanges.len() > last {
@@ -298,9 +296,9 @@ mod tests {
         assert_eq!(ex[0].tools.len(), 2);
         assert_eq!(ex[0].tools[0].name, "Shell");
         assert_eq!(ex[0].tools[0].command.as_deref(), Some("cargo build"));
-        // StrReplace → canonical Edit; file basename captured.
+        // StrReplace → canonical Edit; cursor records no cwd, so the path stays whole.
         assert_eq!(ex[0].tools[1].name, "Edit");
-        assert_eq!(ex[0].files, vec!["main.rs".to_string()]);
+        assert_eq!(ex[0].files, vec!["/repo/src/main.rs".to_string()]);
     }
 
     #[test]

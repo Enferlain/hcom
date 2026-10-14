@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, finalize_action_text, normalize_tool_name,
-    read_file_lossy, truncate_str,
+    Exchange, ToolUse, capture_tool_output, display_path, final_segment, finalize_action_text,
+    normalize_tool_name, read_file_lossy, tool_input_file, truncate_str,
 };
 
 /// `$GROK_HOME` if set, else `~/.grok`.
@@ -137,16 +137,9 @@ fn tool_from_call(update: &Value) -> ToolUse {
         .and_then(Value::as_str)
         .unwrap_or("tool");
     let input = update.get("rawInput").unwrap_or(&Value::Null);
-    let file = ["path", "file_path", "target_file"]
-        .iter()
-        .find_map(|key| input.get(*key).and_then(Value::as_str))
-        .map(|path| {
-            Path::new(path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(path)
-                .to_string()
-        });
+    let file = tool_input_file(name, input)
+        .or_else(|| input.get("target_file").and_then(Value::as_str))
+        .map(|path| display_path(path, None));
     let command = input
         .get("command")
         .and_then(Value::as_str)
@@ -170,6 +163,9 @@ struct Turn {
     errors: Vec<Value>,
     ended_on_error: bool,
     timestamp: String,
+    /// Where the text after the latest tool call starts in `action`.
+    final_start: usize,
+    tool_since_text: bool,
 }
 
 impl Turn {
@@ -185,6 +181,7 @@ impl Turn {
         Exchange {
             position,
             user: self.user,
+            final_text: final_segment(&self.action, self.final_start),
             action,
             files: self.files,
             timestamp: self.timestamp,
@@ -244,10 +241,17 @@ pub(crate) fn parse_grok_updates_jsonl(
                     .push_str(&text_of(update.get("content").unwrap_or(&Value::Null)));
             }
             "agent_message_chunk" => {
-                turn.action
-                    .push_str(&text_of(update.get("content").unwrap_or(&Value::Null)));
+                let text = text_of(update.get("content").unwrap_or(&Value::Null));
+                if !text.is_empty() && std::mem::take(&mut turn.tool_since_text) {
+                    if !turn.action.is_empty() {
+                        turn.action.push('\n');
+                    }
+                    turn.final_start = turn.action.len();
+                }
+                turn.action.push_str(&text);
             }
             "tool_call" => {
+                turn.tool_since_text = true;
                 let tool = tool_from_call(update);
                 if let Some(file) = &tool.file {
                     turn.files.push(file.clone());

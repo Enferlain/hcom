@@ -6,9 +6,9 @@ use serde_json::{Value, json};
 
 use super::shared::{
     Exchange, ToolUse, capture_tool_output, collapse_codex_duplicate_exchanges,
-    dedup_sorted_capped, extract_content_text, extract_edit_info, extract_text_content,
-    finalize_action_text, has_user_text, is_error_result, normalize_tool_name, read_file_lossy,
-    truncate_str,
+    dedup_sorted_capped, display_path, extract_content_text, extract_edit_info,
+    extract_text_content, final_segment, finalize_action_text, has_user_text, is_error_result,
+    normalize_tool_name, read_file_lossy, tool_call_detail, tool_input_file, truncate_str,
 };
 
 fn extract_antigravity_entry_text(entry: &Value) -> String {
@@ -150,9 +150,19 @@ pub(crate) fn parse_claude_jsonl(
     let mut current_edits: Vec<Value> = Vec::new();
     let mut current_errors: Vec<Value> = Vec::new();
     let mut current_last_was_error = false;
+    // Where the text after the latest tool call starts in `current_action`.
+    let mut final_start = 0;
+    // tool_use id → index in `current_tools` of a call still awaiting its result.
+    let mut pending_tools: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut tool_since_text = false;
+    let mut cwd: Option<String> = None;
     let mut position = 0;
 
     for pe in &entries {
+        if let Some(entry_cwd) = pe.data.get("cwd").and_then(Value::as_str) {
+            cwd = Some(entry_cwd.to_string());
+        }
         match pe.entry_type.as_str() {
             "USER_INPUT" => {
                 let user_text = extract_antigravity_entry_text(&pe.data);
@@ -171,6 +181,7 @@ pub(crate) fn parse_claude_jsonl(
                             &current_errors,
                             current_last_was_error,
                         ),
+                        final_text: final_segment(&current_action, final_start),
                         files: dedup_sorted_capped(&current_files, 5),
                         timestamp: current_ts.clone(),
                         tools: std::mem::take(&mut current_tools),
@@ -187,6 +198,9 @@ pub(crate) fn parse_claude_jsonl(
                 current_edits = Vec::new();
                 current_errors = Vec::new();
                 current_last_was_error = false;
+                final_start = 0;
+                tool_since_text = false;
+                pending_tools.clear();
                 current_ts = pe.ts.clone();
             }
             "PLANNER_RESPONSE" => {
@@ -194,6 +208,9 @@ pub(crate) fn parse_claude_jsonl(
                 if !text.is_empty() {
                     if !current_action.is_empty() {
                         current_action.push('\n');
+                    }
+                    if std::mem::take(&mut tool_since_text) {
+                        final_start = current_action.len();
                     }
                     current_action.push_str(&text);
                 }
@@ -236,43 +253,25 @@ pub(crate) fn parse_claude_jsonl(
                                 let normalized = normalize_tool_name(&tool_name);
                                 let output = extract_content_text(block.get("content"));
 
-                                let file = if normalized == "Edit" {
-                                    tool_use_result
-                                        .as_ref()
-                                        .and_then(|r| r.get("filePath").and_then(|v| v.as_str()))
-                                        .or_else(|| {
-                                            tool_input.get("file_path").and_then(|v| v.as_str())
-                                        })
-                                        .map(|s| {
-                                            Path::new(s)
-                                                .file_name()
-                                                .and_then(|n| n.to_str())
-                                                .unwrap_or(s)
-                                                .to_string()
-                                        })
-                                } else {
-                                    None
-                                };
+                                let file = tool_use_result
+                                    .as_ref()
+                                    .filter(|_| normalized == "Edit")
+                                    .and_then(|r| r.get("filePath").and_then(Value::as_str))
+                                    .or_else(|| tool_input_file(&tool_name, &tool_input))
+                                    .map(|f| display_path(f, cwd.as_deref()));
+                                let command = tool_call_detail(&tool_name, &tool_input);
 
-                                let command = if normalized == "Bash" {
-                                    tool_input.get("command").and_then(|v| v.as_str()).map(|s| {
-                                        if s.len() > 80 {
-                                            format!("{}...", truncate_str(s, 77))
-                                        } else {
-                                            s.to_string()
-                                        }
-                                    })
-                                } else {
-                                    None
-                                };
-
-                                current_tools.push(ToolUse {
+                                let tool = ToolUse {
                                     name: normalized.to_string(),
                                     is_error: is_err,
                                     file,
                                     command,
                                     output: capture_tool_output(&output),
-                                });
+                                };
+                                match pending_tools.remove(&tool_use_id) {
+                                    Some(i) => current_tools[i] = tool,
+                                    None => current_tools.push(tool),
+                                }
 
                                 // Extract edit info for Edit tools
                                 if normalized == "Edit"
@@ -310,6 +309,7 @@ pub(crate) fn parse_claude_jsonl(
                             &current_errors,
                             current_last_was_error,
                         ),
+                        final_text: final_segment(&current_action, final_start),
                         files: dedup_sorted_capped(&current_files, 5),
                         timestamp: current_ts.clone(),
                         tools: std::mem::take(&mut current_tools),
@@ -328,6 +328,9 @@ pub(crate) fn parse_claude_jsonl(
                 current_edits = Vec::new();
                 current_errors = Vec::new();
                 current_last_was_error = false;
+                final_start = 0;
+                tool_since_text = false;
+                pending_tools.clear();
                 current_ts = pe.ts.clone();
             }
             "assistant" => {
@@ -342,6 +345,9 @@ pub(crate) fn parse_claude_jsonl(
                                     if !current_action.is_empty() {
                                         current_action.push('\n');
                                     }
+                                    if std::mem::take(&mut tool_since_text) {
+                                        final_start = current_action.len();
+                                    }
                                     current_action.push_str(text);
                                 }
                             } else if block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
@@ -350,20 +356,9 @@ pub(crate) fn parse_claude_jsonl(
                                     block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                 let input = block.get("input").cloned().unwrap_or(json!({}));
 
-                                // Extract file from tool input (including notebook_path)
-                                let file = input
-                                    .get("file_path")
-                                    .or_else(|| input.get("path"))
-                                    .or_else(|| input.get("filePath"))
-                                    .or_else(|| input.get("notebook_path"))
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| {
-                                        Path::new(s)
-                                            .file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or(s)
-                                            .to_string()
-                                    });
+                                tool_since_text = true;
+                                let file = tool_input_file(tool_name, &input)
+                                    .map(|f| display_path(f, cwd.as_deref()));
 
                                 if let Some(ref f) = file
                                     && !current_files.contains(f)
@@ -371,34 +366,25 @@ pub(crate) fn parse_claude_jsonl(
                                     current_files.push(f.clone());
                                 }
 
-                                // Don't push tool to current_tools here in detailed mode —
-                                // tools come from tool_result processing for accurate is_error.
-                                // In non-detailed mode, push with is_error=false.
-                                if !detailed {
-                                    let command = if normalize_tool_name(tool_name) == "Bash" {
-                                        input.get("command").and_then(|v| v.as_str()).map(|s| {
-                                            if s.len() > 80 {
-                                                format!("{}...", truncate_str(s, 77))
-                                            } else {
-                                                s.to_string()
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    };
-
-                                    current_tools.push(ToolUse {
-                                        name: normalize_tool_name(tool_name).to_string(),
-                                        is_error: false,
-                                        file,
-                                        command,
-                                        output: None,
-                                    });
+                                // Recorded at call time so an in-flight call is visible;
+                                // in detailed mode its tool_result fills in the outcome.
+                                if detailed
+                                    && let Some(id) = block.get("id").and_then(Value::as_str)
+                                {
+                                    pending_tools.insert(id.to_string(), current_tools.len());
                                 }
+                                current_tools.push(ToolUse {
+                                    name: normalize_tool_name(tool_name).to_string(),
+                                    is_error: false,
+                                    file,
+                                    command: tool_call_detail(tool_name, &input),
+                                    output: None,
+                                });
                             }
                         }
                     } else if let Some(text) = content.as_str() {
                         current_action = text.to_string();
+                        final_start = 0;
                     }
                 }
             }
@@ -418,6 +404,7 @@ pub(crate) fn parse_claude_jsonl(
                 &current_errors,
                 current_last_was_error,
             ),
+            final_text: final_segment(&current_action, final_start),
             files: dedup_sorted_capped(&current_files, 5),
             timestamp: current_ts,
             tools: current_tools,
@@ -479,5 +466,92 @@ mod tests {
 
         let exchanges = parse_claude_jsonl(file.path(), 10, true).unwrap();
         assert_eq!(exchanges[0].tools[0].output.as_deref(), Some("/work"));
+    }
+
+    #[test]
+    fn final_text_files_and_details_follow_tool_calls() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let lines = [
+            json!({"type": "user", "sessionId": "s1", "cwd": "/repo",
+                   "message": {"role": "user", "content": "check the parser"}}),
+            json!({"type": "assistant", "sessionId": "s1", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "I'll look at the parser first."},
+                {"type": "tool_use", "id": "t1", "name": "Grep",
+                 "input": {"pattern": "fn parse", "path": "/repo/src"}},
+                {"type": "tool_use", "id": "t2", "name": "Read",
+                 "input": {"file_path": "/repo/src/parser.rs"}}
+            ]}}),
+            json!({"type": "user", "sessionId": "s1", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "src/parser.rs:1"},
+                {"type": "tool_result", "tool_use_id": "t2", "content": "fn parse() {}"}
+            ]}}),
+            json!({"type": "assistant", "sessionId": "s1", "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "The parser is fine."}
+            ]}}),
+        ];
+        std::fs::write(
+            file.path(),
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        for detailed in [false, true] {
+            let ex = &parse_claude_jsonl(file.path(), 10, detailed).unwrap()[0];
+            assert_eq!(ex.final_text, "The parser is fine.");
+            // Grep's directory is not a file; paths are relative to the session cwd.
+            assert_eq!(ex.files, ["src/parser.rs"]);
+            let details: Vec<_> = ex
+                .tools
+                .iter()
+                .map(|t| (t.name.as_str(), t.file.as_deref(), t.command.as_deref()))
+                .collect();
+            assert_eq!(
+                details,
+                [
+                    ("Grep", None, Some("fn parse")),
+                    ("Read", Some("src/parser.rs"), None)
+                ],
+                "detailed={detailed}"
+            );
+        }
+    }
+
+    #[test]
+    fn detailed_keeps_tool_calls_still_awaiting_results() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let lines = [
+            json!({"type": "user", "sessionId": "s1", "message": {"role": "user", "content": "run it"}}),
+            json!({"type": "assistant", "sessionId": "s1", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "echo done"}},
+                {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "sleep 100"}}
+            ]}}),
+            json!({"type": "user", "sessionId": "s1", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "done"}
+            ]}}),
+        ];
+        std::fs::write(
+            file.path(),
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let ex = &parse_claude_jsonl(file.path(), 10, true).unwrap()[0];
+        let tools: Vec<_> = ex
+            .tools
+            .iter()
+            .map(|t| (t.command.as_deref(), t.output.as_deref()))
+            .collect();
+        assert_eq!(
+            tools,
+            [(Some("echo done"), Some("done")), (Some("sleep 100"), None)]
+        );
     }
 }

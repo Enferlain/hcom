@@ -26,8 +26,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, extract_content_text, extract_edit_info,
-    finalize_action_text, is_error_result, normalize_tool_name, truncate_str,
+    Exchange, ToolUse, capture_tool_output, display_path, extract_content_text, extract_edit_info,
+    final_segment, finalize_action_text, is_error_result, normalize_tool_name, tool_call_detail,
+    tool_input_file, truncate_str,
 };
 
 /// In-progress turn accumulator.
@@ -43,6 +44,9 @@ struct Turn {
     files: Vec<String>,
     /// toolCallId → index into `tools`, for matching results back to calls.
     call_index: HashMap<String, usize>,
+    /// Where the text after the latest tool call starts in `text`.
+    final_start: usize,
+    tool_since_text: bool,
 }
 
 /// Parse a Kimi `wire.jsonl` into exchanges.
@@ -106,6 +110,9 @@ pub fn parse_kimi_wire_jsonl(
                         match part.get("type").and_then(Value::as_str).unwrap_or("") {
                             "text" => {
                                 if let Some(s) = part.get("text").and_then(Value::as_str) {
+                                    if std::mem::take(&mut t.tool_since_text) {
+                                        t.final_start = t.text.len();
+                                    }
                                     t.text.push_str(s);
                                 }
                             }
@@ -129,14 +136,9 @@ pub fn parse_kimi_wire_jsonl(
                         {
                             obj.insert("file_path".into(), p);
                         }
-                        let file = aliased
-                            .get("file_path")
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                        let command = aliased
-                            .get("command")
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
+                        t.tool_since_text = true;
+                        let file = tool_input_file(name, &args).map(|f| display_path(f, None));
+                        let command = tool_call_detail(name, &args);
                         if let Some(f) = &file
                             && !t.files.contains(f)
                         {
@@ -215,6 +217,7 @@ fn build_exchange(t: Turn, position: usize, detailed: bool) -> Exchange {
         position,
         user: t.user,
         action,
+        final_text: final_segment(&t.text, t.final_start),
         files: t.files,
         timestamp: String::new(),
         tools: t.tools,

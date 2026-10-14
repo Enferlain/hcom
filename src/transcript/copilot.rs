@@ -10,8 +10,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, dedup_sorted_capped, finalize_action_text,
-    normalize_tool_name, read_file_lossy, same_trimmed_text, truncate_str,
+    Exchange, ToolUse, capture_tool_output, dedup_sorted_capped, display_path, final_segment,
+    finalize_action_text, normalize_tool_name, read_file_lossy, same_trimmed_text, tool_input_file,
+    truncate_str,
 };
 
 fn data_text(data: &Value) -> String {
@@ -41,24 +42,6 @@ fn tool_input(data: &Value) -> Value {
         .unwrap_or_default()
 }
 
-fn tool_file(input: &Value) -> Option<String> {
-    let obj = input.as_object()?;
-    for field in ["path", "file_path", "file"] {
-        if let Some(val) = obj.get(field).and_then(Value::as_str)
-            && !val.is_empty()
-        {
-            return Some(
-                Path::new(val)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(val)
-                    .to_string(),
-            );
-        }
-    }
-    None
-}
-
 fn tool_command(input: &Value) -> Option<String> {
     input
         .get("command")
@@ -86,6 +69,9 @@ pub(crate) fn parse_copilot_jsonl(
     let mut timestamp = String::new();
     let mut position = 0usize;
     let mut in_exchange = false;
+    // Where the text after the latest tool call starts in `current_action`.
+    let mut final_start = 0usize;
+    let mut tool_since_text = false;
 
     let flush = |exchanges: &mut Vec<Exchange>,
                  position: &mut usize,
@@ -97,7 +83,9 @@ pub(crate) fn parse_copilot_jsonl(
                  errors: &mut Vec<Value>,
                  last_was_error: &mut bool,
                  call_index: &mut HashMap<String, usize>,
-                 ts: &mut String| {
+                 ts: &mut String,
+                 final_start: &mut usize,
+                 tool_since_text: &mut bool| {
         if !user.is_empty() || !action.is_empty() {
             *position += 1;
             let final_action = finalize_action_text(action, tools, errors, *last_was_error);
@@ -105,6 +93,7 @@ pub(crate) fn parse_copilot_jsonl(
                 position: *position,
                 user: std::mem::take(user),
                 action: final_action,
+                final_text: final_segment(action, *final_start),
                 files: dedup_sorted_capped(files, 5),
                 timestamp: std::mem::take(ts),
                 tools: std::mem::take(tools),
@@ -116,6 +105,8 @@ pub(crate) fn parse_copilot_jsonl(
             files.clear();
             call_index.clear();
             *last_was_error = false;
+            *final_start = 0;
+            *tool_since_text = false;
         }
         *in_exchange = false;
     };
@@ -151,6 +142,8 @@ pub(crate) fn parse_copilot_jsonl(
                     &mut current_last_was_error,
                     &mut call_index,
                     &mut timestamp,
+                    &mut final_start,
+                    &mut tool_since_text,
                 );
                 current_user = text;
                 timestamp = entry
@@ -166,6 +159,9 @@ pub(crate) fn parse_copilot_jsonl(
                     if !current_action.is_empty() {
                         current_action.push_str("\n\n");
                     }
+                    if std::mem::take(&mut tool_since_text) {
+                        final_start = current_action.len();
+                    }
                     current_action.push_str(&text);
                     in_exchange = true;
                 }
@@ -177,7 +173,8 @@ pub(crate) fn parse_copilot_jsonl(
                 }
                 let input = tool_input(data);
                 let normalized = normalize_tool_name(&name).to_string();
-                let file = tool_file(&input);
+                tool_since_text = true;
+                let file = tool_input_file(&name, &input).map(|f| display_path(f, None));
                 if let Some(file) = &file {
                     current_files.push(file.clone());
                 }
@@ -240,6 +237,8 @@ pub(crate) fn parse_copilot_jsonl(
         &mut current_last_was_error,
         &mut call_index,
         &mut timestamp,
+        &mut final_start,
+        &mut tool_since_text,
     );
 
     if last > 0 && exchanges.len() > last {

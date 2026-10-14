@@ -11,6 +11,11 @@ pub struct Exchange {
     pub position: usize,
     pub user: String,
     pub action: String,
+    /// Assistant text after the turn's last tool call: the conclusion of a
+    /// finished turn, the latest note of a running one. Summaries use it so
+    /// they show results rather than an opening "Let me check…". Empty when
+    /// the parser can't tell, in which case summaries fall back to `action`.
+    pub final_text: String,
     pub files: Vec<String>,
     pub timestamp: String,
     pub tools: Vec<ToolUse>,
@@ -203,6 +208,63 @@ pub(crate) fn normalize_tool_name(name: &str) -> &str {
         "skill" => "Skill",
         _ => name,
     }
+}
+
+/// `action[start..]` as an exchange's `final_text`; empty when the final text
+/// is the whole action (start 0), so summaries fall back to `action` itself.
+pub(crate) fn final_segment(action: &str, start: usize) -> String {
+    if start == 0 {
+        String::new()
+    } else {
+        action.get(start..).unwrap_or("").trim().to_string()
+    }
+}
+
+/// Path of the file a tool call works on. The directory argument of a
+/// search/list tool is not a file, so it is ignored.
+pub(crate) fn tool_input_file<'a>(tool: &str, input: &'a Value) -> Option<&'a str> {
+    let keys: &[&str] = if matches!(normalize_tool_name(tool), "Grep" | "Glob" | "LS") {
+        &["file_path", "filePath", "notebook_path"]
+    } else {
+        &["file_path", "filePath", "notebook_path", "path", "file"]
+    };
+    keys.iter()
+        .find_map(|key| input.get(*key)?.as_str())
+        .filter(|path| !path.is_empty())
+}
+
+/// A file path as shown in FILES and tool details: relative to the session's
+/// working directory when under it, `~/`-abbreviated otherwise.
+pub(crate) fn display_path(path: &str, cwd: Option<&str>) -> String {
+    let p = Path::new(path);
+    if let Some(cwd) = cwd.filter(|c| !c.is_empty())
+        && let Ok(rel) = p.strip_prefix(cwd)
+        && !rel.as_os_str().is_empty()
+    {
+        return rel.display().to_string();
+    }
+    if let Some(home) = dirs::home_dir()
+        && let Ok(rel) = p.strip_prefix(&home)
+        && !rel.as_os_str().is_empty()
+    {
+        return format!("~/{}", rel.display());
+    }
+    path.to_string()
+}
+
+/// The argument that identifies a non-file tool call: shell command, search
+/// pattern, URL, subagent task. Kept whole so search sees all of it; display
+/// shortens it.
+pub(crate) fn tool_call_detail(tool: &str, input: &Value) -> Option<String> {
+    let key = match normalize_tool_name(tool) {
+        "Bash" => "command",
+        "Grep" | "Glob" => "pattern",
+        "WebFetch" => "url",
+        "WebSearch" => "query",
+        "Agent" | "Task" => "description",
+        _ => return None,
+    };
+    input.get(key)?.as_str().map(str::to_string)
 }
 
 pub(crate) fn summarize_tool_names(tools: &[ToolUse]) -> String {
@@ -445,7 +507,7 @@ pub fn format_exchanges(exchanges: &[Exchange], full: bool, detailed: bool) -> S
         let action_text = if full {
             ex.action.clone()
         } else {
-            summarize_action(&ex.action)
+            summarize_exchange(ex)
         };
 
         lines.push(format!("[{}] USER: {}", ex.position, user_text));
@@ -462,7 +524,8 @@ pub fn format_exchanges(exchanges: &[Exchange], full: bool, detailed: bool) -> S
                     .file
                     .as_deref()
                     .or(tool.command.as_deref())
-                    .unwrap_or("");
+                    .map(|d| single_line_ellipsized(d, 80))
+                    .unwrap_or_default();
                 lines.push(format!("{marker} {} {detail}", tool.name));
                 if let Some(output) = &tool.output
                     && !output.trim().is_empty()
@@ -554,12 +617,21 @@ fn single_line_ellipsized(text: &str, max: usize) -> String {
     }
 }
 
-/// Summarize action text (first 3 lines, strip prefixes).
+/// One-line summary of an exchange's response, from its final text when known.
+pub fn summarize_exchange(ex: &Exchange) -> String {
+    if ex.final_text.trim().is_empty() {
+        summarize_action(&ex.action)
+    } else {
+        summarize_action(&ex.final_text)
+    }
+}
+
+/// Summarize action text (first 3 lines).
 pub fn summarize_action(text: &str) -> String {
     if text.is_empty() {
         return "(no response)".to_string();
     }
-    let mut lines: Vec<String> = text
+    let lines: Vec<String> = text
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
@@ -567,13 +639,6 @@ pub fn summarize_action(text: &str) -> String {
         .collect();
     if lines.is_empty() {
         return "(no response)".to_string();
-    }
-    // Strip common prefixes
-    for prefix in &["I'll ", "I will ", "Let me ", "Sure, ", "Okay, ", "OK, "] {
-        if lines[0].starts_with(prefix) {
-            lines[0] = lines[0][prefix.len()..].to_string();
-            break;
-        }
     }
     let summary = lines.join(" ");
     if summary.len() > 200 {
@@ -594,6 +659,7 @@ mod tests {
             position: 1,
             user: "question".to_string(),
             action: "answer".to_string(),
+            final_text: String::new(),
             files: vec!["a.rs".to_string()],
             timestamp: String::new(),
             tools: vec![ToolUse {
@@ -649,5 +715,67 @@ mod tests {
         assert_eq!(capture_tool_output("  \n"), None);
         let captured = capture_tool_output(&"x".repeat(2_000)).unwrap();
         assert_eq!(captured.len(), TOOL_OUTPUT_CAPTURE_MAX);
+    }
+
+    #[test]
+    fn tool_input_file_ignores_search_directories() {
+        let grep = json!({"pattern": "fn main", "path": "/repo/src"});
+        assert_eq!(tool_input_file("Grep", &grep), None);
+        assert_eq!(tool_input_file("grep_search", &grep), None);
+        let read = json!({"path": "/repo/src/main.rs"});
+        assert_eq!(
+            tool_input_file("read_file", &read),
+            Some("/repo/src/main.rs")
+        );
+        let notebook = json!({"notebook_path": "/repo/n.ipynb"});
+        assert_eq!(
+            tool_input_file("NotebookEdit", &notebook),
+            Some("/repo/n.ipynb")
+        );
+    }
+
+    #[test]
+    fn display_path_is_relative_to_cwd_then_home() {
+        assert_eq!(display_path("/repo/src/a.rs", Some("/repo")), "src/a.rs");
+        assert_eq!(display_path("/repo", Some("/repo")), "/repo");
+        assert_eq!(
+            display_path("/elsewhere/a.rs", Some("/repo")),
+            "/elsewhere/a.rs"
+        );
+        assert_eq!(display_path("rel/a.rs", None), "rel/a.rs");
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join("x/a.rs");
+            assert_eq!(
+                display_path(path.to_str().unwrap(), Some("/repo")),
+                "~/x/a.rs"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_detail_names_the_call() {
+        assert_eq!(
+            tool_call_detail("Grep", &json!({"pattern": "TODO", "path": "."})).as_deref(),
+            Some("TODO")
+        );
+        assert_eq!(
+            tool_call_detail("Agent", &json!({"description": "review branch"})).as_deref(),
+            Some("review branch")
+        );
+        assert_eq!(tool_call_detail("Read", &json!({"file_path": "/a"})), None);
+    }
+
+    #[test]
+    fn summary_prefers_final_text() {
+        let mut ex = exchange();
+        ex.action = "I'll check the tests first.\nAll 12 tests pass.".to_string();
+        assert_eq!(
+            summarize_exchange(&ex),
+            "I'll check the tests first. All 12 tests pass."
+        );
+        ex.final_text = "All 12 tests pass.".to_string();
+        assert_eq!(summarize_exchange(&ex), "All 12 tests pass.");
+        assert_eq!(final_segment("abc def", 0), "");
+        assert_eq!(final_segment("abc\n def", 4), "def");
     }
 }

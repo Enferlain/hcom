@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 
 use crate::tool::Tool;
 
-pub use shared::{Exchange, ToolUse, flag_hint, format_exchanges, summarize_action};
+pub use shared::{
+    Exchange, ToolUse, flag_hint, format_exchanges, summarize_action, summarize_exchange,
+};
 
 pub(crate) use opencode::TranscriptSearchMatch;
 
@@ -40,6 +42,14 @@ pub enum TranscriptBackend {
     CopilotJsonl,
     PiJsonl,
     GrokUpdatesJsonl,
+}
+
+impl TranscriptBackend {
+    /// One database file holds every session, so a transcript is the
+    /// (path, session_id) pair rather than the path alone.
+    pub fn is_shared_database(self) -> bool {
+        matches!(self, Self::OpenCodeSqlite)
+    }
 }
 
 /// Where `transcript search --all` discovers sessions for a tool.
