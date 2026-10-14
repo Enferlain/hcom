@@ -199,6 +199,7 @@ pub struct Agent {
     pub sync_age: Option<String>,
     pub headless: bool,
     pub session_id: Option<String>,
+    pub transcript_path: Option<String>,
     pub pid: Option<u32>,
     pub terminal_preset: Option<String>,
 }
@@ -949,6 +950,7 @@ mod tests {
             sync_age: None,
             headless: false,
             session_id: None,
+            transcript_path: None,
             pid: None,
             terminal_preset: None,
         }

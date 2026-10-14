@@ -368,7 +368,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
         "SELECT name, tool, status, status_context, status_detail,
                 created_at, status_time, last_stop, tcp_mode,
                 directory, tag, last_event_id, origin_device_id,
-                pid, session_id, background, terminal_preset_effective
+                pid, session_id, background, terminal_preset_effective, transcript_path
          FROM instances ORDER BY created_at DESC",
     ) {
         Ok(s) => s,
@@ -394,6 +394,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
             row.get::<_, Option<String>>(14)?, // session_id
             row.get::<_, Option<i64>>(15)?,    // background (headless)
             row.get::<_, Option<String>>(16)?, // terminal_preset_effective
+            row.get::<_, Option<String>>(17)?, // transcript_path
         ))
     }) {
         Ok(r) => r,
@@ -426,6 +427,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
             session_id,
             background,
             terminal_preset,
+            transcript_path,
         ) = row;
 
         let ctx = ctx.unwrap_or_default();
@@ -504,6 +506,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
             sync_age,
             pid: pid.map(|p| p as u32),
             session_id: session_id.filter(|s| !s.is_empty()),
+            transcript_path: transcript_path.filter(|s| !s.is_empty()),
             headless: background != 0,
             terminal_preset,
         };
@@ -739,7 +742,16 @@ fn load_stopped(conn: &Connection, now: f64, max_age_secs: Option<f64>) -> Vec<A
             device_name: None,
             sync_age: None,
             headless: false,
-            session_id: None,
+            session_id: snapshot
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            transcript_path: snapshot
+                .get("transcript_path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
             pid: None,
             terminal_preset: None,
         });
@@ -1670,6 +1682,7 @@ mod tests {
             sync_age: None,
             headless: false,
             session_id: None,
+            transcript_path: None,
             pid: None,
             terminal_preset: None,
         }
@@ -1807,7 +1820,8 @@ mod tests {
                 pid INTEGER,
                 session_id TEXT,
                 background INTEGER,
-                terminal_preset_effective TEXT
+                terminal_preset_effective TEXT,
+                transcript_path TEXT
             );
             CREATE TABLE kv (key TEXT, value TEXT);
             ",

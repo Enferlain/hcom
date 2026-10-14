@@ -169,6 +169,7 @@ mod tests {
             last_event_id: None,
             headless: false,
             session_id: None,
+            transcript_path: None,
             pid: None,
             terminal_preset: None,
         }

@@ -21,6 +21,7 @@ pub struct App {
     pub ejector: Ejector,
     pub(crate) source: Box<dyn DataSource>,
     pub(crate) rpc_client: Option<RpcClient>,
+    pub(crate) usage: crate::tui::usage::UsageWorker,
 }
 
 impl Default for App {
@@ -39,6 +40,7 @@ impl App {
             data,
             source,
             rpc_client,
+            usage: Default::default(),
             ejector: Ejector::new(),
             ui: UiState {
                 cursor: 0,
@@ -213,6 +215,13 @@ impl App {
         let mut resize_cooldown: u8 = 0;
 
         loop {
+            if is_inline {
+                let agent = match self.cursor_target() {
+                    CursorTarget::Agent(idx) => self.data.agents.get(idx),
+                    _ => None,
+                };
+                dirty |= self.usage.poll(agent);
+            }
             if self.drain_rpc_results() {
                 dirty = true;
             }
@@ -391,6 +400,7 @@ mod tests {
             sync_age: None,
             headless: false,
             session_id: None,
+            transcript_path: None,
             pid: None,
             terminal_preset: None,
         }
@@ -471,6 +481,7 @@ mod tests {
             ejector: Ejector::new(),
             source: Box::new(NullSource),
             rpc_client: None,
+            usage: Default::default(),
         }
     }
 

@@ -985,6 +985,23 @@ fn build_agent_detail(agent: &Agent, app: &App, lines: &mut Vec<Line<'static>>, 
         Span::styled(" \u{00b7} ", Theme::separator()),
         Span::styled(age, Theme::agent_dim()),
     ];
+    if let Some((context, fresh)) = app.usage.context(agent)
+        && let context = format!("ctx:{context}")
+        && left.iter().map(Span::width).sum::<usize>()
+            + 3
+            + UnicodeWidthStr::width(context.as_str())
+            + UnicodeWidthStr::width(format!("created {}  ", created).as_str())
+            <= width
+    {
+        left.push(Span::styled(" · ", Theme::separator()));
+        // Darker until the refresh after selecting this agent lands.
+        let style = if fresh {
+            Theme::agent_dim()
+        } else {
+            Theme::separator()
+        };
+        left.push(Span::styled(context, style));
+    }
     let created_label = format!("created {}", created);
     let right: Vec<Span<'static>> = vec![
         Span::styled(created_label, Theme::agent_dim()),
@@ -1088,4 +1105,48 @@ fn build_orphan_detail(orphan: &OrphanProcess, lines: &mut Vec<Line<'static>>, _
         Span::styled(" \u{00b7} ", Theme::separator()),
         Span::styled(orphan.age_display(), Theme::dim()),
     ]));
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn context_stays_in_heading_and_is_omitted_when_narrow() {
+        crate::config::Config::init();
+        let mut app = App::new();
+        let mut agent = crate::tui::test_helpers::make_test_agent("nahe", 3240.0);
+        agent.tool = crate::tui::model::Tool::Qoder;
+        agent.status_time = agent.created_at;
+        agent.transcript_path = Some("/test/session.jsonl".into());
+        for context in ["100k/200k", "100k"] {
+            app.usage.set_context_for_test(&agent, context);
+            let mut lines = Vec::new();
+            build_agent_detail(&agent, &app, &mut lines, 120);
+            assert_eq!(lines.len(), 3);
+            let heading = lines[0].to_string();
+            assert!(
+                heading.contains(&format!("nahe · qoder · 54m · ctx:{context}")),
+                "{heading}"
+            );
+            assert!(!lines[1].to_string().contains(context));
+            let style_of = |lines: &[Line]| {
+                lines[0]
+                    .spans
+                    .iter()
+                    .find(|s| s.content == format!("ctx:{context}"))
+                    .unwrap()
+                    .style
+            };
+            assert_eq!(style_of(&lines), Theme::agent_dim());
+            app.usage.mark_stale_for_test();
+            lines.clear();
+            build_agent_detail(&agent, &app, &mut lines, 120);
+            assert_eq!(style_of(&lines), Theme::separator());
+            lines.clear();
+            build_agent_detail(&agent, &app, &mut lines, 40);
+            assert!(!lines[0].to_string().contains(context));
+            assert!(lines[0].to_string().contains("nahe · qoder · 54m"));
+        }
+    }
 }

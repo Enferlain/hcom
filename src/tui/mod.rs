@@ -12,6 +12,7 @@ pub mod rpc_async;
 pub mod state;
 pub mod status;
 pub mod theme;
+mod usage;
 
 use std::io::{Write, stdout};
 
@@ -324,6 +325,7 @@ pub mod test_helpers {
             sync_age: None,
             headless: false,
             session_id: None,
+            transcript_path: None,
             pid: None,
             terminal_preset: None,
         }
