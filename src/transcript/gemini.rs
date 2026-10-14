@@ -5,9 +5,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, display_path, extract_gemini_user_text,
-    extract_text_content, finalize_action_text, normalize_tool_name, read_file_lossy,
-    tool_call_detail, tool_input_file, truncate_str,
+    Exchange, TokenUsage, ToolUse, Transcript, UsageCollector, capture_tool_output, display_path,
+    extract_gemini_user_text, extract_text_content, finalize_action_text, normalize_tool_name,
+    read_file_lossy, token_counter, tool_call_detail, tool_input_file, truncate_str,
 };
 
 fn tool_output(tool_call: &Value) -> Option<String> {
@@ -38,7 +38,15 @@ fn tool_output(tool_call: &Value) -> Option<String> {
 }
 
 /// Parse Gemini JSON transcript.
+#[cfg(test)]
 pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange>, String> {
+    let mut transcript = parse_gemini_json_with_usage(path)?;
+    transcript.truncate(last);
+    Ok(transcript.exchanges)
+}
+
+pub(crate) fn parse_gemini_json_with_usage(path: &Path) -> Result<Transcript, String> {
+    let mut usage = UsageCollector::default();
     let content = read_file_lossy(path)?;
 
     let mut messages: Vec<Value> = Vec::new();
@@ -92,6 +100,7 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
             if !current_user.is_empty() || !current_action.is_empty() {
                 position += 1;
                 exchanges.push(Exchange {
+                    usage: None,
                     position,
                     user: current_user.clone(),
                     action: finalize_action_text(
@@ -119,6 +128,27 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
             current_last_was_error = false;
             current_ts = ts;
         } else if msg_type == "gemini" || msg_type == "model" {
+            if let Some(raw) = msg.get("tokens").filter(|v| v.is_object()) {
+                let cached = token_counter(raw, "cached");
+                let thoughts = raw.get("thoughts").and_then(Value::as_u64);
+                let tokens = TokenUsage {
+                    // `tool` is prompt spent on tool use, outside `input`.
+                    input: token_counter(raw, "input")
+                        .saturating_sub(cached)
+                        .saturating_add(token_counter(raw, "tool")),
+                    output: token_counter(raw, "output").saturating_add(thoughts.unwrap_or(0)),
+                    cache_read: cached,
+                    cache_write: 0,
+                    reasoning: thoughts,
+                };
+                usage.record(
+                    tokens,
+                    Some(token_counter(raw, "input")),
+                    None,
+                    msg.get("model").and_then(Value::as_str),
+                    (!current_user.is_empty()).then_some(exchanges.len()),
+                );
+            }
             let text = extract_text_content(msg);
             if !text.is_empty() {
                 if !current_action.is_empty() {
@@ -176,6 +206,7 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
     if !current_user.is_empty() || !current_action.is_empty() {
         position += 1;
         exchanges.push(Exchange {
+            usage: None,
             position,
             user: current_user,
             action: finalize_action_text(
@@ -194,12 +225,7 @@ pub(crate) fn parse_gemini_json(path: &Path, last: usize) -> Result<Vec<Exchange
         });
     }
 
-    if exchanges.len() > last {
-        let start = exchanges.len() - last;
-        exchanges = exchanges[start..].to_vec();
-    }
-
-    Ok(exchanges)
+    Ok(usage.attach(exchanges))
 }
 
 #[cfg(test)]

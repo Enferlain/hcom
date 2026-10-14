@@ -5,9 +5,122 @@ use std::path::Path;
 use regex::Regex;
 use serde_json::{Value, json};
 
+/// Disjoint counters: input excludes cache; reasoning is a subset of output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub reasoning: Option<u64>,
+}
+impl TokenUsage {
+    pub fn is_zero(&self) -> bool {
+        self.input == 0
+            && self.output == 0
+            && self.cache_read == 0
+            && self.cache_write == 0
+            && self.reasoning.unwrap_or(0) == 0
+    }
+    pub fn saturating_sub(self, previous: Self) -> Self {
+        Self {
+            input: self.input.saturating_sub(previous.input),
+            output: self.output.saturating_sub(previous.output),
+            cache_read: self.cache_read.saturating_sub(previous.cache_read),
+            cache_write: self.cache_write.saturating_sub(previous.cache_write),
+            reasoning: self
+                .reasoning
+                .map(|v| v.saturating_sub(previous.reasoning.unwrap_or(0))),
+        }
+    }
+}
+impl std::ops::AddAssign for TokenUsage {
+    fn add_assign(&mut self, rhs: Self) {
+        self.input = self.input.saturating_add(rhs.input);
+        self.output = self.output.saturating_add(rhs.output);
+        self.cache_read = self.cache_read.saturating_add(rhs.cache_read);
+        self.cache_write = self.cache_write.saturating_add(rhs.cache_write);
+        if let Some(v) = rhs.reasoning {
+            self.reasoning = Some(self.reasoning.unwrap_or(0).saturating_add(v));
+        }
+    }
+}
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct SessionUsage {
+    pub tokens: TokenUsage,
+    pub context_tokens: Option<u64>,
+    /// Fraction of the context window, when only a ratio is recorded.
+    pub context_usage_ratio: Option<f64>,
+    pub context_window: Option<u64>,
+    pub cost_usd: Option<f64>,
+    pub model: Option<String>,
+}
+#[derive(Debug, Clone, Default)]
+pub struct Transcript {
+    pub exchanges: Vec<Exchange>,
+    pub usage: Option<SessionUsage>,
+}
+impl Transcript {
+    pub(crate) fn truncate(&mut self, last: usize) {
+        if last > 0 && self.exchanges.len() > last {
+            self.exchanges = self.exchanges.split_off(self.exchanges.len() - last);
+        }
+    }
+}
+/// Accumulates calls during parsing, including calls outside visible exchanges.
+#[derive(Default)]
+pub(crate) struct UsageCollector {
+    pub session: Option<SessionUsage>,
+    exchanges: std::collections::HashMap<usize, TokenUsage>,
+}
+impl UsageCollector {
+    pub fn record(
+        &mut self,
+        tokens: TokenUsage,
+        context: Option<u64>,
+        cost: Option<f64>,
+        model: Option<&str>,
+        exchange: Option<usize>,
+    ) -> &mut SessionUsage {
+        if let Some(index) = exchange
+            && !tokens.is_zero()
+        {
+            *self.exchanges.entry(index).or_default() += tokens;
+        }
+        let session = self.session.get_or_insert_with(SessionUsage::default);
+        session.tokens += tokens;
+        // A call that omits context keeps the last known value.
+        if context.is_some() {
+            session.context_tokens = context;
+        }
+        if let Some(cost) = cost {
+            session.cost_usd = Some(session.cost_usd.unwrap_or(0.0) + cost);
+        }
+        if let Some(model) = model {
+            session.model = Some(model.to_owned());
+        }
+        session
+    }
+    pub fn attach(self, mut exchanges: Vec<Exchange>) -> Transcript {
+        for (index, tokens) in self.exchanges {
+            if let Some(ex) = exchanges.get_mut(index) {
+                ex.usage = Some(tokens);
+            }
+        }
+        Transcript {
+            exchanges,
+            usage: self.session,
+        }
+    }
+}
+pub(crate) fn token_counter(value: &Value, key: &str) -> u64 {
+    value.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
 /// An exchange in a transcript.
 #[derive(Debug, Clone)]
 pub struct Exchange {
+    pub usage: Option<TokenUsage>,
     pub position: usize,
     pub user: String,
     pub action: String,
@@ -349,6 +462,9 @@ pub(crate) fn merge_exchange_metadata(dst: &mut Exchange, src: Exchange) {
     for error in src.errors {
         dst.errors.push(error);
     }
+    if let Some(usage) = src.usage {
+        *dst.usage.get_or_insert_with(TokenUsage::default) += usage;
+    }
     dst.ended_on_error = src.ended_on_error;
 }
 
@@ -495,6 +611,19 @@ pub(crate) fn read_file_lossy(path: &Path) -> Result<String, String> {
 
 /// Format exchanges for display.
 pub fn format_exchanges(exchanges: &[Exchange], full: bool, detailed: bool) -> String {
+    format_exchanges_inner(exchanges, full, detailed, false)
+}
+
+pub fn format_transcript_exchanges(exchanges: &[Exchange], full: bool, detailed: bool) -> String {
+    format_exchanges_inner(exchanges, full, detailed, true)
+}
+
+fn format_exchanges_inner(
+    exchanges: &[Exchange],
+    full: bool,
+    detailed: bool,
+    show_usage: bool,
+) -> String {
     let mut lines = Vec::new();
 
     for ex in exchanges {
@@ -583,6 +712,19 @@ pub fn format_exchanges(exchanges: &[Exchange], full: bool, detailed: bool) -> S
                     single_line_ellipsized(content, 400)
                 ));
             }
+            if show_usage && let Some(usage) = ex.usage {
+                let reasoning = usage.reasoning.map_or_else(String::new, |tokens| {
+                    format!(" ({} reasoning)", format_token_count(tokens))
+                });
+                lines.push(format!(
+                    "  tokens: {} in · {} out{} · {} cache read · {} cache write",
+                    format_token_count(usage.input),
+                    format_token_count(usage.output),
+                    reasoning,
+                    format_token_count(usage.cache_read),
+                    format_token_count(usage.cache_write),
+                ));
+            }
         }
 
         lines.push(String::new()); // blank line between exchanges
@@ -656,6 +798,7 @@ mod tests {
 
     fn exchange() -> Exchange {
         Exchange {
+            usage: None,
             position: 1,
             user: "question".to_string(),
             action: "answer".to_string(),
@@ -682,6 +825,29 @@ mod tests {
         assert!(rendered.contains("Δ EDIT a.rs: -old +new"));
         assert!(rendered.contains("✗ ERROR Bash: exit 1"));
         assert!(!rendered.contains("Note:"));
+    }
+
+    #[test]
+    fn detailed_usage_keeps_reasoning_inside_output_and_preserves_missing_usage() {
+        let mut ex = exchange();
+        ex.usage = Some(TokenUsage {
+            input: 41_000,
+            output: 2_100,
+            cache_read: 380_000,
+            cache_write: 500,
+            reasoning: Some(1_000),
+        });
+        let rendered = format_transcript_exchanges(std::slice::from_ref(&ex), true, true);
+        assert!(rendered.contains(
+            "  tokens: 41k in · 2.1k out (1k reasoning) · 380k cache read · 500 cache write"
+        ));
+        assert!(
+            !format_transcript_exchanges(std::slice::from_ref(&ex), true, false)
+                .contains("tokens:")
+        );
+        assert!(!format_exchanges(std::slice::from_ref(&ex), true, true).contains("tokens:"));
+        ex.usage = None;
+        assert!(!format_transcript_exchanges(&[ex], true, true).contains("tokens:"));
     }
 
     #[test]
@@ -777,5 +943,124 @@ mod tests {
         assert_eq!(summarize_exchange(&ex), "All 12 tests pass.");
         assert_eq!(final_segment("abc def", 0), "");
         assert_eq!(final_segment("abc\n def", 4), "def");
+    }
+}
+
+/// Compact token count for shared usage summaries.
+fn format_token_count(tokens: u64) -> String {
+    let (value, suffix) = if tokens >= 1_000_000 {
+        (tokens as f64 / 1_000_000.0, "M")
+    } else if tokens >= 1_000 {
+        (tokens as f64 / 1_000.0, "k")
+    } else {
+        return tokens.to_string();
+    };
+    let number = format!("{value:.1}");
+    format!("{}{suffix}", number.strip_suffix(".0").unwrap_or(&number))
+}
+
+/// Latest recorded context, with a window only when the tool supplied one.
+pub fn format_context(usage: &SessionUsage) -> Option<String> {
+    let Some(tokens) = usage.context_tokens else {
+        return usage
+            .context_usage_ratio
+            .filter(|ratio| ratio.is_finite() && (0.0..=1.0).contains(ratio))
+            .map(|ratio| format!("{:.0}%", ratio * 100.0));
+    };
+    let context = format_token_count(tokens);
+    Some(match usage.context_window {
+        Some(window) => format!("{context}/{}", format_token_count(window)),
+        None => context,
+    })
+}
+
+/// Whole-session usage; costs and context are shown only when recorded.
+///
+/// Leads with tokens the model newly processed (input, cache writes, output);
+/// cache reads usually dwarf them, so they are listed separately.
+pub fn format_usage(usage: &SessionUsage) -> String {
+    let tokens = usage.tokens;
+    let processed = tokens
+        .input
+        .saturating_add(tokens.cache_write)
+        .saturating_add(tokens.output);
+    let mut parts = Vec::new();
+    // Some tools (Qoder) record all-zero counters next to a context ratio.
+    if processed > 0 || tokens.cache_read > 0 {
+        let mut part = format!("{} tok", format_token_count(processed));
+        if tokens.cache_read > 0 {
+            part.push_str(&format!(
+                " + {} cached",
+                format_token_count(tokens.cache_read)
+            ));
+        }
+        parts.push(part);
+    }
+    if let Some(context) = format_context(usage) {
+        let percent = match (usage.context_tokens, usage.context_window) {
+            (Some(context), Some(window)) if window > 0 => {
+                format!(" ({:.0}%)", context as f64 / window as f64 * 100.0)
+            }
+            _ => String::new(),
+        };
+        parts.push(format!("ctx {context}{percent}"));
+    }
+    // Zero is a free model or a subscription, not a figure worth showing.
+    if let Some(cost) = usage.cost_usd.filter(|cost| *cost > 0.0) {
+        parts.push(format!("${cost:.2}"));
+    }
+    if parts.is_empty() {
+        parts.push("0 tok".to_string());
+    }
+    parts.join(" · ")
+}
+
+#[cfg(test)]
+mod usage_format_tests {
+    use super::*;
+    #[test]
+    fn formats_recorded_context_and_disjoint_totals() {
+        let mut usage = SessionUsage {
+            tokens: TokenUsage {
+                input: 100_000,
+                output: 10_000,
+                cache_read: 100_000,
+                reasoning: Some(5_000),
+                ..Default::default()
+            },
+            context_tokens: Some(100_000),
+            context_window: Some(110_000),
+            cost_usd: Some(0.42),
+            ..Default::default()
+        };
+        assert_eq!(format_context(&usage).as_deref(), Some("100k/110k"));
+        assert_eq!(
+            format_usage(&usage),
+            "110k tok + 100k cached · ctx 100k/110k (91%) · $0.42"
+        );
+        usage.context_window = None;
+        assert_eq!(format_context(&usage).as_deref(), Some("100k"));
+        usage.context_tokens = None;
+        usage.cost_usd = None;
+        assert_eq!(format_context(&usage), None);
+        assert_eq!(format_usage(&usage), "110k tok + 100k cached");
+        usage.tokens.cache_read = 0;
+        assert_eq!(format_usage(&usage), "110k tok");
+        usage.tokens = TokenUsage::default();
+        assert_eq!(format_usage(&usage), "0 tok");
+        usage.cost_usd = Some(0.0);
+        assert_eq!(format_usage(&usage), "0 tok", "zero cost is not shown");
+        usage.cost_usd = None;
+        usage.context_usage_ratio = Some(0.33);
+        assert_eq!(format_usage(&usage), "ctx 33%");
+    }
+    #[test]
+    fn zero_window_does_not_divide_by_zero() {
+        let usage = SessionUsage {
+            context_tokens: Some(0),
+            context_window: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(format_usage(&usage), "ctx 0/0");
     }
 }

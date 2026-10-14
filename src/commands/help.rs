@@ -219,10 +219,13 @@ const LIST_HELP: &[HelpEntry] = &[
     ),
     ("", "  launch_context"),
     ("", ""),
-    ("list [self|<name>]", "Single agent details"),
+    (
+        "list [self|<name>]",
+        "Single agent details, including recorded session usage",
+    ),
     (
         "  [field]",
-        "Print specific field (status, directory, session_id, ...)",
+        "Print specific field (status, directory, session_id, usage, ...)",
     ),
     ("  --json", "Output as JSON"),
     ("  --sh", "Shell exports: eval \"$(hcom list self --sh)\""),
@@ -669,7 +672,10 @@ const TRANSCRIPT_HELP: &[HelpEntry] = &[
     ),
     ("  --last N", "Show the last N exchanges (default: 10)"),
     ("  --full", "Show complete assistant responses"),
-    ("  --detailed", "Show tool I/O, file edits, errors"),
+    (
+        "  --detailed",
+        "Show tool I/O, file edits, errors, token usage",
+    ),
     ("  --json", "JSON output"),
     ("", ""),
     (

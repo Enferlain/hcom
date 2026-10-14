@@ -5,10 +5,11 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, codex_is_error, collapse_codex_duplicate_exchanges,
-    dedup_sorted_capped, display_path, extract_codex_event_message_text, extract_text_content,
-    final_segment, finalize_action_text, is_codex_system_injected_user_text, is_no_response_action,
-    normalize_tool_name, read_file_lossy, same_trimmed_text, tool_call_detail, tool_input_file,
+    Exchange, TokenUsage, ToolUse, Transcript, UsageCollector, capture_tool_output, codex_is_error,
+    collapse_codex_duplicate_exchanges, dedup_sorted_capped, display_path,
+    extract_codex_event_message_text, extract_text_content, final_segment, finalize_action_text,
+    is_codex_system_injected_user_text, is_no_response_action, normalize_tool_name,
+    read_file_lossy, same_trimmed_text, token_counter, tool_call_detail, tool_input_file,
     truncate_str,
 };
 
@@ -107,13 +108,39 @@ fn find_sibling_rollout(path: &Path, id: &str) -> Option<std::path::PathBuf> {
     glob::glob(&pattern).ok()?.filter_map(Result::ok).next()
 }
 
+/// Codex input counts include cached and cache-write tokens; make them disjoint.
+fn codex_tokens(raw: &Value) -> TokenUsage {
+    let read = token_counter(raw, "cached_input_tokens");
+    let write = token_counter(raw, "cache_write_input_tokens");
+    TokenUsage {
+        input: token_counter(raw, "input_tokens")
+            .saturating_sub(read)
+            .saturating_sub(write),
+        output: token_counter(raw, "output_tokens"),
+        cache_read: read,
+        cache_write: write,
+        reasoning: raw.get("reasoning_output_tokens").and_then(Value::as_u64),
+    }
+}
+
 /// Parse Codex JSONL transcript.
 /// Handles both response_item (older) and event_msg (newer) formats.
+#[cfg(test)]
 pub(crate) fn parse_codex_jsonl(
     path: &Path,
     last: usize,
     detailed: bool,
 ) -> Result<Vec<Exchange>, String> {
+    let mut transcript = parse_codex_jsonl_with_usage(path, detailed)?;
+    transcript.truncate(last);
+    Ok(transcript.exchanges)
+}
+
+pub(crate) fn parse_codex_jsonl_with_usage(
+    path: &Path,
+    detailed: bool,
+) -> Result<Transcript, String> {
+    let mut usage = UsageCollector::default();
     let entries = read_codex_rollout_entries(path)?;
 
     // First pass: build call_id → output map for error detection
@@ -170,6 +197,7 @@ pub(crate) fn parse_codex_jsonl(
             *position += 1;
             let final_action = finalize_action_text(action, tools, errors, *last_was_error);
             exchanges.push(Exchange {
+                usage: None,
                 position: *position,
                 user: std::mem::take(user),
                 action: final_action,
@@ -191,6 +219,16 @@ pub(crate) fn parse_codex_jsonl(
         *in_exchange = false;
     };
 
+    // Per-response records cover every call, including compaction, which the
+    // cumulative `token_count` totals leave out; their `thread_token_usage` also
+    // carries earlier rollout segments. Older rollouts only have `token_count`.
+    let has_records = parsed_lines
+        .iter()
+        .any(|entry| entry.get("type").and_then(Value::as_str) == Some("token_usage_record"));
+    let mut seen_responses = std::collections::HashSet::new();
+    let mut thread_total = None;
+    let mut previous_usage = TokenUsage::default();
+    let mut latest_model = None;
     for entry in &parsed_lines {
         let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let ts = entry
@@ -205,6 +243,53 @@ pub(crate) fn parse_codex_jsonl(
             && let Some(entry_cwd) = payload.get("cwd").and_then(Value::as_str)
         {
             cwd = Some(entry_cwd.to_string());
+        }
+
+        if let Some(model) = payload.get("model").and_then(Value::as_str) {
+            latest_model = Some(model.to_owned());
+        }
+        if entry_type == "token_usage_record"
+            && let Some(thread) = payload.get("thread_token_usage").filter(|v| v.is_object())
+        {
+            thread_total = Some(codex_tokens(thread));
+        }
+        if entry_type == "token_usage_record"
+            && let Some(raw) = payload.get("usage").filter(|v| v.is_object())
+            && payload
+                .get("response_id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| seen_responses.insert(id.to_owned()))
+        {
+            usage.record(
+                codex_tokens(raw),
+                None,
+                None,
+                latest_model.as_deref(),
+                in_exchange.then_some(exchanges.len()),
+            );
+        }
+        if entry_type == "event_msg" && payload_type == "token_count" {
+            let info = &payload["info"];
+            if let Some(raw) = info.get("total_token_usage").filter(|v| v.is_object()) {
+                let total = codex_tokens(raw);
+                let delta = total.saturating_sub(previous_usage);
+                previous_usage = total;
+                let session = usage.record(
+                    if has_records {
+                        TokenUsage::default()
+                    } else {
+                        delta
+                    },
+                    info.pointer("/last_token_usage/total_tokens")
+                        .and_then(Value::as_u64),
+                    None,
+                    latest_model.as_deref(),
+                    in_exchange.then_some(exchanges.len()),
+                );
+                if let Some(window) = info.get("model_context_window").and_then(Value::as_u64) {
+                    session.context_window = Some(window);
+                }
+            }
         }
 
         // Skip system entry types
@@ -403,14 +488,14 @@ pub(crate) fn parse_codex_jsonl(
         &mut tool_since_text,
     );
 
-    exchanges = collapse_codex_duplicate_exchanges(exchanges);
-
-    if exchanges.len() > last {
-        let start = exchanges.len() - last;
-        exchanges = exchanges[start..].to_vec();
+    if let Some(total) = thread_total
+        && let Some(session) = usage.session.as_mut()
+    {
+        session.tokens = total;
     }
-
-    Ok(exchanges)
+    let mut transcript = usage.attach(exchanges);
+    transcript.exchanges = collapse_codex_duplicate_exchanges(transcript.exchanges);
+    Ok(transcript)
 }
 
 pub(crate) fn should_retry_codex_transcript(exchanges: &[Exchange]) -> bool {
@@ -418,25 +503,6 @@ pub(crate) fn should_retry_codex_transcript(exchanges: &[Exchange]) -> bool {
         .last()
         .map(|ex| is_no_response_action(&ex.action))
         .unwrap_or(false)
-}
-
-pub(crate) fn retry_codex_transcript(
-    path: &Path,
-    last: usize,
-    detailed: bool,
-    mut exchanges: Vec<Exchange>,
-) -> Result<Vec<Exchange>, String> {
-    for _ in 0..4 {
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let retried = parse_codex_jsonl(path, last, detailed)?;
-        if !should_retry_codex_transcript(&retried) {
-            return Ok(retried);
-        }
-        if retried.len() > exchanges.len() {
-            exchanges = retried;
-        }
-    }
-    Ok(exchanges)
 }
 
 #[cfg(test)]
@@ -753,7 +819,9 @@ mod tests {
             session_id: None,
             allow_codex_retry: true,
         };
-        let exchanges = read(&transcript_path, TranscriptBackend::CodexJsonl, &opts).unwrap();
+        let exchanges = read(&transcript_path, TranscriptBackend::CodexJsonl, &opts)
+            .unwrap()
+            .exchanges;
         assert_eq!(exchanges.len(), 1);
         assert_eq!(exchanges[0].action, "assistant answer");
     }

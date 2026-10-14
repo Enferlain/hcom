@@ -26,9 +26,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, display_path, extract_content_text, extract_edit_info,
-    final_segment, finalize_action_text, is_error_result, normalize_tool_name, tool_call_detail,
-    tool_input_file, truncate_str,
+    Exchange, TokenUsage, ToolUse, Transcript, UsageCollector, capture_tool_output, display_path,
+    extract_content_text, extract_edit_info, final_segment, finalize_action_text, is_error_result,
+    normalize_tool_name, tool_call_detail, tool_input_file, truncate_str,
 };
 
 /// In-progress turn accumulator.
@@ -50,14 +50,22 @@ struct Turn {
 }
 
 /// Parse a Kimi `wire.jsonl` into exchanges.
+#[cfg(test)]
 pub fn parse_kimi_wire_jsonl(
     path: &Path,
     last: usize,
     detailed: bool,
 ) -> Result<Vec<Exchange>, String> {
+    let mut transcript = parse_kimi_wire_jsonl_with_usage(path, detailed)?;
+    transcript.truncate(last);
+    Ok(transcript.exchanges)
+}
+
+pub fn parse_kimi_wire_jsonl_with_usage(path: &Path, detailed: bool) -> Result<Transcript, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
     let reader = BufReader::new(file);
 
+    let mut usage = UsageCollector::default();
     let mut exchanges: Vec<Exchange> = Vec::new();
     let mut position = 0;
     let mut cur: Option<Turn> = None;
@@ -70,6 +78,32 @@ pub fn parse_kimi_wire_jsonl(
         let v: Value = serde_json::from_str(&line).map_err(|e| format!("JSON parse: {e}"))?;
 
         match v.get("type").and_then(Value::as_str).unwrap_or("") {
+            "usage.record" => {
+                if let Some(u) = v
+                    .get("usage")
+                    .filter(|u| u.is_object() && !u.as_object().unwrap().is_empty())
+                {
+                    let n = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0);
+                    let tokens = TokenUsage {
+                        input: n("inputOther"),
+                        output: n("output"),
+                        cache_read: n("inputCacheRead"),
+                        cache_write: n("inputCacheCreation"),
+                        reasoning: None,
+                    };
+                    let context = tokens
+                        .input
+                        .saturating_add(tokens.cache_read)
+                        .saturating_add(tokens.cache_write);
+                    usage.record(
+                        tokens,
+                        Some(context),
+                        None,
+                        v.get("model").and_then(Value::as_str),
+                        cur.as_ref().map(|_| exchanges.len()),
+                    );
+                }
+            }
             "turn.prompt" => {
                 if let Some(t) = cur.take() {
                     position += 1;
@@ -192,11 +226,7 @@ pub fn parse_kimi_wire_jsonl(
         exchanges.push(build_exchange(t, position, detailed));
     }
 
-    if !detailed && exchanges.len() > last {
-        exchanges = exchanges.split_off(exchanges.len() - last);
-    }
-
-    Ok(exchanges)
+    Ok(usage.attach(exchanges))
 }
 
 fn build_exchange(t: Turn, position: usize, detailed: bool) -> Exchange {
@@ -214,6 +244,7 @@ fn build_exchange(t: Turn, position: usize, detailed: bool) -> Exchange {
     let action = finalize_action_text(&action_text, &t.tools, &t.errors, t.ended_on_error);
 
     Exchange {
+        usage: None,
         position,
         user: t.user,
         action,
@@ -384,5 +415,51 @@ mod tests {
         assert_eq!(ex[0].action, "one");
         assert_eq!(ex[1].user, "second");
         assert_eq!(ex[1].action, "two");
+    }
+    #[test]
+    fn collects_usage_including_calls_outside_exchanges() {
+        let call = |input| {
+            json!({"type":"usage.record", "model":"kimi", "usage":{"inputOther":input,"output":7,"inputCacheRead":20,"inputCacheCreation":3}}).to_string()
+        };
+        let f = make_temp_jsonl(&[
+            call(5),
+            turn_prompt("first"),
+            call(10),
+            call(15),
+            turn_prompt("second"),
+            call(30),
+        ]);
+        let t = parse_kimi_wire_jsonl_with_usage(f.path(), false).unwrap();
+        let u = t.usage.unwrap();
+        assert_eq!(u.tokens.input, 60);
+        assert_eq!(u.tokens.output, 28);
+        assert_eq!(u.tokens.cache_read, 80);
+        assert_eq!(u.context_tokens, Some(53));
+        assert_eq!(u.model.as_deref(), Some("kimi"));
+        assert_eq!(t.exchanges[0].usage.unwrap().input, 25);
+        assert_eq!(t.exchanges[1].usage.unwrap().input, 30);
+        assert_eq!(
+            parse_kimi_wire_jsonl(f.path(), 1, false).unwrap()[0]
+                .usage
+                .unwrap()
+                .input,
+            30
+        );
+        let zero = make_temp_jsonl(&[turn_prompt("zero"), json!({"type":"usage.record","usage":{"inputOther":0,"output":0,"inputCacheRead":0,"inputCacheCreation":0}}).to_string()]);
+        assert_eq!(
+            parse_kimi_wire_jsonl_with_usage(zero.path(), false)
+                .unwrap()
+                .usage
+                .unwrap()
+                .tokens,
+            TokenUsage::default()
+        );
+        let empty = make_temp_jsonl(&[turn_prompt("no usage")]);
+        assert!(
+            parse_kimi_wire_jsonl_with_usage(empty.path(), false)
+                .unwrap()
+                .usage
+                .is_none()
+        );
     }
 }

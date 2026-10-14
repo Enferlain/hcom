@@ -5,10 +5,11 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, collapse_codex_duplicate_exchanges,
-    dedup_sorted_capped, display_path, extract_content_text, extract_edit_info,
-    extract_text_content, final_segment, finalize_action_text, has_user_text, is_error_result,
-    normalize_tool_name, read_file_lossy, tool_call_detail, tool_input_file, truncate_str,
+    Exchange, TokenUsage, ToolUse, Transcript, UsageCollector, capture_tool_output,
+    collapse_codex_duplicate_exchanges, dedup_sorted_capped, display_path, extract_content_text,
+    extract_edit_info, extract_text_content, final_segment, finalize_action_text, has_user_text,
+    is_error_result, normalize_tool_name, read_file_lossy, token_counter, tool_call_detail,
+    tool_input_file, truncate_str,
 };
 
 fn extract_antigravity_entry_text(entry: &Value) -> String {
@@ -36,21 +37,34 @@ fn extract_antigravity_entry_text(entry: &Value) -> String {
 }
 
 /// Parse Claude JSONL transcript.
+#[cfg(test)]
 pub(crate) fn parse_claude_jsonl(
     path: &Path,
     last: usize,
     detailed: bool,
 ) -> Result<Vec<Exchange>, String> {
+    let mut transcript = parse_claude_jsonl_with_usage(path, detailed)?;
+    transcript.truncate(last);
+    Ok(transcript.exchanges)
+}
+
+pub(crate) fn parse_claude_jsonl_with_usage(
+    path: &Path,
+    detailed: bool,
+) -> Result<Transcript, String> {
+    let mut usage = UsageCollector::default();
     let content = read_file_lossy(path)?;
 
     // First pass: parse all entries and build tool_use index for detailed mode
     struct ParsedEntry {
         entry_type: String,
+        usage_only: bool,
         ts: String,
         data: Value,
     }
 
     let mut entries = Vec::new();
+    let mut final_usage = std::collections::HashMap::new();
     // Map (session_id, tool_use_id) -> {name, input} for matching tool_results to tool_uses
     let mut tool_use_index: std::collections::HashMap<(String, String), (String, Value)> =
         std::collections::HashMap::new();
@@ -61,20 +75,23 @@ pub(crate) fn parse_claude_jsonl(
             Err(_) => continue,
         };
 
-        // Skip meta/system entries
+        // Sidechains have separate session files and remain outside this transcript.
         if entry
+            .get("isSidechain")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let usage_only = entry
             .get("isMeta")
-            .and_then(|v| v.as_bool())
+            .and_then(Value::as_bool)
             .unwrap_or(false)
             || entry
                 .get("isCompactSummary")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            || entry
-                .get("isSidechain")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        {
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        if usage_only && entry.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
 
@@ -100,6 +117,14 @@ pub(crate) fn parse_claude_jsonl(
                 | "saved_hook_context"
         ) {
             continue;
+        }
+
+        if entry_type == "assistant"
+            && let Some(message) = entry.get("message")
+            && let Some(id) = message.get("id").and_then(Value::as_str)
+            && let Some(raw) = message.get("usage").filter(|v| v.is_object())
+        {
+            final_usage.insert(id.to_owned(), raw.clone());
         }
 
         // Build tool_use index from assistant entries
@@ -135,6 +160,7 @@ pub(crate) fn parse_claude_jsonl(
 
         entries.push(ParsedEntry {
             entry_type,
+            usage_only,
             ts,
             data: entry,
         });
@@ -159,7 +185,55 @@ pub(crate) fn parse_claude_jsonl(
     let mut cwd: Option<String> = None;
     let mut position = 0;
 
+    let mut seen_usage = std::collections::HashSet::new();
     for pe in &entries {
+        if pe.entry_type == "assistant" {
+            let message = &pe.data["message"];
+            let id = message.get("id").and_then(Value::as_str);
+            // Content blocks repeat usage and may update output as the call finishes.
+            // Use its final snapshot at the call's first location, keeping context order.
+            if let Some(raw) = id
+                .and_then(|id| final_usage.get(id))
+                .or_else(|| message.get("usage"))
+                .filter(|v| v.is_object())
+                && id.is_none_or(|id| seen_usage.insert(id.to_owned()))
+            {
+                let tokens = TokenUsage {
+                    input: token_counter(raw, "input_tokens"),
+                    output: token_counter(raw, "output_tokens"),
+                    cache_read: token_counter(raw, "cache_read_input_tokens"),
+                    cache_write: token_counter(raw, "cache_creation_input_tokens"),
+                    reasoning: raw
+                        .pointer("/output_tokens_details/thinking_tokens")
+                        .and_then(Value::as_u64),
+                };
+                let context = tokens
+                    .input
+                    .saturating_add(tokens.cache_read)
+                    .saturating_add(tokens.cache_write);
+                let ratio = raw
+                    .get("context_usage_ratio")
+                    .and_then(Value::as_f64)
+                    .filter(|ratio| ratio.is_finite() && (0.0..=1.0).contains(ratio));
+                let session = usage.record(
+                    tokens,
+                    None,
+                    None,
+                    message.get("model").and_then(Value::as_str),
+                    (!pe.usage_only && !current_user.is_empty()).then_some(exchanges.len()),
+                );
+                // Each call reports its context as tokens or, with zero counters, a ratio.
+                session.context_tokens = if context == 0 && ratio.is_some_and(|ratio| ratio > 0.0) {
+                    None
+                } else {
+                    Some(context)
+                };
+                session.context_usage_ratio = ratio;
+            }
+        }
+        if pe.usage_only {
+            continue;
+        }
         if let Some(entry_cwd) = pe.data.get("cwd").and_then(Value::as_str) {
             cwd = Some(entry_cwd.to_string());
         }
@@ -173,6 +247,7 @@ pub(crate) fn parse_claude_jsonl(
                 if !current_user.is_empty() || !current_action.is_empty() {
                     position += 1;
                     exchanges.push(Exchange {
+                        usage: None,
                         position,
                         user: current_user.clone(),
                         action: finalize_action_text(
@@ -301,6 +376,7 @@ pub(crate) fn parse_claude_jsonl(
                 if !current_user.is_empty() || !current_action.is_empty() {
                     position += 1;
                     exchanges.push(Exchange {
+                        usage: None,
                         position,
                         user: current_user.clone(),
                         action: finalize_action_text(
@@ -396,6 +472,7 @@ pub(crate) fn parse_claude_jsonl(
     if !current_user.is_empty() || !current_action.is_empty() {
         position += 1;
         exchanges.push(Exchange {
+            usage: None,
             position,
             user: current_user,
             action: finalize_action_text(
@@ -414,15 +491,10 @@ pub(crate) fn parse_claude_jsonl(
         });
     }
 
-    // Apply last N
-    exchanges = collapse_codex_duplicate_exchanges(exchanges);
-
-    if exchanges.len() > last {
-        let start = exchanges.len() - last;
-        exchanges = exchanges[start..].to_vec();
-    }
-
-    Ok(exchanges)
+    // Attach call usage before collapsing duplicate exchanges.
+    let mut transcript = usage.attach(exchanges);
+    transcript.exchanges = collapse_codex_duplicate_exchanges(transcript.exchanges);
+    Ok(transcript)
 }
 
 #[cfg(test)]
@@ -553,5 +625,103 @@ mod tests {
             tools,
             [(Some("echo done"), Some("done")), (Some("sleep 100"), None)]
         );
+    }
+}
+
+#[cfg(test)]
+mod usage_snapshot_tests {
+    use super::*;
+    #[test]
+    fn compaction_usage_is_session_only_and_sidechains_are_excluded() {
+        let entries = [
+            json!({"type":"user","message":{"content":"hello"}}),
+            json!({"type":"assistant","isMeta":true,"message":{"id":"compact","content":"hidden","usage":{"input_tokens":10,"output_tokens":2}}}),
+            json!({"type":"assistant","isSidechain":true,"message":{"id":"side","usage":{"input_tokens":100,"output_tokens":20}}}),
+            json!({"type":"assistant","message":{"id":"answer","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":3,"output_tokens":1}}}),
+        ];
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            entries
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let transcript = parse_claude_jsonl_with_usage(file.path(), false).unwrap();
+        assert_eq!(transcript.usage.unwrap().tokens.input, 13);
+        assert_eq!(transcript.exchanges[0].usage.unwrap().input, 3);
+        assert_eq!(transcript.exchanges[0].action, "done");
+    }
+    #[test]
+    fn final_snapshot_counts_once_without_reordering_context() {
+        let call = |id, input, output| json!({"type":"assistant","message":{"id":id,"content":[{"type":"text","text":"done"}],"usage":{"input_tokens":input,"output_tokens":output}}});
+        let entries = [
+            json!({"type":"user","message":{"content":"hello"}}),
+            call("first", 10, 1),
+            call("second", 20, 2),
+            call("first", 10, 5),
+            call("first", 10, 5),
+        ];
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            entries
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let transcript = parse_claude_jsonl_with_usage(file.path(), false).unwrap();
+        let usage = transcript.usage.unwrap();
+        assert_eq!(usage.tokens.input, 30);
+        assert_eq!(usage.tokens.output, 7);
+        assert_eq!(usage.context_tokens, Some(20));
+        assert_eq!(transcript.exchanges[0].usage, Some(usage.tokens));
+    }
+}
+
+#[cfg(test)]
+mod context_ratio_tests {
+    use super::*;
+    #[test]
+    fn ratio_only_context_keeps_recorded_zero_tokens() {
+        for (ratio, expected_context, expected_label) in [
+            (Some(0.33375), None, "33%"),
+            (None, Some(0), "0"),
+            (Some(0.0), Some(0), "0"),
+            (Some(1.1), Some(0), "0"),
+        ] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let entries = [
+                json!({"type":"user","message":{"content":"hello"}}),
+                json!({"type":"assistant","message":{"id":"a","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"context_usage_ratio":ratio,"credits":12}}}),
+            ];
+            std::fs::write(
+                file.path(),
+                entries
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            let transcript = parse_claude_jsonl_with_usage(file.path(), false).unwrap();
+            let usage = transcript.usage.unwrap();
+            assert_eq!(usage.tokens, TokenUsage::default());
+            assert_eq!(usage.context_tokens, expected_context);
+            assert_eq!(usage.context_window, None);
+            assert_eq!(usage.cost_usd, None);
+            assert_eq!(
+                super::super::shared::format_context(&usage).as_deref(),
+                Some(expected_label)
+            );
+            assert_eq!(
+                usage.context_usage_ratio,
+                ratio.filter(|ratio| (0.0..=1.0).contains(ratio))
+            );
+        }
     }
 }

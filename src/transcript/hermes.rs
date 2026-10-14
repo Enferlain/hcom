@@ -12,8 +12,9 @@ use serde_json::{Value, json};
 
 use super::opencode::TranscriptSearchMatch;
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, dedup_sorted_capped, display_path, final_segment,
-    finalize_action_text, normalize_tool_name, tool_input_file, truncate_str,
+    Exchange, SessionUsage, TokenUsage, ToolUse, Transcript, capture_tool_output,
+    dedup_sorted_capped, display_path, final_segment, finalize_action_text, normalize_tool_name,
+    tool_input_file, truncate_str,
 };
 
 fn open(path: &Path) -> Result<rusqlite::Connection, String> {
@@ -86,21 +87,79 @@ fn strip_bootstrap(text: &str) -> &str {
         .trim()
 }
 
+#[cfg(test)]
 pub(crate) fn parse_hermes_sqlite(
     path: &Path,
     session_id: &str,
     last: usize,
 ) -> Result<Vec<Exchange>, String> {
+    let mut transcript = parse_hermes_sqlite_with_usage(path, session_id)?;
+    transcript.truncate(last);
+    Ok(transcript.exchanges)
+}
+
+pub(crate) fn parse_hermes_sqlite_with_usage(
+    path: &Path,
+    session_id: &str,
+) -> Result<Transcript, String> {
     let conn = open(path)?;
     let content = content_column(&conn);
-    let cwd: Option<String> = conn
+    // Read metadata and totals together. Named optional columns also allow
+    // transcripts from older schemas which did not persist token totals.
+    let (cwd, session_usage) = conn
         .query_row(
-            "SELECT cwd FROM sessions WHERE id = ?1",
+            "SELECT * FROM sessions WHERE id = ?1",
             [session_id],
-            |r| r.get(0),
+            |row| {
+                let n = |key: &str| {
+                    row.get::<_, Option<i64>>(key)
+                        .ok()
+                        .flatten()
+                        .and_then(|v| u64::try_from(v).ok())
+                };
+                let tokens = TokenUsage {
+                    input: n("input_tokens").unwrap_or(0),
+                    output: n("output_tokens").unwrap_or(0),
+                    cache_read: n("cache_read_tokens").unwrap_or(0),
+                    cache_write: n("cache_write_tokens").unwrap_or(0),
+                    reasoning: n("reasoning_tokens"),
+                };
+                let recorded = [
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_tokens",
+                    "cache_write_tokens",
+                    "reasoning_tokens",
+                ]
+                .iter()
+                .any(|k| n(k).is_some());
+                let status = row.get::<_, Option<String>>("cost_status").ok().flatten();
+                let cost = row
+                    .get::<_, Option<f64>>("actual_cost_usd")
+                    .ok()
+                    .flatten()
+                    .or_else(|| {
+                        if status.as_deref() == Some("included") {
+                            None
+                        } else {
+                            row.get::<_, Option<f64>>("estimated_cost_usd")
+                                .ok()
+                                .flatten()
+                        }
+                    });
+                let model = row.get::<_, Option<String>>("model").ok().flatten();
+                Ok((
+                    row.get::<_, Option<String>>("cwd").ok().flatten(),
+                    recorded.then_some(SessionUsage {
+                        tokens,
+                        cost_usd: cost,
+                        model,
+                        ..Default::default()
+                    }),
+                ))
+            },
         )
-        .ok()
-        .flatten();
+        .unwrap_or_default();
     let mut stmt = conn
         .prepare(&format!(
             "SELECT role, {content}, tool_calls, tool_name, tool_call_id, timestamp FROM messages m
@@ -151,6 +210,7 @@ pub(crate) fn parse_hermes_sqlite(
                 &mut tool_since_text,
             );
             current = Some(Exchange {
+                usage: None,
                 position: 0,
                 user: strip_bootstrap(&row.content).to_string(),
                 action: String::new(),
@@ -165,6 +225,7 @@ pub(crate) fn parse_hermes_sqlite(
             continue;
         }
         let ex = current.get_or_insert_with(|| Exchange {
+            usage: None,
             position: 0,
             user: String::new(),
             action: String::new(),
@@ -245,11 +306,10 @@ pub(crate) fn parse_hermes_sqlite(
         &mut tool_since_text,
     );
 
-    if last > 0 && exchanges.len() > last {
-        Ok(exchanges.split_off(exchanges.len() - last))
-    } else {
-        Ok(exchanges)
-    }
+    Ok(Transcript {
+        exchanges,
+        usage: session_usage,
+    })
 }
 
 /// The ambient profile's `state.db`, for `transcript search --all`.
@@ -397,5 +457,54 @@ mod tests {
         let hits = search_hermes_sessions(&path, "SIDECAR-CODEWORD", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id.as_deref(), Some("s1"));
+    }
+    #[test]
+    fn reads_session_totals_without_inventing_exchange_usage() {
+        let (_dir, path) = fixture();
+        assert!(
+            parse_hermes_sqlite_with_usage(&path, "s1")
+                .unwrap()
+                .usage
+                .is_none()
+        );
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch("ALTER TABLE sessions ADD COLUMN input_tokens INTEGER; ALTER TABLE sessions ADD COLUMN output_tokens INTEGER; ALTER TABLE sessions ADD COLUMN cache_read_tokens INTEGER; ALTER TABLE sessions ADD COLUMN cache_write_tokens INTEGER; ALTER TABLE sessions ADD COLUMN reasoning_tokens INTEGER; ALTER TABLE sessions ADD COLUMN actual_cost_usd REAL; ALTER TABLE sessions ADD COLUMN estimated_cost_usd REAL; ALTER TABLE sessions ADD COLUMN cost_status TEXT; ALTER TABLE sessions ADD COLUMN model TEXT; UPDATE sessions SET input_tokens=10, output_tokens=20, cache_read_tokens=30, cache_write_tokens=4, reasoning_tokens=5, estimated_cost_usd=0.5, model='hermes' WHERE id='s1';").unwrap();
+        let t = parse_hermes_sqlite_with_usage(&path, "s1").unwrap();
+        let u = t.usage.unwrap();
+        assert_eq!(u.tokens.input, 10);
+        assert_eq!(u.tokens.output, 20);
+        assert_eq!(u.tokens.cache_read, 30);
+        assert_eq!(u.tokens.reasoning, Some(5));
+        assert_eq!(u.cost_usd, Some(0.5));
+        assert!(t.exchanges.iter().all(|e| e.usage.is_none()));
+        c.execute_batch("UPDATE sessions SET cost_status='included';")
+            .unwrap();
+        assert_eq!(
+            parse_hermes_sqlite_with_usage(&path, "s1")
+                .unwrap()
+                .usage
+                .unwrap()
+                .cost_usd,
+            None
+        );
+        c.execute_batch("UPDATE sessions SET input_tokens=0,output_tokens=0,cache_read_tokens=0,cache_write_tokens=0,reasoning_tokens=NULL;").unwrap();
+        assert_eq!(
+            parse_hermes_sqlite_with_usage(&path, "s1")
+                .unwrap()
+                .usage
+                .unwrap()
+                .tokens,
+            TokenUsage::default()
+        );
+        c.execute_batch("UPDATE sessions SET actual_cost_usd=0.2;")
+            .unwrap();
+        assert_eq!(
+            parse_hermes_sqlite_with_usage(&path, "s1")
+                .unwrap()
+                .usage
+                .unwrap()
+                .cost_usd,
+            Some(0.2)
+        );
     }
 }

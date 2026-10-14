@@ -82,11 +82,21 @@ fn content_text(message: &Value) -> String {
 
 /// Basename of a tool-input path field, if any of `path`/`file_path`/`file`.
 /// Parse a cursor-agent JSONL transcript into the shared `Exchange` model.
+#[cfg(test)]
 pub(crate) fn parse_cursor_jsonl(
     path: &Path,
     last: usize,
-    _detailed: bool,
+    detailed: bool,
 ) -> Result<Vec<Exchange>, String> {
+    let mut transcript = parse_cursor_jsonl_with_usage(path, detailed)?;
+    transcript.truncate(last);
+    Ok(transcript.exchanges)
+}
+
+pub(crate) fn parse_cursor_jsonl_with_usage(
+    path: &Path,
+    _detailed: bool,
+) -> Result<super::Transcript, String> {
     let content = read_file_lossy(path)?;
 
     let mut exchanges: Vec<Exchange> = Vec::new();
@@ -116,6 +126,7 @@ pub(crate) fn parse_cursor_jsonl(
             *position += 1;
             let final_action = finalize_action_text(action, tools, &[], false);
             exchanges.push(Exchange {
+                usage: None,
                 position: *position,
                 user: std::mem::take(user),
                 action: final_action,
@@ -245,12 +256,10 @@ pub(crate) fn parse_cursor_jsonl(
         &mut tool_since_text,
     );
 
-    if exchanges.len() > last {
-        let start = exchanges.len() - last;
-        exchanges = exchanges[start..].to_vec();
-    }
-
-    Ok(exchanges)
+    Ok(super::Transcript {
+        exchanges,
+        usage: None,
+    })
 }
 
 #[cfg(test)]

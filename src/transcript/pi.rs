@@ -6,9 +6,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, dedup_sorted_capped, display_path,
-    extract_content_text, final_segment, finalize_action_text, normalize_tool_name,
-    read_file_lossy, tool_input_file, truncate_str,
+    Exchange, TokenUsage, ToolUse, Transcript, UsageCollector, capture_tool_output,
+    dedup_sorted_capped, display_path, extract_content_text, final_segment, finalize_action_text,
+    normalize_tool_name, read_file_lossy, token_counter, tool_input_file, truncate_str,
 };
 
 fn message_text(message: &Value) -> String {
@@ -47,11 +47,22 @@ fn tool_command(input: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_pi_jsonl(
     path: &Path,
     last: usize,
     _detailed: bool,
 ) -> Result<Vec<Exchange>, String> {
+    let mut transcript = parse_pi_jsonl_with_usage(path, _detailed)?;
+    transcript.truncate(last);
+    Ok(transcript.exchanges)
+}
+
+pub(crate) fn parse_pi_jsonl_with_usage(
+    path: &Path,
+    _detailed: bool,
+) -> Result<Transcript, String> {
+    let mut usage = UsageCollector::default();
     let content = read_file_lossy(path)?;
     let mut exchanges: Vec<Exchange> = Vec::new();
     let mut current_user = String::new();
@@ -88,6 +99,7 @@ pub(crate) fn parse_pi_jsonl(
         *position += 1;
         let final_action = finalize_action_text(action, tools, errors, *last_was_error);
         exchanges.push(Exchange {
+            usage: None,
             position: *position,
             user: std::mem::take(user),
             action: final_action,
@@ -144,6 +156,27 @@ pub(crate) fn parse_pi_jsonl(
                     .to_string();
             }
             "assistant" => {
+                if let Some(raw) = message.get("usage").filter(|v| v.is_object()) {
+                    let tokens = TokenUsage {
+                        input: token_counter(raw, "input"),
+                        output: token_counter(raw, "output"),
+                        cache_read: token_counter(raw, "cacheRead"),
+                        cache_write: token_counter(raw, "cacheWrite"),
+                        reasoning: raw.get("reasoning").and_then(Value::as_u64),
+                    };
+                    usage.record(
+                        tokens,
+                        Some(
+                            tokens
+                                .input
+                                .saturating_add(tokens.cache_read)
+                                .saturating_add(tokens.cache_write),
+                        ),
+                        raw.pointer("/cost/total").and_then(Value::as_f64),
+                        message.get("model").and_then(Value::as_str),
+                        (!current_user.is_empty()).then_some(exchanges.len()),
+                    );
+                }
                 if let Some(blocks) = message.get("content").and_then(Value::as_array) {
                     for block in blocks {
                         if block.get("type").and_then(Value::as_str) != Some("toolCall") {
@@ -231,11 +264,7 @@ pub(crate) fn parse_pi_jsonl(
         &mut tool_since_text,
     );
 
-    if last > 0 && exchanges.len() > last {
-        Ok(exchanges.split_off(exchanges.len() - last))
-    } else {
-        Ok(exchanges)
-    }
+    Ok(usage.attach(exchanges))
 }
 
 #[cfg(test)]

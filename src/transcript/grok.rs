@@ -19,8 +19,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, display_path, final_segment, finalize_action_text,
-    normalize_tool_name, read_file_lossy, tool_input_file, truncate_str,
+    Exchange, TokenUsage, ToolUse, Transcript, UsageCollector, capture_tool_output, display_path,
+    final_segment, finalize_action_text, normalize_tool_name, read_file_lossy, tool_input_file,
+    truncate_str,
 };
 
 /// `$GROK_HOME` if set, else `~/.grok`.
@@ -179,6 +180,7 @@ impl Turn {
         let action =
             finalize_action_text(&self.action, &self.tools, &self.errors, self.ended_on_error);
         Exchange {
+            usage: None,
             position,
             user: self.user,
             final_text: final_segment(&self.action, self.final_start),
@@ -194,12 +196,24 @@ impl Turn {
 }
 
 /// Parse a Grok Build `updates.jsonl` transcript into shared exchanges.
+#[cfg(test)]
 pub(crate) fn parse_grok_updates_jsonl(
     path: &Path,
     last: usize,
     detailed: bool,
 ) -> Result<Vec<Exchange>, String> {
+    let mut transcript = parse_grok_updates_jsonl_with_usage(path, detailed)?;
+    transcript.truncate(last);
+    Ok(transcript.exchanges)
+}
+
+pub(crate) fn parse_grok_updates_jsonl_with_usage(
+    path: &Path,
+    detailed: bool,
+) -> Result<Transcript, String> {
     let content = read_file_lossy(path)?;
+    let mut usage = UsageCollector::default();
+    let mut cost_unknown = false;
     let mut exchanges: Vec<Exchange> = Vec::new();
     let mut turn = Turn::default();
     let mut timestamp = String::new();
@@ -287,6 +301,38 @@ pub(crate) fn parse_grok_updates_jsonl(
                 }
             }
             "turn_completed" => {
+                if let Some(u) = update.get("usage").filter(|u| u.is_object()) {
+                    let n = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0);
+                    // ACP PromptUsage input is the full prompt; cache writes are
+                    // a subset of that input too.
+                    let tokens = TokenUsage {
+                        input: n("inputTokens")
+                            .saturating_sub(n("cachedReadTokens"))
+                            .saturating_sub(n("cacheCreationTokens")),
+                        output: n("outputTokens"),
+                        cache_read: n("cachedReadTokens"),
+                        cache_write: n("cacheCreationTokens"),
+                        reasoning: u.get("reasoningTokens").and_then(Value::as_u64),
+                    };
+                    let cost = u
+                        .get("costUsdTicks")
+                        .and_then(Value::as_f64)
+                        .filter(|_| {
+                            u.get("usageIsIncomplete").and_then(Value::as_bool) != Some(true)
+                                && u.get("costIsPartial").and_then(Value::as_bool) != Some(true)
+                        })
+                        .map(|v| v / 1e10);
+                    // One unknown turn makes the session sum an undercount.
+                    cost_unknown |= cost.is_none();
+                    usage.record(
+                        tokens,
+                        None,
+                        cost,
+                        None,
+                        (!turn.is_empty()).then_some(exchanges.len()),
+                    );
+                }
+
                 let reason = update
                     .get("stop_reason")
                     .and_then(Value::as_str)
@@ -303,11 +349,11 @@ pub(crate) fn parse_grok_updates_jsonl(
     }
     finish(&mut turn, &mut exchanges);
 
-    if last > 0 && exchanges.len() > last {
-        Ok(exchanges.split_off(exchanges.len() - last))
-    } else {
-        Ok(exchanges)
+    let mut transcript = usage.attach(exchanges);
+    if cost_unknown && let Some(usage) = transcript.usage.as_mut() {
+        usage.cost_usd = None;
     }
+    Ok(transcript)
 }
 
 #[cfg(test)]
@@ -457,6 +503,68 @@ mod tests {
         assert_eq!(
             session_transcript_path("/a b", "s2"),
             home.path().join("sessions/%2Fa%20b/s2/updates.jsonl")
+        );
+    }
+    #[test]
+    fn normalizes_turn_usage_and_checks_cost_completeness() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let end = |partial| {
+            update(
+                json!({"sessionUpdate":"turn_completed","usage":{"inputTokens":100,"outputTokens":9,"cachedReadTokens":60,"cacheCreationTokens":10,"reasoningTokens":3,"costUsdTicks":2500000000_u64,"costIsPartial":partial}}),
+            )
+        };
+        std::fs::write(
+            f.path(),
+            [
+                chunk("user_message_chunk", "first"),
+                end(false),
+                chunk("user_message_chunk", "second"),
+                end(true),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let t = parse_grok_updates_jsonl_with_usage(f.path(), false).unwrap();
+        let u = t.usage.unwrap();
+        assert_eq!(u.tokens.input, 60);
+        assert_eq!(u.tokens.cache_read, 120);
+        assert_eq!(u.tokens.cache_write, 20);
+        assert_eq!(u.tokens.reasoning, Some(6));
+        assert_eq!(
+            u.cost_usd, None,
+            "a partial turn must not leave an undercounted sum"
+        );
+        assert_eq!(u.context_tokens, None);
+        assert_eq!(t.exchanges[0].usage.unwrap().input, 30);
+        assert_eq!(
+            parse_grok_updates_jsonl(f.path(), 1, false).unwrap()[0].position,
+            2
+        );
+        let complete = [end(false), end(false)].join("\n");
+        std::fs::write(f.path(), &complete).unwrap();
+        assert_eq!(
+            parse_grok_updates_jsonl_with_usage(f.path(), false)
+                .unwrap()
+                .usage
+                .unwrap()
+                .cost_usd,
+            Some(0.5)
+        );
+        std::fs::write(f.path(), update(json!({"sessionUpdate":"turn_completed","usage":{"inputTokens":0,"outputTokens":0}}))).unwrap();
+        assert_eq!(
+            parse_grok_updates_jsonl_with_usage(f.path(), false)
+                .unwrap()
+                .usage
+                .unwrap()
+                .tokens,
+            TokenUsage::default()
+        );
+        std::fs::write(f.path(), chunk("user_message_chunk", "no usage")).unwrap();
+        assert!(
+            parse_grok_updates_jsonl_with_usage(f.path(), false)
+                .unwrap()
+                .usage
+                .is_none()
         );
     }
 }

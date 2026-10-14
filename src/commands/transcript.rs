@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 use crate::db::HcomDb;
 use crate::shared::CommandContext;
 use crate::tool::Tool;
-use crate::transcript::{self, Exchange, ReadOptions, format_exchanges, summarize_exchange};
+use crate::transcript::{
+    self, Exchange, ReadOptions, format_transcript_exchanges, summarize_exchange,
+};
 
 fn run_search_tool(program: &str, args: &[&str]) -> Result<Option<std::process::Output>, String> {
     match std::process::Command::new(program).args(args).output() {
@@ -313,6 +315,18 @@ pub(crate) fn get_exchanges(
     session_id: Option<&str>,
     retry_codex: bool,
 ) -> Result<Vec<Exchange>, String> {
+    get_transcript(path, agent, last, detailed, session_id, retry_codex)
+        .map(|transcript| transcript.exchanges)
+}
+
+pub(crate) fn get_transcript(
+    path: &str,
+    agent: &str,
+    last: usize,
+    detailed: bool,
+    session_id: Option<&str>,
+    retry_codex: bool,
+) -> Result<transcript::Transcript, String> {
     let backend = transcript::backend_from_agent_or_path(agent, path)?;
     let opts = ReadOptions {
         last,
@@ -1351,6 +1365,7 @@ fn render_instance_transcript_impl(
                     "timestamp": ex.timestamp,
                 });
                 if opts.detailed {
+                    obj["usage"] = json!(ex.usage);
                     obj["tools"] = json!(
                         ex.tools
                             .iter()
@@ -1385,7 +1400,7 @@ fn render_instance_transcript_impl(
 
     let header = conversation_header(&filtered, &exchanges, &instance_name);
     let owned: Vec<Exchange> = filtered.into_iter().cloned().collect();
-    let mut formatted = format_exchanges(&owned, opts.full_mode, opts.detailed);
+    let mut formatted = format_transcript_exchanges(&owned, opts.full_mode, opts.detailed);
     if let Some(hint) = transcript::flag_hint(opts.full_mode, opts.detailed) {
         formatted.push('\n');
         formatted.push_str(hint);
@@ -2496,6 +2511,7 @@ View transport messages with: hcom events --remote-fetch --device ABCD --partici
     #[test]
     fn match_exchange_checks_prompt_then_response_then_tools() {
         let mut ex = Exchange {
+            usage: None,
             position: 3,
             user: "please fix the parser".to_string(),
             action: "Fixed the parser in claude.rs.".to_string(),

@@ -6,8 +6,8 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::shared::{
-    Exchange, ToolUse, capture_tool_output, display_path, finalize_action_text,
-    normalize_tool_name, tool_call_detail, tool_input_file, truncate_str,
+    Exchange, TokenUsage, ToolUse, Transcript, UsageCollector, capture_tool_output, display_path,
+    finalize_action_text, normalize_tool_name, tool_call_detail, tool_input_file, truncate_str,
 };
 use crate::log::log_warn;
 
@@ -248,6 +248,7 @@ struct MsgRow {
     role: String,
     time_created: i64,
     parts: Vec<Value>,
+    data: Value,
 }
 
 fn table_exists(conn: &rusqlite::Connection, table: &str) -> bool {
@@ -315,6 +316,7 @@ fn load_v1_messages(conn: &rusqlite::Connection, session_id: &str) -> Result<Vec
             role,
             time_created,
             parts,
+            data,
         });
     }
     Ok(messages)
@@ -425,6 +427,7 @@ fn load_v2_messages(conn: &rusqlite::Connection, session_id: &str) -> Result<Vec
             role,
             time_created,
             parts,
+            data,
         });
     }
     Ok(messages)
@@ -435,11 +438,21 @@ fn load_v2_messages(conn: &rusqlite::Connection, session_id: &str) -> Result<Vec
 /// OpenCode 1 and Kilo store conversations in `message` + `part` tables;
 /// OpenCode 2 stores them in `session_message`. Migration copies v1 history
 /// into v2 and keeps the v1 tables, so v2 wins and v1 is the fallback.
+#[cfg(test)]
 pub(crate) fn parse_opencode_sqlite(
     db_path: &Path,
     session_id: &str,
     last: usize,
 ) -> Result<Vec<Exchange>, String> {
+    let mut transcript = parse_opencode_sqlite_with_usage(db_path, session_id)?;
+    transcript.truncate(last);
+    Ok(transcript.exchanges)
+}
+
+pub(crate) fn parse_opencode_sqlite_with_usage(
+    db_path: &Path,
+    session_id: &str,
+) -> Result<Transcript, String> {
     let conn =
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| format!("Cannot open OpenCode DB: {e}"))?;
@@ -449,7 +462,7 @@ pub(crate) fn parse_opencode_sqlite(
         messages = load_v1_messages(&conn, session_id)?;
     }
     if messages.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Transcript::default());
     }
     // Either schema may be absent, so a failed lookup just means no directory.
     let cwd: Option<String> = ["session_v2", "session"].iter().find_map(|table| {
@@ -462,12 +475,49 @@ pub(crate) fn parse_opencode_sqlite(
     });
 
     // Build exchanges: group by user messages
+    let mut usage = UsageCollector::default();
     let mut exchanges = Vec::new();
     let mut position = 0;
 
     // Find user message indices (with actual text)
     let mut user_indices: Vec<usize> = Vec::new();
     for (i, msg) in messages.iter().enumerate() {
+        if msg.role == "assistant"
+            && let Some(u) = msg.data.get("tokens").filter(|u| u.is_object())
+        {
+            let n = |key: &str| u.get(key).and_then(Value::as_u64).unwrap_or(0);
+            let cache_read = u
+                .pointer("/cache/read")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let cache_write = u
+                .pointer("/cache/write")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let tokens = TokenUsage {
+                input: n("input"),
+                // OpenCode stores visible output separately from reasoning.
+                output: n("output").saturating_add(n("reasoning")),
+                cache_read,
+                cache_write,
+                reasoning: u.get("reasoning").and_then(Value::as_u64),
+            };
+            usage.record(
+                tokens,
+                Some(
+                    tokens
+                        .input
+                        .saturating_add(cache_read)
+                        .saturating_add(cache_write),
+                ),
+                msg.data.get("cost").and_then(Value::as_f64),
+                msg.data
+                    .get("modelID")
+                    .or_else(|| msg.data.get("model"))
+                    .and_then(Value::as_str),
+                user_indices.len().checked_sub(1),
+            );
+        }
         if msg.role != "user" {
             continue;
         }
@@ -611,6 +661,7 @@ pub(crate) fn parse_opencode_sqlite(
         };
 
         exchanges.push(Exchange {
+            usage: None,
             position,
             user: user_text,
             action,
@@ -624,13 +675,7 @@ pub(crate) fn parse_opencode_sqlite(
         });
     }
 
-    // Apply last N
-    if exchanges.len() > last {
-        let skip = exchanges.len() - last;
-        exchanges = exchanges.into_iter().skip(skip).collect();
-    }
-
-    Ok(exchanges)
+    Ok(usage.attach(exchanges))
 }
 
 #[cfg(test)]
@@ -879,6 +924,64 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+    #[test]
+    fn reads_usage_from_both_schemas_without_counting_migrated_rows_twice() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let c = rusqlite::Connection::open(f.path()).unwrap();
+        c.execute_batch("CREATE TABLE message (id TEXT, session_id TEXT, data TEXT, time_created INTEGER); CREATE TABLE part (id TEXT, message_id TEXT, data TEXT); CREATE TABLE session_v2 (id TEXT, directory TEXT); CREATE TABLE session_message (id TEXT, session_id TEXT, type TEXT, data TEXT, time_created INTEGER, seq INTEGER);").unwrap();
+        let assistant = json!({"role":"assistant","modelID":"oc", "tokens":{"input":10,"output":20,"reasoning":3,"cache":{"read":30,"write":4}},"cost":0.25,"content":[]}).to_string();
+        c.execute(
+            "INSERT INTO message VALUES ('u','s',?1,1)",
+            [json!({"role":"user"}).to_string()],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO part VALUES ('p','u',?1)",
+            [json!({"type":"text","text":"hello"}).to_string()],
+        )
+        .unwrap();
+        c.execute("INSERT INTO message VALUES ('a','s',?1,2)", [&assistant])
+            .unwrap();
+        let first = parse_opencode_sqlite_with_usage(f.path(), "s").unwrap();
+        assert_eq!(first.exchanges[0].usage.unwrap().input, 10);
+        let u = first.usage.unwrap();
+        assert_eq!(u.context_tokens, Some(44));
+        assert_eq!(u.cost_usd, Some(0.25));
+        assert_eq!(u.tokens.reasoning, Some(3));
+        assert_eq!(u.tokens.output, 23);
+        c.execute(
+            "INSERT INTO session_message VALUES ('u','s','user',?1,1,0)",
+            [json!({"text":"hello"}).to_string()],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO session_message VALUES ('a','s','assistant',?1,2,1)",
+            [&assistant],
+        )
+        .unwrap();
+        let migrated = parse_opencode_sqlite_with_usage(f.path(), "s").unwrap();
+        assert_eq!(migrated.usage.unwrap(), u);
+        assert_eq!(migrated.exchanges[0].usage.unwrap().cache_read, 30);
+        c.execute(
+            "UPDATE session_message SET data=?1 WHERE type='assistant'",
+            [json!({"tokens":{"input":0,"output":0},"content":[]}).to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            parse_opencode_sqlite_with_usage(f.path(), "s")
+                .unwrap()
+                .usage
+                .unwrap()
+                .tokens,
+            TokenUsage::default()
+        );
+        assert!(
+            parse_opencode_sqlite_with_usage(f.path(), "absent")
+                .unwrap()
+                .usage
+                .is_none()
         );
     }
 }

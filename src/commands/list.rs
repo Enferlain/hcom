@@ -131,6 +131,20 @@ pub struct ListArgs {
     pub last: Option<usize>,
 }
 
+/// Usage is read only for an explicitly selected local agent.
+fn read_usage(
+    path: &str,
+    tool: &str,
+    session_id: Option<&str>,
+) -> Option<crate::transcript::SessionUsage> {
+    if path.is_empty() {
+        return None;
+    }
+    super::transcript::get_transcript(path, tool, 1, false, session_id, false)
+        .ok()?
+        .usage
+}
+
 /// Get unread message count for a single instance.
 fn get_unread_count(db: &HcomDb, name: &str, last_event_id: i64) -> i64 {
     db.conn()
@@ -277,6 +291,19 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     payload["session_id"] = serde_json::json!(sid);
                 }
 
+                let usage = if is_remote_instance(&data) {
+                    None
+                } else if !sh_output && (field_name.is_none() || field_name == Some("usage")) {
+                    read_usage(
+                        &data.transcript_path,
+                        &data.tool,
+                        payload["session_id"].as_str(),
+                    )
+                } else {
+                    None
+                };
+                payload["usage"] = serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null);
+
                 if let Some(field) = field_name {
                     println!("{}", extract_field_value(&payload, field));
                 } else if sh_output {
@@ -284,7 +311,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 } else if json_output {
                     println!("{}", serde_json::to_string(&payload).unwrap_or_default());
                 } else {
-                    print_instance_details(db, &data, &lookup_name);
+                    print_instance_details(db, &data, &lookup_name, usage.as_ref());
                 }
                 return 0;
             }
@@ -696,7 +723,12 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
     0
 }
 
-fn print_instance_details(db: &HcomDb, data: &InstanceRow, display_name: &str) {
+fn print_instance_details(
+    db: &HcomDb,
+    data: &InstanceRow,
+    display_name: &str,
+    usage: Option<&crate::transcript::SessionUsage>,
+) {
     let cs = get_instance_status(data, db);
     let status = cs.status;
 
@@ -807,6 +839,9 @@ fn print_instance_details(db: &HcomDb, data: &InstanceRow, display_name: &str) {
 
     if !data.transcript_path.is_empty() {
         println!("  Transcript:  {}", shorten_path(&data.transcript_path));
+    }
+    if let Some(usage) = usage {
+        println!("  Usage:       {}", crate::transcript::format_usage(usage));
     }
 
     if data.background != 0 && !data.background_log_file.is_empty() {
@@ -931,6 +966,25 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
         let entry = &entries[0];
         let data: serde_json::Value = serde_json::from_str(&entry.data).unwrap_or_default();
         let snapshot = &data["snapshot"];
+        let usage = read_usage(
+            snapshot["transcript_path"].as_str().unwrap_or(""),
+            snapshot["tool"].as_str().unwrap_or(""),
+            snapshot["session_id"].as_str(),
+        );
+        if args.json || args.field.is_some() {
+            let mut payload = snapshot.clone();
+            if !payload.is_object() {
+                payload = serde_json::json!({});
+            }
+            payload["name"] = serde_json::json!(entry.instance);
+            payload["usage"] = serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null);
+            if let Some(field) = &args.field {
+                println!("{}", extract_field_value(&payload, field));
+            } else {
+                println!("{}", payload);
+            }
+            return 0;
+        }
         println!("Stopped: {}", entry.instance);
         println!("  Time:       {}", entry.timestamp);
         if let Some(by) = data["by"].as_str() {
@@ -962,6 +1016,9 @@ fn cmd_list_stopped(db: &HcomDb, args: &ListArgs) -> i32 {
             && !tp.is_empty()
         {
             println!("  Transcript: {tp}");
+        }
+        if let Some(usage) = &usage {
+            println!("  Usage:      {}", crate::transcript::format_usage(usage));
         }
         let output = data["output"].as_str().unwrap_or("");
         print!("{}", crate::identity::last_output_block(output));
@@ -1074,6 +1131,27 @@ fn get_recently_stopped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_usage_reads_whole_session_and_preserves_missing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, concat!(
+            "{\"type\":\"user\",\"message\":{\"content\":\"first\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"one\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":\"second\"}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"two\",\"content\":[],\"usage\":{\"input_tokens\":20,\"output_tokens\":7}}}\n"
+        )).unwrap();
+        let usage = read_usage(path.to_str().unwrap(), "claude", None).unwrap();
+        assert_eq!(usage.tokens.input, 30);
+        assert_eq!(usage.tokens.output, 12);
+        assert_eq!(usage.context_tokens, Some(20));
+        assert_eq!(usage.context_window, None);
+        assert_eq!(usage.cost_usd, None);
+        assert!(read_usage("", "claude", None).is_none());
+        std::fs::write(&path, "").unwrap();
+        assert!(read_usage(path.to_str().unwrap(), "claude", None).is_none());
+    }
 
     fn test_db() -> HcomDb {
         let dir = tempfile::tempdir().unwrap();
