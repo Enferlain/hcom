@@ -1104,7 +1104,7 @@ impl Proxy {
                     for origin in child_input.flush(&self.pty_master)? {
                         match origin {
                             InputOrigin::User => {
-                                if self.config.target.name() != "cursor" {
+                                if !matches!(self.config.target.name(), "cursor" | "codex") {
                                     self.screen.clear_approval();
                                 }
                                 shared::note_user_keystroke(

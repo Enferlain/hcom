@@ -36,8 +36,8 @@ fn real_codex_full_lifecycle_send_fork_kill_resume_and_cleanup() {
 }
 
 /// Codex's approval gate is hcom's only PTY-driven block path, and
-/// `blocked(pty:approval)` only latches when a message is pending behind a
-/// visible approval prompt. This drives that exact race: with Codex configured
+/// `blocked(pty:approval)` is published while an approval prompt is visible.
+/// This exercises a message pending behind that prompt: with Codex configured
 /// for workspace-write and on-request approvals, a scripted shell call that
 /// asks to run outside the sandbox raises Codex's approval prompt, an inbound
 /// hcom message is held while the prompt is up, then a real approval
@@ -49,10 +49,10 @@ fn real_codex_full_lifecycle_send_fork_kill_resume_and_cleanup() {
 /// under hcom's headless PTY, so Codex falls back to the Bel backend and emits
 /// no OSC9. hcom instead scrapes the approval surface from the terminal
 /// (`src/pty/screen.rs`), publishes the `pty:approval` block / `pty:approval_cleared`
-/// release as status events (`publish_approval_status`), and clears the gate
-/// synchronously when an injected keystroke answers the prompt
-/// (`clear_injected_approval`) — do not regress by reconfiguring Codex to force
-/// a signal.
+/// release as status events (`publish_approval_status`). Input alone does not
+/// clear approval: the dialog must disappear, or PostToolUse must confirm that
+/// the approved tool ran. Whichever release happens first owns the transition;
+/// do not require a redundant PTY event after the hook has already released it.
 #[test]
 #[ignore = "requires the pinned real @openai/codex binary"]
 #[serial]
@@ -311,7 +311,13 @@ fn real_codex_approval_gate_blocks_pending_message_then_clears_on_approval() {
             let cleared = stdout
                 .lines()
                 .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .any(|event| event["data"]["context"].as_str() == Some("pty:approval_cleared"));
+                .any(|event| {
+                    let data = &event["data"];
+                    data["status"].as_str() == Some("active")
+                        && (data["context"].as_str() == Some("pty:approval_cleared")
+                            || (data["context"].as_str() == Some("approved:Bash")
+                                && data["old_context"].as_str() == Some("pty:approval")))
+                });
             if cleared { Ok(Some(())) } else { Ok(None) }
         },
     );

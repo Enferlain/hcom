@@ -242,8 +242,8 @@ pub(super) fn update_delivery_state(
 ///
 /// Only acts when approval is currently showing, so routine message
 /// injection (approval already false) is a no-op and never falsely stamps
-/// user-active state. Cursor's approval is authoritative-by-prompt — it
-/// clears only when the prompt leaves the screen — so it is excluded here,
+/// user-active state. Cursor and Codex approvals clear only when the prompt
+/// leaves the screen, so they are excluded here,
 /// matching the interactive stdin handler.
 ///
 /// Returns `true` when the approval was cleared; the caller is then responsible
@@ -254,7 +254,7 @@ pub(super) fn clear_injected_approval_state(
     screen_state: &Arc<RwLock<ScreenState>>,
     publish: &dyn Fn(bool),
 ) -> bool {
-    if target.name() == "cursor" {
+    if matches!(target.name(), "cursor" | "codex") {
         return false;
     }
     let approval_cleared = match screen_state.write() {
@@ -274,13 +274,12 @@ pub(super) fn clear_injected_approval_state(
 /// Record a genuine user keystroke against the shared delivery state.
 ///
 /// Genuine keystrokes answering a title-detected approval clear it immediately.
-/// Cursor's approval is screen-scraped and authoritative-by-prompt, so it clears
-/// only when the prompt actually leaves the screen.
+/// Cursor and Codex approvals clear only when the prompt leaves the screen.
 ///
 /// Returns `true` only when a standing approval was actually cleared — matching
 /// `clear_injected_approval_state`. The Unix caller ignores this and clears its
-/// tracker inline on every non-cursor keystroke; the Windows caller uses it to
-/// gate the tracker-clear atomic it consumes, so a keystroke with no approval
+/// tracker inline for tools other than Cursor and Codex. The Windows caller
+/// uses it to gate the tracker-clear atomic it consumes, so input with no approval
 /// showing does not wipe the OSC scrape buffer (`output_buffer`) and lose an
 /// approval edge that arrives in the same window.
 pub(super) fn note_user_keystroke(
@@ -288,11 +287,11 @@ pub(super) fn note_user_keystroke(
     screen_state: &Arc<RwLock<ScreenState>>,
     publish: &dyn Fn(bool),
 ) -> bool {
-    let cursor_scrape = target.name() == "cursor";
+    let screen_authoritative = matches!(target.name(), "cursor" | "codex");
     let mut approval_cleared = false;
     if let Ok(mut state) = screen_state.write() {
         state.last_user_input = Instant::now();
-        if !cursor_scrape {
+        if !screen_authoritative {
             approval_cleared = state.approval;
             state.approval = false;
         }
@@ -1933,6 +1932,23 @@ No session found matching 'never-saved'"
         assert!(!cleared);
         assert!(state.read().unwrap().approval, "cursor approval untouched");
         assert_eq!(calls.get(), 0, "cursor keystroke must not publish");
+    }
+
+    #[test]
+    fn codex_input_preserves_approval_until_screen_clears() {
+        let target = PtyTarget::Known(Tool::Codex);
+        let state = Arc::new(RwLock::new(ScreenState {
+            approval: true,
+            approval_scrape_latched: true,
+            ..ScreenState::default()
+        }));
+        let publish = |_a: bool| panic!("input must not publish an approval edge");
+        for _ in 0..3 {
+            assert!(!note_user_keystroke(&target, &state, &publish));
+            assert!(!clear_injected_approval_state(&target, &state, &publish));
+            assert!(state.read().unwrap().approval);
+            assert!(state.read().unwrap().approval_scrape_latched);
+        }
     }
 
     #[test]
