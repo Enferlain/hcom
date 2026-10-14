@@ -11,16 +11,21 @@ let failures = 0;
 const FAILURES_BEFORE_REPORT = 3;
 // Ticks to skip after a failed poll, so a broken hcom is not respawned 4x/s.
 let backoff = 0;
+// process.run starts in the session's working directory by default. Claude
+// keeps that directory after a Bash command deletes it, and every spawn then
+// fails with ENOENT until the command ends. hcom needs no particular directory.
+const CWD = '/';
 
 async function report($, session, event, detail) {
   try {
     const result = await $.process.run(
       [...command, 'claude-mod-poll', '--session-id', session, '--event', event, '--detail', detail],
-      { timeoutMs: 10000 },
+      { cwd: CWD, timeoutMs: 10000 },
     );
     if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout);
   } catch (error) {
-    await $.ui.log('hcom mod could not record ' + event + ': ' + String(error)).catch(() => {});
+    // $.ui.log is fire-and-forget: it returns nothing, so it has no .catch.
+    $.ui.log('hcom mod could not record ' + event + ': ' + String(error));
   }
 }
 
@@ -38,7 +43,7 @@ async function poll($) {
     session = await $.session.id();
     const result = await $.process.run(
       [...command, 'claude-mod-poll', '--session-id', session, ...(submitting ? ['--observe'] : [])],
-      { timeoutMs: 30000 },
+      { cwd: CWD, timeoutMs: 30000 },
     );
     if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout || 'hcom poll failed');
     const state = JSON.parse(result.stdout);
@@ -61,7 +66,7 @@ async function poll($) {
         async (error) => {
           submitting = false;
           await report($, session, 'submission-failed', String(error));
-          await $.ui.log('hcom mod wake failed; messages remain queued: ' + String(error)).catch(() => {});
+          $.ui.log('hcom mod wake failed; messages remain queued: ' + String(error));
         },
       );
     } catch (error) {
@@ -77,7 +82,7 @@ async function poll($) {
     if (failures >= FAILURES_BEFORE_REPORT) {
       if (session) await report($, session, 'poll-failed', String(error));
       if (failures === FAILURES_BEFORE_REPORT) {
-        await $.ui.log('hcom mod poll failed; messages remain queued: ' + String(error)).catch(() => {});
+        $.ui.log('hcom mod poll failed; messages remain queued: ' + String(error));
       }
     }
   } finally {
@@ -104,7 +109,7 @@ export function register(on) {
         throw new Error('expected a nonempty command argument array');
       }
     } catch (error) {
-      await $.ui.log('hcom mod cannot start: invalid HCOM_MOD_COMMAND: ' + String(error)).catch(() => {});
+      $.ui.log('hcom mod cannot start: invalid HCOM_MOD_COMMAND: ' + String(error));
       return next(e);
     }
     timer?.cancel();
