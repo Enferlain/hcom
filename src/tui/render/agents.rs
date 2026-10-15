@@ -57,8 +57,13 @@ const SPINNER_FRAMES: &[&str] = &[
 
 /// Pad left spans and append right spans so the result fills `width`.
 fn append_right_aligned(left: &mut Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16) {
-    let left_w: usize = left.iter().map(|s| s.width()).sum();
+    let right = super::fit_spans(right, width as usize);
     let right_w: usize = right.iter().map(|s| s.width()).sum();
+    *left = super::fit_spans(
+        std::mem::take(left),
+        (width as usize).saturating_sub(right_w),
+    );
+    let left_w: usize = left.iter().map(|s| s.width()).sum();
     let pad = (width as usize).saturating_sub(left_w + right_w);
     left.push(Span::raw(" ".repeat(pad)));
     left.extend(right);
@@ -111,66 +116,11 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
         .unwrap_or(4)
         .max(4);
 
-    // Reserve lines for section headers + expanded items that must be visible.
-    // Count exact rows from sections, up to and including the cursor position.
-    let section_reserve = {
-        let live = app.data.agents.len();
-        let mut rows = 0usize;
-
-        if !app.data.remote_agents.is_empty() {
-            rows += 1; // header
-            if app.ui.remote_expanded {
-                rows += app.data.remote_agents.len();
-            }
-        }
-        if app.ui.view_mode != ViewMode::Inline && !app.data.stopped_agents.is_empty() {
-            rows += 1;
-            if app.ui.stopped_expanded {
-                rows += app.data.stopped_agents.len();
-            }
-        }
-        if !app.data.orphans.is_empty() {
-            rows += 1;
-            if app.ui.orphans_expanded {
-                rows += app.data.orphans.len();
-            }
-        }
-
-        // If cursor is in sections, ensure at least enough rows to reach it
-        if app.ui.cursor >= live {
-            rows.max(app.ui.cursor - live + 1)
-        } else {
-            rows
-        }
-    };
-    let live_max = max_visible.saturating_sub(section_reserve).max(1);
-
-    // Compute scroll window centered on cursor (live agents only)
-    let live_cursor = if app.ui.cursor < app.data.agents.len() {
-        app.ui.cursor
-    } else {
-        app.data.agents.len().saturating_sub(1)
-    };
-    let scroll = compute_scroll(live_cursor, app.data.agents.len(), live_max);
-    let end = (scroll + live_max).min(app.data.agents.len());
-
-    // Scroll-up indicator
-    if scroll > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("  ↑ {} more", scroll),
-            Theme::dim(),
-        )));
-    }
-
-    for i in scroll..end {
-        let agent = &app.data.agents[i];
+    // Build complete groups first so overflow indicators and detail rows count
+    // against the same budget as agent rows.
+    for (i, agent) in app.data.agents.iter().enumerate() {
         let is_cursor = app.ui.cursor == i;
         let is_selected = app.ui.selected.contains(&agent.name);
-
-        if lines.len() >= max_visible {
-            break;
-        }
-
         lines.push(compact_agent_line(
             agent,
             is_cursor,
@@ -179,27 +129,18 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
             app.ui.tick,
             multi_tool,
         ));
-
-        if is_cursor && is_selected && lines.len() < max_visible {
+        if is_cursor && is_selected {
             lines.push(detail_line_info(agent, width));
         }
     }
-
-    // Scroll-down indicator
-    let remaining = app.data.agents.len().saturating_sub(end);
-    if remaining > 0 && lines.len() < max_visible {
-        lines.push(Line::from(Span::styled(
-            format!("  ↓ {} more", remaining),
-            Theme::dim(),
-        )));
-    }
+    let mut section_lines = Vec::new();
 
     // ── Collapsible sections (remote / stopped / orphans) ──
     let ct = app.cursor_target();
 
     render_collapsible_section(
-        &mut lines,
-        max_visible,
+        &mut section_lines,
+        usize::MAX,
         app.data.remote_agents.len(),
         "remote",
         app.ui.remote_expanded,
@@ -225,8 +166,8 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
     );
 
     render_collapsible_section(
-        &mut lines,
-        max_visible,
+        &mut section_lines,
+        usize::MAX,
         app.data.stopped_agents.len(),
         "stopped",
         app.ui.stopped_expanded,
@@ -251,8 +192,8 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
     );
 
     render_collapsible_section(
-        &mut lines,
-        max_visible,
+        &mut section_lines,
+        usize::MAX,
         app.data.orphans.len(),
         "orphans",
         app.ui.orphans_expanded,
@@ -265,7 +206,54 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
         }),
     );
 
-    lines
+    // Expanded sections get at most half the pane while live agents exist.
+    // Each group scrolls independently to keep its cursor in view.
+    let section_budget = if lines.is_empty() {
+        max_visible
+    } else {
+        max_visible / 2 + usize::from(max_visible == 1 && app.ui.cursor >= app.data.agents.len())
+    }
+    .min(section_lines.len());
+    let live_budget = max_visible.saturating_sub(section_budget);
+    let mut visible = window_agent_rows(lines, live_budget);
+    visible.extend(window_agent_rows(
+        section_lines,
+        max_visible.saturating_sub(visible.len()),
+    ));
+    visible
+}
+
+/// Reserve overflow rows before choosing content. Cursor rows carry the
+/// selection background; selected agents without the cursor do not.
+fn window_agent_rows(rows: Vec<Line<'static>>, height: usize) -> Vec<Line<'static>> {
+    if rows.len() <= height {
+        return rows;
+    }
+    if height == 0 {
+        return Vec::new();
+    }
+    let cursor = rows
+        .iter()
+        .position(|line| line.style.bg == Some(palette::SELECTION))
+        .unwrap_or(0);
+    let count = height.saturating_sub(2).max(1);
+    let start = compute_scroll(cursor, rows.len(), count);
+    let end = (start + count).min(rows.len());
+    let mut visible = Vec::new();
+    if start > 0 && height > 1 {
+        visible.push(Line::from(Span::styled(
+            format!("  ↑ {} more", start),
+            Theme::dim(),
+        )));
+    }
+    visible.extend(rows[start..end].iter().cloned());
+    if end < rows.len() && visible.len() < height {
+        visible.push(Line::from(Span::styled(
+            format!("  ↓ {} more", rows.len() - end),
+            Theme::dim(),
+        )));
+    }
+    visible
 }
 
 fn compute_scroll(cursor: usize, total: usize, visible: usize) -> usize {
@@ -324,7 +312,7 @@ fn detail_line_info(agent: &Agent, width: u16) -> Line<'static> {
     }
     if let Some(ref sid) = agent.session_id {
         parts.push(Span::styled(" \u{00b7} ", Theme::separator()));
-        let short = if sid.len() > 6 { &sid[..6] } else { sid };
+        let short: String = sid.chars().take(6).collect();
         parts.push(Span::styled(format!("session:{}", short), Theme::dim()));
     }
     if let Some(pid) = agent.pid {
@@ -1063,7 +1051,7 @@ fn build_agent_detail(agent: &Agent, app: &App, lines: &mut Vec<Line<'static>>, 
     }
     if let Some(ref sid) = agent.session_id {
         info.push(Span::styled(" \u{00b7} ", Theme::separator()));
-        let short = if sid.len() > 6 { &sid[..6] } else { sid };
+        let short: String = sid.chars().take(6).collect();
         info.push(Span::styled(format!("session:{}", short), Theme::dim()));
     }
     if agent.unread > 0 {
@@ -1111,6 +1099,94 @@ mod usage_tests {
     use super::*;
 
     #[test]
+    fn right_badge_survives_long_unicode_middle_fields() {
+        for width in 5..30 {
+            let mut left = vec![Span::raw("  nova "), Span::raw("界".repeat(100))];
+            append_right_aligned(&mut left, vec![Span::raw(" 12m ")], width);
+            let line = Line::from(left);
+            assert!(line.width() <= width as usize);
+            assert!(line.to_string().ends_with(" 12m "));
+        }
+    }
+
+    #[test]
+    fn scrolling_keeps_every_cursor_visible_and_counts_hidden_rows() {
+        for height in 1..12 {
+            for cursor in 0..20 {
+                let rows = (0..20)
+                    .map(|i| {
+                        let line = Line::raw(format!("agent {i}"));
+                        if i == cursor {
+                            line.style(Style::default().bg(palette::SELECTION))
+                        } else {
+                            line
+                        }
+                    })
+                    .collect();
+                let visible = window_agent_rows(rows, height);
+                assert!(visible.len() <= height);
+                assert!(
+                    visible
+                        .iter()
+                        .any(|line| line.to_string() == format!("agent {cursor}"))
+                );
+                if height >= 3 {
+                    let content: Vec<usize> = visible
+                        .iter()
+                        .filter_map(|line| {
+                            line.to_string()
+                                .strip_prefix("agent ")
+                                .and_then(|s| s.parse().ok())
+                        })
+                        .collect();
+                    let first = *content.first().unwrap();
+                    let last = *content.last().unwrap();
+                    if first > 0 {
+                        assert_eq!(visible[0].to_string(), format!("  ↑ {first} more"));
+                    }
+                    if last < 19 {
+                        assert_eq!(
+                            visible.last().unwrap().to_string(),
+                            format!("  ↓ {} more", 19 - last)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_stopped_section_keeps_live_share_and_section_cursor_visible() {
+        crate::config::Config::init();
+        let mut app = App::new();
+        app.data.agents = (0..10)
+            .map(|i| crate::tui::test_helpers::make_test_agent(&format!("live{i}"), 0.0))
+            .collect();
+        app.data.stopped_agents = (0..100)
+            .map(|i| crate::tui::test_helpers::make_test_agent(&format!("stop{i}"), 0.0))
+            .collect();
+        app.ui.stopped_expanded = true;
+        app.ui.view_mode = ViewMode::Vertical;
+        for cursor in [0, 9, 10, 11, 110] {
+            app.ui.cursor = cursor;
+            let lines = collect_agent_lines(&app, 80, 12);
+            assert!(lines.len() <= 12);
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.style.bg == Some(palette::SELECTION))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .filter(|line| line.to_string().contains("live"))
+                    .count()
+                    >= 4
+            );
+        }
+    }
+
+    #[test]
     fn context_stays_in_heading_and_is_omitted_when_narrow() {
         crate::config::Config::init();
         let mut app = App::new();
@@ -1147,5 +1223,19 @@ mod usage_tests {
             assert!(!lines[0].to_string().contains(context));
             assert!(lines[0].to_string().contains("nahe · qoder · 54m"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_preview_truncates_at_character_boundaries() {
+        let mut agent = crate::tui::test_helpers::make_test_agent("nova", 60.0);
+        agent.session_id = Some("é世🙂abcde".into());
+        let line = detail_line_info(&agent, 200).to_string();
+        assert!(line.contains("session:é世🙂abc"), "{line}");
+        assert!(!line.contains("abcde"), "{line}");
     }
 }
