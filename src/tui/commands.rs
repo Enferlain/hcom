@@ -10,8 +10,10 @@
 //! would corrupt the TUI display. Subprocess isolation is clean and
 //! adds ~5ms overhead — imperceptible for interactive operations.
 
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::tui::rpc::Response;
 
@@ -31,13 +33,62 @@ fn hcom_binary() -> Result<PathBuf, String> {
 pub fn run_native(argv: &[String]) -> Result<Response, String> {
     let binary = hcom_binary()?;
 
-    let output = Command::new(&binary)
-        .args(argv)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
+    let timeout = if matches!(
+        crate::router::resolve_action(argv),
+        crate::router::Action::Launch { .. }
+    ) {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs(60)
+    };
+    run_with_timeout(Command::new(binary).args(argv), timeout)
+}
+
+fn run_with_timeout(command: &mut Command, timeout: Duration) -> Result<Response, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("spawn hcom: {e}"))?;
+    // Drain both pipes concurrently so a full pipe cannot block child exit.
+    let read_pipe = |mut pipe: Box<dyn Read + Send>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = tx.send(bytes);
+        });
+        rx
+    };
+    let stdout = read_pipe(Box::new(child.stdout.take().unwrap()));
+    let stderr = read_pipe(Box::new(child.stderr.take().unwrap()));
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match result {
+                    Err(e) => format!("wait for hcom: {e}"),
+                    _ => format!("hcom command timed out after {} seconds", timeout.as_secs()),
+                });
+            }
+        }
+    };
+    let output = std::process::Output {
+        status,
+        stdout: stdout
+            .recv_timeout(timeout.saturating_sub(start.elapsed()))
+            .map_err(|_| "hcom output collection timed out".to_string())?,
+        stderr: stderr
+            .recv_timeout(timeout.saturating_sub(start.elapsed()))
+            .map_err(|_| "hcom output collection timed out".to_string())?,
+    };
 
     Ok(Response {
         exit_code: output.status.code().unwrap_or(1),
@@ -49,6 +100,19 @@ pub fn run_native(argv: &[String]) -> Result<Response, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_timeout_stops_waiting() {
+        let start = Instant::now();
+        let error = run_with_timeout(
+            Command::new("sh").args(["-c", "sleep 2"]),
+            Duration::from_millis(30),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
 
     /// Find the hcom binary for testing. In test context, current_exe()
     /// returns the test runner, not hcom. Look in cargo target dir instead.

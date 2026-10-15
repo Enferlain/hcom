@@ -65,12 +65,17 @@ pub struct RpcClient {
 
 impl RpcClient {
     pub fn start() -> Self {
+        Self::start_with(run_op)
+    }
+
+    fn start_with(run: impl Fn(&RpcOp) -> Result<Response, String> + Send + 'static) -> Self {
         let (tx_req, rx_req) = mpsc::channel::<RpcOp>();
         let (tx_res, rx_res) = mpsc::channel::<RpcResult>();
 
         thread::spawn(move || {
             for op in rx_req {
-                let result = run_op(&op);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&op)))
+                    .unwrap_or_else(|_| Err("hcom RPC worker operation panicked".into()));
                 let _ = tx_res.send(RpcResult { op, result });
             }
         });
@@ -191,5 +196,36 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
             );
             commands::run_native(&argv)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_survives_panic_and_drains_pending() {
+        let mut client = RpcClient::start_with(|op| {
+            if matches!(op, RpcOp::RelayStatus) {
+                panic!("test operation panic");
+            }
+            Ok(Response {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        client.submit(RpcOp::RelayStatus).unwrap();
+        client.submit(RpcOp::RelayNew).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut results = Vec::new();
+        while client.pending_count() > 0 && std::time::Instant::now() < deadline {
+            results.extend(client.drain());
+            std::thread::yield_now();
+        }
+        assert_eq!(client.pending_count(), 0);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].result.is_err());
+        assert!(results[1].result.is_ok());
     }
 }
