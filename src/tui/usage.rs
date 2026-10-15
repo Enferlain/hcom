@@ -72,7 +72,7 @@ fn collect(source: &Source, cache: &mut Vec<Cached>) -> Option<String> {
     )
     .ok()
     .and_then(|t| t.usage)
-    .and_then(|u| transcript::format_context(&u));
+    .map(|u| usage_label(&u));
     cache.retain(|c| c.source != *source);
     if cache.len() >= 32 {
         cache.remove(0);
@@ -83,6 +83,13 @@ fn collect(source: &Source, cache: &mut Vec<Cached>) -> Option<String> {
         context: context.clone(),
     });
     context
+}
+
+fn usage_label(usage: &transcript::SessionUsage) -> String {
+    match transcript::format_context(usage) {
+        Some(context) => format!("ctx:{context}"),
+        None => transcript::format_usage(usage),
+    }
 }
 
 #[derive(Default)]
@@ -171,7 +178,10 @@ impl UsageWorker {
 
     #[cfg(test)]
     pub fn set_context_for_test(&mut self, agent: &Agent, context: &str) {
-        self.results = vec![(Source::for_agent(agent).unwrap(), Some(context.into()))];
+        self.results = vec![(
+            Source::for_agent(agent).unwrap(),
+            Some(format!("ctx:{context}")),
+        )];
         self.selected = Source::for_agent(agent);
         self.fresh = true;
     }
@@ -198,6 +208,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_totals_are_shown_when_context_is_unavailable() {
+        let mut usage = transcript::SessionUsage {
+            tokens: transcript::TokenUsage {
+                input: 70_000,
+                output: 4_000,
+                cache_read: 1_100_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(usage_label(&usage), "74k tok + 1.1M cached");
+        usage.context_tokens = Some(50_000);
+        assert_eq!(usage_label(&usage), "ctx:50k");
+    }
+
+    #[test]
     fn cache_invalidates_file_and_session_and_caches_missing_usage() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
@@ -212,7 +238,7 @@ mod tests {
         assert_eq!(collect(&source, &mut cache), None);
         assert_eq!(cache.len(), 1);
         std::fs::write(&path, r#"{"type":"assistant","message":{"id":"a","content":[],"usage":{"input_tokens":100000,"output_tokens":1}}}"#).unwrap();
-        assert_eq!(collect(&source, &mut cache).as_deref(), Some("100k"));
+        assert_eq!(collect(&source, &mut cache).as_deref(), Some("ctx:100k"));
         assert_eq!(cache.len(), 1);
         source.session = Some("two".into());
         collect(&source, &mut cache);
@@ -262,9 +288,9 @@ mod tests {
         wait(&mut worker, &a);
         wait(&mut worker, &b);
         worker.poll(Some(&a));
-        assert_eq!(worker.context(&a), Some(("1k".into(), false)));
+        assert_eq!(worker.context(&a), Some(("ctx:1k".into(), false)));
         wait(&mut worker, &a);
-        assert_eq!(worker.context(&a), Some(("1k".into(), true)));
+        assert_eq!(worker.context(&a), Some(("ctx:1k".into(), true)));
     }
 
     #[test]

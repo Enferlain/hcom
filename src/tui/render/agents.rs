@@ -986,7 +986,6 @@ fn build_agent_detail(agent: &Agent, app: &App, lines: &mut Vec<Line<'static>>, 
         Span::styled(age, Theme::agent_dim()),
     ];
     if let Some((context, fresh)) = app.usage.context(agent)
-        && let context = format!("ctx:{context}")
         && left.iter().map(Span::width).sum::<usize>()
             + 3
             + UnicodeWidthStr::width(context.as_str())
