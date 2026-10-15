@@ -474,63 +474,59 @@ fn attach_runtime_state(
             .map_err(|e| format!("failed to register inject port: {}", e))?;
     }
 
-    let mut updates = serde_json::Map::new();
-    if !orphan.terminal_preset.is_empty() {
-        updates.insert(
-            "terminal_preset_effective".into(),
-            serde_json::json!(orphan.terminal_preset),
-        );
-    }
+    db.with_write_scope(|| {
+        let mut updates = serde_json::Map::new();
+        if !orphan.terminal_preset.is_empty() {
+            updates.insert(
+                "terminal_preset_effective".into(),
+                serde_json::json!(orphan.terminal_preset),
+            );
+        }
 
-    // Merge into whatever a hook already captured (tty, env, git branch).
-    let existing = db
-        .get_instance_full(instance_name)
-        .map_err(|e| format!("failed to read instance '{}': {}", instance_name, e))?
-        .and_then(|row| row.launch_context)
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| v.as_object().cloned());
-    let mut launch_context = existing.clone().unwrap_or_default();
-    for (key, value) in [
-        ("process_id", &orphan.process_id),
-        ("pane_id", &orphan.pane_id),
-        ("terminal_id", &orphan.terminal_id),
-        ("kitty_listen_on", &orphan.kitty_listen_on),
-    ] {
-        if !value.is_empty() {
-            launch_context.insert(key.into(), serde_json::json!(value));
+        // Merge into whatever a hook already captured (tty, env, git branch).
+        let existing = db
+            .get_instance_full(instance_name)?
+            .and_then(|row| row.launch_context)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| v.as_object().cloned());
+        let mut launch_context = existing.clone().unwrap_or_default();
+        for (key, value) in [
+            ("process_id", &orphan.process_id),
+            ("pane_id", &orphan.pane_id),
+            ("terminal_id", &orphan.terminal_id),
+            ("kitty_listen_on", &orphan.kitty_listen_on),
+        ] {
+            if !value.is_empty() {
+                launch_context.insert(key.into(), serde_json::json!(value));
+            }
         }
-    }
-    for (key, value) in [
-        ("ZELLIJ_SESSION_NAME", &orphan.zellij_session_name),
-        ("HERDR_SOCKET_PATH", &orphan.herdr_socket_path),
-        ("WEZTERM_UNIX_SOCKET", &orphan.wezterm_unix_socket),
-    ] {
-        if value.is_empty() {
-            continue;
+        for (key, value) in [
+            ("ZELLIJ_SESSION_NAME", &orphan.zellij_session_name),
+            ("HERDR_SOCKET_PATH", &orphan.herdr_socket_path),
+            ("WEZTERM_UNIX_SOCKET", &orphan.wezterm_unix_socket),
+        ] {
+            if value.is_empty() {
+                continue;
+            }
+            let env = launch_context
+                .entry("env")
+                .or_insert_with(|| serde_json::json!({}));
+            if !env.is_object() {
+                *env = serde_json::json!({});
+            }
+            env[key] = serde_json::json!(value);
         }
-        let env = launch_context
-            .entry("env")
-            .or_insert_with(|| serde_json::json!({}));
-        if !env.is_object() {
-            *env = serde_json::json!({});
+        if Some(&launch_context) != existing.as_ref() && !launch_context.is_empty() {
+            updates.insert(
+                "launch_context".into(),
+                serde_json::json!(
+                    serde_json::to_string(&launch_context).unwrap_or_else(|_| "{}".to_string())
+                ),
+            );
         }
-        env[key] = serde_json::json!(value);
-    }
-    if Some(&launch_context) != existing.as_ref() && !launch_context.is_empty() {
-        updates.insert(
-            "launch_context".into(),
-            serde_json::json!(
-                serde_json::to_string(&launch_context).unwrap_or_else(|_| "{}".to_string())
-            ),
-        );
-    }
-    db.update_instance_pid_with_fields(instance_name, orphan.pid, &updates)
-        .map_err(|e| {
-            format!(
-                "failed to attach runtime state to '{}': {}",
-                instance_name, e
-            )
-        })?;
+        db.update_instance_pid_with_fields(instance_name, orphan.pid, &updates)
+    })
+    .map_err(|e| format!("failed to attach runtime state to '{instance_name}': {e}"))?;
     Ok(())
 }
 
