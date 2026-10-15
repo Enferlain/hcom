@@ -1702,7 +1702,10 @@ fn render_relay_popup(frame: &mut Frame, relay: &RelayPopupState) {
         let display = if relay.token_input.is_empty() {
             Span::styled("paste token\u{2026}", Style::default().fg(palette::FG_DARK))
         } else {
-            Span::styled(relay.token_input.clone(), Style::default().fg(palette::FG))
+            Span::styled(
+                "•".repeat(relay.token_input.chars().count()),
+                Style::default().fg(palette::FG),
+            )
         };
         lines.push(Line::from(vec![
             Span::raw("  "),
@@ -1722,9 +1725,9 @@ fn render_relay_popup(frame: &mut Frame, relay: &RelayPopupState) {
 
     // Position cursor in token input
     if relay.editing_token {
-        let display_width = unicode_width::UnicodeWidthStr::width(
-            &relay.token_input[..relay.token_cursor.min(relay.token_input.len())],
-        );
+        let display_width = relay.token_input[..relay.token_cursor.min(relay.token_input.len())]
+            .chars()
+            .count();
         let cursor_x = popup.x + 2 + 2 + display_width as u16;
         let cursor_y = popup.y + h - 2;
         frame.set_cursor_position(Position::new(

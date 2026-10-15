@@ -1139,7 +1139,7 @@ impl App {
                 }
                 KeyCode::Enter if !popup.token_input.is_empty() => {
                     let token = popup.token_input.clone();
-                    let cmd = format!("relay connect {}", token);
+                    let cmd = "relay connect".to_string();
                     if let Err(e) = self.enqueue_rpc(RpcOp::RelayConnect {
                         token: token.clone(),
                     }) {
@@ -1489,6 +1489,23 @@ mod tests {
 
         assert_eq!(app.resolve_kill_targets(), vec!["nova"]);
         assert_eq!(app.resolve_tag_targets(), vec!["nova"]);
+    }
+
+    #[test]
+    fn relay_connect_enqueue_error_label_omits_token() {
+        let mut app = test_app();
+        ctrl(&mut app, 'r');
+        let popup = app.ui.relay_popup.as_mut().expect("relay popup");
+        popup.editing_token = true;
+        popup.token_input = "secret-token".into();
+        popup.token_cursor = popup.token_input.len();
+
+        key(&mut app, KeyCode::Enter);
+
+        assert_eq!(
+            app.ui.command_result.as_ref().unwrap().label,
+            "relay connect"
+        );
     }
 
     #[test]

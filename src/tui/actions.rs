@@ -230,16 +230,26 @@ impl App {
             RpcOp::RelayNew => {
                 self.show_command_output("relay new", rpc_output_lines(result.result));
             }
-            RpcOp::RelayConnect { token } => {
+            RpcOp::RelayConnect { .. } => {
                 let success = matches!(&result.result, Ok(resp) if resp.ok());
-                let output = rpc_output_lines(result.result);
+                let output = rpc_output_lines(result.result)
+                    .into_iter()
+                    .map(|line| {
+                        // Switching groups prints a rejoin command containing the old token.
+                        if let Some((prefix, _)) = line.split_once("hcom relay connect ") {
+                            format!("{prefix}hcom relay connect [hidden]")
+                        } else {
+                            line
+                        }
+                    })
+                    .collect();
                 if !success {
                     self.ui.flash = Some(Flash::new(
                         "Relay connect failed".into(),
                         Theme::flash_err(),
                     ));
                 }
-                self.show_command_output(&format!("relay connect {}", token), output);
+                self.show_command_output("relay connect", output);
                 self.reload_data_force();
             }
             RpcOp::Command { cmd } => {
@@ -496,6 +506,34 @@ mod tests {
 
         assert_eq!(app.ui.mode, InputMode::CommandOutput);
         assert!(!app.ui.pending_eject_cmd);
+    }
+
+    #[test]
+    fn relay_connect_result_hides_tokens() {
+        let mut app = test_app();
+        app.apply_rpc_result(RpcResult {
+            op: RpcOp::RelayConnect {
+                token: "secret-token".into(),
+            },
+            result: Ok(Response {
+                exit_code: 0,
+                stdout: "Leaving group old. To rejoin: hcom relay connect old-secret\nconnected"
+                    .into(),
+                stderr: String::new(),
+            }),
+        });
+        assert_eq!(
+            app.ui.command_result.as_ref().unwrap().label,
+            "relay connect"
+        );
+        let output = &app.ui.command_result.as_ref().unwrap().output;
+        assert_eq!(
+            output,
+            &vec![
+                "Leaving group old. To rejoin: hcom relay connect [hidden]".to_string(),
+                "connected".to_string(),
+            ]
+        );
     }
 
     #[test]
