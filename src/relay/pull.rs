@@ -411,14 +411,15 @@ pub fn handle_state_message(
                 .unwrap_or(0.0);
             let status_time_i64 = status_time as i64;
 
+            // Retained snapshots still protect existing rows from pruning.
+            let namespaced = super::add_device_suffix(name, &short_id);
+            seen_instances.insert(namespaced.clone());
+
             // Local reset wins: ignore remote snapshots older than our reset so
             // cleared instances don't reappear from broker-retained state.
             if local_reset_ts > 0.0 && status_time < local_reset_ts {
                 continue;
             }
-
-            let namespaced = super::add_device_suffix(name, &short_id);
-            seen_instances.insert(namespaced.clone());
 
             let parent = inst
                 .get("parent")
@@ -1095,6 +1096,44 @@ mod tests {
             safe_kv_get(&db, "relay_sync_time_device-1234").is_some(),
             "the peer's sync time is applied by the time anyone is woken"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn stale_snapshot_preserves_existing_rows_without_recreating_cleared_rows() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        safe_kv_set(&db, "relay_local_reset_ts", Some("200"));
+        db.conn().execute(
+            "INSERT INTO instances (name, created_at, origin_device_id) VALUES ('kept:ABCD', 1, 'device-1234'), ('gone:ABCD', 1, 'device-1234')",
+            [],
+        ).unwrap();
+        let payload = json!({
+            "state": {"short_id": "ABCD", "reset_ts": 0.0, "instances": {
+                "kept": {"status_time": 100.0},
+                "cleared": {"status_time": 100.0}
+            }},
+            "events": []
+        });
+        let topic = "hcom/relay-test/device-1234/state";
+        let envelope = seal_for_test(&payload, topic, "relay-test");
+        let mut guard = ReplayGuard::default();
+        let psk = fixture_psk();
+        handle_state_message(
+            &db,
+            "device-1234",
+            &envelope,
+            "own-device-5678",
+            &mut InboundContext {
+                psk: &psk,
+                relay_id: "relay-test",
+                topic,
+                replay_guard: &mut guard,
+            },
+        );
+        assert!(db.get_instance_full("kept:ABCD").unwrap().is_some());
+        assert!(db.get_instance_full("cleared:ABCD").unwrap().is_none());
+        assert!(db.get_instance_full("gone:ABCD").unwrap().is_none());
     }
 
     #[test]
