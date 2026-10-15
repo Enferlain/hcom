@@ -10,6 +10,13 @@ use crate::tui::theme::Theme;
 
 impl App {
     pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        self.handle_key_inner(code, modifiers);
+        if self.ui.mode != InputMode::CommandOutput && !self.ui.pending_eject_cmd {
+            self.ui.command_result = None;
+        }
+    }
+
+    fn handle_key_inner(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         // AltGr on non-US keyboards sends Ctrl+Alt — exclude from Ctrl shortcut matching
         // so characters like @ (AltGr+Q on German) and \ (AltGr on many layouts) pass through.
         let ctrl =
@@ -1318,6 +1325,35 @@ mod tests {
             .as_ref()
             .map(|f| f.text.clone())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn leaving_command_output_for_relay_clears_result() {
+        let mut app = test_app();
+        app.ui.mode = InputMode::CommandOutput;
+        app.ui.command_result = Some(CommandResult {
+            label: "test".into(),
+            output: vec!["output".into()],
+        });
+        app.handle_key(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        assert_eq!(app.ui.mode, InputMode::Relay);
+        assert!(app.ui.command_result.is_none());
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(app.ui.mode, InputMode::Navigate);
+        assert!(app.ui.command_result.is_none());
+    }
+
+    #[test]
+    fn inline_command_output_survives_until_ejection() {
+        let mut app = test_app();
+        app.ui.mode = InputMode::Navigate;
+        app.ui.pending_eject_cmd = true;
+        app.ui.command_result = Some(CommandResult {
+            label: "test".into(),
+            output: vec!["output".into()],
+        });
+        key(&mut app, KeyCode::Null);
+        assert!(app.ui.command_result.is_some());
     }
 
     #[test]
