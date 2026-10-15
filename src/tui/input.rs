@@ -176,6 +176,12 @@ impl App {
             return;
         }
 
+        // Unhandled Ctrl combos must not fall through as plain letters
+        // (Ctrl+K would open kill, Ctrl+V would type 'v').
+        if ctrl && matches!(code, KeyCode::Char(_)) {
+            return;
+        }
+
         // ── Mode dispatch ──
         match self.ui.mode {
             InputMode::Relay => self.handle_relay(code),
@@ -1305,6 +1311,17 @@ mod tests {
 
     fn ctrl(app: &mut App, c: char) {
         app.handle_key(KeyCode::Char(c), KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn unhandled_ctrl_letters_do_nothing() {
+        let mut app = test_app();
+        app.data.agents = vec![crate::tui::test_helpers::make_test_agent("nova", 0.0)];
+        ctrl(&mut app, 'k');
+        assert!(app.ui.confirm.is_none());
+        app.ui.mode = InputMode::Compose;
+        ctrl(&mut app, 'v');
+        assert!(app.ui.input.is_empty());
     }
 
     #[test]
