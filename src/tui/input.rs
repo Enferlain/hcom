@@ -775,30 +775,18 @@ impl App {
             OverlayKind::Command => {
                 if !overlay.input.is_empty() {
                     let cmd = overlay.input;
-                    let is_inline = self.ui.view_mode == ViewMode::Inline;
-                    if let Err(e) = self.enqueue_rpc(RpcOp::Command { cmd: cmd.clone() }) {
-                        self.ui.command_result = Some(CommandResult {
-                            label: cmd,
-                            output: vec![format!("Error: {}", e)],
-                        });
-                        if is_inline {
-                            self.ui.pending_eject_cmd = true;
-                        } else {
-                            self.ui.mode = InputMode::CommandOutput;
-                        }
-                    } else {
-                        self.ui.command_result = Some(CommandResult {
-                            label: cmd,
-                            output: vec!["(running...)".into()],
-                        });
-                        if is_inline {
-                            self.ui.flash =
-                                Some(Flash::new("Running...".into(), Theme::flash_info()));
-                        } else {
-                            self.ui.mode = InputMode::CommandOutput;
-                        }
+                    if crate::tui::rpc::parse_command_argv(&cmd).is_ok_and(|args| {
+                        matches!(crate::router::resolve_action(&args),
+                            crate::router::Action::Command { cmd, .. } if cmd == "reset")
+                    }) {
+                        self.ui.confirm = Some(Confirm::new(
+                            "Stop all agents and archive the database?".into(),
+                            ConfirmAction::Reset(cmd),
+                            false,
+                        ));
+                        return;
                     }
-                    self.ui.msg_scroll = 0;
+                    self.run_palette_command(cmd);
                 }
             }
             OverlayKind::Tag => {
@@ -826,6 +814,32 @@ impl App {
                 }
             }
         }
+    }
+
+    pub(crate) fn run_palette_command(&mut self, cmd: String) {
+        let is_inline = self.ui.view_mode == ViewMode::Inline;
+        if let Err(e) = self.enqueue_rpc(RpcOp::Command { cmd: cmd.clone() }) {
+            self.ui.command_result = Some(CommandResult {
+                label: cmd,
+                output: vec![format!("Error: {}", e)],
+            });
+            if is_inline {
+                self.ui.pending_eject_cmd = true;
+            } else {
+                self.ui.mode = InputMode::CommandOutput;
+            }
+        } else {
+            self.ui.command_result = Some(CommandResult {
+                label: cmd,
+                output: vec!["(running...)".into()],
+            });
+            if is_inline {
+                self.ui.flash = Some(Flash::new("Running...".into(), Theme::flash_info()));
+            } else {
+                self.ui.mode = InputMode::CommandOutput;
+            }
+        }
+        self.ui.msg_scroll = 0;
     }
 
     fn cancel_overlay(&mut self) {
@@ -885,7 +899,7 @@ impl App {
         });
         s.push(CommandSuggestion {
             command: "archive".into(),
-            description: "archive stopped",
+            description: "list archives",
         });
         s.push(CommandSuggestion {
             command: "reset".into(),
@@ -1255,7 +1269,7 @@ fn push_agent_command_suggestions(s: &mut Vec<CommandSuggestion>, agent: &Agent)
     });
     s.push(CommandSuggestion {
         command: format!("transcript {} --full", name),
-        description: "full transcript",
+        description: "last 10 exchanges, full text",
     });
     if agent.can_resume() {
         s.push(CommandSuggestion {
@@ -1295,6 +1309,43 @@ mod tests {
 
     fn ctrl(app: &mut App, c: char) {
         app.handle_key(KeyCode::Char(c), KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn reset_commands_require_confirmation() {
+        for command in [
+            "reset",
+            "reset --force",
+            "  reset  ",
+            "'reset'",
+            "--go reset",
+        ] {
+            let mut app = test_app();
+            key(&mut app, KeyCode::Char('!'));
+            let overlay = app.ui.overlay.as_mut().unwrap();
+            overlay.input = command.into();
+            overlay.palette = None;
+            key(&mut app, KeyCode::Enter);
+            let confirm = app.ui.confirm.as_ref().expect("reset confirmation");
+            assert!(matches!(confirm.action, ConfirmAction::Reset(_)));
+            assert!(!confirm.selected);
+            assert!(app.ui.command_result.is_none());
+            key(&mut app, KeyCode::Esc);
+            assert!(app.ui.confirm.is_none());
+        }
+    }
+
+    #[test]
+    fn selected_reset_suggestion_requires_confirmation() {
+        let mut app = test_app();
+        key(&mut app, KeyCode::Char('!'));
+        app.handle_paste("reset");
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            app.ui.confirm.as_ref().unwrap().action,
+            ConfirmAction::Reset(_)
+        ));
+        assert!(app.ui.command_result.is_none());
     }
 
     fn make_agent(name: &str) -> Agent {

@@ -1566,7 +1566,7 @@ fn render_confirm(frame: &mut Frame, confirm: &Confirm) {
     } else {
         let is_destructive = matches!(
             confirm.action,
-            ConfirmAction::KillAgents(_) | ConfirmAction::KillOrphan(_)
+            ConfirmAction::KillAgents(_) | ConfirmAction::KillOrphan(_) | ConfirmAction::Reset(_)
         );
         let accent = if is_destructive {
             palette::RED
@@ -1622,6 +1622,7 @@ fn render_confirm(frame: &mut Frame, confirm: &Confirm) {
         ConfirmAction::ResumeAgents(ref names) if names.len() > 1 => " Batch Resume ",
         ConfirmAction::ResumeAgents(_) => " Resume ",
         ConfirmAction::OrphanAction(_) => " Orphan ",
+        ConfirmAction::Reset(_) => " Reset ",
     };
     let block = Block::default()
         .title(Span::styled(title, Style::default().fg(border_accent)))

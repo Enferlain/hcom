@@ -141,6 +141,7 @@ impl Confirm {
 }
 
 pub enum ConfirmAction {
+    Reset(String),
     KillAgents(Vec<String>),
     ForkAgents(Vec<String>),
     ResumeAgents(Vec<String>),

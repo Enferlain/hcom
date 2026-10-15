@@ -275,6 +275,7 @@ impl App {
 
     pub fn execute_confirm(&mut self, action: ConfirmAction) {
         match action {
+            ConfirmAction::Reset(cmd) => self.run_palette_command(cmd),
             ConfirmAction::KillAgents(ref names) => {
                 for name in names {
                     if let Err(e) = self.enqueue_rpc(RpcOp::KillAgent { name: name.clone() }) {
