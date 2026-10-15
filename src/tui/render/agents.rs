@@ -120,7 +120,7 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
     // against the same budget as agent rows.
     for (i, agent) in app.data.agents.iter().enumerate() {
         let is_cursor = app.ui.cursor == i;
-        let is_selected = app.ui.selected.contains(&agent.name);
+        let is_selected = app.ui.selected.contains(&agent.action_name());
         lines.push(compact_agent_line(
             agent,
             is_cursor,
@@ -153,7 +153,7 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
             .enumerate()
             .map(|(i, ragent)| {
                 let ic = matches!(ct, CursorTarget::RemoteAgent(idx) if idx == i);
-                let is = app.ui.selected.contains(&ragent.display_name());
+                let is = app.ui.selected.contains(&ragent.action_name());
                 vec![remote_agent_line(
                     ragent,
                     ic,
@@ -180,7 +180,7 @@ fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'s
             .enumerate()
             .map(|(i, agent)| {
                 let ic = matches!(ct, CursorTarget::StoppedAgent(idx) if idx == i);
-                let is = app.ui.selected.contains(&agent.name);
+                let is = app.ui.selected.contains(&agent.action_name());
                 let mut item = vec![stopped_agent_line(
                     agent, ic, is, width, multi_tool, name_width,
                 )];
@@ -717,7 +717,7 @@ fn build_tab_strip(app: &App, width: usize) -> Line<'static> {
     // Live agents
     for (i, agent) in app.data.agents.iter().enumerate() {
         let is_cursor = app.ui.cursor == i;
-        let is_selected = app.ui.selected.contains(&agent.name);
+        let is_selected = app.ui.selected.contains(&agent.action_name());
         let icon = agent_icon(agent, app.ui.tick);
         let name = agent.display_name();
         let indicator = tab_indicator_color(agent);
@@ -751,7 +751,7 @@ fn build_tab_strip(app: &App, width: usize) -> Line<'static> {
         if app.ui.remote_expanded {
             for (i, ragent) in app.data.remote_agents.iter().enumerate() {
                 let is_cursor = app.ui.cursor == offset + i;
-                let is_selected = app.ui.selected.contains(&ragent.display_name());
+                let is_selected = app.ui.selected.contains(&ragent.action_name());
                 let icon = agent_icon(ragent, app.ui.tick);
                 let indicator = tab_indicator_color(ragent);
                 tabs.push(TabEntry {
@@ -954,8 +954,7 @@ fn compute_tab_scroll(
 
 fn build_agent_detail(agent: &Agent, app: &App, lines: &mut Vec<Line<'static>>, width: usize) {
     let w = width as u16;
-    let is_selected =
-        app.ui.selected.contains(&agent.name) || app.ui.selected.contains(&agent.display_name());
+    let is_selected = app.ui.selected.contains(&agent.action_name());
 
     // Line 1: icon name · tool · age · context                 created Xm
     let icon = agent_icon(agent, app.ui.tick);
@@ -1097,6 +1096,26 @@ fn build_orphan_detail(orphan: &OrphanProcess, lines: &mut Vec<Line<'static>>, _
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    #[test]
+    fn detail_selection_uses_action_identity() {
+        crate::config::Config::init();
+        let mut app = App::new();
+        let mut agent = crate::tui::test_helpers::make_test_agent("nova", 0.0);
+        agent.device_name = Some("BOX".into());
+        for (selected, expected) in [("nova", false), ("nova:BOX", true)] {
+            app.ui.selected.clear();
+            app.ui.selected.insert(selected.into());
+            let mut lines = Vec::new();
+            build_agent_detail(&agent, &app, &mut lines, 100);
+            let name = lines[0]
+                .spans
+                .iter()
+                .find(|span| span.content == "nova:BOX")
+                .unwrap();
+            assert_eq!(name.style, selected_name_style(expected));
+        }
+    }
 
     #[test]
     fn right_badge_survives_long_unicode_middle_fields() {
