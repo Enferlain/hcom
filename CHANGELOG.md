@@ -2,6 +2,31 @@
 
 UTC release dates from [PyPI](https://pypi.org/project/hcom/#history).
 
+## 0.7.30 — 2026-10-15
+
+### Added
+
+- Added Hermes Agent, `hcom hermes`: messaging, status, resume, and transcripts.
+- Added Hermes gateway chats as hcom agents: after `hcom hooks add hermes`, run `/hcom start` in a chat (Telegram, Discord, IRC, ...) to join and `/hcom stop` to leave.
+- Added token usage to `hcom list <name>` and `hcom transcript --detailed`, and context usage for the selected agent in the TUI.
+
+### Changed
+
+- Changed `hcom transcript search` to match exchanges instead of raw transcript lines, with the command to open each hit.
+- Made transcript summaries show what the agent concluded instead of its opening line, with full file paths.
+
+### Fixed
+
+- Fixed OpenCode 2 agents not receiving messages after about an hour idle [#161](https://github.com/aannoo/hcom/pull/161) — @pbarbuda.
+- Fixed transcript search for OpenCode and Kilo.
+- Fixed a stopped agent's old process interfering with the agent after `hcom r`.
+- Fixed `--on-hit` subscriptions reacting to their own messages.
+- Fixed `hcom update` upgrading the wrong pip or uv install.
+- Fixed Codex counting as ready while a startup or update screen was open, and leaving `blocked` before its approval dialog closed.
+- Fixed Claude native delivery errors after the working directory was deleted or the computer woke from sleep.
+- Fixed Kitty launches into a window that no longer exists.
+- Updated dependencies, including security fixes in Rustls.
+
 ## 0.7.29 — 2026-10-12
 
 ### Breaking changes
