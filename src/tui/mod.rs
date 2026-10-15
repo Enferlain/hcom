@@ -108,9 +108,17 @@ fn run_app(app: &mut App, viewport_height: u16, in_alt_screen: &mut bool) -> Res
                 };
 
                 app.run(&mut terminal, viewport_height)?;
+                // Ratatui anchors the inline viewport at the cursor row, not the
+                // screen bottom, so take its real origin before dropping it.
+                let viewport_top = terminal.get_frame().area().y;
                 drop(terminal);
 
                 if app.ui.should_quit {
+                    // Erase the box so the shell prompt starts below the timeline
+                    // instead of drawing over the last frame.
+                    let mut out = stdout();
+                    write!(out, "\x1b[r\x1b[{};1H\x1b[J", viewport_top + 1)?;
+                    out.flush()?;
                     break;
                 }
 
