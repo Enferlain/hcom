@@ -1413,7 +1413,7 @@ pub fn write_config_toml_path(path: &std::path::Path, content: &str) -> std::io:
 }
 
 #[cfg(unix)]
-fn lock_down_config_permissions(path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn lock_down_config_permissions(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut perms = std::fs::metadata(path)?.permissions();
@@ -1422,7 +1422,7 @@ fn lock_down_config_permissions(path: &std::path::Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn lock_down_config_permissions(_path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn lock_down_config_permissions(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -2593,5 +2593,14 @@ active = "default"
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+
+        // Edit mode also tightens permissions on an existing config.
+        let path = paths::config_toml_path();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        lock_down_config_permissions(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

@@ -2217,3 +2217,23 @@ fn run_help_and_docs_flags_preserve_script_help() {
         "{stderr}"
     );
 }
+
+#[test]
+fn config_reports_file_parse_errors_in_get_and_list_modes() {
+    let h = Hcom::new();
+    std::fs::write(h.hcom_dir.join("config.toml"), "timeout = [broken\n").unwrap();
+    for args in [
+        vec!["config", "timeout"],
+        vec!["config", "terminal"],
+        vec!["config", "dev_root"],
+        vec!["config"],
+        vec!["config", "--json"],
+    ] {
+        let (code, stdout, stderr) = h.run(args);
+        assert_eq!(code, 0, "{stderr}");
+        assert!(
+            stderr.contains("Invalid config.toml"),
+            "stdout={stdout} stderr={stderr}"
+        );
+    }
+}

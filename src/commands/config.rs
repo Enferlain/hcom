@@ -123,6 +123,22 @@ fn config_set_at_path(path: &Path, key: &str, value: Option<&str>) -> Result<(),
         validate_config_args(field.name, value)?;
     }
 
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create config directory: {e}"))?;
+    }
+    // Lock a stable sibling: the config itself is replaced by atomic rename.
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("Failed to open config lock: {e}"))?;
+    crate::sys::fs::lock_exclusive(&lock_file)
+        .map_err(|e| format!("Failed to lock config: {e}"))?;
+
     let content = std::fs::read_to_string(path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = content
         .parse()
@@ -264,6 +280,30 @@ fn config_dev_root(
 
 // ── Instance Config ──────────────────────────────────────────────────────
 
+fn unique_instance_prefix(db: &HcomDb, name: &str) -> Result<Option<String>, String> {
+    let escaped = name
+        .replace('!', "!!")
+        .replace('%', "!%")
+        .replace('_', "!_");
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT name FROM instances WHERE name LIKE ? ESCAPE '!' ORDER BY name")
+        .map_err(|e| e.to_string())?;
+    let candidates = stmt
+        .query_map([format!("{escaped}%")], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| e.to_string())?;
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        _ => Err(format!(
+            "Ambiguous agent prefix '{name}': {}",
+            candidates.join(", ")
+        )),
+    }
+}
+
 /// Handle instance-level config: `hcom config -i <name> [key] [value]`
 fn config_instance(
     db: &HcomDb,
@@ -289,20 +329,20 @@ fn config_instance(
         Ok(Some(inst)) => inst,
         Ok(None) => {
             // Try prefix match
-            match db.conn().query_row(
-                "SELECT name FROM instances WHERE name LIKE ? LIMIT 1",
-                rusqlite::params![format!("{name}%")],
-                |row| row.get::<_, String>(0),
-            ) {
-                Ok(matched) => match db.get_instance_full(&matched) {
+            match unique_instance_prefix(db, &name) {
+                Ok(Some(matched)) => match db.get_instance_full(&matched) {
                     Ok(Some(inst)) => inst,
                     _ => {
                         eprintln!("Error: {}", identity::describe_missing_agent(db, &name));
                         return 1;
                     }
                 },
-                Err(_) => {
+                Ok(None) => {
                     eprintln!("Error: {}", identity::describe_missing_agent(db, &name));
+                    return 1;
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
                     return 1;
                 }
             }
@@ -683,8 +723,14 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
     if edit_mode {
         let path = config_path();
         // Ensure file exists
-        if !path.exists() {
-            let _ = std::fs::write(&path, "# hcom configuration\n");
+        let prepared = if path.exists() {
+            crate::config::lock_down_config_permissions(&path)
+        } else {
+            crate::config::write_config_toml_path(&path, "# hcom configuration\n")
+        };
+        if let Err(e) = prepared {
+            eprintln!("Error: Failed to prepare config.toml: {e}");
+            return 1;
         }
         let editor = std::env::var("EDITOR")
             .or_else(|_| std::env::var("VISUAL"))
@@ -711,6 +757,14 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
     // No args: show all config
     if argv.is_empty() {
         return show_all_config(db, ctx, json_mode);
+    }
+
+    // File-level failures affect every get path, including special keys.
+    if argv.len() == 1 && !unset_mode && !info_mode {
+        let (_, errors) = crate::config::HcomConfig::load_with_errors(None);
+        if let Some(msg) = errors.get("config.toml") {
+            eprintln!("Invalid config.toml: {msg}");
+        }
     }
 
     let key_arg = &argv[0];
@@ -919,6 +973,9 @@ fn show_all_config(db: &HcomDb, ctx: Option<&CommandContext>, json_mode: bool) -
     let runtime_overrides = get_runtime_overrides(db, ctx);
     let dev_root = crate::router::resolve_effective_dev_root(db.path());
     let (_, config_errors) = crate::config::HcomConfig::load_with_errors(None);
+    if let Some(msg) = config_errors.get("config.toml") {
+        eprintln!("Invalid config.toml: {msg}");
+    }
 
     if json_mode {
         let mut result = serde_json::Map::new();
@@ -1974,6 +2031,86 @@ fn update_auto_approve_permissions() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_unique_instance_prefix_requires_one_literal_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        for name in ["luna", "lune", "a_one", "axone", "a%one", "a!one"] {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, created_at) VALUES (?, 1)",
+                    [name],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            unique_instance_prefix(&db, "luna").unwrap().as_deref(),
+            Some("luna")
+        );
+        let error = unique_instance_prefix(&db, "lun").unwrap_err();
+        assert!(error.contains("luna, lune"));
+        assert_eq!(
+            unique_instance_prefix(&db, "a_").unwrap().as_deref(),
+            Some("a_one")
+        );
+        assert_eq!(
+            unique_instance_prefix(&db, "a%").unwrap().as_deref(),
+            Some("a%one")
+        );
+        assert_eq!(
+            unique_instance_prefix(&db, "a!").unwrap().as_deref(),
+            Some("a!one")
+        );
+        assert_eq!(unique_instance_prefix(&db, "absent").unwrap(), None);
+        assert_eq!(
+            config_instance(&db, "lun", &["tag".into(), "changed".into()], None, false),
+            1
+        );
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .tag
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn config_set_reads_after_acquiring_sibling_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        config_set_at_path(&path, "tag", Some("before")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path.with_extension("toml.lock"))
+            .unwrap();
+        crate::sys::fs::lock_exclusive(&lock).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let path = &path;
+            scope.spawn(move || {
+                tx.send(config_set_at_path(path, "timeout", Some("600")))
+                    .unwrap();
+            });
+            let blocked = rx.recv_timeout(std::time::Duration::from_millis(100));
+            // Simulate another writer committing while it owns the lock.
+            crate::config::write_config_toml_path(path, "[launch]\ntag = 'under-lock'\n").unwrap();
+            drop(lock);
+            assert!(matches!(
+                blocked,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+        });
+        let content = std::fs::read_to_string(&path).unwrap();
+        let doc: toml_edit::DocumentMut = content.parse().unwrap();
+        assert_eq!(doc["launch"]["tag"].as_str(), Some("under-lock"));
+        assert_eq!(doc["preferences"]["timeout"].as_integer(), Some(600));
+    }
 
     #[test]
     fn test_normalize_key() {
