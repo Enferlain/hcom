@@ -700,7 +700,8 @@ fn load_stopped(conn: &Connection, now: f64, max_age_secs: Option<f64>) -> Vec<A
     let mut stopped = Vec::new();
 
     for (name, data, ts) in &rows {
-        if parse_iso_to_epoch(ts) < cutoff as f64 {
+        let stopped_at = parse_iso_to_epoch(ts);
+        if stopped_at < cutoff as f64 {
             continue;
         }
         if !seen.insert(name.clone()) {
@@ -732,8 +733,8 @@ fn load_stopped(conn: &Connection, now: f64, max_age_secs: Option<f64>) -> Vec<A
             status_context: action.to_string(),
             status_detail: String::new(),
             created_at,
-            status_time: now,
-            last_heartbeat: now,
+            status_time: stopped_at,
+            last_heartbeat: stopped_at,
             has_tcp: false,
             directory: directory.to_string(),
             tag: tag.to_string(),
@@ -1721,6 +1722,8 @@ mod tests {
         let stopped = load_recently_stopped(&conn, now);
         assert_eq!(stopped.len(), 1);
         assert_eq!(stopped[0].name, "reca");
+        assert_eq!(stopped[0].status_time, now - 30.0);
+        assert_eq!(stopped[0].last_heartbeat, now - 30.0);
     }
 
     #[test]
