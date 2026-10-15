@@ -982,7 +982,11 @@ fn parse_message_row(id: i64, timestamp: &str, data: &str) -> Option<Message> {
         .get("intent")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let reply_to = json.get("reply_to").and_then(|v| v.as_u64());
+    // Imported event IDs belong to the origin device, not this database.
+    let reply_to = json
+        .get("reply_to_local")
+        .filter(|_| json.get("_relay").is_none())
+        .and_then(|v| v.as_u64());
 
     Some(Message {
         event_id: id as u64,
@@ -1881,7 +1885,7 @@ mod tests {
         let msg = parse_message_row(
             8,
             "2026-02-18T00:09:30+00:00",
-            r#"{"from":"sys","text":"hi","scope":"mentions","sender_kind":"human","mentions":["nova"],"delivered_to":["nova"],"intent":"request","reply_to":42}"#,
+            r#"{"from":"sys","text":"hi","scope":"mentions","sender_kind":"human","mentions":["nova"],"delivered_to":["nova"],"intent":"request","reply_to":"7:BOXE","reply_to_local":42}"#,
         )
         .unwrap();
 
@@ -1889,6 +1893,16 @@ mod tests {
         assert_eq!(msg.recipients, vec!["nova"]);
         assert_eq!(msg.intent.as_deref(), Some("request"));
         assert_eq!(msg.reply_to, Some(42));
+    }
+
+    #[test]
+    fn imported_reply_does_not_use_origin_local_id() {
+        let msg = parse_message_row(
+            100,
+            "2026-02-18T00:09:30+00:00",
+            r#"{"from":"nova:BOXE","text":"reply","reply_to":"7:BOXE","reply_to_local":42,"_relay":{"device":"remote","short":"BOXE","id":8}}"#,
+        ).unwrap();
+        assert!(msg.reply_to.is_none());
     }
 
     #[test]
