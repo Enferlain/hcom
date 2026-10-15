@@ -219,7 +219,7 @@ impl App {
                     insert_at(&mut self.ui.input, &mut self.ui.input_cursor, c);
                 }
             }
-        } else if self.ui.mode == InputMode::Compose {
+        } else if matches!(self.ui.mode, InputMode::Compose | InputMode::Launch) {
             for c in clean.chars() {
                 insert_at(&mut self.ui.input, &mut self.ui.input_cursor, c);
             }
@@ -1105,7 +1105,9 @@ impl App {
                 let prompt = self.ui.input.clone();
                 let tool_name = tool.name().to_string();
 
+                let settings = Box::new(self.ui.launch.clone());
                 if let Err(e) = self.enqueue_rpc(RpcOp::Launch {
+                    settings,
                     tool,
                     count,
                     tag,
@@ -1123,11 +1125,11 @@ impl App {
                         format!("Launching {} {}", count, tool_name),
                         Theme::flash_info(),
                     ));
+                    self.ui.input.clear();
+                    self.ui.input_cursor = 0;
+                    self.ui.launch = LaunchState::new();
+                    self.ui.mode = InputMode::Navigate;
                 }
-                self.ui.input.clear();
-                self.ui.input_cursor = 0;
-                self.ui.launch = LaunchState::new();
-                self.ui.mode = InputMode::Navigate;
             }
 
             KeyCode::Backspace => delete_back(&mut self.ui.input, &mut self.ui.input_cursor),
@@ -1340,6 +1342,21 @@ mod tests {
             ConfirmAction::Reset(_)
         ));
         assert!(app.ui.command_result.is_none());
+    }
+
+    #[test]
+    fn paste_launch_prompt_and_preserve_on_enqueue_failure() {
+        let mut app = test_app();
+        app.ui.mode = InputMode::Launch;
+        app.ui.launch.count = 3;
+        app.ui.input = "ab".into();
+        app.ui.input_cursor = 1;
+        app.handle_paste("你好");
+        assert_eq!(app.ui.input, "a你好b");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.ui.input, "a你好b");
+        assert_eq!(app.ui.launch.count, 3);
+        assert_eq!(app.ui.mode, InputMode::Launch);
     }
 
     fn make_agent(name: &str) -> Agent {

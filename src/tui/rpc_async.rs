@@ -31,6 +31,7 @@ pub enum RpcOp {
         tag: String,
     },
     Launch {
+        settings: Box<crate::tui::model::LaunchState>,
         tool: Tool,
         count: u8,
         tag: String,
@@ -184,6 +185,7 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
             headless_pty,
             terminal,
             prompt,
+            ..
         } => {
             let argv = build_launch_argv(
                 tool.clone(),

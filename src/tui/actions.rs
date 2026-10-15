@@ -192,7 +192,13 @@ impl App {
                 }
                 other => self.ui.flash = Some(rpc_error_flash("Tag failed", other)),
             },
-            RpcOp::Launch { tool, count, .. } => match result.result {
+            RpcOp::Launch {
+                tool,
+                count,
+                settings,
+                prompt,
+                ..
+            } => match result.result {
                 Ok(resp) if resp.ok() => {
                     self.ui.flash = Some(Flash::new(
                         format!("Launched {} {}", count, tool.name()),
@@ -200,7 +206,21 @@ impl App {
                     ));
                     self.reload_data_force();
                 }
-                other => self.ui.flash = Some(rpc_error_flash("Launch failed", other)),
+                other => {
+                    // Reopen the wizard for a retry only if the user hasn't
+                    // moved on; never clobber a draft or another mode.
+                    if self.ui.mode == InputMode::Navigate
+                        && self.ui.input.is_empty()
+                        && self.ui.overlay.is_none()
+                        && self.ui.confirm.is_none()
+                    {
+                        self.ui.launch = *settings;
+                        self.ui.input = prompt;
+                        self.ui.input_cursor = self.ui.input.len();
+                        self.ui.mode = InputMode::Launch;
+                    }
+                    self.ui.flash = Some(rpc_error_flash("Launch failed", other));
+                }
             },
             RpcOp::RelayToggle { enable } => {
                 let ok = matches!(&result.result, Ok(resp) if resp.ok());
@@ -444,6 +464,43 @@ mod tests {
             .as_ref()
             .map(|f| f.text.clone())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn failed_launch_restores_submitted_prompt_and_settings() {
+        let mut app = test_app();
+        let mut settings = app.ui.launch.clone();
+        settings.count = 4;
+        settings.tag = "retry".into();
+        let failed = |settings: &LaunchState| RpcResult {
+            op: RpcOp::Launch {
+                tool: settings.tool.clone(),
+                count: settings.count,
+                tag: settings.tag.clone(),
+                headless: settings.headless,
+                headless_pty: settings.headless_pty,
+                terminal: String::new(),
+                prompt: "try again".into(),
+                settings: Box::new(settings.clone()),
+            },
+            result: Err("failed".into()),
+        };
+        app.apply_rpc_result(failed(&settings));
+        assert_eq!(app.ui.mode, InputMode::Launch);
+        assert_eq!(app.ui.input, "try again");
+        assert_eq!(app.ui.input_cursor, app.ui.input.len());
+        assert_eq!(app.ui.launch.count, 4);
+        assert_eq!(app.ui.launch.tag, "retry");
+
+        // A draft typed while the launch ran is left alone.
+        app.ui.mode = InputMode::Compose;
+        app.ui.input = "draft".into();
+        app.ui.launch = LaunchState::new();
+        app.apply_rpc_result(failed(&settings));
+        assert_eq!(app.ui.mode, InputMode::Compose);
+        assert_eq!(app.ui.input, "draft");
+        assert_eq!(app.ui.launch.count, 1);
+        assert!(app.ui.flash.is_some());
     }
 
     #[test]
