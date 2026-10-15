@@ -383,6 +383,34 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Promote presets captured before the dedicated column was populated.
+    /// An explicit launcher decision in the column remains authoritative.
+    pub fn promote_terminal_presets(&self, name: Option<&str>) -> Result<()> {
+        let predicate = "COALESCE(terminal_preset_effective, '') = ''
+            AND (?1 IS NULL OR name = ?1)
+            AND CASE WHEN json_valid(launch_context) THEN
+                json_type(launch_context, '$.terminal_preset_effective') = 'text'
+                AND json_extract(launch_context, '$.terminal_preset_effective') != ''
+                ELSE 0 END";
+        // Most opens have nothing to repair. Avoid taking a write lock then.
+        let needed: bool = self.conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM instances WHERE {predicate})"),
+            params![name],
+            |row| row.get(0),
+        )?;
+        if needed {
+            self.conn.execute(
+                &format!(
+                    "UPDATE instances SET terminal_preset_effective =
+                    json_extract(launch_context, '$.terminal_preset_effective')
+                    WHERE {predicate}"
+                ),
+                params![name],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Store launch_context JSON (terminal preset, pane_id, env snapshot).
     /// Merges incoming keys into existing JSON, only filling fields that are
     /// currently missing or empty so late-bound PTY metadata can be persisted
@@ -1167,6 +1195,54 @@ mod tests {
     fn reopen_broken_schema(db_path: &std::path::Path) -> HcomDb {
         // Use open_raw here: open_at would repair the table we deliberately dropped.
         HcomDb::open_raw(db_path).unwrap()
+    }
+
+    #[test]
+    fn test_v20_migration_promotes_captured_terminal_presets() {
+        let (db, path) = setup_full_test_db();
+        for (name, preset, context) in [
+            ("captured", "", r#"{"terminal_preset_effective":"kitty"}"#),
+            (
+                "explicit",
+                "herdr",
+                r#"{"terminal_preset_effective":"kitty"}"#,
+            ),
+            ("invalid", "", "invalid JSON"),
+            ("numeric", "", r#"{"terminal_preset_effective":42}"#),
+            ("empty", "", r#"{"terminal_preset_effective":""}"#),
+        ] {
+            db.conn.execute("INSERT INTO instances (name, created_at, terminal_preset_effective, launch_context) VALUES (?, 1.0, ?, ?)", params![name, preset, context]).unwrap();
+        }
+        db.conn.execute_batch("PRAGMA user_version = 19").unwrap();
+        drop(db);
+        let db = HcomDb::open_at(&path).unwrap();
+        for (name, expected) in [
+            ("captured", Some("kitty")),
+            ("explicit", Some("herdr")),
+            ("invalid", None),
+            ("numeric", None),
+            ("empty", None),
+        ] {
+            assert_eq!(
+                db.get_instance_full(name)
+                    .unwrap()
+                    .unwrap()
+                    .terminal_preset_effective
+                    .as_deref(),
+                expected
+            );
+        }
+        // Repeated repair is harmless and doesn't erase an explicit decision.
+        db.promote_terminal_presets(None).unwrap();
+        assert_eq!(
+            db.get_instance_full("explicit")
+                .unwrap()
+                .unwrap()
+                .terminal_preset_effective
+                .as_deref(),
+            Some("herdr")
+        );
+        cleanup_test_db(path);
     }
 
     #[test]

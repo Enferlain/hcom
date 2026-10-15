@@ -129,7 +129,8 @@ pub fn capture_and_store_launch_context(db: &HcomDb, instance_name: &str) {
         let json = serde_json::to_string(&ctx).unwrap_or_else(|_| "{}".to_string());
         let mut updates = serde_json::Map::new();
         updates.insert("launch_context".into(), serde_json::json!(json));
-        db.update_instance_fields(instance_name, &updates)
+        db.update_instance_fields(instance_name, &updates)?;
+        db.promote_terminal_presets(Some(instance_name))
     });
     if let Err(e) = result {
         crate::log::log_error(
@@ -360,6 +361,7 @@ fn migrate_placeholder_runtime_state(
         if let Some(ref ctx) = ph.launch_context {
             db.store_launch_context(canonical_name, ctx)?;
         }
+        db.promote_terminal_presets(Some(canonical_name))?;
         Ok(())
     });
     if let Err(e) = result {
@@ -1448,6 +1450,7 @@ mod tests {
         capture_and_store_launch_context(&db, "luna");
 
         let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.terminal_preset_effective.as_deref(), Some("herdr"));
         let ctx: serde_json::Value =
             serde_json::from_str(row.launch_context.as_deref().unwrap_or("{}")).unwrap();
         assert_eq!(
@@ -2047,8 +2050,11 @@ mod tests {
         db.set_process_binding("pid-kimi", "", "mozi").unwrap();
         db.update_instance_pid_with_identity("mozi", 4242, Some("spawn-incarnation"))
             .unwrap();
-        db.store_launch_context("mozi", r#"{"pane_id":"kitty-7"}"#)
-            .unwrap();
+        db.store_launch_context(
+            "mozi",
+            r#"{"pane_id":"kitty-7","terminal_preset_effective":"kitty-tab"}"#,
+        )
+        .unwrap();
 
         let result =
             bind_session_to_process_for_tool(&db, "ses-kimi", Some("pid-kimi"), "kimi", true);
@@ -2057,6 +2063,7 @@ mod tests {
         assert!(db.get_instance_full("mozi").unwrap().is_none());
         let fano = db.get_instance_full("fano").unwrap().unwrap();
         assert_eq!(fano.pid, Some(4242));
+        assert_eq!(fano.terminal_preset_effective.as_deref(), Some("kitty-tab"));
         assert!(
             fano.launch_context
                 .as_deref()

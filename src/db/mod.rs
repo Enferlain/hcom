@@ -38,7 +38,7 @@ pub use instances::InstanceStatus;
 pub use instances::observe_pid_identity;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 19;
+const SCHEMA_VERSION: i32 = 20;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -75,6 +75,16 @@ const MIGRATIONS: &[(i32, &str)] = &[
              DELETE FROM events_fts WHERE rowid = old.id;
          END;
          DELETE FROM events_fts WHERE rowid NOT IN (SELECT id FROM events);",
+    ),
+    (
+        20,
+        "UPDATE instances
+         SET terminal_preset_effective = json_extract(launch_context, '$.terminal_preset_effective')
+         WHERE COALESCE(terminal_preset_effective, '') = ''
+           AND CASE WHEN json_valid(launch_context) THEN
+               json_type(launch_context, '$.terminal_preset_effective') = 'text'
+               AND json_extract(launch_context, '$.terminal_preset_effective') != ''
+               ELSE 0 END;",
     ),
 ];
 
