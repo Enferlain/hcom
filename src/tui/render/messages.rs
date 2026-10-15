@@ -30,14 +30,7 @@ pub struct ScrollMetrics {
 }
 
 pub fn render_messages(frame: &mut Frame, area: Rect, app: &App) -> ScrollMetrics {
-    if app.ui.show_events {
-        let agents = if app.ui.selected.is_empty() {
-            None
-        } else {
-            Some(&app.ui.selected)
-        };
-        render_events_timeline(frame, area, app, agents)
-    } else if let Some(ref cr) = app.ui.command_result {
+    if let Some(ref cr) = app.ui.command_result {
         render_command_output(
             frame,
             area,
@@ -50,99 +43,6 @@ pub fn render_messages(frame: &mut Frame, area: Rect, app: &App) -> ScrollMetric
     } else {
         render_all_messages(frame, area, app)
     }
-}
-
-// ── Events timeline: all events + messages merged ────────────────────
-
-fn render_events_timeline(
-    frame: &mut Frame,
-    area: Rect,
-    app: &App,
-    agents: Option<&BTreeSet<String>>,
-) -> ScrollMetrics {
-    let mut items: Vec<FeedItem> = Vec::new();
-    for ev in &app.data.events {
-        if agents.is_none_or(|a| a.contains(&ev.agent)) {
-            items.push(FeedItem::Ev(ev));
-        }
-    }
-    for msg in &app.data.messages {
-        if agents.is_none_or(|a| {
-            a.contains(&msg.sender)
-                || msg.recipients.iter().any(|r| a.contains(r))
-                || (msg.recipients.is_empty() && !msg.is_system())
-        }) {
-            items.push(FeedItem::Msg(msg));
-        }
-    }
-    items.sort_by(|a, b| a.time().total_cmp(&b.time()));
-
-    // Keep only the most recent items up to the display limit
-    if items.len() > DISPLAY_LIMIT {
-        items.drain(..items.len() - DISPLAY_LIMIT);
-    }
-
-    // Filter by search query if present
-    let query = app.active_search_query();
-    if let Some(q) = query {
-        items.retain(|item| match item {
-            FeedItem::Ev(ev) => event_matches(ev, q),
-            FeedItem::Msg(msg) => msg_matches(msg, q),
-        });
-    }
-
-    if items.is_empty() {
-        let msg = if query.is_some() {
-            "  No matches"
-        } else {
-            "  No events yet"
-        };
-        let empty = vec![
-            Line::raw(""),
-            Line::from(Span::styled(msg, Style::default().fg(palette::FG_DIM))),
-        ];
-        frame.render_widget(Paragraph::new(empty), area);
-        return ScrollMetrics::default();
-    }
-
-    let resolve_name = |name: &str| app.data.resolve_display_name(name);
-    let wl = build_waterlines(app);
-    let mut lines: Vec<Line> = Vec::new();
-    let mut prev_group: Option<(String, String)> = None;
-    for item in &items {
-        match item {
-            FeedItem::Ev(ev) => {
-                let time_str = format_time(ev.time);
-                let same = prev_group
-                    .as_ref()
-                    .is_some_and(|(a, t)| a == &ev.agent && t == &time_str);
-                prev_group = Some((ev.agent.clone(), time_str.clone()));
-                lines.push(event_line(
-                    ev,
-                    &time_str,
-                    same,
-                    true,
-                    area.width,
-                    query,
-                    &resolve_name,
-                ));
-                push_sub_lines(&mut lines, ev);
-            }
-            FeedItem::Msg(msg) => {
-                prev_group = None;
-                push_feed_message(
-                    &mut lines,
-                    msg,
-                    area.width as usize,
-                    query,
-                    &resolve_name,
-                    Some(&wl),
-                );
-            }
-        }
-    }
-
-    render_scrolled(frame, area, lines, app.ui.msg_scroll, app.ui.last_msg_total)
 }
 
 // ── Shared feed rendering helpers ───────────────────────────────────
@@ -678,56 +578,9 @@ fn search_counts(app: &App) -> (usize, usize) {
     }
 }
 
-/// Counts for events timeline: (search_matched, total) respecting agent selection.
-/// When no search query, matched == total.
-fn events_search_counts(app: &App) -> (usize, usize) {
-    let agents = if app.ui.selected.is_empty() {
-        None
-    } else {
-        Some(&app.ui.selected)
-    };
-    let agent_ev = |e: &&Event| agents.is_none_or(|a| a.contains(&e.agent));
-    let agent_msg = |m: &&Message| {
-        agents.is_none_or(|a| {
-            a.contains(&m.sender)
-                || m.recipients.iter().any(|r| a.contains(r))
-                || (m.recipients.is_empty() && !m.is_system())
-        })
-    };
-    let total = (app.data.events.iter().filter(agent_ev).count()
-        + app.data.messages.iter().filter(agent_msg).count())
-    .min(DISPLAY_LIMIT);
-    let query = match app.active_search_query() {
-        Some(q) => q,
-        None => return (total, total),
-    };
-    let matched = app
-        .data
-        .events
-        .iter()
-        .filter(agent_ev)
-        .filter(|e| event_matches(e, query))
-        .count()
-        + app
-            .data
-            .messages
-            .iter()
-            .filter(agent_msg)
-            .filter(|m| msg_matches(m, query))
-            .count();
-    (matched.min(total), total)
-}
-
 /// Returns a short count string like "[42]" or "[3/42]" for the panel heading and inline separator.
 pub fn display_count_str(app: &App) -> String {
-    if app.ui.show_events {
-        let (matched, total) = events_search_counts(app);
-        if app.active_search_query().is_some() {
-            format!("[{}/{}]", matched, total)
-        } else {
-            format!("[{}]", total)
-        }
-    } else if !app.ui.selected.is_empty() {
+    if !app.ui.selected.is_empty() {
         let (matched, total) = search_counts(app);
         if app.active_search_query().is_some() {
             format!("[{}/{}]", matched, total)

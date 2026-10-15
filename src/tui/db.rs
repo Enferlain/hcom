@@ -526,7 +526,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
 
         // Apply stale detection for local agents
         if !is_remote {
-            let computed = status::compute_status(&agent, now, None);
+            let computed = status::compute_status(&agent, now);
             agent.status = computed.status;
             agent.status_context = computed.status_context;
             agent.status_detail = computed.status_detail;

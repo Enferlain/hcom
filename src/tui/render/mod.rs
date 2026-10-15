@@ -756,11 +756,7 @@ fn render_messages_heading(frame: &mut Frame, area: Rect, app: &App) {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let label = if app.ui.show_events && !app.ui.selected.is_empty() {
-        format!("events: {}", selected_names())
-    } else if app.ui.show_events {
-        "events".to_string()
-    } else if !app.ui.selected.is_empty() {
+    let label = if !app.ui.selected.is_empty() {
         selected_names()
     } else {
         "messages".to_string()

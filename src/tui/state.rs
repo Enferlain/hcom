@@ -87,7 +87,6 @@ pub struct UiState {
     pub remote_expanded: bool,
     pub stopped_expanded: bool,
     pub show_all_stopped: bool,
-    pub show_events: bool,
     pub orphans_expanded: bool,
     pub eject_filter: Option<BTreeSet<String>>,
     pub inline_filter_changed: bool,

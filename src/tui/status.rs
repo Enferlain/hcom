@@ -7,7 +7,6 @@ const HEARTBEAT_THRESHOLD_TCP: f64 = instance_lifecycle::HEARTBEAT_THRESHOLD_TCP
 const HEARTBEAT_THRESHOLD_NO_TCP: f64 = instance_lifecycle::HEARTBEAT_THRESHOLD_NO_TCP as f64;
 const STATUS_ACTIVITY_TIMEOUT: f64 = instance_lifecycle::STATUS_ACTIVITY_TIMEOUT as f64;
 const LAUNCH_PLACEHOLDER_TIMEOUT: f64 = instance_lifecycle::LAUNCH_PLACEHOLDER_TIMEOUT as f64;
-const WAKE_GRACE_PERIOD: f64 = instance_lifecycle::WAKE_GRACE_PERIOD;
 const UNKNOWN_HEARTBEAT_AGE: f64 = instance_lifecycle::UNKNOWN_HEARTBEAT_AGE as f64;
 
 // ── Computed status result ────────────────────────────────────────
@@ -22,10 +21,7 @@ pub struct ComputedStatus {
 ///
 /// returns the computed status (may differ from stored status if heartbeat
 /// has gone stale).
-///
-/// `wake_time`: if Some, the epoch time of last system wake. Used for
-/// wake grace period (skip stale checks for 60s after wake).
-pub fn compute_status(agent: &Agent, now: f64, wake_time: Option<f64>) -> ComputedStatus {
+pub fn compute_status(agent: &Agent, now: f64) -> ComputedStatus {
     let status = agent.status;
     let ctx = &agent.status_context;
     let detail = &agent.status_detail;
@@ -35,10 +31,6 @@ pub fn compute_status(agent: &Agent, now: f64, wake_time: Option<f64>) -> Comput
         status_context: ctx.clone(),
         status_detail: detail.clone(),
     };
-
-    let in_wake_grace = wake_time
-        .map(|wt| (now - wt) < WAKE_GRACE_PERIOD)
-        .unwrap_or(false);
 
     // ── Launching: instance created but session not yet bound ─────
     if ctx == "new" && matches!(status, AgentStatus::Inactive | AgentStatus::Launching) {
@@ -84,10 +76,6 @@ pub fn compute_status(agent: &Agent, now: f64, wake_time: Option<f64>) -> Comput
         };
 
         if heartbeat_age > threshold {
-            if in_wake_grace {
-                // Heartbeat will refresh soon after wake
-                return passthrough();
-            }
             return ComputedStatus {
                 status: AgentStatus::Inactive,
                 status_context: "stale".into(),
@@ -123,7 +111,7 @@ pub fn compute_status(agent: &Agent, now: f64, wake_time: Option<f64>) -> Comput
             let heartbeat_fresh = agent.last_heartbeat > 0.0
                 && (now - agent.last_heartbeat) < HEARTBEAT_THRESHOLD_TCP;
 
-            if heartbeat_fresh || in_wake_grace {
+            if heartbeat_fresh {
                 return passthrough();
             }
 
@@ -179,7 +167,7 @@ mod tests {
     fn launching_within_timeout() {
         let mut agent = test_agent(AgentStatus::Inactive, "new");
         agent.created_at = 1000.0;
-        let result = compute_status(&agent, 1020.0, None);
+        let result = compute_status(&agent, 1020.0);
         assert_eq!(result.status, AgentStatus::Launching);
     }
 
@@ -187,7 +175,7 @@ mod tests {
     fn launching_past_timeout() {
         let mut agent = test_agent(AgentStatus::Inactive, "new");
         agent.created_at = 1000.0;
-        let result = compute_status(&agent, 1050.0, None);
+        let result = compute_status(&agent, 1050.0);
         assert_eq!(result.status, AgentStatus::Inactive);
         assert_eq!(result.status_context, "launch_failed");
     }
@@ -196,7 +184,7 @@ mod tests {
     fn listening_fresh_heartbeat() {
         let mut agent = test_agent(AgentStatus::Listening, "listening");
         agent.last_heartbeat = 990.0;
-        let result = compute_status(&agent, 1000.0, None);
+        let result = compute_status(&agent, 1000.0);
         assert_eq!(result.status, AgentStatus::Listening);
     }
 
@@ -204,7 +192,7 @@ mod tests {
     fn listening_stale_heartbeat_tcp() {
         let mut agent = test_agent(AgentStatus::Listening, "listening");
         agent.last_heartbeat = 950.0;
-        let result = compute_status(&agent, 1000.0, None);
+        let result = compute_status(&agent, 1000.0);
         assert_eq!(result.status, AgentStatus::Inactive);
         assert_eq!(result.status_context, "stale");
     }
@@ -214,16 +202,8 @@ mod tests {
         let mut agent = test_agent(AgentStatus::Listening, "listening");
         agent.has_tcp = false;
         agent.last_heartbeat = 985.0; // 15s ago > 10s threshold
-        let result = compute_status(&agent, 1000.0, None);
+        let result = compute_status(&agent, 1000.0);
         assert_eq!(result.status, AgentStatus::Inactive);
-    }
-
-    #[test]
-    fn listening_wake_grace_skips_stale() {
-        let mut agent = test_agent(AgentStatus::Listening, "listening");
-        agent.last_heartbeat = 900.0; // very stale
-        let result = compute_status(&agent, 1000.0, Some(980.0)); // woke 20s ago
-        assert_eq!(result.status, AgentStatus::Listening);
     }
 
     #[test]
@@ -231,7 +211,7 @@ mod tests {
         let mut agent = test_agent(AgentStatus::Listening, "listening");
         agent.device_name = Some("BOXE".into());
         agent.last_heartbeat = 0.0; // no heartbeat data
-        let result = compute_status(&agent, 1000.0, None);
+        let result = compute_status(&agent, 1000.0);
         assert_eq!(result.status, AgentStatus::Listening);
     }
 
@@ -240,7 +220,7 @@ mod tests {
         let mut agent = test_agent(AgentStatus::Active, "tool");
         agent.status_time = 600.0;
         agent.last_heartbeat = 600.0; // also stale
-        let result = compute_status(&agent, 1000.0, None);
+        let result = compute_status(&agent, 1000.0);
         assert_eq!(result.status, AgentStatus::Inactive);
         assert_eq!(result.status_context, "stale");
         assert_eq!(result.status_detail, "active");
@@ -251,7 +231,7 @@ mod tests {
         let mut agent = test_agent(AgentStatus::Active, "tool");
         agent.status_time = 600.0; // 400s ago > 300s threshold
         agent.last_heartbeat = 990.0; // fresh heartbeat
-        let result = compute_status(&agent, 1000.0, None);
+        let result = compute_status(&agent, 1000.0);
         assert_eq!(result.status, AgentStatus::Active); // kept alive by heartbeat
     }
 }
