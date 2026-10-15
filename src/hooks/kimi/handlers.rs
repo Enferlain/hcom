@@ -199,11 +199,13 @@ fn handle_pretooluse(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
     };
     let instance_name = &instance.name;
 
-    let detail =
-        crate::hooks::family::extract_tool_detail("kimi", &payload.tool_name, &payload.tool_input);
-    if !detail.is_empty() {
-        lifecycle::set_status(db, instance_name, ST_ACTIVE, &detail, Default::default());
-    }
+    crate::hooks::common::update_tool_status(
+        db,
+        instance_name,
+        "kimi",
+        &payload.tool_name,
+        &payload.tool_input,
+    );
 
     hook_noop()
 }
@@ -531,4 +533,44 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
     );
 
     exit_code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn pretooluse_records_tool_context_even_without_detail() {
+        let (_dir, hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open_at(&hcom_dir.join("hcom.db")).unwrap();
+        db.save_instance_named(
+            "luna",
+            json!({"tool": "kimi", "created_at": 1.0, "status": "listening"})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        db.rebind_session("ses-kimi", "luna").unwrap();
+        db.set_process_binding("pid-kimi", "ses-kimi", "luna")
+            .unwrap();
+        let ctx = HcomContext::from_env(
+            &std::collections::HashMap::from([("HCOM_PROCESS_ID".into(), "pid-kimi".into())]),
+            home,
+        );
+        for (tool, input, expected_detail) in [
+            ("Bash", json!({"command": "echo hello"}), "echo hello"),
+            ("Unknown", json!({}), ""),
+        ] {
+            let payload = HookPayload::from_kimi(
+                "kimi-pretooluse",
+                json!({"session_id": "ses-kimi", "tool_name": tool, "tool_input": input}),
+            );
+            handle_pretooluse(&db, &ctx, &payload);
+            let row = db.get_instance_full("luna").unwrap().unwrap();
+            assert_eq!(row.status, ST_ACTIVE);
+            assert_eq!(row.status_context, format!("tool:{tool}"));
+            assert_eq!(row.status_detail, expected_detail);
+        }
+    }
 }
