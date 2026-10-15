@@ -220,7 +220,11 @@ impl DbDataSource {
 
 impl DataSource for DbDataSource {
     fn set_timeline_limit(&mut self, limit: usize) {
-        self.timeline_limit = limit;
+        if self.timeline_limit != limit {
+            self.timeline_limit = limit;
+            // Force the next load to re-query; the cached window used the old limit.
+            self.last_data_version = 0;
+        }
     }
 
     fn last_error(&self) -> Option<String> {
