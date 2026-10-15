@@ -956,11 +956,6 @@ impl App {
 
     fn send_message(&mut self) {
         let (recipients, body) = parse_outbound_message(&self.ui.input);
-        let recipients = if recipients.is_empty() {
-            vec!["all".to_string()]
-        } else {
-            recipients
-        };
         if let Err(e) = self.enqueue_rpc(RpcOp::Send {
             recipients,
             body,
