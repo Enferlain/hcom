@@ -155,13 +155,19 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
 
         RpcOp::KillAgent { name } => commands::run_native(&["kill".into(), name.clone()]),
 
-        RpcOp::ForkAgent { name, .. } => {
-            commands::run_native(&["f".into(), name.clone(), "--no-run-here".into()])
-        }
+        RpcOp::ForkAgent { name, .. } => commands::run_native(&[
+            "--go".into(),
+            "f".into(),
+            name.clone(),
+            "--no-run-here".into(),
+        ]),
 
-        RpcOp::ResumeAgent { name, .. } => {
-            commands::run_native(&["r".into(), name.clone(), "--no-run-here".into()])
-        }
+        RpcOp::ResumeAgent { name, .. } => commands::run_native(&[
+            "--go".into(),
+            "r".into(),
+            name.clone(),
+            "--no-run-here".into(),
+        ]),
 
         RpcOp::KillPid { pid } => commands::run_native(&["kill".into(), pid.to_string()]),
 

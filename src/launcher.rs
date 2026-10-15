@@ -271,12 +271,16 @@ fn is_tool_installed(tool: &str) -> bool {
     find_tool_path(tool).is_some()
 }
 
+/// Whether a launch replaces the current process instead of opening a new
+/// terminal. Without an interactive stdin (TUI RPC, pipes, scripts) there is no
+/// terminal to take over, so only an explicit `--run-here`/`here` does it.
 pub fn will_run_in_current_terminal(
     count: usize,
     background: bool,
     run_here: Option<bool>,
     terminal: Option<&str>,
     inside_ai_tool: bool,
+    stdin_is_terminal: bool,
 ) -> bool {
     if let Some(rh) = run_here {
         return rh;
@@ -288,7 +292,7 @@ pub fn will_run_in_current_terminal(
     if inside_ai_tool {
         return false;
     }
-    if background {
+    if background || !stdin_is_terminal {
         return false;
     }
     count == 1
@@ -1596,6 +1600,7 @@ fn launch_pty_or_background(
             params.run_here,
             ctx.terminal_mode,
             inside_ai_tool,
+            std::io::IsTerminal::is_terminal(&std::io::stdin()),
         );
         let ok = launch_pty(
             ctx.tool,
@@ -1892,6 +1897,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         params.run_here,
         terminal_mode,
         inside_ai_tool,
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
     );
 
     // Build base environment for the current launch regime, then overlay
@@ -2291,6 +2297,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             params.run_here,
                             terminal_mode,
                             inside_ai_tool,
+                            std::io::IsTerminal::is_terminal(&std::io::stdin()),
                         );
                         let (launch_result, effective_preset) = terminal::launch_terminal(
                             &claude_cmd,
@@ -3135,6 +3142,7 @@ mod tests {
             false,
             Some(true),
             None,
+            false,
             false
         ));
         assert!(!will_run_in_current_terminal(
@@ -3142,7 +3150,8 @@ mod tests {
             false,
             Some(false),
             None,
-            false
+            false,
+            true
         ));
 
         // terminal=here
@@ -3151,18 +3160,32 @@ mod tests {
             false,
             None,
             Some("here"),
+            false,
             false
         ));
 
         // Inside AI tool → always new window
-        assert!(!will_run_in_current_terminal(1, false, None, None, true));
+        assert!(!will_run_in_current_terminal(
+            1, false, None, None, true, true
+        ));
 
         // Background → never run here
-        assert!(!will_run_in_current_terminal(1, true, None, None, false));
+        assert!(!will_run_in_current_terminal(
+            1, true, None, None, false, true
+        ));
+
+        // No interactive stdin (TUI RPC, pipes) → new window
+        assert!(!will_run_in_current_terminal(
+            1, false, None, None, false, false
+        ));
 
         // Single → run here, multiple → new window
-        assert!(will_run_in_current_terminal(1, false, None, None, false));
-        assert!(!will_run_in_current_terminal(2, false, None, None, false));
+        assert!(will_run_in_current_terminal(
+            1, false, None, None, false, true
+        ));
+        assert!(!will_run_in_current_terminal(
+            2, false, None, None, false, true
+        ));
     }
 
     #[test]

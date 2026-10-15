@@ -47,7 +47,7 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 // ── Helpers ──────────────────────────────────────────────────────
 
 /// Build argv for a TUI-initiated launch:
-/// `hcom [count] <tool> --no-run-here [--tag T] [--terminal T] [--headless] [--hcom-prompt P]`.
+/// `hcom [count] <tool> --no-run-here --go [--tag T] [--terminal T] [--headless] [--hcom-prompt P]`.
 ///
 /// Per-tool prompt shaping is NOT duplicated here: the prompt is passed through
 /// the launcher's generic `--hcom-prompt`, which applies the tool's
@@ -65,6 +65,7 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 /// Always includes `--no-run-here` so the launcher opens a new terminal window/tab
 /// instead of running the agent in the TUI's own terminal (which would cause the
 /// agent to launch into a piped subprocess with no interactive I/O).
+/// Includes `--go` to execute confirmed TUI actions inside AI-tool environments.
 pub fn build_launch_argv(
     tool: Tool,
     count: u8,
@@ -78,6 +79,7 @@ pub fn build_launch_argv(
         count.to_string(),
         tool.name().into(),
         "--no-run-here".into(),
+        "--go".into(),
     ];
     if !tag.is_empty() {
         argv.extend(["--tag".into(), tag.into()]);
@@ -157,6 +159,7 @@ mod tests {
         assert_eq!(argv[0], "2");
         assert_eq!(argv[1], "claude");
         assert!(argv.contains(&"--no-run-here".into()));
+        assert!(argv.contains(&"--go".into()));
         assert!(argv.contains(&"--tag".into()));
         assert!(argv.contains(&"review".into()));
         assert!(argv.contains(&"--terminal".into()));
@@ -172,7 +175,14 @@ mod tests {
         let argv = build_launch_argv(Tool::Gemini, 1, "", false, false, "default", "");
         assert_eq!(
             argv,
-            vec!["1", "gemini", "--no-run-here", "--terminal", "default"]
+            vec![
+                "1",
+                "gemini",
+                "--no-run-here",
+                "--go",
+                "--terminal",
+                "default"
+            ]
         );
     }
 
@@ -199,6 +209,7 @@ mod tests {
                     "1".to_string(),
                     tool.name().to_string(),
                     "--no-run-here".to_string(),
+                    "--go".to_string(),
                     "--terminal".to_string(),
                     "kitty".to_string(),
                     "--hcom-prompt".to_string(),
@@ -220,6 +231,7 @@ mod tests {
                 "1",
                 "gemini",
                 "--no-run-here",
+                "--go",
                 "--terminal",
                 "kitty",
                 "--headless",
@@ -240,6 +252,7 @@ mod tests {
                 "1",
                 "claude",
                 "--no-run-here",
+                "--go",
                 "--terminal",
                 "kitty",
                 "--headless",
@@ -259,6 +272,7 @@ mod tests {
                 "1",
                 "claude",
                 "--no-run-here",
+                "--go",
                 "--terminal",
                 "kitty",
                 "--headless",
