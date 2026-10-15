@@ -567,8 +567,10 @@ fn render_vertical(frame: &mut Frame, app: &mut App, area: Rect) {
     let body_right = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(body[2]);
 
     render_messages_heading(frame, body_right[0], app);
-    let max_scroll = messages::render_messages(frame, body_right[1], app);
-    app.ui.scroll_max = max_scroll;
+    let scroll = messages::render_messages(frame, body_right[1], app);
+    app.ui.scroll_max = scroll.max;
+    app.ui.msg_scroll = scroll.offset;
+    app.ui.last_msg_total = scroll.total;
     update_input_scroll(app, false, area.width);
     render_bottom_section(
         frame,

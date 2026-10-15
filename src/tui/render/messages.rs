@@ -22,7 +22,14 @@ const DISPLAY_LIMIT: usize = 5000; // vertical mode loads up to 5000 from DB
 
 use super::truncate_display;
 
-pub fn render_messages(frame: &mut Frame, area: Rect, app: &App) -> usize {
+#[derive(Default)]
+pub struct ScrollMetrics {
+    pub max: usize,
+    pub total: usize,
+    pub offset: usize,
+}
+
+pub fn render_messages(frame: &mut Frame, area: Rect, app: &App) -> ScrollMetrics {
     if app.ui.show_events {
         let agents = if app.ui.selected.is_empty() {
             None
@@ -31,7 +38,13 @@ pub fn render_messages(frame: &mut Frame, area: Rect, app: &App) -> usize {
         };
         render_events_timeline(frame, area, app, agents)
     } else if let Some(ref cr) = app.ui.command_result {
-        render_command_output(frame, area, &cr.output, app.ui.msg_scroll)
+        render_command_output(
+            frame,
+            area,
+            &cr.output,
+            app.ui.msg_scroll,
+            app.ui.last_msg_total,
+        )
     } else if !app.ui.selected.is_empty() {
         render_agent_feed(frame, area, app, &app.ui.selected)
     } else {
@@ -46,7 +59,7 @@ fn render_events_timeline(
     area: Rect,
     app: &App,
     agents: Option<&BTreeSet<String>>,
-) -> usize {
+) -> ScrollMetrics {
     let mut items: Vec<FeedItem> = Vec::new();
     for ev in &app.data.events {
         if agents.is_none_or(|a| a.contains(&ev.agent)) {
@@ -89,7 +102,7 @@ fn render_events_timeline(
             Line::from(Span::styled(msg, Style::default().fg(palette::FG_DIM))),
         ];
         frame.render_widget(Paragraph::new(empty), area);
-        return 0;
+        return ScrollMetrics::default();
     }
 
     let resolve_name = |name: &str| app.data.resolve_display_name(name);
@@ -129,7 +142,7 @@ fn render_events_timeline(
         }
     }
 
-    render_scrolled(frame, area, lines, app.ui.msg_scroll)
+    render_scrolled(frame, area, lines, app.ui.msg_scroll, app.ui.last_msg_total)
 }
 
 // ── Shared feed rendering helpers ───────────────────────────────────
@@ -317,7 +330,12 @@ fn push_feed_message(
 
 // ── Agent feed: merged tool events + messages ──────────────────────
 
-fn render_agent_feed(frame: &mut Frame, area: Rect, app: &App, agents: &BTreeSet<String>) -> usize {
+fn render_agent_feed(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    agents: &BTreeSet<String>,
+) -> ScrollMetrics {
     let resolve_name = |name: &str| app.data.resolve_display_name(name);
     // Collect relevant items
     let mut items: Vec<FeedItem> = Vec::new();
@@ -366,7 +384,7 @@ fn render_agent_feed(frame: &mut Frame, area: Rect, app: &App, agents: &BTreeSet
             Line::from(Span::styled(msg, Style::default().fg(palette::FG_DIM))),
         ];
         frame.render_widget(Paragraph::new(empty), area);
-        return 0;
+        return ScrollMetrics::default();
     }
 
     let show_agent_name = agents.len() > 1;
@@ -407,12 +425,12 @@ fn render_agent_feed(frame: &mut Frame, area: Rect, app: &App, agents: &BTreeSet
         }
     }
 
-    render_scrolled(frame, area, lines, app.ui.msg_scroll)
+    render_scrolled(frame, area, lines, app.ui.msg_scroll, app.ui.last_msg_total)
 }
 
 // ── All messages view ──────────────────────────────────────────────
 
-fn render_all_messages(frame: &mut Frame, area: Rect, app: &App) -> usize {
+fn render_all_messages(frame: &mut Frame, area: Rect, app: &App) -> ScrollMetrics {
     let resolve_name = |name: &str| app.data.resolve_display_name(name);
 
     // Use FTS search results when available (vertical mode with active query).
@@ -446,7 +464,7 @@ fn render_all_messages(frame: &mut Frame, area: Rect, app: &App) -> usize {
             Line::from(Span::styled(label, Style::default().fg(palette::FG_DIM))),
         ];
         frame.render_widget(Paragraph::new(empty), area);
-        return 0;
+        return ScrollMetrics::default();
     }
 
     // search_query drives highlight spans; filtering is skipped for FTS results.
@@ -516,7 +534,7 @@ fn render_all_messages(frame: &mut Frame, area: Rect, app: &App) -> usize {
         }
     }
 
-    render_scrolled(frame, area, lines, app.ui.msg_scroll)
+    render_scrolled(frame, area, lines, app.ui.msg_scroll, app.ui.last_msg_total)
 }
 
 fn push_msg_header(
@@ -732,7 +750,8 @@ fn render_command_output(
     area: Rect,
     output: &[String],
     msg_scroll: usize,
-) -> usize {
+    last_total: usize,
+) -> ScrollMetrics {
     let mut lines: Vec<Line> = Vec::new();
     for line in output {
         lines.push(Line::from(vec![
@@ -741,21 +760,22 @@ fn render_command_output(
         ]));
     }
 
-    render_scrolled(frame, area, lines, msg_scroll)
+    render_scrolled(frame, area, lines, msg_scroll, last_total)
 }
 
 /// Render lines with bottom-anchored scroll and an auto-hiding scrollbar.
-/// Returns `max_scroll` so callers can clamp `msg_scroll`.
+/// Return the total and adjusted offset for the next frame.
 fn render_scrolled(
     frame: &mut Frame,
     area: Rect,
     lines: Vec<Line<'_>>,
     scroll_from_bottom: usize,
-) -> usize {
+    last_total: usize,
+) -> ScrollMetrics {
     let total = lines.len();
     let visible = area.height as usize;
     let max_scroll = total.saturating_sub(visible);
-    let effective = scroll_from_bottom.min(max_scroll);
+    let effective = anchored_offset(scroll_from_bottom, last_total, total).min(max_scroll);
     let scroll_pos = max_scroll - effective;
 
     let paragraph = Paragraph::new(lines).scroll((scroll_pos.min(u16::MAX as usize) as u16, 0));
@@ -774,5 +794,30 @@ fn render_scrolled(
         );
     }
 
-    max_scroll
+    ScrollMetrics {
+        max: max_scroll,
+        total,
+        offset: effective,
+    }
+}
+
+fn anchored_offset(offset: usize, last_total: usize, total: usize) -> usize {
+    if offset > 0 {
+        offset.saturating_add(total.saturating_sub(last_total))
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::anchored_offset;
+
+    #[test]
+    fn new_lines_keep_scrolled_view_in_place() {
+        assert_eq!(anchored_offset(5, 100, 103), 8);
+        assert_eq!(anchored_offset(0, 100, 103), 0);
+        assert_eq!(anchored_offset(5, 100, 90), 5);
+        assert_eq!(anchored_offset(8, 103, 103), 8);
+    }
 }

@@ -67,6 +67,8 @@ pub struct UiState {
     pub should_quit: bool,
     pub switch_viewport: bool,
     pub msg_scroll: usize,
+    /// Rendered fullscreen lines in the previous frame, for scroll anchoring.
+    pub last_msg_total: usize,
     pub scroll_max: usize,
     pub search_filter: Option<String>,
     pub help_open: bool,
