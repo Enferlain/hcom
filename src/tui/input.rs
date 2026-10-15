@@ -1101,13 +1101,7 @@ impl App {
                 let tag = self.ui.launch.tag.clone();
                 let headless = self.ui.launch.headless;
                 let headless_pty = self.ui.launch.headless_pty;
-                let terminal = self
-                    .ui
-                    .launch
-                    .terminal_presets
-                    .get(self.ui.launch.terminal)
-                    .map(|s| s.as_str())
-                    .unwrap_or("auto");
+                let terminal = self.ui.launch.terminal_override().to_string();
                 let prompt = self.ui.input.clone();
                 let tool_name = tool.name().to_string();
 
@@ -1117,7 +1111,7 @@ impl App {
                     tag,
                     headless,
                     headless_pty,
-                    terminal: terminal.into(),
+                    terminal,
                     prompt,
                 }) {
                     self.ui.flash = Some(Flash::new(

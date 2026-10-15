@@ -447,6 +447,7 @@ mod tests {
                     headless_pty: false,
                     terminal: 0,
                     terminal_presets: vec!["default".into()],
+                    configured_terminal: "default".into(),
                     editing: None,
                     edit_cursor: 0,
                     edit_snapshot: None,
