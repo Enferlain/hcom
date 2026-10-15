@@ -67,7 +67,7 @@ impl HcomDb {
     pub fn has_direct_unread(&self, name: &str) -> bool {
         let last_event_id = match self.get_instance_status(name) {
             Ok(Some(status)) => status.last_event_id,
-            _ => 0,
+            _ => return false,
         };
         let mut stmt = match self.conn.prepare_cached(
             "SELECT data FROM events
@@ -795,6 +795,12 @@ mod tests {
         )
         .unwrap();
         assert!(db.has_direct_unread("luna_reviewer_1"));
+        db.conn
+            .execute("DELETE FROM instances WHERE name = 'luna_reviewer_1'", [])
+            .unwrap();
+        assert!(!db.has_direct_unread("luna_reviewer_1"));
+        db.conn.execute_batch("DROP TABLE instances").unwrap();
+        assert!(!db.has_direct_unread("luna_reviewer_1"));
 
         cleanup_test_db(db_path);
     }
