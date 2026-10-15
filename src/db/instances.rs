@@ -257,15 +257,25 @@ impl HcomDb {
     /// Update gate blocking status WITHOUT logging a status event.
     ///
     /// Used for transient PTY gate states (tui:*) that shouldn't pollute the events table.
-    /// Only updates the instance row; TUI reads this for display but no event is created.
+    /// Updates only listening rows; returns whether the gate was installed.
+    /// TUI reads the row for display but no event is created.
     ///
     /// Args:
     ///   context: Gate context like "tui:not-ready", "tui:user-active", etc.
     ///   detail: Human-readable description like "user is typing"
-    pub fn set_gate_status(&self, name: &str, context: &str, detail: &str) -> Result<()> {
+    pub fn set_gate_status(&self, name: &str, context: &str, detail: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE instances SET status_context = ?, status_detail = ? WHERE name = ? AND status = ?",
+            params![context, detail, name, ST_LISTENING],
+        )? > 0)
+    }
+
+    /// Clear only the gate context this caller last installed.
+    pub fn clear_gate_status(&self, name: &str, expected_context: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE instances SET status_context = ?, status_detail = ? WHERE name = ?",
-            params![context, detail, name],
+            "UPDATE instances SET status_context = '', status_detail = ''
+             WHERE name = ? AND status_context = ? AND status = ?",
+            params![name, expected_context, ST_LISTENING],
         )?;
         Ok(())
     }
@@ -1157,6 +1167,29 @@ mod tests {
     fn reopen_broken_schema(db_path: &std::path::Path) -> HcomDb {
         // Use open_raw here: open_at would repair the table we deliberately dropped.
         HcomDb::open_raw(db_path).unwrap()
+    }
+
+    #[test]
+    fn test_gate_writes_preserve_approval_and_newer_contexts() {
+        let (db, path) = setup_full_test_db();
+        db.conn.execute("INSERT INTO instances (name, created_at, status) VALUES ('luna', 1.0, 'listening')", []).unwrap();
+        db.set_gate_status("luna", "tui:not-ready", "waiting")
+            .unwrap();
+        db.clear_gate_status("luna", "tui:user-active").unwrap();
+        assert_eq!(db.get_status("luna").unwrap().unwrap().1, "tui:not-ready");
+        db.clear_gate_status("luna", "tui:not-ready").unwrap();
+        assert_eq!(db.get_status("luna").unwrap().unwrap().1, "");
+        for context in ["pty:approval", "approval"] {
+            db.set_status("luna", "blocked", context).unwrap();
+            db.clear_gate_status("luna", "tui:not-ready").unwrap();
+            db.set_gate_status("luna", "tui:wake-unacknowledged", "paused")
+                .unwrap();
+            assert_eq!(
+                db.get_status("luna").unwrap().unwrap(),
+                ("blocked".into(), context.into())
+            );
+        }
+        cleanup_test_db(path);
     }
 
     #[test]

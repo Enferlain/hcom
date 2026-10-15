@@ -1024,7 +1024,17 @@ pub(super) fn run(
                         "grok.acp.connect_failed",
                         &format!("attempt={connect_failures} retry_in={backoff:?}: {detail}"),
                     );
-                    let _ = db.set_gate_status(current_name, "acp_disconnected", &detail);
+                    // Connection diagnostics also apply while launching/active.
+                    let _ = db.update_instance_fields(
+                        current_name,
+                        &serde_json::Map::from_iter([
+                            (
+                                "status_context".into(),
+                                serde_json::json!("acp_disconnected"),
+                            ),
+                            ("status_detail".into(), serde_json::json!(detail)),
+                        ]),
+                    );
                     if launched_at.elapsed() >= SETUP_TIMEOUT {
                         block_launch(
                             db,

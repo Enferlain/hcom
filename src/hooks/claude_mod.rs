@@ -171,7 +171,16 @@ pub fn report_health(db: &HcomDb, process: &str, name: &str) -> Result<()> {
         return Ok(());
     }
     if row.status_context != context || row.status_detail != detail {
-        db.set_gate_status(name, context, detail)?;
+        // The row may have left listening since is_idle; don't log a no-op.
+        let applied = if context.is_empty() {
+            db.clear_gate_status(name, &row.status_context)?;
+            true
+        } else {
+            db.set_gate_status(name, context, detail)?
+        };
+        if !applied {
+            return Ok(());
+        }
         let event = if context.is_empty() {
             "claude.mod_ready".to_string()
         } else {

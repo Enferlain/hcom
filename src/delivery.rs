@@ -2141,63 +2141,37 @@ pub fn run_delivery_loop(
                             if let Some(since) = block_since
                                 && since.elapsed().as_secs_f64() >= 2.0
                             {
-                                match db.get_status(&current_name) {
-                                    Ok(Some((status, _))) if status == ST_LISTENING => {
-                                        let context = "tui:not-idle".to_string();
-                                        if context != last_block_context {
-                                            if let Err(e) = db.set_gate_status(
-                                                &current_name,
-                                                &context,
-                                                "waiting for idle status",
-                                            ) {
-                                                log_warn(
-                                                    "native",
-                                                    "delivery.gate_status_fail",
-                                                    &format!("{}", e),
-                                                );
-                                            }
-                                            last_block_context = context;
-                                        }
-                                    }
-                                    Ok(Some(_)) | Ok(None) => {
-                                        // Status not "listening" or not found - skip
-                                    }
-                                    Err(e) => {
-                                        log_error(
+                                let context = "tui:not-idle".to_string();
+                                if context != last_block_context {
+                                    match db.set_gate_status(
+                                        &current_name,
+                                        &context,
+                                        "waiting for idle status",
+                                    ) {
+                                        Ok(true) => last_block_context = context,
+                                        Ok(false) => {}
+                                        Err(e) => log_warn(
                                             "native",
-                                            "delivery.tui_status_update",
-                                            &format!("DB error checking status: {}", e),
-                                        );
+                                            "delivery.gate_status_fail",
+                                            &format!("{e}"),
+                                        ),
                                     }
                                 }
                             }
                         } else if let Some(since) = block_since {
                             // After 2 seconds of blocking, update TUI status context
                             if since.elapsed().as_secs_f64() >= 2.0 {
-                                // Only update if status is "listening" (don't overwrite active/blocked)
-                                match db.get_status(&current_name) {
-                                    Ok(Some((status, _))) if status == ST_LISTENING => {
-                                        // Format context: tui:not-ready, tui:user-active, etc.
-                                        let reason_formatted = gate.reason.replace("_", "-");
-                                        let context = format!("tui:{}", reason_formatted);
-
-                                        // Only update if context changed
-                                        if context != last_block_context {
-                                            let detail = gate_block_detail(gate.reason);
-                                            let _ =
-                                                db.set_gate_status(&current_name, &context, detail);
-                                            last_block_context = context;
-                                        }
-                                    }
-                                    Ok(Some(_)) | Ok(None) => {
-                                        // Status not "listening" or not found - skip
-                                    }
-                                    Err(e) => {
-                                        log_error(
+                                let context = format!("tui:{}", gate.reason.replace('_', "-"));
+                                if context != last_block_context {
+                                    let detail = gate_block_detail(gate.reason);
+                                    match db.set_gate_status(&current_name, &context, detail) {
+                                        Ok(true) => last_block_context = context,
+                                        Ok(false) => {}
+                                        Err(e) => log_warn(
                                             "native",
-                                            "delivery.gate_status_update",
-                                            &format!("DB error checking status: {}", e),
-                                        );
+                                            "delivery.gate_status_fail",
+                                            &format!("{e}"),
+                                        ),
                                     }
                                 }
                             }
@@ -2426,7 +2400,8 @@ pub fn run_delivery_loop(
                     if current_cursor > cursor_before {
                         // Success! Clear gate block status
                         if !last_block_context.is_empty() {
-                            if let Err(e) = db.set_gate_status(&current_name, "", "") {
+                            if let Err(e) = db.clear_gate_status(&current_name, &last_block_context)
+                            {
                                 log_warn("native", "delivery.gate_clear_fail", &format!("{}", e));
                             }
                             last_block_context.clear();
@@ -2483,7 +2458,9 @@ pub fn run_delivery_loop(
                                 // wedging when hook delivery succeeded but
                                 // cursor bookkeeping did not advance.
                                 if !last_block_context.is_empty() {
-                                    if let Err(e) = db.set_gate_status(&current_name, "", "") {
+                                    if let Err(e) =
+                                        db.clear_gate_status(&current_name, &last_block_context)
+                                    {
                                         log_warn(
                                             "native",
                                             "delivery.gate_clear_fail",
@@ -2584,7 +2561,7 @@ pub fn run_delivery_loop(
                     let current_cursor = db.get_cursor(&current_name);
                     let has_pending = db.has_pending(&current_name);
                     if current_cursor > cursor_before || !has_pending {
-                        if let Err(e) = db.set_gate_status(&current_name, "", "") {
+                        if let Err(e) = db.clear_gate_status(&current_name, &last_block_context) {
                             log_warn("native", "delivery.gate_clear_fail", &format!("{}", e));
                         }
                         last_block_context.clear();
