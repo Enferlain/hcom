@@ -155,6 +155,18 @@ fn push_token(
 }
 
 pub(crate) fn render_body(text: &str, width: usize, query: Option<&str>) -> Vec<Line<'static>> {
+    let normalized = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\t', "    ");
+    normalized
+        .trim_end_matches('\n')
+        .split('\n')
+        .flat_map(|line| render_body_line(line, width, query))
+        .collect()
+}
+
+fn render_body_line(text: &str, width: usize, query: Option<&str>) -> Vec<Line<'static>> {
     let indent = 4usize;
     let max_w = width.saturating_sub(indent);
     if max_w == 0 {
@@ -383,6 +395,13 @@ mod tests {
     }
 
     // ── render_body ───────────────────────────────────────────────
+
+    #[test]
+    fn render_body_preserves_line_breaks_and_expands_tabs() {
+        let lines = render_body("first\r\n\n@nova\tlast\n", 40, None);
+        let text: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        assert_eq!(text, ["  │ first", "  │ ", "  │ @nova    last"]);
+    }
 
     #[test]
     fn render_body_wraps_long_text() {
