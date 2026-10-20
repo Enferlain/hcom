@@ -349,6 +349,95 @@ fn list_json_empty() {
 }
 
 #[test]
+fn kill_json_reports_every_target() {
+    let h = Hcom::new();
+    let agent = h.start();
+    let (code, _, stderr) = h.run(["stop", &agent]);
+    assert_eq!(code, 0, "stop failed: {stderr}");
+
+    let (code, stdout, stderr) = h.run(["kill", &agent, "nosuchagent", "--json"]);
+    assert_eq!(
+        code, 1,
+        "a missing target fails the command: stderr={stderr}"
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("kill --json object");
+    assert_eq!(report["ok"], false);
+    let results = report["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2, "one outcome per target: {stdout}");
+    assert_eq!(results[0]["target"], agent.as_str());
+    assert_eq!(results[0]["kind"], "stopped");
+    assert_eq!(results[0]["result"], "already_stopped");
+    assert_eq!(results[0]["resume"], format!("hcom r {agent}"));
+    assert_eq!(results[1]["target"], "nosuchagent");
+    assert_eq!(results[1]["result"], "error");
+    assert!(results[1]["error"].is_string(), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn launch_json_reports_names_for_kill_json() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = Hcom::new();
+    // A stand-in `claude` that answers --version and then idles: enough for
+    // hcom to launch, track, and kill it without a real tool.
+    let fake_bin = h.root_path().join("fake-bin");
+    std::fs::create_dir_all(&fake_bin).expect("create fake bin");
+    let fake_claude = fake_bin.join("claude");
+    std::fs::write(
+        &fake_claude,
+        "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.200 (Claude Code)'; exit 0;; esac\nsleep 300\n",
+    )
+    .expect("write fake claude");
+    std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake claude");
+    let hcom_bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_hcom"))
+        .parent()
+        .expect("hcom bin dir")
+        .to_path_buf();
+    let path = std::env::join_paths([hcom_bin_dir, fake_bin].into_iter().chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("join PATH");
+
+    let output = h
+        .cmd()
+        .args(["1", "claude", "--headless", "--json"])
+        .env("PATH", &path)
+        .output()
+        .expect("run launch");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    let launch: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout is exactly one JSON object");
+    assert_eq!(launch["action"], "launch");
+    assert_eq!(launch["tool"], "claude");
+    assert_eq!(launch["launched"], 1);
+    assert_eq!(launch["failed"], 0);
+    assert!(
+        launch["batch_id"].as_str().is_some_and(|b| !b.is_empty()),
+        "{launch}"
+    );
+    let names = launch["names"].as_array().expect("names array");
+    assert_eq!(names.len(), 1, "{launch}");
+    let name = names[0].as_str().expect("name string");
+
+    let (_, stdout, stderr) = h.run(["kill", name, "--json"]);
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout} / {stderr}"));
+    let outcome = &report["results"][0];
+    assert_eq!(outcome["target"], name, "{report}");
+    // Usually still running; a slow host may have already given up waiting
+    // for the fake tool to become ready, which stops it first.
+    assert!(
+        outcome["kind"] == "agent" || outcome["kind"] == "stopped",
+        "{report}"
+    );
+    assert_eq!(outcome["resume"], format!("hcom r {name}"));
+}
+
+#[test]
 fn events_empty_in_fresh_dir() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["events", "--last", "5"]);

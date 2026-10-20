@@ -602,13 +602,15 @@ The conditional array expansion also works with macOS Bash 3.2 under `set -u`.
 
 ## Launching & Cleaning Up Agents
 
-Launch output includes "Names: <name>" — parse to track spawned agents:
+With `--json`, a launch prints one JSON object whose "names" array lists the
+spawned agents (also `launched`, `failed`, `batch_id`, `errors`). Parse it to
+track them; agent names are plain words, so splitting on quotes is safe:
 
   LAUNCHED_NAMES=()
   track_launch() {
     local output="$1"
     local names
-    names=$(echo "$output" | grep '^Names: ' | sed 's/^Names: //')
+    names=$(grep -o '"names":\[[^]]*\]' <<<"$output" | grep -o '"[^"]*"' | tail -n +2 | tr -d '"') || true
     for n in $names; do LAUNCHED_NAMES+=("$n"); done
   }
   cleanup() {
@@ -620,7 +622,7 @@ Launch output includes "Names: <name>" — parse to track spawned agents:
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
-  launch_out=$(hcom 1 claude --tag worker --go --headless -p \
+  launch_out=$(hcom 1 claude --tag worker --go --json --headless -p \
     --hcom-prompt "Wait for a task via hcom; end your turn to receive messages." \
     ${name_arg[@]+"${name_arg[@]}"} 2>&1) || { echo "$launch_out" >&2; exit 1; }
   track_launch "$launch_out"
@@ -655,7 +657,7 @@ request itself contains `DONE` and must not count as a worker response.
 - hcom injects `--name` when it knows the caller; parse and forward it when your
   script issues hcom commands on that caller's behalf.
 - Launched agent names are generated dynamically. Capture them from the
-  `Names:` launch output when you need to address or clean them up.
+  `--json` launch output when you need to address or clean them up.
 - `hcom events --wait` and `hcom events sub` are useful alternatives to sleeps
   when the next step depends on an hcom event.
 - `hcom events --follow` streams matching events as JSON Lines for a long-lived

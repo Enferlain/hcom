@@ -21,8 +21,10 @@ pub(crate) const INLINE_SINGLE_LAUNCH_WAIT_SECS: u64 = 15;
 
 /// Run the launch command. `argv` is the full argv[1..] including count/tool.
 pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
-    let (count, tool, hcom_flags, tool_args) = parse_launch_argv(argv)?;
+    let (count, tool, mut hcom_flags, tool_args) = parse_launch_argv(argv)?;
     let launch_tool = LaunchTool::from_str(&tool)?;
+    hcom_flags.run_here = json_run_here(&hcom_flags)?;
+    let json_output = hcom_flags.json;
 
     // Count validation
     if count == 0 {
@@ -65,6 +67,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
             config: &hcom_config,
             show_config_args: remote_device.is_none(),
             notes: if remote_device.is_some() { &notes } else { &[] },
+            json: json_output,
         });
         return Ok(0);
     }
@@ -124,9 +127,10 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
                     run_here: remote_output.run_here,
                     hcom_config: &hcom_config,
                     inline_readiness_wait_secs: None,
+                    json: json_output,
                 };
-                print_launch_feedback(&db, &launch_result, &output)?;
-                return Ok(0);
+                report_launch(&db, &launch_result, &output)?;
+                return Ok(readiness_exit_code(None, launch_result.failed));
             }
             Err(e) => bail!("Remote launch failed for device {device}: {e}"),
         }
@@ -163,6 +167,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         } else {
             None
         },
+        json: json_output,
     };
 
     let result = launcher::launch(
@@ -203,11 +208,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
         },
     )?;
 
-    print_launch_feedback(&db, &result, &output)?;
-    let readiness_state = output
-        .inline_readiness_wait_secs
-        .filter(|_| result.launched == 1)
-        .map(|secs| print_inline_launch_readiness(&db, &result, secs));
+    let readiness_state = report_launch(&db, &result, &output)?;
 
     // Log summary
     log_info(
@@ -338,6 +339,7 @@ pub(crate) struct LaunchPreview<'a> {
     pub config: &'a HcomConfig,
     pub show_config_args: bool,
     pub notes: &'a [&'a str],
+    pub json: bool,
 }
 
 pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
@@ -384,6 +386,34 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
         .map(|s| s.to_string())
         .or_else(|| std::env::var("HCOM_TERMINAL").ok())
         .unwrap_or_else(|| preview.config.terminal.clone());
+
+    if preview.json {
+        let notes: Vec<&str> = preview
+            .notes
+            .iter()
+            .copied()
+            .filter(|n| !n.is_empty())
+            .collect();
+        println!(
+            "{}",
+            json!({
+                "preview": true,
+                "action": preview.action,
+                "tool": preview.tool,
+                "count": preview.count,
+                "mode": mode,
+                "dir": cwd,
+                "terminal": terminal,
+                "tag": preview.tag,
+                "notes": notes,
+                "config_args": env_args,
+                "config_args_key": args_key,
+                "cli_args": preview.args,
+                "hint": "Add --go to proceed.",
+            })
+        );
+        return;
+    }
 
     println!("\n== LAUNCH PREVIEW ==");
     println!("Add --go to proceed.\n");
@@ -435,6 +465,60 @@ pub(crate) struct HcomLaunchFlags {
     pub run_here: Option<bool>,
     pub batch_id: Option<String>,
     pub dir: Option<String>,
+    /// `--json`: report the outcome as one JSON object on stdout.
+    pub json: bool,
+}
+
+/// `--json` output is meant to be captured by a script, so the agent must not
+/// take over the caller's terminal: open it elsewhere, and reject an explicit
+/// request to run here.
+pub(crate) fn json_run_here(flags: &HcomLaunchFlags) -> Result<Option<bool>> {
+    if !flags.json {
+        return Ok(flags.run_here);
+    }
+    if flags.run_here == Some(true) || flags.terminal.as_deref() == Some("here") {
+        bail!("--json cannot be combined with --run-here or --terminal here");
+    }
+    Ok(Some(false))
+}
+
+/// hcom launch flags that take the next token as their value, matching the
+/// arms of `extract_launch_flags` (a test keeps the two in step).
+const LAUNCH_VALUE_FLAGS: &[&str] = &[
+    "--tag",
+    "--terminal",
+    "--device",
+    "--dir",
+    "--hcom-system-prompt",
+    "--system",
+    "--hcom-prompt",
+    "--batch-id",
+    "--name",
+];
+
+/// `args` minus the `--json` tokens that `extract_launch_flags` reads as the
+/// flag. A value that happens to be `--json` (`--hcom-prompt --json`) and
+/// anything after `--` are kept.
+pub(crate) fn without_json_flag(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            out.extend_from_slice(&args[i..]);
+            break;
+        }
+        if LAUNCH_VALUE_FLAGS.contains(&arg) && i + 1 < args.len() {
+            out.extend_from_slice(&args[i..i + 2]);
+            i += 2;
+            continue;
+        }
+        if arg != "--json" {
+            out.push(args[i].clone());
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Parse launch argv: extract count, tool name, hcom flags, and tool-specific args.
@@ -620,6 +704,10 @@ pub(crate) fn extract_launch_flags(args: &[String]) -> (HcomLaunchFlags, Vec<Str
                 flags.headless = true;
                 i += 1;
             }
+            "--json" => {
+                flags.json = true;
+                i += 1;
+            }
             "--hcom-system-prompt" if i + 1 < args.len() => {
                 flags.system_prompt = Some(args[i + 1].clone());
                 i += 2;
@@ -674,18 +762,70 @@ pub(crate) struct LaunchOutputContext<'a> {
     pub run_here: Option<bool>,
     pub hcom_config: &'a HcomConfig,
     pub inline_readiness_wait_secs: Option<u64>,
+    pub json: bool,
 }
 
-pub(crate) fn print_launch_feedback(
+/// Report a launch, resume, or fork: human feedback followed by the optional
+/// inline readiness wait, or with `--json` a single object on stdout. Returns
+/// the readiness outcome when a wait ran.
+pub(crate) fn report_launch(
+    db: &HcomDb,
+    result: &LaunchResult,
+    ctx: &LaunchOutputContext<'_>,
+) -> Result<Option<InlineLaunchReadiness>> {
+    let wait_secs = ctx
+        .inline_readiness_wait_secs
+        .filter(|_| result.launched == 1);
+    if !ctx.json {
+        print_launch_feedback(db, result, ctx)?;
+        return Ok(wait_secs.map(|secs| print_inline_launch_readiness(db, result, secs)));
+    }
+
+    // Errors also go to stderr so a script that only parses stdout still
+    // surfaces them to whoever is watching.
+    let errors = launch_error_messages(result);
+    for msg in &errors {
+        eprintln!("Error: {}", msg);
+    }
+    let wait = wait_secs
+        .map(|secs| launch_status::wait_for_launch(db, None, Some(&result.batch_id), secs));
+    println!(
+        "{}",
+        json!({
+            "action": ctx.action,
+            "tool": ctx.tool,
+            "requested": ctx.requested_count,
+            "launched": result.launched,
+            "failed": result.failed,
+            "names": instance_names_from_launch_result(result),
+            "tag": ctx.tag,
+            "batch_id": result.batch_id,
+            "background": ctx.background,
+            "log_files": result.log_files,
+            "errors": errors,
+            // Same shape as `hcom events launch`; null when no wait ran.
+            "readiness": wait.as_ref().map(|w| w.to_json()),
+        })
+    );
+    Ok(wait.map(|w| inline_readiness_from_status(&w.status)))
+}
+
+fn launch_error_messages(result: &LaunchResult) -> Vec<&str> {
+    result
+        .errors
+        .iter()
+        .filter_map(|err| err.get("error").and_then(|v| v.as_str()))
+        .collect()
+}
+
+fn print_launch_feedback(
     db: &HcomDb,
     result: &LaunchResult,
     ctx: &LaunchOutputContext<'_>,
 ) -> Result<()> {
     if result.failed > 0 {
-        for err in &result.errors {
-            if let Some(msg) = err.get("error").and_then(|v| v.as_str()) {
-                eprintln!("Error: {}", msg);
-            }
+        for msg in launch_error_messages(result) {
+            eprintln!("Error: {}", msg);
         }
     }
 
@@ -773,7 +913,16 @@ pub(crate) fn readiness_exit_code(state: Option<InlineLaunchReadiness>, failed: 
     }
 }
 
-pub(crate) fn print_inline_launch_readiness(
+fn inline_readiness_from_status(status: &LaunchStatus) -> InlineLaunchReadiness {
+    match status {
+        LaunchStatus::Ready => InlineLaunchReadiness::Ready,
+        LaunchStatus::Error => InlineLaunchReadiness::Failed,
+        LaunchStatus::Blocked => InlineLaunchReadiness::Blocked,
+        LaunchStatus::Timeout | LaunchStatus::NoLaunches => InlineLaunchReadiness::Launching,
+    }
+}
+
+fn print_inline_launch_readiness(
     db: &HcomDb,
     result: &LaunchResult,
     timeout_secs: u64,
@@ -783,13 +932,11 @@ pub(crate) fn print_inline_launch_readiness(
     let wait = launch_status::wait_for_launch(db, None, Some(&result.batch_id), timeout_secs);
     let elapsed_secs = start.elapsed().as_secs_f64();
 
-    let (state, details) = match wait.status {
-        LaunchStatus::Ready => (InlineLaunchReadiness::Ready, Vec::new()),
-        LaunchStatus::Error => (InlineLaunchReadiness::Failed, wait.failures),
-        LaunchStatus::Blocked => (InlineLaunchReadiness::Blocked, wait.blockers),
-        LaunchStatus::Timeout | LaunchStatus::NoLaunches => {
-            (InlineLaunchReadiness::Launching, Vec::new())
-        }
+    let state = inline_readiness_from_status(&wait.status);
+    let details = match state {
+        InlineLaunchReadiness::Failed => wait.failures,
+        InlineLaunchReadiness::Blocked => wait.blockers,
+        InlineLaunchReadiness::Ready | InlineLaunchReadiness::Launching => Vec::new(),
     };
 
     println!(
@@ -1061,6 +1208,64 @@ mod tests {
         .unwrap();
         assert_eq!(flags.batch_id, Some("batch-123".to_string()));
         assert_eq!(args, s(&["--model", "haiku"]));
+    }
+
+    #[test]
+    fn test_parse_launch_argv_json_is_hcom_flag_unless_after_dashdash() {
+        let (_, _, flags, args) =
+            parse_launch_argv(&s(&["claude", "--json", "--model", "haiku"])).unwrap();
+        assert!(flags.json);
+        assert_eq!(args, s(&["--model", "haiku"]));
+
+        let (_, _, flags, args) = parse_launch_argv(&s(&["claude", "--", "--json"])).unwrap();
+        assert!(!flags.json);
+        assert_eq!(args, s(&["--json"]));
+    }
+
+    #[test]
+    fn test_without_json_flag_keeps_values_and_tool_args() {
+        assert_eq!(
+            without_json_flag(&s(&[
+                "--json", "--tag", "x", "--model", "m", "--", "--json"
+            ])),
+            s(&["--tag", "x", "--model", "m", "--", "--json"])
+        );
+        // Every value flag swallows a following `--json` as its value, in the
+        // parser and in the stripper alike.
+        for flag in LAUNCH_VALUE_FLAGS {
+            let args = s(&[flag, "--json"]);
+            let (flags, _) = extract_launch_flags(&args);
+            assert!(!flags.json, "{flag} should take --json as its value");
+            assert_eq!(without_json_flag(&args), args, "{flag}");
+        }
+    }
+
+    #[test]
+    fn test_json_run_here_opens_elsewhere_and_rejects_run_here() {
+        let json = HcomLaunchFlags {
+            json: true,
+            ..Default::default()
+        };
+        assert_eq!(json_run_here(&json).unwrap(), Some(false));
+        for flags in [
+            HcomLaunchFlags {
+                run_here: Some(true),
+                ..json.clone()
+            },
+            HcomLaunchFlags {
+                terminal: Some("here".to_string()),
+                ..json.clone()
+            },
+        ] {
+            assert!(json_run_here(&flags).is_err());
+        }
+        // Without --json, run-here resolution is untouched.
+        let plain = HcomLaunchFlags {
+            run_here: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(json_run_here(&plain).unwrap(), Some(true));
+        assert_eq!(json_run_here(&HcomLaunchFlags::default()).unwrap(), None);
     }
 
     #[test]

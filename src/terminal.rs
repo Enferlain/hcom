@@ -30,6 +30,17 @@ pub enum KillResult {
     PermissionDenied,
 }
 
+impl KillResult {
+    /// Wire name used by relay kill RPCs and `hcom kill --json`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KillResult::Sent => "sent",
+            KillResult::AlreadyDead => "already_dead",
+            KillResult::PermissionDenied => "permission_denied",
+        }
+    }
+}
+
 const TERMINAL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]

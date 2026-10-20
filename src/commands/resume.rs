@@ -9,7 +9,7 @@ use std::io::BufRead;
 
 use crate::commands::launch::{
     LaunchOutputContext, LaunchPreview, extract_launch_flags, is_background_from_args,
-    load_hcom_config, print_launch_feedback, print_launch_preview, resolve_launcher_name,
+    load_hcom_config, print_launch_preview, report_launch, resolve_launcher_name,
 };
 use crate::commands::transcript::detect_agent_type;
 use crate::db::HcomDb;
@@ -49,6 +49,7 @@ struct ResumeOutputContext {
     background: bool,
     run_here: Option<bool>,
     launcher_name: String,
+    json: bool,
 }
 
 struct TrackedForkIdentity {
@@ -139,6 +140,12 @@ pub fn do_resume(
             return Ok(0);
         }
 
+        // Validate locally what the peer will never see: `--json` shapes local
+        // output only, and a peer running an older hcom would forward it to
+        // the tool.
+        let (_, launch_flags, _) = extract_resume_flags(extra_args);
+        crate::commands::launch::json_run_here(&launch_flags)?;
+        let remote_args = crate::commands::launch::without_json_flag(extra_args);
         let launcher_name =
             resolve_launcher_name(&db, flags, std::env::var("HCOM_PROCESS_ID").ok().as_deref());
         let inner = crate::relay::control::dispatch_remote(
@@ -149,7 +156,7 @@ pub fn do_resume(
             &json!({
                 "target": base_name,
                 "fork": fork,
-                "extra_args": extra_args,
+                "extra_args": remote_args,
                 "launcher": launcher_name,
             }),
             crate::relay::control::RPC_RESUME_TIMEOUT,
@@ -173,9 +180,13 @@ pub fn do_resume(
             run_here: remote_output.run_here,
             hcom_config: &hcom_config,
             inline_readiness_wait_secs: None,
+            json: remote_output.json,
         };
-        print_launch_feedback(&db, &launch_result, &output)?;
-        return Ok(0);
+        report_launch(&db, &launch_result, &output)?;
+        return Ok(crate::commands::launch::readiness_exit_code(
+            None,
+            launch_result.failed,
+        ));
     }
 
     let (resolved, plan) = resolve_name_to_plan(&db, &name, fork, extra_args, flags)?;
@@ -408,6 +419,7 @@ fn prepare_resume_plan_from_source(
 
     // Extract hcom-level flags from extra args before tool parsing.
     let (dir_override, launch_flags, clean_extra) = extract_resume_flags(extra_args);
+    let run_here = crate::commands::launch::json_run_here(&launch_flags)?;
 
     // Determine effective working directory:
     // - Explicit --dir flag wins (validated and canonicalized)
@@ -539,8 +551,9 @@ fn prepare_resume_plan_from_source(
             tag: output_tag,
             terminal: launch_flags.terminal.clone(),
             background: is_headless,
-            run_here: launch_flags.run_here,
+            run_here,
             launcher_name: launcher_name_for_output,
+            json: launch_flags.json,
         },
         launch: LaunchParams {
             tool: tool.clone(),
@@ -558,7 +571,7 @@ fn prepare_resume_plan_from_source(
             cwd: Some(effective_cwd),
             env: None,
             launcher: Some(launcher_name),
-            run_here: launch_flags.run_here,
+            run_here,
             batch_id: launch_flags.batch_id.clone(),
             name: launch_name,
             skip_validation: false,
@@ -632,14 +645,12 @@ fn execute_prepared_resume(
             run_here: plan.output.run_here,
             hcom_config,
             inline_readiness_wait_secs,
+            json: plan.output.json,
         };
-        print_launch_feedback(db, &result, &output)?;
         // Resume/fork share launch's inline readiness wait + exit-code mapping:
         // when invoked from inside an AI tool we block briefly so the caller
         // sees ready/blocked/failed instead of a bare "spawned" line.
-        let readiness_state = inline_readiness_wait_secs
-            .filter(|_| result.launched == 1)
-            .map(|secs| crate::commands::launch::print_inline_launch_readiness(db, &result, secs));
+        let readiness_state = report_launch(db, &result, &output)?;
         log_info(
             if fork { "fork" } else { "resume" },
             &format!("cmd.{}", if fork { "fork" } else { "resume" }),
@@ -706,6 +717,7 @@ fn build_remote_resume_output(
         background: launch_result.background,
         run_here: launch_flags.run_here,
         launcher_name,
+        json: launch_flags.json,
     }
 }
 
@@ -738,6 +750,7 @@ fn print_resume_preview(
         config: hcom_config,
         show_config_args: false,
         notes: &notes,
+        json: plan.output.json,
     });
 }
 
@@ -781,7 +794,12 @@ fn should_preview_resume(
     launch_flags: &crate::commands::launch::HcomLaunchFlags,
     tool_args: &[String],
 ) -> bool {
-    !tool_args.is_empty() || *launch_flags != crate::commands::launch::HcomLaunchFlags::default()
+    // `--json` only changes how the outcome is reported, not what launches.
+    let launch_flags = crate::commands::launch::HcomLaunchFlags {
+        json: false,
+        ..launch_flags.clone()
+    };
+    !tool_args.is_empty() || launch_flags != crate::commands::launch::HcomLaunchFlags::default()
 }
 
 /// A direct Claude/Codex run that joined with `hcom start` is stored as
@@ -3764,6 +3782,15 @@ mod tests {
             ..Default::default()
         };
         assert!(should_preview_resume(&flags, &[]));
+    }
+
+    #[test]
+    fn test_should_preview_resume_ignores_json() {
+        let flags = crate::commands::launch::HcomLaunchFlags {
+            json: true,
+            ..Default::default()
+        };
+        assert!(!should_preview_resume(&flags, &[]));
     }
 
     #[test]

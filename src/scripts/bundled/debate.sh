@@ -22,10 +22,16 @@ cleanup() {
     done
   fi
 }
+# Extract instance names from `hcom ... --json` launch output, append to LAUNCHED_NAMES
 track_launch() {
   local output="$1"
   local names
-  names=$(echo "$output" | grep '^Names: ' | sed 's/^Names: //' | tr ',' '\n' | xargs) || { echo "Error: launch returned no agent names: $output" >&2; return 1; }
+  # Agent names are plain words, so splitting the "names" array on quotes is safe.
+  names=$(grep -o '"names":\[[^]]*\]' <<<"$output" | grep -o '"[^"]*"' | tail -n +2 | tr -d '"') || true
+  if [[ -z "$names" ]]; then
+    echo "Error: launch returned no agent names: $output" >&2
+    return 1
+  fi
   for n in $names; do
     LAUNCHED_NAMES+=("$n")
   done
@@ -212,7 +218,7 @@ All messages use --thread ${thread}. You can see your opponent's arguments direc
 Wait for the judge to start, then present your opening argument when prompted.
 Use: hcom send \"@judge.${thread}- @con.${thread}- [your argument]\" --thread ${thread} --intent inform"
 
-  launch_out=$(hcom 1 "$tool" --tag "pro.${thread}" --go \
+  launch_out=$(hcom 1 "$tool" --tag "pro.${thread}" --go --json \
     --hcom-system-prompt "$PRO_SYSTEM" \
     --hcom-prompt "$pro_prompt" \
     ${bg_flag[@]+"${bg_flag[@]}"} ${name_arg[@]+"${name_arg[@]}"} 2>&1) || { echo "$launch_out" >&2; exit 1; }
@@ -231,7 +237,7 @@ All messages use --thread ${thread}. You can see your opponent's arguments direc
 Wait for the judge to start, then present your argument when prompted.
 Use: hcom send \"@judge.${thread}- @pro.${thread}- [your argument]\" --thread ${thread} --intent inform"
 
-  launch_out=$(hcom 1 "$tool" --tag "con.${thread}" --go \
+  launch_out=$(hcom 1 "$tool" --tag "con.${thread}" --go --json \
     --hcom-system-prompt "$CON_SYSTEM" \
     --hcom-prompt "$con_prompt" \
     ${bg_flag[@]+"${bg_flag[@]}"} ${name_arg[@]+"${name_arg[@]}"} 2>&1) || { echo "$launch_out" >&2; exit 1; }
@@ -381,7 +387,7 @@ End your turn between requests to receive hcom messages. Begin now."
 fi
 
 # Launch judge
-launch_out=$(hcom 1 "$tool" --tag "judge.${thread}" --go \
+launch_out=$(hcom 1 "$tool" --tag "judge.${thread}" --go --json \
   --hcom-system-prompt "$JUDGE_SYSTEM" \
   --hcom-prompt "$judge_prompt" \
   ${bg_flag[@]+"${bg_flag[@]}"} ${name_arg[@]+"${name_arg[@]}"} 2>&1) || { echo "$launch_out" >&2; exit 1; }

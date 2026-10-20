@@ -520,6 +520,7 @@ const KILL_HELP: &[HelpEntry] = &[
     ),
     ("kill tag:<name>", "Kill all with tag"),
     ("kill all", "Kill all with tracked PIDs"),
+    ("  --json", "Print every outcome as one JSON object"),
 ];
 
 const LISTEN_HELP: &[HelpEntry] = &[
@@ -1235,6 +1236,7 @@ const SHARED_LAUNCH_FLAGS: &[(&str, &str)] = &[
     ("--headless", "Run in background"),
     ("--hcom-prompt <text>", "Initial prompt"),
     ("--hcom-system-prompt <text>", "System prompt"),
+    ("--json", "Print the result as one JSON object"),
 ];
 
 /// Shared help body for `hcom r` / `hcom f` (both accept the same target

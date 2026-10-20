@@ -828,11 +828,7 @@ fn handle_remote_kill(
     Ok(json!({
         "target": result.target,
         "pid": result.pid,
-        "kill_result": match result.kill_result {
-            crate::terminal::KillResult::Sent => "sent",
-            crate::terminal::KillResult::AlreadyDead => "already_dead",
-            crate::terminal::KillResult::PermissionDenied => "permission_denied",
-        },
+        "kill_result": result.kill_result.as_str(),
         "pane_closed": result.pane_closed,
         "pane_retry_command": result.pane_retry_command,
         "preset_name": result.preset_name,

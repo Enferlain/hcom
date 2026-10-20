@@ -292,6 +292,7 @@ hcom launch flags:
 | `--device <name>` | Spawn on a remote device (via relay) |
 | `--hcom-prompt <text>` | Initial user prompt |
 | `--hcom-system-prompt <text>` | Append to system prompt |
+| `--json` | Print the outcome as one JSON object (also `hcom r`, `hcom f`, `hcom kill`); an error that stops the command before it acts goes to stderr with a non-zero exit and no JSON |
 
 Anything else is forwarded to the tool: `--model sonnet`, `--yolo`, etc.
 

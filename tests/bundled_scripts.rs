@@ -68,14 +68,14 @@ case "$1" in
       *) echo listening ;;
     esac ;;
   events) echo '{"data":{"text":"answer"}}' ;;
-  r) echo 'Names: worker' ;;
+  r) echo '{"names":["worker"]}' ;;
   codex) if [[ "$2" == --help ]]; then echo '  hcom [N] codex [args...]'; fi ;;
   1)
     while [[ $# -gt 0 ]]; do
       if [[ "$1" == --tag && "$2" == judge.* ]]; then echo 'deliberate launch failure' >&2; exit 1; fi
       shift
     done
-    echo 'Names: worker' ;;
+    echo '{"names":["worker"]}' ;;
 esac
 "#).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -112,6 +112,14 @@ fn failed_launch_cleans_up_previously_started_agents() {
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
         assert!(
             calls.lines().any(|line| line.starts_with("kill worker")),
+            "{calls}"
+        );
+        // Scripts read launched names from the JSON result, not the human text.
+        assert!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("1 "))
+                .all(|line| line.contains("--json")),
             "{calls}"
         );
     }
