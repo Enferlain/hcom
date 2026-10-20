@@ -189,9 +189,9 @@ pub(crate) const FIELDS: &[ConfigField] = &[
     f("auto_subscribe", "HCOM_AUTO_SUBSCRIBE", "launch.auto_subscribe", Str, "Auto-subscribe event presets (comma-separated)"),
     f("auto_trust_workspace", "HCOM_AUTO_TRUST_WORKSPACE", "launch.auto_trust_workspace", Bool, "Auto-approve workspace trust at launch; may persist in tool config"),
     f("claude_args", "HCOM_CLAUDE_ARGS", "launch.claude.args", Str, "Default args for claude on launch"),
-    f("claude_delivery", "HCOM_CLAUDE_DELIVERY", "launch.claude.delivery", Str, "Claude delivery for new launches (inject | native)"),
+    f("claude_delivery", "HCOM_CLAUDE_DELIVERY", "launch.claude.idle_delivery", Str, "Idle Claude delivery for new launches (native | inject)"),
     f("copilot_args", "HCOM_COPILOT_ARGS", "launch.copilot.args", Str, "Default args for copilot on launch"),
-    f("copilot_delivery", "HCOM_COPILOT_DELIVERY", "launch.copilot.delivery", Str, "Idle Copilot delivery for new launches (inject | native)"),
+    f("copilot_delivery", "HCOM_COPILOT_DELIVERY", "launch.copilot.idle_delivery", Str, "Idle Copilot delivery for new launches (native | inject)"),
     f("gemini_args", "HCOM_GEMINI_ARGS", "launch.gemini.args", Str, "Default args for gemini on launch"),
     f("gemini_system_prompt", "HCOM_GEMINI_SYSTEM_PROMPT", "launch.gemini.system_prompt", Str, "System prompt for gemini on launch"),
     f("codex_args", "HCOM_CODEX_ARGS", "launch.codex.args", Str, "Default args for codex on launch"),
@@ -240,10 +240,10 @@ const TERMINAL_DANGEROUS_CHARS: &[char] = &['`', '$', ';', '|', '&', '\n', '\r']
 
 use crate::shared::terminal_presets::TERMINAL_PRESETS;
 
-/// `<tool>_delivery` values: `native` (the tool's own API: mod, extension)
-/// or `inject` (typing into the PTY, [`DEFAULT_DELIVERY`]).
+/// `<tool>_delivery` values: `native` (the tool's own API: mod, extension,
+/// [`DEFAULT_DELIVERY`]) or `inject` (typing into the PTY).
 pub const DELIVERY_MODES: &[&str] = &["native", "inject"];
-pub const DEFAULT_DELIVERY: &str = "inject";
+pub const DEFAULT_DELIVERY: &str = "native";
 
 /// TOML file header comment.
 const TOML_HEADER: &str = "\
@@ -272,7 +272,9 @@ pub struct HcomConfig {
     pub notes: String,
     pub tag: String,
     pub claude_args: String,
-    /// Claude delivery transport ("native" | "inject"), fixed for each new launch.
+    /// How idle Claude agents are woken: `"native"` (default) through hcom's
+    /// bundled Claude mod, `"inject"` by typing into the PTY. Fixed per launch.
+    /// See [`DELIVERY_MODES`].
     pub claude_delivery: String,
     pub gemini_args: String,
     pub codex_args: String,
@@ -298,8 +300,8 @@ pub struct HcomConfig {
     pub auto_subscribe: String,
     pub name_export: String,
     pub auto_trust_workspace: bool,
-    /// How Copilot agents get messages while idle: `"native"` through hcom's
-    /// Copilot CLI extension, `"inject"` (default) by typing into the PTY.
+    /// How Copilot agents get messages while idle: `"native"` (default) through
+    /// hcom's Copilot CLI extension, `"inject"` by typing into the PTY.
     /// See [`DELIVERY_MODES`].
     pub copilot_delivery: String,
     /// Terminal-title behavior: `"combined"` (default) shows
@@ -864,7 +866,13 @@ pub(crate) fn file_field_error(content: &str, field: &str) -> Option<String> {
 
 /// Write every field of `config` to config.toml. An existing file keeps its
 /// comments and other keys (e.g. terminal presets).
+#[cfg(test)]
 pub fn save_toml_config(config: &HcomConfig) -> std::io::Result<()> {
+    save_toml_fields(config, &[])
+}
+
+/// [`save_toml_config`] without the fields named in `skip`.
+fn save_toml_fields(config: &HcomConfig, skip: &[&str]) -> std::io::Result<()> {
     let toml_path = paths::config_toml_path();
     if let Some(parent) = toml_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -876,7 +884,7 @@ pub fn save_toml_config(config: &HcomConfig) -> std::io::Result<()> {
     let is_new = existing.is_none();
     let mut doc = existing.unwrap_or_default();
 
-    for field in FIELDS {
+    for field in FIELDS.iter().filter(|f| !skip.contains(&f.name)) {
         if let Some(val) = config.get_field(field.name) {
             let value = field_toml_value(field, &val).map_err(std::io::Error::other)?;
             set_doc_path(&mut doc, field.toml, Some(value));
@@ -1282,10 +1290,18 @@ pub fn load_config_snapshot() -> ConfigSnapshot {
     }
 }
 
+/// Fields left out of a new config.toml so it follows their default if that
+/// changes again, instead of pinning today's value.
+///
+/// 0.7.29-0.7.30 stored delivery as `launch.<tool>.delivery` and wrote the
+/// then-default `"inject"` into every new config.toml. The key moved to
+/// `idle_delivery` when native became the default, so those stale lines are
+/// ignored (unknown keys are) and an `inject` set from now on sticks.
+const UNPINNED_FIELDS: &[&str] = &["claude_delivery", "copilot_delivery"];
+
 /// Write default config.toml + env file.
 pub fn write_default_config() -> std::io::Result<()> {
-    let config = HcomConfig::default();
-    save_toml_config(&config)?;
+    save_toml_fields(&HcomConfig::default(), UNPINNED_FIELDS)?;
     save_env_file(&HashMap::new())
 }
 
@@ -1470,14 +1486,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_delivery_defaults_to_inject_and_rejects_unknown_modes() {
+    fn claude_delivery_defaults_to_native_and_rejects_unknown_modes() {
         let mut config = HcomConfig::default();
-        assert_eq!(config.to_env_dict()["HCOM_CLAUDE_DELIVERY"], "inject");
-        config.set_field("claude_delivery", "native").unwrap();
+        assert_eq!(config.to_env_dict()["HCOM_CLAUDE_DELIVERY"], "native");
+        config.set_field("claude_delivery", "inject").unwrap();
         let (loaded, errors) =
             HcomConfig::load_from_sources(&HashMap::new(), Some(&config.to_env_dict()));
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(loaded.claude_delivery, "native");
+        assert_eq!(loaded.claude_delivery, "inject");
         config.set_field("claude_delivery", "pty").unwrap();
         assert!(config.collect_errors().contains_key("claude_delivery"));
     }
@@ -1972,20 +1988,20 @@ mod tests {
     fn test_load_from_sources_copilot_delivery() {
         let none = HashMap::new();
         let config = HcomConfig::load_from_sources(&none, Some(&HashMap::new())).0;
-        assert_eq!(config.copilot_delivery, "inject");
+        assert_eq!(config.copilot_delivery, "native");
 
         let mut file_config = HashMap::new();
         file_config.insert(
             "copilot_delivery".to_string(),
-            TomlFieldValue::Str("native".to_string()),
+            TomlFieldValue::Str("inject".to_string()),
         );
         let config = HcomConfig::load_from_sources(&file_config, Some(&HashMap::new())).0;
-        assert_eq!(config.copilot_delivery, "native");
+        assert_eq!(config.copilot_delivery, "inject");
 
         let mut env = HashMap::new();
-        env.insert("HCOM_COPILOT_DELIVERY".to_string(), "inject".to_string());
+        env.insert("HCOM_COPILOT_DELIVERY".to_string(), "native".to_string());
         let config = HcomConfig::load_from_sources(&file_config, Some(&env)).0;
-        assert_eq!(config.copilot_delivery, "inject");
+        assert_eq!(config.copilot_delivery, "native");
 
         env.insert("HCOM_COPILOT_DELIVERY".to_string(), "typo".to_string());
         let (config, errors) = HcomConfig::load_from_sources(&none, Some(&env));
@@ -2259,7 +2275,7 @@ auto_approve = false
             (FieldKind::Bool, _) => "0",
             (_, "terminal") => "print",
             (_, "title_mode") => "label",
-            (_, name) if name.ends_with("_delivery") => "native",
+            (_, name) if name.ends_with("_delivery") => "inject",
             (_, "auto_subscribe") => "sample",
             _ => "sample-value",
         }
@@ -2571,6 +2587,43 @@ active = "default"
 
         let presets = load_toml_presets(&path);
         assert!(presets.is_none());
+    }
+
+    /// 0.7.29-0.7.30 wrote `delivery = "inject"` into every new config.toml.
+    /// Those lines are ignored without a warning, and `inject` set after the
+    /// upgrade sticks.
+    #[test]
+    fn old_delivery_keys_are_ignored_for_the_native_default() {
+        let old = "[launch.claude]\nargs = \"--model keep\"\ndelivery = \"inject\"\n\n\
+                   [launch.copilot]\ndelivery = \"inject\"\n";
+        let (values, errors) = toml_values_from_str(old);
+        assert!(errors.is_empty(), "{errors:?}");
+        let config = HcomConfig::load_from_sources(&values, Some(&HashMap::new())).0;
+        assert_eq!(config.claude_delivery, "native");
+        assert_eq!(config.copilot_delivery, "native");
+        assert_eq!(config.claude_args, "--model keep");
+
+        let mut doc: toml_edit::DocumentMut = old.parse().unwrap();
+        let field = user_field("claude_delivery").unwrap();
+        set_doc_path(
+            &mut doc,
+            field.toml,
+            Some(field_toml_value(field, "inject").unwrap()),
+        );
+        let (values, _) = toml_values_from_str(&doc.to_string());
+        let config = HcomConfig::load_from_sources(&values, Some(&HashMap::new())).0;
+        assert_eq!(config.claude_delivery, "inject");
+        assert_eq!(config.copilot_delivery, "native");
+    }
+
+    #[test]
+    #[serial]
+    fn default_config_file_does_not_pin_delivery() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        write_default_config().unwrap();
+        let content = std::fs::read_to_string(paths::config_toml_path()).unwrap();
+        assert!(!content.contains("delivery"), "{content}");
+        assert!(content.contains("[launch.claude]"), "{content}");
     }
 
     #[test]

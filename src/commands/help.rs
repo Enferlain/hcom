@@ -594,7 +594,7 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
     ),
     (
         "  claude_delivery / copilot_delivery",
-        "Idle delivery: inject (PTY, default) | native (claude: experimental mod, copilot: CLI extension)",
+        "Idle delivery: native (default; claude: mod, copilot: CLI extension) | inject (PTY)",
     ),
     (
         "  gemini_system_prompt / codex_system_prompt",

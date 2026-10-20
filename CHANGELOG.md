@@ -2,6 +2,12 @@
 
 UTC release dates from [PyPI](https://pypi.org/project/hcom/#history).
 
+## Unreleased
+
+### Changed
+
+- Made native delivery the default for idle Claude and Copilot agents. Configure in config: `claude_delivery` / `copilot_delivery`.
+
 ## 0.7.30 — 2026-10-15
 
 ### Added

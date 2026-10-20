@@ -1,4 +1,4 @@
-// hcom delivery for an idle Copilot CLI session (`hcom config copilot_delivery native`).
+// hcom delivery for an idle Copilot CLI session (`copilot_delivery = native`, the default).
 //
 // Shipped in hcom's per-run plugin only for extension-delivery launches. Hooks
 // still own everything mid-turn (PostToolUse context, Stop block); this covers

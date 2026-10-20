@@ -1,4 +1,4 @@
-//! Experimental native Claude wakes. Classic hooks own the queue and acknowledgements.
+//! Native Claude wakes (default delivery). Classic hooks own the queue and acknowledgements.
 
 use std::path::PathBuf;
 use std::time::Duration;

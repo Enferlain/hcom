@@ -215,6 +215,7 @@ fn get_agent_counts(db: &HcomDb) -> AgentCounts {
 
 /// Main entry point for `hcom status` command.
 pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>) -> i32 {
+    crate::commands::config::drop_old_delivery_keys();
     let json_mode = args.json;
     let show_logs = args.logs;
 

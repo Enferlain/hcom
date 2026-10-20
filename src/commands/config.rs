@@ -123,6 +123,25 @@ fn config_set_at_path(path: &Path, key: &str, value: Option<&str>) -> Result<(),
         validate_config_args(field.name, value)?;
     }
 
+    let new_value = value
+        .map(|v| crate::config::field_toml_value(field, v))
+        .transpose()?;
+    edit_config_at_path(path, |doc| {
+        crate::config::set_doc_path(doc, field.toml, new_value);
+        // Refuse what the loader would reject and replace with the default.
+        match crate::config::file_field_error(&doc.to_string(), field.name) {
+            Some(err) => Err(err),
+            None => Ok(true),
+        }
+    })
+}
+
+/// Read-modify-write config.toml under its lock. `edit` returns whether to
+/// write the document back.
+fn edit_config_at_path(
+    path: &Path,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<bool, String>,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create config directory: {e}"))?;
@@ -143,19 +162,43 @@ fn config_set_at_path(path: &Path, key: &str, value: Option<&str>) -> Result<(),
     let mut doc: toml_edit::DocumentMut = content
         .parse()
         .map_err(|e| format!("Failed to parse config.toml: {e}"))?;
-    let new_value = value
-        .map(|v| crate::config::field_toml_value(field, v))
-        .transpose()?;
-    crate::config::set_doc_path(&mut doc, field.toml, new_value);
-    let content = doc.to_string();
-
-    // Refuse what the loader would reject and replace with the default.
-    if let Some(err) = crate::config::file_field_error(&content, field.name) {
-        return Err(err);
+    if !edit(&mut doc)? {
+        return Ok(());
     }
-
-    crate::config::write_config_toml_path(path, &content)
+    crate::config::write_config_toml_path(path, &doc.to_string())
         .map_err(|e| format!("Failed to write config.toml: {e}"))
+}
+
+/// One-off cleanup of the 0.7.29-0.7.30 `launch.<tool>.delivery` keys (see
+/// `UNPINNED_FIELDS` in config.rs). They are already ignored; this only drops
+/// the dead lines. Run from `hcom config` and `hcom status`, which are rare,
+/// not from every config load. Remove once those versions are long gone.
+pub(crate) fn drop_old_delivery_keys() {
+    drop_old_delivery_keys_at(&config_path());
+}
+
+fn drop_old_delivery_keys_at(path: &Path) {
+    const OLD_KEYS: [&str; 2] = ["launch.claude.delivery", "launch.copilot.delivery"];
+    // Unlocked check on the text: almost always nothing to do. Also skips a
+    // missing file (never created) and `idle_delivery`/`rpc_delivery`.
+    let stale = std::fs::read_to_string(path).is_ok_and(|content| {
+        content
+            .lines()
+            .any(|line| line.trim_start().starts_with("delivery"))
+    });
+    if !stale {
+        return;
+    }
+    let result = edit_config_at_path(path, |doc| {
+        let before = doc.to_string();
+        for key in OLD_KEYS {
+            crate::config::set_doc_path(doc, key, None);
+        }
+        Ok(doc.to_string() != before)
+    });
+    if let Err(e) = result {
+        crate::log::log_warn("config", "config.old_delivery_keys_failed", &e);
+    }
 }
 
 /// Set a key the way `hcom config <key> <value>` does, including side effects.
@@ -631,6 +674,7 @@ pub fn config_instance_set(
 
 /// Main entry point for `hcom config` command.
 pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) -> i32 {
+    drop_old_delivery_keys();
     let json_mode = args.json;
     let edit_mode = args.edit;
     let unset_mode = args.unset;
@@ -1157,13 +1201,11 @@ Notes:
             "\
 HCOM_CLAUDE_DELIVERY - How hcom wakes idle Claude agents
 
-Default: inject
+  hcom config claude_delivery inject     # type into the terminal
+  hcom config claude_delivery --unset    # back to the default (native)
+  HCOM_CLAUDE_DELIVERY=inject hcom claude  # one launch
 
-  hcom config claude_delivery native     # experimental Claude mod
-  hcom config claude_delivery --unset    # back to inject
-  HCOM_CLAUDE_DELIVERY=native hcom claude  # one launch
-
-native  bundled Claude mod (loaded with --plugin-dir) submits the wake
+native  bundled Claude mod (loaded with --plugin-dir) submits the wake (default)
 inject  PTY wrapper types the wake into Claude's prompt
 
 Native needs Claude Code 2.1.287+ (mod support). Managed disableSideloadFlags
@@ -1363,12 +1405,11 @@ Prepended to launch-time cli args.",
             "\
 HCOM_COPILOT_DELIVERY - How idle Copilot agents get messages
 
-  hcom config copilot_delivery native   # Copilot CLI extension
-  hcom config copilot_delivery inject   # type into the terminal (default)
-  hcom config copilot_delivery --unset  # back to the default
-  HCOM_COPILOT_DELIVERY=native hcom copilot   # per-launch override
+  hcom config copilot_delivery inject   # type into the terminal
+  hcom config copilot_delivery --unset  # back to the default (native)
+  HCOM_COPILOT_DELIVERY=inject hcom copilot   # per-launch override
 
-native: `hcom copilot` ships an extension in its per-run plugin that hands
+native (default): `hcom copilot` ships an extension in its per-run plugin that hands
 messages to an idle session with the Copilot SDK (`session.send`) instead of
 typing into the terminal: no waiting for an empty prompt, no extra wake turn.
 Copilot CLI extensions are experimental: if Copilot's settings.json leaves
@@ -2254,21 +2295,42 @@ mod tests {
     }
 
     #[test]
+    fn old_delivery_keys_are_dropped_and_the_rest_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let old = "# mine\n[launch.claude]\nargs = \"--x\"\ndelivery = \"inject\"\n\n\
+                   [launch.copilot]\ndelivery = \"inject\"\nidle_delivery = \"inject\"\n";
+        std::fs::write(&path, old).unwrap();
+        drop_old_delivery_keys_at(&path);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("\ndelivery"), "{content}");
+        assert!(
+            content.contains("# mine") && content.contains("args = \"--x\""),
+            "{content}"
+        );
+        assert!(content.contains("idle_delivery = \"inject\""), "{content}");
+
+        let missing = dir.path().join("none.toml");
+        drop_old_delivery_keys_at(&missing);
+        assert!(!missing.exists());
+    }
+
+    #[test]
     fn test_config_set_copilot_delivery() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let read = || -> toml::Table { std::fs::read_to_string(&path).unwrap().parse().unwrap() };
 
-        config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", Some("native")).unwrap();
+        config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", Some("inject")).unwrap();
         assert_eq!(
-            read()["launch"]["copilot"]["delivery"].as_str(),
-            Some("native")
+            read()["launch"]["copilot"]["idle_delivery"].as_str(),
+            Some("inject")
         );
         assert!(config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", Some("pty")).is_err());
 
         // --unset writes "", which removes the key (back to the default).
         config_set_at_path(&path, "HCOM_COPILOT_DELIVERY", None).unwrap();
-        assert!(read()["launch"]["copilot"].get("delivery").is_none());
+        assert!(read()["launch"]["copilot"].get("idle_delivery").is_none());
     }
 
     #[test]

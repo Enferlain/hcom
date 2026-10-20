@@ -12,8 +12,12 @@
 //! 2. Wait for ready event, capture and validate full screen state
 //! 3. Send message → verify delivery via events, capture post-delivery screen
 //! 4. Inject uncommitted text → verify gate blocks delivery, capture screen
-//! 5. Submit text → verify blocked message delivers
+//!    (native: verify delivery happens anyway and the text survives)
+//! 5. Submit text → verify blocked message delivers (native: the turn completes)
 //! 6. Cleanup
+//!
+//! Claude and Copilot test native idle delivery by default;
+//! `HCOM_TEST_DELIVERY=inject` tests the PTY inject path instead.
 //!
 //! Phases (opencode/kilo/pi — PTY bootstrap injection):
 //! 1. Launch tool in tmux, wait for ready event
@@ -25,6 +29,7 @@
 //!     cargo test -p hcom --test test_pty_delivery -- --ignored --nocapture --test-threads=1
 //!     cargo test -p hcom --test test_pty_delivery test_pty_claude -- --ignored --nocapture --test-threads=1
 //!     HCOM_TEST_TERMINAL=kitty cargo test -p hcom --test test_pty_delivery test_pty_claude -- --ignored --nocapture --test-threads=1
+//!     HCOM_TEST_DELIVERY=inject cargo test -p hcom --test test_pty_delivery test_pty_claude -- --ignored --nocapture --test-threads=1
 //!
 //! Why `#[ignore]`:
 //! These tests are not part of `cargo test` deliberately. They launch real agent
@@ -109,7 +114,8 @@ fn prompt_marker(tool: &str) -> &'static str {
         "gemini" => " > ",
         "antigravity" => ">",
         "cursor" => "→",
-        "copilot" => "❯",
+        // Copilot 1.0.100+: the input sits in a ┃-bordered box.
+        "copilot" => "┃",
         "qoder" => ">",
         _ => panic!("No prompt marker for {tool}"),
     }
@@ -197,6 +203,27 @@ fn configure_test_terminal_env() -> String {
     }
 
     terminal
+}
+
+/// Pin `<tool>_delivery` in the launch env so the user's config can't change
+/// what is asserted: native unless `HCOM_TEST_DELIVERY=inject`. Returns the
+/// mode, or None for tools without the setting.
+fn configure_delivery_env(tool: &str) -> Option<&'static str> {
+    let key = match tool {
+        "claude" => "HCOM_CLAUDE_DELIVERY",
+        "copilot" => "HCOM_COPILOT_DELIVERY",
+        _ => return None,
+    };
+    let mode = match std::env::var("HCOM_TEST_DELIVERY").as_deref() {
+        Ok("inject") => "inject",
+        Ok("native" | "") | Err(_) => "native",
+        Ok(other) => panic!("HCOM_TEST_DELIVERY must be native or inject, got {other:?}"),
+    };
+    // SAFETY: Integration tests run serially (serial_lock guards callers).
+    unsafe {
+        std::env::set_var(key, mode);
+    }
+    Some(mode)
 }
 
 fn hcom(cmd: &str) -> Output {
@@ -297,6 +324,40 @@ fn poll_until<T>(
         );
         thread::sleep(interval);
     }
+}
+
+/// First `deliver:` status event after `after_id`.
+fn wait_for_delivery(base_name: &str, after_id: i64, timeout: Duration) -> serde_json::Value {
+    poll_until(
+        || {
+            get_events(base_name, 30, false).into_iter().find(|ev| {
+                ev["id"].as_i64().unwrap_or(0) > after_id
+                    && ev["type"].as_str() == Some("status")
+                    && ev["data"]["context"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("deliver:"))
+            })
+        },
+        "delivery event",
+        timeout,
+        Duration::from_secs(1),
+    )
+}
+
+/// First `listening` status event after `after_id`.
+fn wait_for_listening_after(base_name: &str, after_id: i64, description: &str) {
+    poll_until(
+        || {
+            get_events(base_name, 30, false).into_iter().find(|ev| {
+                ev["id"].as_i64().unwrap_or(0) > after_id
+                    && ev["type"].as_str() == Some("status")
+                    && ev["data"]["status"].as_str() == Some("listening")
+            })
+        },
+        description,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
 }
 
 /// Wait until the agent is *stably* idle: the most recent status event is
@@ -692,10 +753,18 @@ fn run_pty_test(tool: &str) {
     let _serial = serial_lock();
 
     let terminal = configure_test_terminal_env();
+    let delivery = configure_delivery_env(tool);
+    let native = delivery == Some("native");
     let log = TestLog::new(tool);
 
     logln!(log, "{}", "=".repeat(60));
-    logln!(log, "PTY Delivery Test: {tool} via {terminal}");
+    match delivery {
+        Some(mode) => logln!(
+            log,
+            "PTY Delivery Test: {tool} via {terminal} ({mode} delivery)"
+        ),
+        None => logln!(log, "PTY Delivery Test: {tool} via {terminal}"),
+    }
     logln!(log, "{}", "=".repeat(60));
 
     // Record last event ID before launch
@@ -937,7 +1006,8 @@ fn run_pty_test(tool: &str) {
     // ── Phase 3: Delivery blocked by uncommitted text ────────────
     logln!(
         log,
-        "\n[Phase 3] Testing delivery blocked by uncommitted text..."
+        "\n[Phase 3] Testing delivery {} uncommitted text...",
+        if native { "past" } else { "blocked by" }
     );
 
     poll_until(
@@ -1000,14 +1070,40 @@ fn run_pty_test(tool: &str) {
 
     let baseline_event2 = get_last_event_id(&base_name);
 
-    send_msg(&format!(
-        "@{instance_name} [hcom heartbeat-2 should-block] automated test ping. acknowledge inline with \"ok\" only. no tools. no hcom send."
-    ));
-    logln!(log, "  OK: Message sent (should be blocked)");
+    if native {
+        // Native delivery doesn't type into the PTY, so it has no prompt gate:
+        // the message is delivered with the draft in place, which must survive.
+        send_msg(&format!(
+            "@{instance_name} [hcom heartbeat-2 with-draft] automated test ping. acknowledge inline with \"ok\" only. no tools. no hcom send."
+        ));
+        logln!(log, "  OK: Message sent (should deliver past the draft)");
 
-    // Wait and verify delivery does NOT happen
-    logln!(log, "  Waiting 8s to confirm no delivery...");
-    thread::sleep(Duration::from_secs(8));
+        let delivery2 = wait_for_delivery(
+            &base_name,
+            baseline_event2,
+            clean_prompt_delivery_timeout(tool),
+        );
+        let delivery2_id = delivery2["id"].as_i64().unwrap_or(0);
+        logln!(
+            log,
+            "  OK: Delivered with draft present: id={delivery2_id} context={}",
+            delivery2["data"]["context"]
+        );
+        wait_for_listening_after(
+            &base_name,
+            delivery2_id,
+            "agent returns to listening after draft-time delivery",
+        );
+    } else {
+        send_msg(&format!(
+            "@{instance_name} [hcom heartbeat-2 should-block] automated test ping. acknowledge inline with \"ok\" only. no tools. no hcom send."
+        ));
+        logln!(log, "  OK: Message sent (should be blocked)");
+
+        // Wait and verify delivery does NOT happen
+        logln!(log, "  Waiting 8s to confirm no delivery...");
+        thread::sleep(Duration::from_secs(8));
+    }
 
     let screen = get_screen(&base_name).unwrap();
     validate_screen_schema(&screen);
@@ -1019,32 +1115,44 @@ fn run_pty_test(tool: &str) {
     logln!(log, "  OK: Uncommitted text preserved: {text:?}");
     validate_prompt_consistency(&screen);
 
-    // Verify no delivery event during gate block
-    let events_after = get_events(&base_name, 20, false);
-    let delivery_during_block: Vec<_> = events_after
-        .iter()
-        .filter(|ev| {
-            ev["id"].as_i64().unwrap_or(0) > baseline_event2
-                && ev["type"].as_str() == Some("status")
-                && ev["data"]["context"]
-                    .as_str()
-                    .is_some_and(|c| c.contains("deliver:"))
-        })
-        .collect();
-    assert!(
-        delivery_during_block.is_empty(),
-        "Unexpected delivery during gate block: {:?}",
-        delivery_during_block.first()
-    );
-    logln!(log, "  OK: No delivery event during gate block");
+    if native {
+        log.log_screen(
+            &screen,
+            &format!("{tool} — delivered past draft (text preserved)"),
+        );
+    } else {
+        // Verify no delivery event during gate block
+        let events_after = get_events(&base_name, 20, false);
+        let delivery_during_block: Vec<_> = events_after
+            .iter()
+            .filter(|ev| {
+                ev["id"].as_i64().unwrap_or(0) > baseline_event2
+                    && ev["type"].as_str() == Some("status")
+                    && ev["data"]["context"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("deliver:"))
+            })
+            .collect();
+        assert!(
+            delivery_during_block.is_empty(),
+            "Unexpected delivery during gate block: {:?}",
+            delivery_during_block.first()
+        );
+        logln!(log, "  OK: No delivery event during gate block");
 
-    validate_gate_block(&base_name, tool, baseline_event2, &log);
-    log.log_screen(&screen, &format!("{tool} — gate blocked (text preserved)"));
+        validate_gate_block(&base_name, tool, baseline_event2, &log);
+        log.log_screen(&screen, &format!("{tool} — gate blocked (text preserved)"));
+    }
 
     // ── Phase 4: Submit uncommitted text, unblock delivery ────────
     logln!(
         log,
-        "\n[Phase 4] Submitting uncommitted text, waiting for blocked message delivery..."
+        "\n[Phase 4] Submitting uncommitted text, waiting for {}...",
+        if native {
+            "its turn"
+        } else {
+            "blocked message delivery"
+        }
     );
 
     let baseline_event3 = get_last_event_id(&base_name);
@@ -1069,32 +1177,28 @@ fn run_pty_test(tool: &str) {
         Duration::from_secs(1),
     );
 
-    // Wait for delivery of previously-blocked message
-    let delivery3: serde_json::Value = poll_until(
-        || {
-            let evs = get_events(&base_name, 20, false);
-            evs.into_iter().find(|ev| {
-                ev["id"].as_i64().unwrap_or(0) > baseline_event3
-                    && ev["type"].as_str() == Some("status")
-                    && ev["data"]["context"]
-                        .as_str()
-                        .is_some_and(|c| c.contains("deliver:"))
-            })
-        },
-        "delivery event for blocked message",
-        Duration::from_secs(60),
-        Duration::from_secs(1),
-    );
-    logln!(
-        log,
-        "  OK: Blocked message delivered: id={} context={}",
-        delivery3["id"],
-        delivery3["data"]["context"]
-    );
-    log.log(&format!(
-        "Phase 4 delivery event: {}",
-        serde_json::to_string_pretty(&delivery3).unwrap()
-    ));
+    if native {
+        // Nothing was held back; the submitted draft is an ordinary turn.
+        wait_for_listening_after(
+            &base_name,
+            baseline_event3,
+            "agent returns to listening after the submitted draft",
+        );
+        logln!(log, "  OK: Submitted draft turn completed");
+    } else {
+        // Wait for delivery of previously-blocked message
+        let delivery3 = wait_for_delivery(&base_name, baseline_event3, Duration::from_secs(60));
+        logln!(
+            log,
+            "  OK: Blocked message delivered: id={} context={}",
+            delivery3["id"],
+            delivery3["data"]["context"]
+        );
+        log.log(&format!(
+            "Phase 4 delivery event: {}",
+            serde_json::to_string_pretty(&delivery3).unwrap()
+        ));
+    }
 
     // Capture final screen
     let screen = get_screen(&base_name).unwrap();
