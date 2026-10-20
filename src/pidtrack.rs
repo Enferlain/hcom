@@ -34,6 +34,8 @@ pub struct PidEntry {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub wezterm_unix_socket: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tmux: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session_id: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub notify_port: u16,
@@ -62,6 +64,7 @@ pub struct OrphanProcess {
     pub zellij_session_name: String,
     pub herdr_socket_path: String,
     pub wezterm_unix_socket: String,
+    pub tmux: String,
     pub session_id: String,
     pub notify_port: u16,
     pub inject_port: u16,
@@ -80,6 +83,7 @@ impl OrphanProcess {
             zellij_session_name: self.zellij_session_name.clone(),
             herdr_socket_path: self.herdr_socket_path.clone(),
             wezterm_unix_socket: self.wezterm_unix_socket.clone(),
+            tmux: self.tmux.clone(),
         }
     }
 }
@@ -99,6 +103,7 @@ impl From<(u32, &PidEntry)> for OrphanProcess {
             zellij_session_name: entry.zellij_session_name.clone(),
             herdr_socket_path: entry.herdr_socket_path.clone(),
             wezterm_unix_socket: entry.wezterm_unix_socket.clone(),
+            tmux: entry.tmux.clone(),
             session_id: entry.session_id.clone(),
             notify_port: entry.notify_port,
             inject_port: entry.inject_port,
@@ -148,6 +153,7 @@ pub struct PidRecord<'a> {
     pub zellij_session_name: &'a str,
     pub herdr_socket_path: &'a str,
     pub wezterm_unix_socket: &'a str,
+    pub tmux: &'a str,
     pub session_id: &'a str,
     pub notify_port: u16,
     pub inject_port: u16,
@@ -177,6 +183,7 @@ impl<'a> PidRecord<'a> {
             zellij_session_name: "",
             herdr_socket_path: "",
             wezterm_unix_socket: "",
+            tmux: "",
             session_id: "",
             notify_port: 0,
             inject_port: 0,
@@ -201,6 +208,7 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         zellij_session_name,
         herdr_socket_path,
         wezterm_unix_socket,
+        tmux,
         session_id,
         notify_port,
         inject_port,
@@ -239,6 +247,9 @@ pub fn record_pid(rec: &PidRecord<'_>) {
         if !wezterm_unix_socket.is_empty() && entry.wezterm_unix_socket.is_empty() {
             entry.wezterm_unix_socket = wezterm_unix_socket.to_string();
         }
+        if !tmux.is_empty() && entry.tmux.is_empty() {
+            entry.tmux = tmux.to_string();
+        }
         if !session_id.is_empty() && entry.session_id.is_empty() {
             entry.session_id = session_id.to_string();
         }
@@ -267,6 +278,7 @@ pub fn record_pid(rec: &PidRecord<'_>) {
                 zellij_session_name: zellij_session_name.to_string(),
                 herdr_socket_path: herdr_socket_path.to_string(),
                 wezterm_unix_socket: wezterm_unix_socket.to_string(),
+                tmux: tmux.to_string(),
                 session_id: session_id.to_string(),
                 notify_port: *notify_port,
                 inject_port: *inject_port,
@@ -504,6 +516,7 @@ fn attach_runtime_state(
             ("ZELLIJ_SESSION_NAME", &orphan.zellij_session_name),
             ("HERDR_SOCKET_PATH", &orphan.herdr_socket_path),
             ("WEZTERM_UNIX_SOCKET", &orphan.wezterm_unix_socket),
+            ("TMUX", &orphan.tmux),
         ] {
             if value.is_empty() {
                 continue;
@@ -638,6 +651,7 @@ mod tests {
             zellij_session_name: "wise-kangaroo",
             herdr_socket_path: "/run/herdr/sessions/work/herdr.sock",
             wezterm_unix_socket: "",
+            tmux: "/tmp/tmux-1000/default,4242,0",
             session_id: "sess-1",
             notify_port: 8080,
             inject_port: 8081,
@@ -672,6 +686,7 @@ mod tests {
             info.herdr_socket_path,
             "/run/herdr/sessions/work/herdr.sock"
         );
+        assert_eq!(info.tmux, "/tmp/tmux-1000/default,4242,0");
     }
 
     #[test]
@@ -812,6 +827,7 @@ mod tests {
             zellij_session_name: String::new(),
             herdr_socket_path: String::new(),
             wezterm_unix_socket: String::new(),
+            tmux: String::new(),
             session_id: String::new(),
             notify_port: 0,
             inject_port: 0,
@@ -843,6 +859,7 @@ mod tests {
             zellij_session_name: String::new(),
             herdr_socket_path: String::new(),
             wezterm_unix_socket: String::new(),
+            tmux: String::new(),
             session_id: "sess-retry".into(),
             notify_port: 0,
             inject_port: 0,

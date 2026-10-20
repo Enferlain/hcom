@@ -200,6 +200,7 @@ fn capture_context() -> serde_json::Map<String, serde_json::Value> {
         "GUAKE_TAB_UUID",
         "WT_SESSION",
         "ConEmuHWND",
+        "TMUX",
         "TMUX_PANE",
         "STY",
         "ZELLIJ_SESSION_NAME",
