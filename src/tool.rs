@@ -9,7 +9,7 @@ use std::str::FromStr;
 use crate::integration_spec;
 
 /// Supported AI coding tools
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tool {
     Claude,
     Gemini,
@@ -78,29 +78,10 @@ impl Tool {
     /// Per-run tools (`hooks::runtime::is_per_run`) have no install; callers
     /// must branch on that first.
     pub fn verify_hooks_installed(&self, include_permissions: bool) -> bool {
-        match self {
-            Tool::Gemini => {
-                crate::hooks::gemini::verify_gemini_hooks_installed(include_permissions)
-            }
-            Tool::Claude
-            | Tool::Codex
-            | Tool::Copilot
-            | Tool::Qoder
-            | Tool::Pi
-            | Tool::Omp
-            | Tool::OpenCode
-            | Tool::Kilo
-            | Tool::Grok => per_run_has_no_install(*self),
-            Tool::Antigravity => {
-                crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
-            }
-            Tool::Cursor => {
-                crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions)
-            }
-            Tool::Kimi => crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions),
-            // Hermes has its own approval system; hcom grants no permissions.
-            Tool::Hermes => crate::hooks::hermes::verify_hermes_plugin_installed(),
-            Tool::Adhoc => false,
+        match self.hook_installer() {
+            Some(ops) => (ops.verify)(include_permissions),
+            None if *self == Tool::Adhoc => false,
+            None => per_run_has_no_install(*self),
         }
     }
 
@@ -108,30 +89,10 @@ impl Tool {
     /// failure. Per-run tools have nothing to install (see above).
     /// `Tool::Adhoc` always errors — adhoc has no hook surface.
     pub fn try_setup_hooks(&self, include_permissions: bool) -> Result<(), String> {
-        match self {
-            Tool::Gemini => crate::hooks::gemini::try_setup_gemini_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
-            Tool::Claude
-            | Tool::Codex
-            | Tool::Copilot
-            | Tool::Qoder
-            | Tool::Pi
-            | Tool::Omp
-            | Tool::OpenCode
-            | Tool::Kilo
-            | Tool::Grok => per_run_has_no_install(*self),
-            Tool::Antigravity => {
-                crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
-                    .map_err(|e| e.to_string())
-            }
-            Tool::Cursor => crate::hooks::cursor::try_setup_cursor_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
-            Tool::Kimi => crate::hooks::kimi::try_setup_kimi_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
-            Tool::Hermes => {
-                crate::hooks::hermes::try_setup_hermes_plugin().map_err(|e| format!("{e:#}"))
-            }
-            Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
+        match self.hook_installer() {
+            Some(ops) => (ops.setup)(include_permissions),
+            None if *self == Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
+            None => per_run_has_no_install(*self),
         }
     }
 
@@ -183,25 +144,53 @@ impl Tool {
     /// file or plugin location). Empty for `Tool::Adhoc`. Per-run tools have
     /// none (see above).
     pub fn hooks_settings_path(&self) -> String {
-        let path_buf = match self {
-            Tool::Claude
-            | Tool::Codex
-            | Tool::Copilot
-            | Tool::Qoder
-            | Tool::Pi
-            | Tool::Omp
-            | Tool::OpenCode
-            | Tool::Kilo
-            | Tool::Grok => per_run_has_no_install(*self),
-            Tool::Gemini => crate::hooks::gemini::get_gemini_settings_path(),
-            Tool::Antigravity => crate::hooks::antigravity::get_antigravity_hooks_path(),
-            Tool::Cursor => crate::hooks::cursor::get_cursor_hooks_path(),
-            Tool::Kimi => crate::hooks::kimi::get_kimi_settings_path(),
-            Tool::Hermes => crate::hooks::hermes::get_hermes_plugin_path(),
-            Tool::Adhoc => return String::new(),
-        };
-        path_buf.to_string_lossy().to_string()
+        match self.hook_installer() {
+            Some(ops) => (ops.settings_path)().to_string_lossy().to_string(),
+            None if *self == Tool::Adhoc => String::new(),
+            None => per_run_has_no_install(*self),
+        }
     }
+
+    /// Persistent hook operations are registered together so verify, setup and
+    /// diagnostics cannot disagree about which tools have a global install.
+    pub(crate) fn hook_installer(&self) -> Option<HookInstaller> {
+        use crate::hooks::{antigravity, cursor, gemini, hermes, kimi};
+        Some(match self {
+            Tool::Gemini => HookInstaller {
+                verify: gemini::verify_gemini_hooks_installed,
+                setup: |p| gemini::try_setup_gemini_hooks(p).map_err(|e| e.to_string()),
+                settings_path: gemini::get_gemini_settings_path,
+            },
+            Tool::Antigravity => HookInstaller {
+                verify: antigravity::verify_antigravity_hooks_installed,
+                setup: |p| antigravity::try_setup_antigravity_hooks(p).map_err(|e| e.to_string()),
+                settings_path: antigravity::get_antigravity_hooks_path,
+            },
+            Tool::Cursor => HookInstaller {
+                verify: cursor::verify_cursor_hooks_installed,
+                setup: |p| cursor::try_setup_cursor_hooks(p).map_err(|e| e.to_string()),
+                settings_path: cursor::get_cursor_hooks_path,
+            },
+            Tool::Kimi => HookInstaller {
+                verify: kimi::verify_kimi_hooks_installed,
+                setup: |p| kimi::try_setup_kimi_hooks(p).map_err(|e| e.to_string()),
+                settings_path: kimi::get_kimi_settings_path,
+            },
+            // Hermes has its own approval system; hcom grants no permissions.
+            Tool::Hermes => HookInstaller {
+                verify: |_| hermes::verify_hermes_plugin_installed(),
+                setup: |_| hermes::try_setup_hermes_plugin().map_err(|e| format!("{e:#}")),
+                settings_path: hermes::get_hermes_plugin_path,
+            },
+            _ => return None,
+        })
+    }
+}
+
+pub(crate) struct HookInstaller {
+    verify: fn(bool) -> bool,
+    setup: fn(bool) -> Result<(), String>,
+    settings_path: fn() -> std::path::PathBuf,
 }
 
 /// Per-run tools load hooks per launch (`hooks::runtime`) and have no global

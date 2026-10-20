@@ -686,106 +686,39 @@ fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)])
 /// Uses verify-first pattern: read-only check first, only write if needed.
 /// Strict gate: refuses to launch if hooks can't be installed.
 fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Result<()> {
-    match tool {
-        LaunchTool::Claude | LaunchTool::ClaudePty => unreachable!("Claude uses per-run hooks"),
-        LaunchTool::Gemini => {
-            if !crate::hooks::gemini::is_gemini_version_supported() {
-                if let Some(ver) = crate::hooks::gemini::get_gemini_version() {
-                    bail!(
-                        "Gemini CLI version {}.{}.{} is too old. Update: npm i -g @google/gemini-cli@latest",
-                        ver.0,
-                        ver.1,
-                        ver.2
-                    );
-                } else {
-                    eprintln!("Warning: Could not detect Gemini CLI version");
-                }
-            }
-            if crate::hooks::gemini::verify_gemini_hooks_installed(include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::gemini::try_setup_gemini_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[(
-                        "settings_path",
-                        crate::hooks::gemini::get_gemini_settings_path(),
-                    )],
-                );
-                bail!(
-                    "Failed to setup Gemini hooks: {e}\n\
-                     Run: hcom hooks add gemini\n\
-                     {diag}"
-                );
-            }
-            Ok(())
+    if *tool == LaunchTool::Gemini && !crate::hooks::gemini::is_gemini_version_supported() {
+        if let Some(ver) = crate::hooks::gemini::get_gemini_version() {
+            bail!(
+                "Gemini CLI version {}.{}.{} is too old. Update: npm i -g @google/gemini-cli@latest",
+                ver.0,
+                ver.1,
+                ver.2
+            );
+        } else {
+            eprintln!("Warning: Could not detect Gemini CLI version");
         }
-        LaunchTool::Codex => unreachable!("Codex uses per-run hooks"),
-        LaunchTool::OpenCode => unreachable!("OpenCode uses per-run hooks"),
-        LaunchTool::Kilo => unreachable!("Kilo uses per-run hooks"),
-        LaunchTool::Pi => unreachable!("Pi uses per-run hooks"),
-        LaunchTool::Omp => unreachable!("OMP uses per-run hooks"),
-        LaunchTool::Antigravity => {
-            if crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) =
-                crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
-            {
-                let diag = install_diag_context(
-                    tool,
-                    &[(
-                        "hooks_path",
-                        crate::hooks::antigravity::get_antigravity_hooks_path(),
-                    )],
-                );
-                bail!(
-                    "Failed to setup Antigravity hooks: {e}\n\
-                     Run: hcom hooks add antigravity\n\
-                     {diag}"
-                );
-            }
-            Ok(())
-        }
-        LaunchTool::Cursor => {
-            if crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::cursor::try_setup_cursor_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[("hooks_path", crate::hooks::cursor::get_cursor_hooks_path())],
-                );
-                bail!(
-                    "Failed to setup Cursor hooks: {e}\n\
-                     Run: hcom hooks add cursor\n\
-                     {diag}"
-                );
-            }
-            Ok(())
-        }
-        LaunchTool::Kimi => {
-            if crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::kimi::try_setup_kimi_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[("hooks_path", crate::hooks::kimi::get_kimi_settings_path())],
-                );
-                bail!(
-                    "Failed to setup Kimi hooks: {e}\n\
-                     Run: hcom hooks add kimi\n\
-                     {diag}"
-                );
-            }
-            Ok(())
-        }
-        LaunchTool::Copilot => unreachable!("Copilot uses per-run hooks"),
-        LaunchTool::Qoder => unreachable!("Qoder uses per-run hooks"),
-        LaunchTool::Grok => unreachable!("Grok has no hooks"),
-        LaunchTool::Hermes => unreachable!("Hermes installs into the launch's profile"),
     }
+    let integration = tool.tool();
+    if integration.verify_hooks_installed(include_permissions) {
+        return Ok(());
+    }
+    if let Err(e) = integration.try_setup_hooks(include_permissions) {
+        let path_label = if integration == crate::tool::Tool::Gemini {
+            "settings_path"
+        } else {
+            "hooks_path"
+        };
+        let diag = install_diag_context(
+            tool,
+            &[(path_label, integration.hooks_settings_path().into())],
+        );
+        bail!(
+            "Failed to setup {} hooks: {e}\nRun: hcom hooks add {}\n{diag}",
+            tool.spec().label,
+            tool.base_tool()
+        );
+    }
+    Ok(())
 }
 
 /// Build a command string for Claude (non-PTY mode). Quoting matches the
@@ -2372,155 +2305,94 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     }
                 }
 
-                LaunchTool::ClaudePty => {
-                    instances::update_instance_position(
-                        db,
-                        &instance_name,
-                        &serde_json::Map::from_iter([(
-                            "launch_args".to_string(),
-                            json!(&stored_launch_args),
-                        )]),
-                    );
-                    // Same background/foreground split as gemini/codex/opencode:
-                    // foreground → visible PTY in a terminal; background → PTY
-                    // wrapper in a detached runner. The wrapper handles the TUI
-                    // the same way either way, which is what lets PTY-headless
-                    // claude keep a live session that accepts hcom inject.
-                    launch_pty_or_background(
-                        &mut BackgroundLaunchCtx {
-                            db,
-                            tool: "claude",
-                            instance_name: &instance_name,
-                            process_id: &process_id,
-                            terminal_mode,
-                            tag: params.tag.as_deref().unwrap_or(""),
-                            working_dir,
-                            log_files: &mut log_files,
-                            handles: &mut handles,
-                        },
-                        &mut instance_env,
-                        &params.args,
-                        &params,
-                        inside_ai_tool,
-                    )
-                }
-
-                LaunchTool::Gemini => {
-                    instances::update_instance_position(
-                        db,
-                        &instance_name,
-                        &serde_json::Map::from_iter([(
-                            "launch_args".to_string(),
-                            json!(&stored_launch_args),
-                        )]),
-                    );
-                    launch_pty_or_background(
-                        &mut BackgroundLaunchCtx {
-                            db,
-                            tool: "gemini",
-                            instance_name: &instance_name,
-                            process_id: &process_id,
-                            terminal_mode,
-                            tag: params.tag.as_deref().unwrap_or(""),
-                            working_dir,
-                            log_files: &mut log_files,
-                            handles: &mut handles,
-                        },
-                        &mut instance_env,
-                        &params.args,
-                        &params,
-                        inside_ai_tool,
-                    )
-                }
-
-                LaunchTool::Codex => {
-                    // Bootstrap delivered via developer_instructions at launch
-                    instances::update_instance_position(
-                        db,
-                        &instance_name,
-                        &serde_json::Map::from_iter([("name_announced".to_string(), json!(true))]),
-                    );
-
-                    // Build effective args: system_prompt + preprocessing
+                _ => {
                     let mut effective_args = params.args.clone();
-                    if let Some(ref sp) = params.system_prompt {
-                        let mut pre =
-                            vec!["-c".to_string(), format!("developer_instructions={}", sp)];
-                        pre.extend(effective_args);
-                        effective_args = pre;
+                    let mut position = serde_json::Map::from_iter([(
+                        "launch_args".to_string(),
+                        json!(&stored_launch_args),
+                    )]);
+                    match normalized {
+                        LaunchTool::Codex => {
+                            // Preserve the announcement before rendering the launch bootstrap.
+                            instances::update_instance_position(
+                                db,
+                                &instance_name,
+                                &serde_json::Map::from_iter([(
+                                    "name_announced".to_string(),
+                                    json!(true),
+                                )]),
+                            );
+
+                            // Build effective args: system_prompt + preprocessing
+                            if let Some(ref sp) = params.system_prompt {
+                                let mut pre = vec![
+                                    "-c".to_string(),
+                                    format!("developer_instructions={}", sp),
+                                ];
+                                pre.extend(effective_args);
+                                effective_args = pre;
+                            }
+
+                            // Generate bootstrap text for preprocessing
+                            let bootstrap = build_codex_bootstrap(
+                                db,
+                                &paths::hcom_dir(),
+                                &instance_name,
+                                params.background,
+                                &instance_env,
+                            );
+
+                            effective_args = codex_preprocessing::preprocess_codex_args(
+                                &effective_args,
+                                &bootstrap,
+                                codex_home.as_ref().map(|(path, _)| path.as_path()),
+                            );
+                        }
+                        LaunchTool::OpenCode
+                        | LaunchTool::Kilo
+                        | LaunchTool::Pi
+                        | LaunchTool::Omp
+                        | LaunchTool::Hermes => {
+                            opencode_preprocessing::preprocess_opencode_env(
+                                &mut instance_env,
+                                &instance_name,
+                            );
+                            effective_args = if normalized == LaunchTool::OpenCode {
+                                opencode_preprocessing::preprocess_opencode_args(
+                                    &params.args,
+                                    &mut instance_env,
+                                    std::path::Path::new(working_dir),
+                                )?
+                            } else {
+                                params.args.clone()
+                            };
+                        }
+                        LaunchTool::Antigravity => {
+                            // Bootstrap arrives through SessionStart; leave name_announced unset.
+                            instance_env.insert("ANTIGRAVITY_AGENT".to_string(), "1".to_string());
+                        }
+                        LaunchTool::Grok => {
+                            // Grok hook output never reaches the model, so the bootstrap
+                            // goes in at launch through `--rules` (appended to the
+                            // system prompt).
+                            let bootstrap = build_grok_bootstrap(
+                                db,
+                                &paths::hcom_dir(),
+                                &instance_name,
+                                params.background,
+                                &instance_env,
+                            );
+
+                            inject_grok_rules(&mut effective_args, &bootstrap);
+                            ensure_grok_session_id(&mut effective_args);
+                            if let Some(ref sp) = params.system_prompt {
+                                inject_grok_rules(&mut effective_args, sp);
+                            }
+                            position.insert("name_announced".to_string(), json!(true));
+                        }
+                        _ => {}
                     }
-
-                    // Generate bootstrap text for preprocessing
-                    let bootstrap = build_codex_bootstrap(
-                        db,
-                        &paths::hcom_dir(),
-                        &instance_name,
-                        params.background,
-                        &instance_env,
-                    );
-
-                    effective_args = codex_preprocessing::preprocess_codex_args(
-                        &effective_args,
-                        &bootstrap,
-                        codex_home.as_ref().map(|(path, _)| path.as_path()),
-                    );
-
-                    instances::update_instance_position(
-                        db,
-                        &instance_name,
-                        &serde_json::Map::from_iter([(
-                            "launch_args".to_string(),
-                            json!(&stored_launch_args),
-                        )]),
-                    );
-
-                    launch_pty_or_background(
-                        &mut BackgroundLaunchCtx {
-                            db,
-                            tool: "codex",
-                            instance_name: &instance_name,
-                            process_id: &process_id,
-                            terminal_mode,
-                            tag: params.tag.as_deref().unwrap_or(""),
-                            working_dir,
-                            log_files: &mut log_files,
-                            handles: &mut handles,
-                        },
-                        &mut instance_env,
-                        &effective_args,
-                        &params,
-                        inside_ai_tool,
-                    )
-                }
-
-                LaunchTool::OpenCode
-                | LaunchTool::Kilo
-                | LaunchTool::Pi
-                | LaunchTool::Omp
-                | LaunchTool::Hermes => {
-                    opencode_preprocessing::preprocess_opencode_env(
-                        &mut instance_env,
-                        &instance_name,
-                    );
-                    let effective_args = if normalized == LaunchTool::OpenCode {
-                        opencode_preprocessing::preprocess_opencode_args(
-                            &params.args,
-                            &mut instance_env,
-                            std::path::Path::new(working_dir),
-                        )?
-                    } else {
-                        params.args.clone()
-                    };
-
-                    instances::update_instance_position(
-                        db,
-                        &instance_name,
-                        &serde_json::Map::from_iter([(
-                            "launch_args".to_string(),
-                            json!(&stored_launch_args),
-                        )]),
-                    );
-
+                    instances::update_instance_position(db, &instance_name, &position);
                     launch_pty_or_background(
                         &mut BackgroundLaunchCtx {
                             db,
@@ -2535,189 +2407,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         },
                         &mut instance_env,
                         &effective_args,
-                        &params,
-                        inside_ai_tool,
-                    )
-                }
-                LaunchTool::Antigravity => {
-                    // Antigravity ignores GEMINI_SYSTEM_MD; bootstrap is delivered via the
-                    // SessionStart hook's inject_bootstrap_once (name_announced stays 0 here).
-                    instance_env.insert("ANTIGRAVITY_AGENT".to_string(), "1".to_string());
-
-                    instances::update_instance_position(
-                        db,
-                        &instance_name,
-                        &serde_json::Map::from_iter([(
-                            "launch_args".to_string(),
-                            json!(&stored_launch_args),
-                        )]),
-                    );
-                    launch_pty_or_background(
-                        &mut BackgroundLaunchCtx {
-                            db,
-                            tool: "antigravity",
-                            instance_name: &instance_name,
-                            process_id: &process_id,
-                            terminal_mode,
-                            tag: params.tag.as_deref().unwrap_or(""),
-                            working_dir,
-                            log_files: &mut log_files,
-                            handles: &mut handles,
-                        },
-                        &mut instance_env,
-                        &params.args,
-                        &params,
-                        inside_ai_tool,
-                    )
-                }
-                LaunchTool::Cursor => {
-                    instances::update_instance_position(
-                        db,
-                        &instance_name,
-                        &serde_json::Map::from_iter([(
-                            "launch_args".to_string(),
-                            json!(&stored_launch_args),
-                        )]),
-                    );
-                    launch_pty_or_background(
-                        &mut BackgroundLaunchCtx {
-                            db,
-                            tool: "cursor",
-                            instance_name: &instance_name,
-                            process_id: &process_id,
-                            terminal_mode,
-                            tag: params.tag.as_deref().unwrap_or(""),
-                            working_dir,
-                            log_files: &mut log_files,
-                            handles: &mut handles,
-                        },
-                        &mut instance_env,
-                        &params.args,
-                        &params,
-                        inside_ai_tool,
-                    )
-                }
-
-                LaunchTool::Kimi => {
-                    instances::update_instance_position(
-                        db,
-                        &instance_name,
-                        &serde_json::Map::from_iter([(
-                            "launch_args".to_string(),
-                            json!(&stored_launch_args),
-                        )]),
-                    );
-                    launch_pty_or_background(
-                        &mut BackgroundLaunchCtx {
-                            db,
-                            tool: "kimi",
-                            instance_name: &instance_name,
-                            process_id: &process_id,
-                            terminal_mode,
-                            tag: params.tag.as_deref().unwrap_or(""),
-                            working_dir,
-                            log_files: &mut log_files,
-                            handles: &mut handles,
-                        },
-                        &mut instance_env,
-                        &params.args,
-                        &params,
-                        inside_ai_tool,
-                    )
-                }
-                LaunchTool::Copilot => {
-                    instances::update_instance_position(
-                        db,
-                        &instance_name,
-                        &serde_json::Map::from_iter([(
-                            "launch_args".to_string(),
-                            json!(&stored_launch_args),
-                        )]),
-                    );
-                    launch_pty_or_background(
-                        &mut BackgroundLaunchCtx {
-                            db,
-                            tool: "copilot",
-                            instance_name: &instance_name,
-                            process_id: &process_id,
-                            terminal_mode,
-                            tag: params.tag.as_deref().unwrap_or(""),
-                            working_dir,
-                            log_files: &mut log_files,
-                            handles: &mut handles,
-                        },
-                        &mut instance_env,
-                        &params.args,
-                        &params,
-                        inside_ai_tool,
-                    )
-                }
-                LaunchTool::Qoder => {
-                    instances::update_instance_position(
-                        db,
-                        &instance_name,
-                        &serde_json::Map::from_iter([(
-                            "launch_args".to_string(),
-                            json!(&stored_launch_args),
-                        )]),
-                    );
-                    launch_pty_or_background(
-                        &mut BackgroundLaunchCtx {
-                            db,
-                            tool: "qoder",
-                            instance_name: &instance_name,
-                            process_id: &process_id,
-                            terminal_mode,
-                            tag: params.tag.as_deref().unwrap_or(""),
-                            working_dir,
-                            log_files: &mut log_files,
-                            handles: &mut handles,
-                        },
-                        &mut instance_env,
-                        &params.args,
-                        &params,
-                        inside_ai_tool,
-                    )
-                }
-                LaunchTool::Grok => {
-                    // Grok hook output never reaches the model, so the bootstrap
-                    // goes in at launch through `--rules` (appended to the
-                    // system prompt).
-                    let bootstrap = build_grok_bootstrap(
-                        db,
-                        &paths::hcom_dir(),
-                        &instance_name,
-                        params.background,
-                        &instance_env,
-                    );
-                    let mut grok_args = params.args.clone();
-                    inject_grok_rules(&mut grok_args, &bootstrap);
-                    ensure_grok_session_id(&mut grok_args);
-                    if let Some(ref sp) = params.system_prompt {
-                        inject_grok_rules(&mut grok_args, sp);
-                    }
-                    instances::update_instance_position(
-                        db,
-                        &instance_name,
-                        &serde_json::Map::from_iter([
-                            ("launch_args".to_string(), json!(&stored_launch_args)),
-                            ("name_announced".to_string(), json!(true)),
-                        ]),
-                    );
-                    launch_pty_or_background(
-                        &mut BackgroundLaunchCtx {
-                            db,
-                            tool: "grok",
-                            instance_name: &instance_name,
-                            process_id: &process_id,
-                            terminal_mode,
-                            tag: params.tag.as_deref().unwrap_or(""),
-                            working_dir,
-                            log_files: &mut log_files,
-                            handles: &mut handles,
-                        },
-                        &mut instance_env,
-                        &grok_args,
                         &params,
                         inside_ai_tool,
                     )
