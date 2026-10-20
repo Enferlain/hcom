@@ -13,7 +13,95 @@ pub(crate) enum RejectedArgKind {
     RootSubcommand,
 }
 
-pub(crate) const GROK_REJECTED_ARGS: &[RejectedArg] = &[
+const GROK_LEADER_REASON: &str =
+    "Grok ignores this flag in leader mode; configure it in Grok instead";
+
+const GROK_REJECTED_ARGS: &[RejectedArg] = &[
+    RejectedArg {
+        token: "--allow",
+        reason: GROK_LEADER_REASON,
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--deny",
+        reason: GROK_LEADER_REASON,
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--allowedTools",
+        reason: GROK_LEADER_REASON,
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--allowed-tools",
+        reason: GROK_LEADER_REASON,
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--disallowedTools",
+        reason: GROK_LEADER_REASON,
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--disable-web-search",
+        reason: GROK_LEADER_REASON,
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--no-memory",
+        reason: GROK_LEADER_REASON,
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--experimental-memory",
+        reason: GROK_LEADER_REASON,
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--storage-mode",
+        reason: GROK_LEADER_REASON,
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--leader",
+        reason: "hcom manages Grok's leader connection; remove this flag",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--no-leader",
+        reason: "hcom manages Grok's leader connection; remove this flag",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--leader-socket",
+        reason: "hcom manages Grok's leader connection; remove this flag",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--tools",
+        reason: "Grok ignores this tool restriction in the TUI; configure it in Grok instead",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--disallowed-tools",
+        reason: "Grok ignores this tool restriction in the TUI; configure it in Grok instead",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--agents",
+        reason: "Grok only supports inline agent definitions in one-shot mode",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--max-turns",
+        reason: "Grok ignores this turn limit in the TUI",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--memory-flush",
+        reason: "Grok only supports this action in one-shot mode",
+        kind: RejectedArgKind::Flag,
+    },
     RejectedArg {
         token: "-p",
         reason: "exits after one prompt; not a persistent hcom agent",
@@ -35,6 +123,25 @@ pub(crate) const GROK_REJECTED_ARGS: &[RejectedArg] = &[
         kind: RejectedArgKind::Flag,
     },
 ];
+
+/// Validate Grok's persistent leader-backed TUI, excluding prompt text.
+pub(crate) fn validate_grok_args(args: &[&str]) -> Vec<String> {
+    args.iter()
+        .copied()
+        .take_while(|arg| *arg != "--")
+        .filter_map(|arg| {
+            GROK_REJECTED_ARGS
+                .iter()
+                .find(|rule| long_flag_matches(arg, rule.token))
+        })
+        .map(|rule| {
+            format!(
+                "Grok argument `{}` is not supported by `hcom grok`: {}.",
+                rule.token, rule.reason
+            )
+        })
+        .collect()
+}
 
 pub(crate) const KIMI_REJECTED_ARGS: &[RejectedArg] = &[
     RejectedArg {

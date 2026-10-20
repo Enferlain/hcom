@@ -23,9 +23,9 @@ use crate::shared::constants::HCOM_IDENTITY_VARS;
 use crate::shared::tool_detection::tool_marker_vars;
 use crate::terminal;
 use crate::tools::launch_arg_validation::{
-    ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, GROK_REJECTED_ARGS, KILO_REJECTED_ARGS,
-    KIMI_REJECTED_ARGS, OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS,
-    QODER_REJECTED_ARGS, validate_rejected_args,
+    ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, KILO_REJECTED_ARGS, KIMI_REJECTED_ARGS,
+    OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS, QODER_REJECTED_ARGS,
+    validate_grok_args, validate_rejected_args,
 };
 use crate::tools::{
     codex_preprocessing, copilot_preprocessing, cursor_preprocessing, opencode_preprocessing,
@@ -382,10 +382,19 @@ fn reply_handoff_suffix(
 fn ensure_grok_session_id(args: &mut Vec<String>) {
     let opens_conversation = args.iter().take_while(|arg| *arg != "--").any(|arg| {
         let flag = arg.split('=').next().unwrap_or(arg);
-        matches!(
-            flag,
-            "-r" | "--resume" | "-c" | "--continue" | "-s" | "--session-id"
-        )
+        matches!(flag, "--resume" | "--load" | "--continue" | "--session-id")
+            || arg
+                .strip_prefix('-')
+                .filter(|short| !short.starts_with('-'))
+                .is_some_and(|short| {
+                    // clap accepts attached values (-rID, -sUUID) and boolean
+                    // clusters (-cmMODEL). Stop at any value-taking option so a
+                    // model/worktree name containing c/r/s is never a selector.
+                    short
+                        .chars()
+                        .take_while(|c| matches!(c, 'c' | 'r' | 's' | 'h' | 'v'))
+                        .any(|c| matches!(c, 'c' | 'r' | 's'))
+                })
     });
     if !opens_conversation {
         args.insert(0, "--session-id".to_string());
@@ -2816,12 +2825,8 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
             validate_rejected_args("Qoder", "hcom qoder", args, QODER_REJECTED_ARGS)
         }
         LaunchTool::Grok => {
-            let mut errors = validate_rejected_args("Grok", "hcom grok", args, GROK_REJECTED_ARGS);
             let borrowed: Vec<_> = args.iter().map(String::as_str).collect();
-            if let Err(error) = crate::delivery::grok::Launch::validate_args(&borrowed) {
-                errors.push(error.to_string());
-            }
-            errors
+            validate_grok_args(&borrowed)
         }
     }
 }
@@ -2968,7 +2973,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_grok_rejects_one_shot() {
+    fn validate_grok_rejects_one_shot_and_ignored_flags() {
         let errors = validate_tool_args(&LaunchTool::Grok, &["-p".to_string(), "task".to_string()]);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("-p") || errors[0].contains("single"));
@@ -2979,12 +2984,27 @@ mod tests {
             validate_tool_args(&LaunchTool::Grok, &["--no-leader".into()]).len(),
             1
         );
-        for flag in ["--deny=bash", "--disable-web-search", "--allow"] {
+        for flag in [
+            "--deny=bash",
+            "--disable-web-search",
+            "--allow",
+            "--no-memory",
+            "--experimental-memory",
+            "--storage-mode=local",
+            "--tools=Read",
+            "--disallowed-tools=Bash",
+            "--agents={}",
+            "--max-turns=1",
+            "--memory-flush",
+        ] {
             assert_eq!(
                 validate_tool_args(&LaunchTool::Grok, &[flag.to_string()]).len(),
                 1
             );
         }
+        assert!(
+            validate_tool_args(&LaunchTool::Grok, &["--".into(), "--tools=Read".into()]).is_empty()
+        );
         assert!(validate_tool_args(&LaunchTool::Grok, &["--no-subagents".to_string()]).is_empty());
     }
 
@@ -3550,6 +3570,10 @@ mod tests {
             vec!["-c"],
             vec!["--session-id=abc"],
             vec!["--resume", "abc", "--fork-session"],
+            vec!["--load=abc"],
+            vec!["-rabc"],
+            vec!["-sabc"],
+            vec!["-cmopenrouter-free"],
         ] {
             let mut args: Vec<String> = existing.iter().map(|s| s.to_string()).collect();
             let before = args.clone();
@@ -3559,6 +3583,15 @@ mod tests {
         let mut literal = vec!["--".to_string(), "--resume".to_string()];
         ensure_grok_session_id(&mut literal);
         assert_eq!(literal[0], "--session-id");
+        for args in [
+            ["-m", "crs"],
+            ["-mcrs", "--always-approve"],
+            ["-wcrs", "--always-approve"],
+        ] {
+            let mut args = args.map(str::to_string).to_vec();
+            ensure_grok_session_id(&mut args);
+            assert_eq!(args[0], "--session-id");
+        }
     }
 
     #[test]

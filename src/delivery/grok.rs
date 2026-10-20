@@ -8,14 +8,17 @@
 //! sessions, so:
 //!
 //! - **Binding.** Every visible resident session in the roster
-//!   (`x.ai/sessions/list`) belongs to the TUI. hcom loads each with
-//!   `noReplay` (live events, no history) and binds the instance to the TUI's
+//!   (`x.ai/sessions/list`) belongs to the TUI. A read-only session-info
+//!   request subscribes hcom to live events and binds the instance to the TUI's
 //!   current one: the first to appear, then any that newly appears idle
 //!   (`/new`, `/resume` from disk). Switching the TUI to a session that is
 //!   already open emits nothing, so hcom follows that switch when a user
 //!   prompt starts running there.
 //! - **Status.** The leader broadcasts each session's queue, tool calls,
 //!   pending approvals and turn ends to every attached client.
+//!   On reconnect the roster recovers coarse activity, including pending
+//!   human input. Existing approvals remain with the TUI; subscribing does
+//!   not replay their requests or change the session's configuration.
 //! - **Delivery.** Each mailbox batch is queued as an ordinary prompt with
 //!   `sendNow:false`. Nothing is typed into the TUI composer, so the user's
 //!   draft is never touched, and a busy session runs the batch after its
@@ -65,21 +68,10 @@ const ROSTER_SLOW_POLL: Duration = Duration::from_secs(15);
 /// Wait before re-queueing a batch whose prompt was dropped before it ran
 /// (user removed it from the queue, prompt error, transport lost).
 const REQUEUE_DELAY: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
-/// Wait before loading the bound session again after a failed load.
-const LOAD_RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Wait before retrying a failed live-event subscription.
+const SUBSCRIBE_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Prompts hcom queues carry this `promptId` prefix.
 const HCOM_PROMPT_ID_PREFIX: &str = "hcom-";
-/// Leader-mode Grok ignores these (it warns and continues). Since hcom must
-/// run Grok against a leader, reject them rather than silently drop a
-/// restriction the user asked for.
-const LEADER_IGNORED_FLAGS: &[&str] = &[
-    "--allow",
-    "--deny",
-    "--allowedTools",
-    "--disallowedTools",
-    "--disable-web-search",
-];
-
 /// Grok gets nothing injected per run: everything hcom needs arrives over the
 /// ACP client above. Registering as per-run keeps it out of the global
 /// hook-install paths (`hcom hooks`, status, launch).
@@ -112,17 +104,9 @@ fn flags<'a>(args: &'a [&'a str]) -> impl Iterator<Item = &'a str> {
 
 impl Launch {
     pub(crate) fn validate_args(args: &[&str]) -> Result<()> {
-        for arg in flags(args) {
-            let flag = arg.split('=').next().unwrap_or(arg);
-            if matches!(flag, "--leader" | "--no-leader" | "--leader-socket") {
-                bail!("hcom manages Grok's leader connection; remove {flag}");
-            }
-            if LEADER_IGNORED_FLAGS.contains(&flag) {
-                bail!(
-                    "Grok ignores {flag} when attached to a leader, which hcom needs for \
-                     message delivery; set the rule in Grok's config instead"
-                );
-            }
+        let errors = crate::tools::launch_arg_validation::validate_grok_args(args);
+        if !errors.is_empty() {
+            bail!("{}", errors.join("\n"));
         }
         Ok(())
     }
@@ -428,9 +412,8 @@ enum Effect {
         cwd: String,
     },
     /// Subscribe to this session's live events.
-    Load {
+    Subscribe {
         session: String,
-        cwd: String,
     },
     Status(Status),
     RefreshRoster,
@@ -461,6 +444,11 @@ struct Tracker {
     /// Open approvals/questions (by tool call id) in the bound session and
     /// its subagents; the turn stays blocked until all are answered.
     interactions: HashSet<String>,
+    /// Coarse live state also recovers approvals whose reverse-request was
+    /// sent while this observer was disconnected. The TUI still owns them.
+    activities: HashMap<String, String>,
+    roster_blocked: bool,
+    recover_status_on_roster: bool,
 }
 
 fn str_of<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -492,6 +480,8 @@ impl Tracker {
         self.bound = Some(session.to_string());
         self.last_tool = None;
         self.interactions.clear();
+        self.roster_blocked = false;
+        self.recover_status_on_roster = true;
         Effect::Bind {
             session: session.to_string(),
             cwd: cwd.to_string(),
@@ -503,9 +493,23 @@ impl Tracker {
         self.resident = None;
         self.running.clear();
         self.interactions.clear();
+        self.activities.clear();
+        self.roster_blocked = false;
+        self.last_tool = None;
+        self.recover_status_on_roster = true;
     }
 
     fn on_roster(&mut self, sessions: &[Value]) -> Vec<Effect> {
+        self.activities = sessions
+            .iter()
+            .filter(|entry| entry["resident"] == true)
+            .filter_map(|entry| {
+                Some((
+                    str_of(entry, "sessionId")?.to_string(),
+                    str_of(entry, "activity")?.to_string(),
+                ))
+            })
+            .collect();
         let visible: HashMap<String, RosterEntry> = sessions
             .iter()
             .filter(|entry| entry["resident"] == true)
@@ -533,9 +537,8 @@ impl Tracker {
         let mut effects: Vec<Effect> = visible
             .iter()
             .filter(|(id, _)| is_new(id))
-            .map(|(id, entry)| Effect::Load {
+            .map(|(id, _)| Effect::Subscribe {
                 session: id.clone(),
-                cwd: entry.cwd.clone(),
             })
             .collect();
         let newest = |candidates: &mut dyn Iterator<Item = (&String, &RosterEntry)>| {
@@ -560,7 +563,58 @@ impl Tracker {
         if let Some((session, cwd)) = target.filter(|(id, _)| !self.is_bound(id)) {
             effects.push(self.bind(&session, &cwd));
         }
+        let recover = std::mem::take(&mut self.recover_status_on_roster);
+        if let Some(status) = self.recover_status(recover) {
+            effects.push(Effect::Status(status));
+        }
         effects
+    }
+
+    /// Roster snapshots recover coarse status without reloading the actor.
+    /// Keep detailed tool/approval status from live events whenever possible.
+    fn recover_status(&mut self, reconnect: bool) -> Option<Status> {
+        // During normal streaming only reverse-requests mean a human is
+        // needed. Grok's PendingInteractionGuard wraps PermissionHandle::request
+        // before the manager decides whether to prompt, so roster needs_input
+        // can also cover automatic decisions. Use it to recover missed state.
+        if !reconnect && !self.roster_blocked {
+            return None;
+        }
+        let needs_input = self
+            .activities
+            .iter()
+            .any(|(session, activity)| activity == "needs_input" && self.speaks_for_bound(session));
+        if needs_input {
+            if self.interactions.is_empty() && (!self.roster_blocked || reconnect) {
+                self.roster_blocked = true;
+                return Some(Status::Blocked("input".into()));
+            }
+            return None;
+        }
+        self.roster_blocked = false;
+        if !self.interactions.is_empty() {
+            return None;
+        }
+        match self
+            .activities
+            .get(self.bound.as_ref()?)
+            .map(String::as_str)
+        {
+            Some("working") => Some(match self.last_tool.clone() {
+                Some((name, input)) => Status::Tool { name, input },
+                None => Status::Prompt,
+            }),
+            Some("idle" | "completed") => Some(Status::Listening(String::new())),
+            _ => None,
+        }
+    }
+
+    fn can_retry_detached(&self, session: &str) -> bool {
+        self.resident.is_some()
+            && !matches!(
+                self.activities.get(session).map(String::as_str),
+                Some("working" | "needs_input")
+            )
     }
 
     /// A shared interaction Grok is asking a human about. Only these block:
@@ -675,6 +729,9 @@ impl Tracker {
                         let removed = self
                             .interactions
                             .remove(str_of(update, "tool_call_id").unwrap_or_default());
+                        if self.roster_blocked && self.interactions.is_empty() {
+                            return vec![Effect::RefreshRoster];
+                        }
                         if !removed || !self.interactions.is_empty() {
                             return Vec::new();
                         }
@@ -695,30 +752,40 @@ impl Tracker {
                 }
             }
             "x.ai/sessions/changed" => {
-                if let Some(resident) = self.resident.as_mut() {
-                    for removed in params["removed"].as_array().into_iter().flatten() {
-                        if let Some(id) = removed.as_str() {
+                for removed in params["removed"].as_array().into_iter().flatten() {
+                    if let Some(id) = removed.as_str() {
+                        self.activities.remove(id);
+                        if let Some(resident) = self.resident.as_mut() {
                             resident.remove(id);
                         }
                     }
                 }
-                let unknown = params["upserted"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|entry| str_of(entry, "sessionId"))
-                    .any(|id| {
-                        !self.children.contains_key(id)
-                            && self
-                                .resident
-                                .as_ref()
-                                .is_none_or(|resident| !resident.contains_key(id))
-                    });
-                if unknown {
-                    vec![Effect::RefreshRoster]
-                } else {
-                    Vec::new()
+                let mut unknown = false;
+                for entry in params["upserted"].as_array().into_iter().flatten() {
+                    let Some(id) = str_of(entry, "sessionId") else {
+                        continue;
+                    };
+                    if entry["resident"] == true {
+                        if let Some(activity) = str_of(entry, "activity") {
+                            self.activities.insert(id.to_string(), activity.to_string());
+                        }
+                    } else {
+                        self.activities.remove(id);
+                    }
+                    unknown |= !self.children.contains_key(id)
+                        && self
+                            .resident
+                            .as_ref()
+                            .is_none_or(|resident| !resident.contains_key(id));
                 }
+                let mut effects = Vec::new();
+                if let Some(status) = self.recover_status(false) {
+                    effects.push(Effect::Status(status));
+                }
+                if unknown {
+                    effects.push(Effect::RefreshRoster);
+                }
+                effects
             }
             // Broadcast when a session is set up, without saying which.
             "x.ai/models/update" | "x.ai/mcp/servers_updated" | "x.ai/announcements/update" => {
@@ -752,13 +819,6 @@ struct InFlight {
     /// prompt when its client disconnects, so the batch is followed through
     /// the reconnected client's queue snapshots, not treated as dropped.
     detached_at: Option<Instant>,
-    /// Whether the latest roster since the drop shows its session idle.
-    /// Reconnecting brings no queue snapshot, and Grok runs a queued prompt
-    /// as soon as its session is idle, so only an idle session proves the
-    /// batch is no longer waiting behind a turn. (A row the user holds for
-    /// editing at the front can still park it, for up to Grok's edit-hold
-    /// TTL; that stays a possible duplicate.)
-    idle_after_detach: bool,
 }
 
 /// How long to wait after `removedFromQueue` for the snapshot showing a merge.
@@ -849,7 +909,7 @@ fn response_outcome(value: &Value) -> Option<Outcome> {
 
 enum Pending {
     Roster,
-    Load(String),
+    Subscribe(String),
 }
 
 /// The roster result, which the stdio bridge may wrap once more.
@@ -862,13 +922,14 @@ fn roster_sessions(result: &Value) -> &[Value] {
         .unwrap_or_default()
 }
 
-/// Whether the roster shows `session` in a turn: running, or waiting on an
-/// approval or question (`needs_input` wins over `working` mid-turn).
-fn roster_busy(sessions: &[Value], session: &str) -> bool {
-    sessions.iter().any(|entry| {
-        entry["sessionId"] == session
-            && matches!(entry["activity"].as_str(), Some("working" | "needs_input"))
-    })
+fn subscription_error(response: &Value, session: &str) -> Option<String> {
+    if let Some(error) = response.get("error") {
+        return Some(error.to_string());
+    }
+    let result = &response["result"];
+    let id = str_of(result, "sessionId")
+        .or_else(|| result.pointer("/result/sessionId").and_then(Value::as_str));
+    (id != Some(session)).then(|| "session is no longer resident".to_string())
 }
 
 /// Point the instance at `session`, as a hook-based SessionStart would.
@@ -967,12 +1028,12 @@ pub(super) fn run(
 ) {
     let mut client: Option<Client> = None;
     let mut tracker = Tracker::default();
-    let mut loaded: HashSet<String> = HashSet::new();
+    let mut subscribed: HashSet<String> = HashSet::new();
     let mut pending: HashMap<u64, Pending> = HashMap::new();
     let mut roster_due: Option<Instant> = None;
     let mut roster_fast_until = Instant::now();
     let mut in_flight: Option<InFlight> = None;
-    let mut load_retry_at = Instant::now();
+    let mut subscribe_retry_at = Instant::now();
     let mut current_status = ST_LISTENING.to_string();
     let mut heartbeat = Instant::now();
     let mut connect_failures: u32 = 0;
@@ -991,9 +1052,14 @@ pub(super) fn run(
             tool: &config.tool,
             host_label,
         });
-        // Ready once the bound session is loaded: until then it is not
+        // Ready once the bound session is subscribed: until then it is not
         // subscribed and nothing can be delivered.
-        if client.is_some() && tracker.bound.as_ref().is_some_and(|s| loaded.contains(s)) {
+        if client.is_some()
+            && tracker
+                .bound
+                .as_ref()
+                .is_some_and(|s| subscribed.contains(s))
+        {
             super::drive_launch_outcome(
                 db,
                 state,
@@ -1037,7 +1103,7 @@ pub(super) fn run(
                     client = Some(connected);
                     connect_failures = 0;
                     tracker.reconnected();
-                    loaded.clear();
+                    subscribed.clear();
                     pending.clear();
                     roster_due = Some(Instant::now());
                 }
@@ -1102,43 +1168,45 @@ pub(super) fn run(
                             }
                             None => {
                                 let sessions = roster_sessions(&value["result"]);
-                                if let Some(flight) = in_flight.as_mut()
-                                    && flight.detached_at.is_some()
-                                {
-                                    flight.idle_after_detach =
-                                        !roster_busy(sessions, &flight.session);
-                                }
                                 effects.extend(tracker.on_roster(sessions))
                             }
                         },
-                        Some(Pending::Load(session)) => match value.get("error") {
-                            Some(error) => {
-                                load_retry_at = Instant::now() + LOAD_RETRY_DELAY;
-                                let detail = format!("Grok session/load failed: {error}");
-                                log_warn(
-                                    "native",
-                                    "grok.acp.load_failed",
-                                    &format!("session={session}: {detail}"),
-                                );
-                                // Readiness waits for the bound session to load,
-                                // so one that never loads would stay pending.
-                                if tracker.bound.as_deref() == Some(session.as_str())
-                                    && launched_at.elapsed() >= SETUP_TIMEOUT
-                                {
-                                    block_launch(
-                                        db,
-                                        state,
-                                        current_name,
-                                        launch_outcome,
-                                        "grok_session_load",
-                                        &detail,
+                        Some(Pending::Subscribe(session)) => {
+                            match subscription_error(&value, &session) {
+                                Some(error) => {
+                                    subscribe_retry_at = Instant::now() + SUBSCRIBE_RETRY_DELAY;
+                                    let detail =
+                                        format!("Grok session subscription failed: {error}");
+                                    log_warn(
+                                        "native",
+                                        "grok.acp.subscribe_failed",
+                                        &format!("session={session}: {detail}"),
                                     );
+                                    // Readiness waits for the bound session subscription.
+                                    if tracker.bound.as_deref() == Some(session.as_str())
+                                        && launched_at.elapsed() >= SETUP_TIMEOUT
+                                    {
+                                        block_launch(
+                                            db,
+                                            state,
+                                            current_name,
+                                            launch_outcome,
+                                            "grok_session_subscribe",
+                                            &detail,
+                                        );
+                                    }
+                                }
+                                None => {
+                                    if tracker.is_bound(&session) {
+                                        // Cover an approval opened between the
+                                        // discovery poll and the subscription.
+                                        tracker.recover_status_on_roster = true;
+                                        roster_due = Some(Instant::now());
+                                    }
+                                    subscribed.insert(session);
                                 }
                             }
-                            None => {
-                                loaded.insert(session);
-                            }
-                        },
+                        }
                         None => {
                             if let Some(flight) = in_flight.as_mut()
                                 && id.is_some()
@@ -1209,26 +1277,17 @@ pub(super) fn run(
                     };
                     *current_name = apply_bind(db, process_id, current_name, &session, &cwd);
                 }
-                Effect::Load { session, cwd } => {
-                    if loaded.contains(&session)
+                Effect::Subscribe { session } => {
+                    if subscribed.contains(&session)
                         || pending
                             .values()
-                            .any(|p| matches!(p, Pending::Load(s) if *s == session))
+                            .any(|p| matches!(p, Pending::Subscribe(s) if *s == session))
                     {
                         continue;
                     }
-                    let cwd = if cwd.is_empty() {
-                        instance.directory.clone()
-                    } else {
-                        cwd
-                    };
-                    match conn.send(
-                        "session/load",
-                        json!({"sessionId": session, "cwd": cwd, "mcpServers": [],
-                               "_meta": {"noReplay": true}}),
-                    ) {
+                    match conn.send("_x.ai/session/info", json!({"sessionId": session})) {
                         Ok(id) => {
-                            pending.insert(id, Pending::Load(session));
+                            pending.insert(id, Pending::Subscribe(session));
                         }
                         Err(error) => closed = Some(format!("write failed: {error:#}")),
                     }
@@ -1266,7 +1325,6 @@ pub(super) fn run(
             if let Some(flight) = in_flight.as_mut() {
                 flight.request_id = None;
                 flight.detached_at.get_or_insert_with(Instant::now);
-                flight.idle_after_detach = false;
             }
             log_warn("native", "grok.acp.disconnected", &error);
         }
@@ -1281,7 +1339,7 @@ pub(super) fn run(
         if outcome.is_none()
             && in_flight
                 .as_ref()
-                .filter(|flight| flight.idle_after_detach)
+                .filter(|flight| client.is_some() && tracker.can_retry_detached(&flight.session))
                 .and_then(|flight| flight.detached_at)
                 .is_some_and(|at| at.elapsed() >= DETACHED_WAIT)
         {
@@ -1337,31 +1395,21 @@ pub(super) fn run(
         let Some(conn) = client.as_mut() else {
             continue;
         };
-        // The bound session must be loaded, or its queue events never arrive.
-        // Other sessions only matter once they are bound, so only this one
-        // is retried.
+        // Requests carrying sessionId subscribe at the leader before the
+        // request runs. session/info only reads the resident actor: unlike
+        // session/load it cannot restore an old model, effort or client config.
+        // Other sessions are retried when they become bound.
         if let Some(session) = tracker.bound.clone()
-            && !loaded.contains(&session)
+            && !subscribed.contains(&session)
             && !pending
                 .values()
-                .any(|p| matches!(p, Pending::Load(s) if *s == session))
-            && Instant::now() >= load_retry_at
+                .any(|p| matches!(p, Pending::Subscribe(s) if *s == session))
+            && Instant::now() >= subscribe_retry_at
         {
-            let cwd = tracker
-                .resident
-                .as_ref()
-                .and_then(|resident| resident.get(&session))
-                .filter(|cwd| !cwd.is_empty())
-                .cloned()
-                .unwrap_or_else(|| instance.directory.clone());
-            load_retry_at = Instant::now() + LOAD_RETRY_DELAY;
-            match conn.send(
-                "session/load",
-                json!({"sessionId": session, "cwd": cwd, "mcpServers": [],
-                       "_meta": {"noReplay": true}}),
-            ) {
+            subscribe_retry_at = Instant::now() + SUBSCRIBE_RETRY_DELAY;
+            match conn.send("_x.ai/session/info", json!({"sessionId": session})) {
                 Ok(id) => {
-                    pending.insert(id, Pending::Load(session));
+                    pending.insert(id, Pending::Subscribe(session));
                 }
                 Err(error) => {
                     log_warn("native", "grok.acp.write_failed", &format!("{error:#}"));
@@ -1372,7 +1420,7 @@ pub(super) fn run(
                 }
             }
         }
-        let target = tracker.bound.clone().filter(|s| loaded.contains(s));
+        let target = tracker.bound.clone().filter(|s| subscribed.contains(s));
         if let Some(session) = target
             && in_flight.is_none()
             && Instant::now() >= requeue_at
@@ -1415,7 +1463,6 @@ pub(super) fn run(
                         ack: prepared.ack,
                         removed_at: None,
                         detached_at: None,
-                        idle_after_detach: false,
                     });
                 }
                 Err(error) => {
@@ -1454,7 +1501,6 @@ mod tests {
             },
             removed_at: removed.then(Instant::now),
             detached_at: None,
-            idle_after_detach: false,
         }
     }
 
@@ -1530,15 +1576,25 @@ mod tests {
     }
 
     #[test]
-    fn roster_busy_includes_pending_approvals() {
-        let roster = |activity: &str| {
-            vec![json!({"sessionId": "s", "resident": true, "activity": activity})]
-        };
-        assert!(roster_busy(&roster("working"), "s"));
-        // An approval mid-turn reports needs_input, not working.
-        assert!(roster_busy(&roster("needs_input"), "s"));
-        assert!(!roster_busy(&roster("idle"), "s"));
-        assert!(!roster_busy(&roster("working"), "other"));
+    fn detached_retry_follows_roster_snapshots_and_live_changes() {
+        let mut tracker = Tracker::default();
+        assert!(!tracker.can_retry_detached("s"));
+        tracker.on_roster(&[entry("s", "working", 1)]);
+        assert!(!tracker.can_retry_detached("s"));
+        for (activity, retry) in [("idle", true), ("needs_input", false), ("working", false)] {
+            tracker.on_notification(
+                "x.ai/sessions/changed",
+                &json!({"upserted": [entry("s", activity, 2)]}),
+            );
+            assert_eq!(tracker.can_retry_detached("s"), retry);
+        }
+        tracker.on_notification("x.ai/sessions/changed", &json!({"removed": ["s"]}));
+        assert!(tracker.can_retry_detached("s"));
+        assert!(!tracker.resident.as_ref().unwrap().contains_key("s"));
+        tracker.reconnected();
+        assert!(!tracker.can_retry_detached("s"));
+        tracker.on_roster(&[entry("s", "idle", 3)]);
+        assert!(tracker.can_retry_detached("s"));
     }
 
     #[test]
@@ -1626,11 +1682,11 @@ mod tests {
             .collect()
     }
 
-    fn loads(effects: &[Effect]) -> Vec<&str> {
+    fn subscriptions(effects: &[Effect]) -> Vec<&str> {
         let mut ids: Vec<&str> = effects
             .iter()
             .filter_map(|e| match e {
-                Effect::Load { session, .. } => Some(session.as_str()),
+                Effect::Subscribe { session, .. } => Some(session.as_str()),
                 _ => None,
             })
             .collect();
@@ -1674,14 +1730,14 @@ mod tests {
     }
 
     #[test]
-    fn binds_the_first_resident_session_and_loads_all() {
+    fn binds_the_first_resident_session_and_subscribes_all() {
         let mut tracker = Tracker::default();
         assert!(tracker.on_roster(&[]).is_empty());
         let dormant =
             json!({"sessionId": "old", "cwd": "/w", "activity": "dormant", "resident": false});
         let effects = tracker.on_roster(&[dormant, entry("a", "idle", 5)]);
         assert_eq!(binds(&effects), ["a"]);
-        assert_eq!(loads(&effects), ["a"]);
+        assert_eq!(subscriptions(&effects), ["a"]);
     }
 
     #[test]
@@ -1691,7 +1747,7 @@ mod tests {
         // /new: a fresh idle session.
         let effects = tracker.on_roster(&[entry("a", "idle", 1), entry("b", "idle", 2)]);
         assert_eq!(binds(&effects), ["b"]);
-        assert_eq!(loads(&effects), ["b"]);
+        assert_eq!(subscriptions(&effects), ["b"]);
         // A new session that is already working waits for a user prompt.
         let effects = tracker.on_roster(&[
             entry("a", "idle", 1),
@@ -1699,12 +1755,12 @@ mod tests {
             entry("c", "working", 3),
         ]);
         assert!(binds(&effects).is_empty());
-        assert_eq!(loads(&effects), ["c"]);
-        // After a reconnect everything is reloaded, the binding kept.
+        assert_eq!(subscriptions(&effects), ["c"]);
+        // After a reconnect everything is resubscribed, the binding kept.
         tracker.reconnected();
         let effects = tracker.on_roster(&[entry("a", "idle", 9), entry("b", "idle", 2)]);
         assert!(binds(&effects).is_empty());
-        assert_eq!(loads(&effects), ["a", "b"]);
+        assert_eq!(subscriptions(&effects), ["a", "b"]);
     }
 
     #[test]
@@ -1742,7 +1798,7 @@ mod tests {
         );
         let effects = tracker.on_roster(&[entry("a", "working", 1), entry("kid", "idle", 2)]);
         assert!(binds(&effects).is_empty());
-        assert!(loads(&effects).is_empty());
+        assert!(subscriptions(&effects).is_empty());
         assert!(
             tracker
                 .on_notification("x.ai/queue/changed", &queue("kid", Some("u1")))
@@ -1936,8 +1992,12 @@ mod tests {
             vec!["--allow", "Bash"],
             vec!["--deny=bash"],
             vec!["--allowedTools", "Read(*)"],
+            vec!["--allowed-tools", "Read(*)"],
             vec!["--disallowedTools", "Bash(*)"],
             vec!["--disable-web-search"],
+            vec!["--no-memory"],
+            vec!["--experimental-memory"],
+            vec!["--storage-mode=local"],
         ] {
             assert!(Launch::validate_args(&args).is_err(), "{args:?}");
         }
@@ -1956,13 +2016,103 @@ mod tests {
         assert!(plain.child_env().is_empty());
     }
 
+    #[test]
+    fn subscription_requires_a_resident_session_info_response() {
+        for result in [
+            json!({"sessionId": "s"}),
+            json!({"result": {"sessionId": "s"}}),
+        ] {
+            assert!(subscription_error(&json!({"result": result}), "s").is_none());
+        }
+        for response in [
+            json!({"result": {}}),
+            json!({"result": {"sessionId": "other"}}),
+            json!({"error": {"message": "disconnected"}}),
+        ] {
+            assert!(subscription_error(&response, "s").is_some());
+        }
+    }
+
+    #[test]
+    fn reconnect_recovers_pending_approval_status_without_loading() {
+        let mut tracker = Tracker::default();
+        tracker.on_roster(&[entry("a", "working", 1)]);
+        tracker.on_request("session/request_permission", &ask("a", "lost"));
+        tracker.reconnected();
+        let effects = tracker.on_roster(&[entry("a", "needs_input", 2)]);
+        assert_eq!(subscriptions(&effects), ["a"]);
+        assert!(effects.contains(&Effect::Status(Status::Blocked("input".into()))));
+        // No replayed reverse-request is needed. When the TUI answers,
+        // either a live roster delta or the next poll recovers status.
+        let changed = json!({"upserted": [entry("a", "working", 3)], "removed": []});
+        assert_eq!(
+            tracker.on_notification("x.ai/sessions/changed", &changed),
+            [Effect::Status(Status::Prompt)]
+        );
+        assert!(!tracker.roster_blocked);
+        tracker.reconnected();
+        assert!(
+            tracker
+                .on_roster(&[entry("a", "idle", 4)])
+                .contains(&Effect::Status(Status::Listening(String::new())))
+        );
+    }
+
+    #[test]
+    fn reconnect_recovers_subagent_approval_and_waits_for_all_input() {
+        let mut tracker = Tracker::default();
+        tracker.on_roster(&[entry("a", "working", 1)]);
+        tracker.on_notification(
+            "x.ai/session_notification",
+            &note(
+                "a",
+                json!({"sessionUpdate": "subagent_spawned", "child_session_id": "kid"}),
+            ),
+        );
+        tracker.reconnected();
+        let effects =
+            tracker.on_roster(&[entry("a", "working", 1), entry("kid", "needs_input", 2)]);
+        assert!(effects.contains(&Effect::Status(Status::Blocked("input".into()))));
+        // The parent's activity alone cannot clear a child's approval.
+        assert!(
+            tracker
+                .on_notification(
+                    "x.ai/sessions/changed",
+                    &json!({"upserted": [entry("a", "working", 3)]})
+                )
+                .is_empty()
+        );
+        let effects = tracker.on_roster(&[entry("a", "idle", 4), entry("kid", "idle", 4)]);
+        assert_eq!(effects, [Effect::Status(Status::Listening(String::new()))]);
+    }
+
+    #[test]
+    fn roster_recovery_keeps_live_tool_and_approval_details() {
+        let mut tracker = Tracker::default();
+        tracker.on_roster(&[entry("a", "working", 1)]);
+        // Grok's internal approval decision is not a human reverse-request.
+        assert!(
+            tracker
+                .on_roster(&[entry("a", "needs_input", 2)])
+                .is_empty()
+        );
+        tracker.on_request("session/request_permission", &ask("a", "t1"));
+        tracker.recover_status_on_roster = true;
+        assert!(
+            tracker
+                .on_roster(&[entry("a", "needs_input", 2)])
+                .is_empty()
+        );
+        assert!(tracker.on_roster(&[entry("a", "working", 3)]).is_empty());
+    }
+
     /// Stands in for `grok agent --leader --leader-socket <sock> stdio`. On
     /// the first bridge the leader restarts as hcom's batch goes out: the
     /// bridge announces `x.ai/leader_reconnected`, the old leader never
     /// answers the prompt, and the new one has an empty queue. With a
     /// `queued` flag file beside it, only the bridge drops instead: the
     /// batch stays queued behind a turn that ends after `DETACHED_WAIT`. As
-    /// with Grok, loading a session sends no queue snapshot; only the
+    /// with Grok, subscribing sends no queue snapshot; only the
     /// roster shows the turn. Every prompt the second bridge receives is
     /// counted in `requeued`.
     #[cfg(unix)]
@@ -1973,9 +2123,11 @@ echo "$run" > "$dir/runs"
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
-    *'"method":"initialize"'*|*'"method":"session/load"'*)
-      echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
-      case "$line" in *session/load*)
+    *'"method":"initialize"'*)
+      echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}" ;;
+    *'"method":"_x.ai/session/info"'*)
+      echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"sessionId\":\"s1\"}}"
+      case "$line" in *_x.ai/session/info*)
         if [ -f "$dir/turn" ]; then
           # The turn ends and the held batch runs.
           held=$(cat "$dir/prompt")
