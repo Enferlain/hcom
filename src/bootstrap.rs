@@ -36,14 +36,46 @@ use crate::tool::Tool;
 //
 // Note: --name should go after cmd in hcom <cmd> otherwise would break SAFE_HCOM_COMMANDS allowlist.
 
-const UNIVERSAL: &str = r#"[HCOM SESSION]
+pub(crate) const EXCLUDE_PARTS: &[&str] =
+    &["identity", "messages", "capabilities", "rules", "handoff"];
+
+pub(crate) fn parse_excluded_parts(value: &str) -> Result<std::collections::HashSet<&str>, String> {
+    let value = value.trim();
+    if value.is_empty() || value == "none" {
+        return Ok(std::collections::HashSet::new());
+    }
+    if value == "all" {
+        return Ok(EXCLUDE_PARTS.iter().copied().collect());
+    }
+    let mut parts = std::collections::HashSet::new();
+    for part in value.split(',').map(str::trim) {
+        if part == "none" || part == "all" {
+            return Err(format!("bootstrap_exclude: '{part}' must be used alone"));
+        }
+        if !EXCLUDE_PARTS.contains(&part) {
+            return Err(format!(
+                "bootstrap_exclude: unknown part '{part}' (valid: {}, none, all)",
+                EXCLUDE_PARTS.join(", ")
+            ));
+        }
+        if !parts.insert(part) {
+            return Err(format!("bootstrap_exclude: duplicate part '{part}'"));
+        }
+    }
+    Ok(parts)
+}
+
+const IDENTITY_HEAD: &str = r#"[HCOM SESSION]
 You have access to the hcom cli communication tool.
 - Your name: {display_name}
 - Authority: Prioritize @{SENDER} over others{launched_by}
 
-You run hcom commands on behalf of the human user. The human uses natural language with you.
+You run hcom commands on behalf of the human user. The human uses natural language with you."#;
 
-## MESSAGES
+const MESSAGES: &str = r#"## MESSAGES
+
+Sending rules:
+- Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
 
 Response rules:
 - From {SENDER} or intent=request → always respond
@@ -52,9 +84,9 @@ Response rules:
 
 Routing rules:
 - hcom message (<hcom> tags, hook feedback) → run `hcom send` to respond
-- Normal user chat → respond in chat
+- Normal user chat → respond in chat"#;
 
-## CAPABILITIES
+const CAPABILITIES: &str = r#"## CAPABILITIES
 
 You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 
@@ -69,7 +101,7 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
   Example: events sub --idle luna → <hcom> msg when luna goes idle
 - Handoff context: bundle prepare
 - Spawn agents: [num] <{launch_tools}> [--tag labelOrGroup] [--hcom-prompt 'task']
-  Example: `hcom 1 claude --tag cool --hcom-prompt 'task'` → <hcom> sends you result when done
+  Example: `hcom 1 claude --tag cool --hcom-prompt 'task'`{handoff_result}
   Without --hcom-prompt: you get auto notify <hcom> when ready, then use hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
   each supports --help (set prompt, system, background, forward args, etc)
@@ -78,19 +110,48 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 - View agent screen: term [name] | inject text/enter: term inject <name> ['text'] [--enter]
 - Other commands: status (diagnostics), config (set terminal, etc), relay (remote)
 
-If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
+If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess."#;
 
-## RULES
+const RULES: &str = r#"## RULES
 
 1. No filler messages (greetings, thanks, congrats).
-2. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
-3. User says 'the pi/claude/codex agent' or unclear → run `hcom list` to resolve name
-4. Don't delegate to existing agents unless asked. Need help? Spawn your own agents.
+2. Don't delegate to existing agents unless asked. Need help? Spawn your own agents."#;
 
-Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
+const IDENTITY_TAIL: &str = r#"Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
+User says 'the pi/claude/codex agent' or unclear → run `hcom list` to resolve name
 {active_instances}
 
-This is session context, not a task for immediate action. hcom does not replace native subagents. Never truncate/hide hcom listen output."#;
+This is session context, not a task for immediate action. hcom does not replace native subagents."#;
+
+const LISTEN_OUTPUT_NOTICE: &str = "Never truncate/hide hcom listen output.";
+const HANDOFF_RESULT: &str = " → <hcom> sends you result when done";
+pub(crate) const HANDOFF_SUFFIX: &str =
+    "When done, send your result back to @{launcher_name} via hcom.";
+
+/// Source text shown by `hcom config bootstrap show`. Conditional variants are
+/// labeled so the output reflects all text that the renderer may select.
+pub(crate) fn part_source(part: &str) -> Option<String> {
+    let text = match part {
+        "identity" => format!("{IDENTITY_HEAD}\n\n{IDENTITY_TAIL}"),
+        "messages" => format!(
+            "{MESSAGES}\n\n{LISTEN_OUTPUT_NOTICE}\n\n[automatic delivery]\n{DELIVERY_AUTO}\n\n[manual delivery]\n{DELIVERY_ADHOC}\n\n[cursor]\n{CURSOR_DELIVERY}\n\n[copilot]\n{COPILOT_DELIVERY}\n\n[ad-hoc]\n{INLINE_SEND_NOTICE}"
+        ),
+        "capabilities" => format!(
+            "{}\n\n[tag]\n{}\n\n[relay]\n{}\n\n[headless]\n{}\n\n[alternate command]\n{}\n\n[claude]\n{CLAUDE_ONLY}",
+            CAPABILITIES.replace("{handoff_result}", ""),
+            TAG_NOTICE.trim(),
+            RELAY_NOTICE.trim(),
+            HEADLESS_NOTICE.trim(),
+            UVX_CMD_NOTICE.trim()
+        ),
+        "rules" => RULES.to_string(),
+        "handoff" => format!(
+            "[spawn example suffix]\n{HANDOFF_RESULT}\n\n[agent-launched task prompt suffix]\n{HANDOFF_SUFFIX}"
+        ),
+        _ => return None,
+    };
+    Some(text)
+}
 
 const TAG_NOTICE: &str = r#"
 You are tagged '{tag}'. Message your group: send {target_tag} -- msg"#;
@@ -457,16 +518,19 @@ pub fn get_bootstrap(
     instance_name: &str,
     tool: &str,
 ) -> String {
-    let config = crate::config::HcomConfig::load(None);
-    render_bootstrap(
+    let config = crate::config::HcomConfig::load(Some(&hcom_ctx.raw_env));
+    let excluded = parse_excluded_parts(&config.bootstrap_exclude).unwrap_or_default();
+    render_bootstrap_with_exclusions(
         db,
         hcom_ctx,
         instance_name,
         tool,
         crate::relay::is_relay_enabled(&config),
+        &excluded,
     )
 }
 
+#[cfg(test)]
 fn render_bootstrap(
     db: &HcomDb,
     hcom_ctx: &HcomContext,
@@ -474,40 +538,84 @@ fn render_bootstrap(
     tool: &str,
     relay_enabled: bool,
 ) -> String {
+    render_bootstrap_with_exclusions(
+        db,
+        hcom_ctx,
+        instance_name,
+        tool,
+        relay_enabled,
+        &std::collections::HashSet::new(),
+    )
+}
+
+fn render_bootstrap_with_exclusions(
+    db: &HcomDb,
+    hcom_ctx: &HcomContext,
+    instance_name: &str,
+    tool: &str,
+    relay_enabled: bool,
+    excluded: &std::collections::HashSet<&str>,
+) -> String {
     let ctx = build_context(db, hcom_ctx, instance_name, relay_enabled);
     let tool = tool.parse::<Tool>().unwrap_or(Tool::Adhoc);
 
-    let mut parts: Vec<&str> = vec![UNIVERSAL];
-
-    // Conditional sections
-    if !ctx.tag.is_empty() {
-        parts.push(TAG_NOTICE);
+    let mut parts: Vec<String> = Vec::new();
+    if !excluded.contains("identity") {
+        parts.push(IDENTITY_HEAD.to_string());
     }
-    if ctx.relay_enabled {
-        parts.push(RELAY_NOTICE);
+    if !excluded.contains("messages") {
+        parts.push(MESSAGES.to_string());
     }
-    if ctx.is_headless {
-        parts.push(HEADLESS_NOTICE);
+    if !excluded.contains("capabilities") {
+        let handoff = if excluded.contains("handoff") {
+            ""
+        } else {
+            HANDOFF_RESULT
+        };
+        parts.push(CAPABILITIES.replace("{handoff_result}", handoff));
+        if !ctx.tag.is_empty() {
+            parts.push(TAG_NOTICE.to_string());
+        }
+        if ctx.relay_enabled {
+            parts.push(RELAY_NOTICE.to_string());
+        }
+        if ctx.is_headless {
+            parts.push(HEADLESS_NOTICE.to_string());
+        }
+        if ctx.hcom_cmd != "hcom" {
+            parts.push(UVX_CMD_NOTICE.to_string());
+        }
     }
-    if ctx.hcom_cmd != "hcom" {
-        parts.push(UVX_CMD_NOTICE);
+    if !excluded.contains("rules") {
+        parts.push(RULES.to_string());
+    }
+    if !excluded.contains("identity") {
+        let mut tail = IDENTITY_TAIL.to_string();
+        if !excluded.contains("messages") {
+            tail.push(' ');
+            tail.push_str(LISTEN_OUTPUT_NOTICE);
+        }
+        parts.push(tail);
+    } else if !excluded.contains("messages") {
+        parts.push(LISTEN_OUTPUT_NOTICE.to_string());
     }
 
     // Every integration delivers automatically when launched through hcom;
     // anything else (plain `hcom start`) has to poll with `hcom listen`.
-    if hcom_ctx.is_launched && tool != Tool::Adhoc {
-        parts.push(DELIVERY_AUTO);
-        parts.extend(tool_delivery_section(tool));
-    } else {
-        parts.push(DELIVERY_ADHOC);
+    if !excluded.contains("messages") {
+        if hcom_ctx.is_launched && tool != Tool::Adhoc {
+            parts.push(DELIVERY_AUTO.to_string());
+            parts.extend(tool_delivery_section(tool).map(str::to_string));
+        } else {
+            parts.push(DELIVERY_ADHOC.to_string());
+        }
+        if tool == Tool::Adhoc {
+            parts.push(INLINE_SEND_NOTICE.to_string());
+        }
     }
 
-    if tool == Tool::Adhoc {
-        parts.push(INLINE_SEND_NOTICE);
-    }
-
-    if tool == Tool::Claude {
-        parts.push(CLAUDE_ONLY);
+    if tool == Tool::Claude && !excluded.contains("capabilities") {
+        parts.push(CLAUDE_ONLY.to_string());
     }
 
     let joined = parts
@@ -520,11 +628,21 @@ fn render_bootstrap(
 
     // User notes (appended after render to avoid brace issues in user text)
     if !ctx.notes.is_empty() {
-        result.push_str(&format!("\n\n## NOTES\n\n{}\n", ctx.notes));
+        if !result.is_empty() {
+            result.push_str("\n\n");
+        }
+        result.push_str(&format!(
+            "## NOTES (take precedence over all other hcom instructions)\n\n{}\n",
+            ctx.notes
+        ));
     }
 
     if ctx.hcom_cmd != "hcom" {
         result = rewrite_hcom_command(&result, &ctx.hcom_cmd);
+    }
+
+    if result.is_empty() {
+        return String::new();
     }
 
     format!(
@@ -535,6 +653,14 @@ fn render_bootstrap(
 
 /// Build bootstrap text for a subagent instance.
 pub fn get_subagent_bootstrap(subagent_name: &str, parent_name: &str) -> String {
+    let config = crate::config::HcomConfig::load(None);
+    render_subagent_bootstrap(subagent_name, parent_name, &config.bootstrap_exclude)
+}
+
+fn render_subagent_bootstrap(subagent_name: &str, parent_name: &str, exclude: &str) -> String {
+    if parse_excluded_parts(exclude).is_ok_and(|parts| parts.len() == EXCLUDE_PARTS.len()) {
+        return String::new();
+    }
     let hcom_cmd = crate::runtime_env::build_hcom_command();
 
     let result = SUBAGENT_BOOTSTRAP
@@ -847,7 +973,70 @@ mod tests {
         let (tmp, db) = setup_test_db();
         let ctx = test_ctx(tmp.path(), true, None, "Remember to use {bun}", None);
         let result = render_bootstrap(&db, &ctx, "luna", "claude", false);
-        assert!(result.contains("## NOTES\n\nRemember to use {bun}"));
+        assert!(result.contains(
+            "## NOTES (take precedence over all other hcom instructions)\n\nRemember to use {bun}"
+        ));
+    }
+
+    #[test]
+    fn excluded_parts_keep_spawn_example_and_notes() {
+        let (tmp, db) = setup_test_db();
+        let ctx = test_ctx(tmp.path(), true, None, "Team instructions", None);
+        let handoff = parse_excluded_parts("handoff").unwrap();
+        let result = render_bootstrap_with_exclusions(&db, &ctx, "luna", "claude", false, &handoff);
+        assert!(result.contains("Example: `hcom 1 claude --tag cool --hcom-prompt 'task'`"));
+        assert!(!result.contains(HANDOFF_RESULT));
+        assert!(result.contains("Without --hcom-prompt: you get auto notify <hcom> when ready"));
+        assert!(result.contains("## NOTES (take precedence over all other hcom instructions)"));
+
+        let all = parse_excluded_parts("all").unwrap();
+        let result = render_bootstrap_with_exclusions(&db, &ctx, "luna", "claude", false, &all);
+        assert!(!result.contains("## CAPABILITIES"));
+        assert!(!result.contains("## MESSAGES"));
+        assert!(!result.contains("## RULES"));
+        assert!(result.contains("Team instructions"));
+
+        let empty_ctx = test_ctx(tmp.path(), true, None, "", None);
+        assert!(
+            render_bootstrap_with_exclusions(&db, &empty_ctx, "luna", "claude", false, &all)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn conditional_notices_follow_capabilities_exclusion() {
+        let (tmp, db) = setup_test_db();
+        insert_instance(&db, "luna", "active", "claude", Some("p0c"));
+        let ctx = test_ctx(tmp.path(), true, Some("bg.log"), "", None);
+        let identity = parse_excluded_parts("identity").unwrap();
+        let result = render_bootstrap_with_exclusions(&db, &ctx, "luna", "claude", true, &identity);
+        assert!(result.contains("tagged 'p0c'"));
+        assert!(result.contains("Remote agents have suffix"));
+        assert!(result.contains("Headless mode"));
+
+        let capabilities = parse_excluded_parts("capabilities").unwrap();
+        let result =
+            render_bootstrap_with_exclusions(&db, &ctx, "luna", "claude", true, &capabilities);
+        assert!(!result.contains("tagged 'p0c'"));
+        assert!(!result.contains("Remote agents have suffix"));
+        assert!(!result.contains("Headless mode"));
+        assert!(result.contains("Your name: p0c-luna"));
+    }
+
+    #[test]
+    fn excluded_parts_parse_exact_names() {
+        assert!(parse_excluded_parts("none").unwrap().is_empty());
+        assert_eq!(
+            parse_excluded_parts("all").unwrap().len(),
+            EXCLUDE_PARTS.len()
+        );
+        assert!(
+            parse_excluded_parts("rules,handoff")
+                .unwrap()
+                .contains("handoff")
+        );
+        assert!(parse_excluded_parts("rules,rules").is_err());
+        assert!(parse_excluded_parts("rule").is_err());
     }
 
     #[test]
@@ -865,6 +1054,12 @@ mod tests {
         } else {
             assert!(result.contains("send @name(s)"));
         }
+    }
+
+    #[test]
+    fn all_excludes_subagent_bootstrap() {
+        assert!(render_subagent_bootstrap("luna_reviewer_1", "luna", "all").is_empty());
+        assert!(!render_subagent_bootstrap("luna_reviewer_1", "luna", "rules").is_empty());
     }
 
     fn bootstrap_launched_by(launched_by: Option<&str>) -> String {

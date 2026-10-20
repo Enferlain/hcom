@@ -334,6 +334,7 @@ hcom config -i <name> <key> <value>   # per-agent override at runtime
 | `tag` | Group label — launched agents become `tag-name` |
 | `hints` | Text appended to every message the agent receives |
 | `notes` | Text appended to bootstrap (one-time, at launch) |
+| `bootstrap_exclude` | Bootstrap parts to omit: `identity`, `messages`, `capabilities` (including tag, relay, headless, and command notices), `rules`, `handoff`, or `all` (default: `none`). Inspect with `hcom config bootstrap show [part]`. |
 | `auto_approve` | Auto-approve safe hcom commands (send/list/events/…) |
 | `auto_subscribe` | Event subscription presets: `collision`, `created`, `stopped`, `blocked` |
 | `name_export` | Export instance name to a custom env var |

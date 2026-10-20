@@ -153,6 +153,9 @@ fn bootstrap(db: &HcomDb, bridge: &Bridge) -> String {
     ]);
     let ctx = HcomContext::from_env(&env, PathBuf::from(&bridge.home));
     let base = crate::bootstrap::get_bootstrap(db, &ctx, &bridge.name, "hermes");
+    if base.is_empty() {
+        return base;
+    }
     let hcom = hcom_command();
     if hcom == "hcom" {
         return base;

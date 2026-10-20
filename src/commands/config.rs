@@ -28,6 +28,8 @@ pub struct ConfigArgs {
     /// Value to set (quote multi-word or dash-prefixed values)
     #[arg(allow_hyphen_values = true)]
     pub value: Option<String>,
+    /// Additional arguments for `config bootstrap show/render`.
+    pub extra: Vec<String>,
     /// JSON output
     #[arg(long)]
     pub json: bool,
@@ -672,8 +674,89 @@ pub fn config_instance_set(
 
 // ── Main Entry Point ─────────────────────────────────────────────────────
 
+fn note_bootstrap_exclusion_source() {
+    let file_config = crate::config::HcomConfig::load(Some(&std::collections::HashMap::new()));
+    let effective = crate::config::HcomConfig::load(None);
+    if effective.bootstrap_exclude != file_config.bootstrap_exclude
+        && std::env::var_os("HCOM_BOOTSTRAP_EXCLUDE").is_some()
+    {
+        eprintln!(
+            "Note: bootstrap_exclude={} from the current environment overrides config.toml ({}).",
+            effective.bootstrap_exclude, file_config.bootstrap_exclude
+        );
+    }
+}
+
+fn config_bootstrap(db: &HcomDb, args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("show") => {
+            if args.len() > 2 {
+                eprintln!("Usage: hcom config bootstrap show [part]");
+                return 1;
+            }
+            note_bootstrap_exclusion_source();
+            if let Some(part) = args.get(1) {
+                match crate::bootstrap::part_source(part) {
+                    Some(source) => println!("{source}"),
+                    None => {
+                        eprintln!(
+                            "Unknown bootstrap part '{part}'. Valid parts: {}",
+                            crate::bootstrap::EXCLUDE_PARTS.join(", ")
+                        );
+                        return 1;
+                    }
+                }
+            } else {
+                let config = crate::config::HcomConfig::load(None);
+                let excluded = crate::bootstrap::parse_excluded_parts(&config.bootstrap_exclude)
+                    .unwrap_or_default();
+                for part in crate::bootstrap::EXCLUDE_PARTS {
+                    let state = if excluded.contains(part) {
+                        "excluded"
+                    } else {
+                        "included"
+                    };
+                    println!(
+                        "{part} ({state})\n{}\n",
+                        crate::bootstrap::part_source(part).unwrap_or_default()
+                    );
+                }
+            }
+            0
+        }
+        Some("render") => {
+            if !(3..=4).contains(&args.len()) || (args.len() == 4 && args[3] != "launched") {
+                eprintln!("Usage: hcom config bootstrap render <name> <tool> [launched]");
+                return 1;
+            }
+            if args[2].parse::<crate::tool::Tool>().is_err() {
+                eprintln!("Unknown tool '{}'", args[2]);
+                return 1;
+            }
+            note_bootstrap_exclusion_source();
+            let mut hcom_ctx = crate::shared::HcomContext::from_os();
+            hcom_ctx.is_launched = args.len() == 4;
+            println!(
+                "{}",
+                crate::bootstrap::get_bootstrap(db, &hcom_ctx, &args[1], &args[2])
+            );
+            0
+        }
+        _ => {
+            eprintln!(
+                "Usage: hcom config bootstrap show [part]\n       hcom config bootstrap render <name> <tool> [launched]"
+            );
+            1
+        }
+    }
+}
+
 /// Main entry point for `hcom config` command.
 pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) -> i32 {
+    if args.key.as_deref() != Some("bootstrap") && !args.extra.is_empty() {
+        eprintln!("Error: quote multi-word config values");
+        return 1;
+    }
     drop_old_delivery_keys();
     let json_mode = args.json;
     let edit_mode = args.edit;
@@ -688,6 +771,7 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
         .iter()
         .cloned()
         .chain(args.value.iter().cloned())
+        .chain(args.extra.iter().cloned())
         .collect();
 
     // --setup: only valid with 'terminal kitty' (C4 fix)
@@ -812,6 +896,21 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
     }
 
     let key_arg = &argv[0];
+
+    if key_arg == "bootstrap" {
+        if instance_name.is_some()
+            || edit_mode
+            || unset_mode
+            || reset_mode
+            || setup_mode
+            || info_mode
+            || json_mode
+        {
+            eprintln!("Error: unsupported option for 'hcom config bootstrap'");
+            return 1;
+        }
+        return config_bootstrap(db, &argv[1..]);
+    }
 
     if normalize_key(key_arg) == "HCOM_DEV_ROOT" {
         return config_dev_root(
@@ -1152,6 +1251,29 @@ Usage:
   HCOM_NOTES=\"tips\" hcom 1 claude                 # Per-launch override
 
   Changing after launch has no effect (bootstrap already delivered).",
+        ),
+
+        "HCOM_BOOTSTRAP_EXCLUDE" => Some(
+            "\
+HCOM_BOOTSTRAP_EXCLUDE - Comma-separated bootstrap parts to leave out
+
+Parts: identity, messages, capabilities, rules, handoff
+Default: none
+Use all to exclude every built-in part.
+Excluded parts may remove instructions agents need to use hcom correctly.
+Individual parts affect the main bootstrap; all also suppresses the Claude subagent bootstrap.
+
+  hcom config bootstrap_exclude rules
+  hcom config bootstrap_exclude rules,handoff
+  hcom config bootstrap_exclude all
+  hcom config bootstrap_exclude none
+  HCOM_BOOTSTRAP_EXCLUDE=rules hcom 1 claude
+
+Inspect the exact parts and rendered result:
+  hcom config bootstrap show [part]
+  hcom config bootstrap render <name> <tool> [launched]
+
+Notes remain appended and take precedence over other hcom instructions.",
         ),
 
         "HCOM_TIMEOUT" => Some(

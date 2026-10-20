@@ -242,6 +242,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         .into_values()
         .collect();
     let config_valid = config_errors.is_empty();
+    let bootstrap_exclude = crate::config::HcomConfig::load(None).bootstrap_exclude;
 
     // Terminal — read from config
     let config = crate::config::load_config_snapshot().core;
@@ -282,6 +283,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
             "hcom_writable": dir_writable,
             "config_valid": config_valid,
             "config_errors": config_errors,
+            "bootstrap_exclude": bootstrap_exclude,
             "tools": tool_statuses_json(&tools),
             "terminal": {
                 "config": terminal_config,
@@ -367,6 +369,9 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
     println!("config:    {config_symbol} {config_desc}");
     for msg in &config_errors {
         println!("           {msg}");
+    }
+    if bootstrap_exclude != "none" {
+        println!("bootstrap: ⚠ excluded {bootstrap_exclude}");
     }
 
     // Tools

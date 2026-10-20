@@ -185,6 +185,7 @@ pub(crate) const FIELDS: &[ConfigField] = &[
     f("tag", "HCOM_TAG", "launch.tag", Str, "Group tag for launched instances"),
     f("hints", "HCOM_HINTS", "launch.hints", Str, "Text injected with all messages"),
     f("notes", "HCOM_NOTES", "launch.notes", Str, "One-time notes appended at bootstrap"),
+    f("bootstrap_exclude", "HCOM_BOOTSTRAP_EXCLUDE", "launch.bootstrap_exclude", Str, "Bootstrap parts to exclude (comma-separated, none, or all)"),
     f("subagent_timeout", "HCOM_SUBAGENT_TIMEOUT", "launch.subagent_timeout", Int, "Timeout for Claude subagents in seconds (default: 30)"),
     f("auto_subscribe", "HCOM_AUTO_SUBSCRIBE", "launch.auto_subscribe", Str, "Auto-subscribe event presets (comma-separated)"),
     f("auto_trust_workspace", "HCOM_AUTO_TRUST_WORKSPACE", "launch.auto_trust_workspace", Bool, "Auto-approve workspace trust at launch; may persist in tool config"),
@@ -270,6 +271,7 @@ pub struct HcomConfig {
     pub terminal: String,
     pub hints: String,
     pub notes: String,
+    pub bootstrap_exclude: String,
     pub tag: String,
     pub claude_args: String,
     /// How idle Claude agents are woken: `"native"` (default) through hcom's
@@ -319,6 +321,7 @@ impl Default for HcomConfig {
             terminal: "default".to_string(),
             hints: String::new(),
             notes: String::new(),
+            bootstrap_exclude: "none".to_string(),
             tag: String::new(),
             claude_args: String::new(),
             claude_delivery: DEFAULT_DELIVERY.to_string(),
@@ -483,6 +486,9 @@ impl HcomConfig {
             }
         }
 
+        if let Err(error) = crate::bootstrap::parse_excluded_parts(&self.bootstrap_exclude) {
+            errors.insert("bootstrap_exclude".into(), error);
+        }
         // Validate auto_subscribe (comma-separated alphanumeric/underscore preset names)
         if !self.auto_subscribe.is_empty() {
             for preset in self.auto_subscribe.split(',') {
@@ -509,6 +515,7 @@ impl HcomConfig {
             "terminal" => Some(self.terminal.clone()),
             "hints" => Some(self.hints.clone()),
             "notes" => Some(self.notes.clone()),
+            "bootstrap_exclude" => Some(self.bootstrap_exclude.clone()),
             "tag" => Some(self.tag.clone()),
             "claude_args" => Some(self.claude_args.clone()),
             "claude_delivery" => Some(self.claude_delivery.clone()),
@@ -559,6 +566,7 @@ impl HcomConfig {
             "terminal" => self.terminal = value.to_string(),
             "hints" => self.hints = value.to_string(),
             "notes" => self.notes = value.to_string(),
+            "bootstrap_exclude" => self.bootstrap_exclude = value.to_string(),
             "tag" => self.tag = value.to_string(),
             "claude_args" => self.claude_args = value.to_string(),
             "claude_delivery" => self.claude_delivery = value.to_string(),
@@ -2277,6 +2285,7 @@ auto_approve = false
             (_, "title_mode") => "label",
             (_, name) if name.ends_with("_delivery") => "inject",
             (_, "auto_subscribe") => "sample",
+            (_, "bootstrap_exclude") => "rules",
             _ => "sample-value",
         }
     }

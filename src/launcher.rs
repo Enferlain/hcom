@@ -354,6 +354,25 @@ fn apply_inherited_notes(instance_env: &mut HashMap<String, String>, inherited: 
     }
 }
 
+fn reply_handoff_suffix(
+    launcher_name: &str,
+    append_reply_handoff: bool,
+    excluded: &std::collections::HashSet<&str>,
+) -> String {
+    if append_reply_handoff
+        && launcher_name != "api"
+        && launcher_name != "user"
+        && !excluded.contains("handoff")
+    {
+        format!(
+            "\n\n{}",
+            crate::bootstrap::HANDOFF_SUFFIX.replace("{launcher_name}", launcher_name)
+        )
+    } else {
+        String::new()
+    }
+}
+
 /// Start a new Grok conversation under an explicit session id.
 ///
 /// Without one the TUI opens on its welcome screen over a hidden "home"
@@ -1921,6 +1940,12 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             insert_effective_env(&mut base_env, key.clone(), value.clone(), cfg!(windows));
         }
     }
+    let bootstrap_exclude_value = base_env
+        .get("HCOM_BOOTSTRAP_EXCLUDE")
+        .cloned()
+        .unwrap_or_else(|| "none".to_string());
+    let bootstrap_excluded = crate::bootstrap::parse_excluded_parts(&bootstrap_exclude_value)
+        .map_err(anyhow::Error::msg)?;
     base_env.remove("HCOM_TERMINAL");
     ensure_tool_config_env(&normalized, &mut base_env);
 
@@ -2089,12 +2114,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // When a real hcom participant launched us, append a reply instruction so
     // the spawned agent knows to send its result back.
     if let Some(ref prompt) = params.initial_prompt {
-        let reply_suffix =
-            if params.append_reply_handoff && launcher_name != "api" && launcher_name != "user" {
-                format!("\n\nWhen done, send your result back to @{launcher_name} via hcom.")
-            } else {
-                String::new()
-            };
+        let reply_suffix = reply_handoff_suffix(
+            &launcher_name,
+            params.append_reply_handoff,
+            &bootstrap_excluded,
+        );
         let full_prompt = format!("{prompt}{reply_suffix}");
         append_initial_prompt_args(&normalized, &mut params.args, full_prompt)?;
     }
@@ -3597,6 +3621,30 @@ mod tests {
         let bootstrap = build_grok_bootstrap(&db, hcom_dir.path(), "kumo", true, &HashMap::new());
         assert!(bootstrap.contains("Your name: kumo"));
         assert!(bootstrap.contains("Messages instantly and automatically arrive"));
+    }
+
+    #[test]
+    fn test_handoff_exclusion_controls_reply_suffix() {
+        let included = crate::bootstrap::parse_excluded_parts("none").unwrap();
+        let excluded = crate::bootstrap::parse_excluded_parts("handoff").unwrap();
+        assert_eq!(
+            reply_handoff_suffix("nova", true, &included),
+            "\n\nWhen done, send your result back to @nova via hcom."
+        );
+        assert!(reply_handoff_suffix("nova", true, &excluded).is_empty());
+        assert!(reply_handoff_suffix("user", true, &included).is_empty());
+        assert!(reply_handoff_suffix("nova", false, &included).is_empty());
+    }
+
+    #[test]
+    fn test_codex_bootstrap_uses_effective_exclusion_env() {
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let env = HashMap::from([("HCOM_BOOTSTRAP_EXCLUDE".to_string(), "messages".to_string())]);
+        let bootstrap = build_codex_bootstrap(&db, hcom_dir.path(), "luna", false, &env);
+        assert!(!bootstrap.contains("## MESSAGES"));
+        assert!(!bootstrap.contains("## DELIVERY"));
+        assert!(bootstrap.contains("## CAPABILITIES"));
     }
 
     #[test]

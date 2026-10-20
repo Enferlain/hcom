@@ -604,6 +604,10 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
     ("  hints", "Text appended to all messages agent receives"),
     ("  notes", "Notes appended to agent bootstrap"),
     (
+        "  bootstrap_exclude",
+        "Bootstrap parts to leave out (see config bootstrap show)",
+    ),
+    (
         "  subagent_timeout",
         "Subagent keep-alive seconds after task",
     ),
@@ -1016,6 +1020,10 @@ fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String
         "HCOM_HINTS"
     ));
     lines.push(format!("    {:<28} One-time bootstrap notes", "HCOM_NOTES"));
+    lines.push(format!(
+        "    {:<28} Bootstrap parts to exclude",
+        "HCOM_BOOTSTRAP_EXCLUDE"
+    ));
     for (u, d) in spec.help.extra_env {
         lines.push(format!("    {:<28} {}", u.trim(), d));
     }

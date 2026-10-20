@@ -214,6 +214,9 @@ pub fn add_codex_developer_instructions(
     codex_args: &[String],
     bootstrap_text: &str,
 ) -> Vec<String> {
+    if bootstrap_text.is_empty() {
+        return codex_args.to_vec();
+    }
     let mut existing_dev_instructions: Option<String> = None;
     let mut remaining = Vec::with_capacity(codex_args.len() + 2);
     let mut i = 0;
@@ -543,6 +546,12 @@ mod tests {
             result,
             s(&["-m", "o3", "-c", "developer_instructions=\"BOOTSTRAP\""])
         );
+    }
+
+    #[test]
+    fn test_empty_bootstrap_preserves_existing_developer_instructions() {
+        let args = s(&["-c", "developer_instructions=\"USER_NOTES\"", "-m", "o3"]);
+        assert_eq!(add_codex_developer_instructions(&args, ""), args);
     }
 
     #[test]
