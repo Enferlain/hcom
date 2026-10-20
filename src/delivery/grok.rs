@@ -23,8 +23,9 @@
 //!
 //! Grok uses our `promptId` as the queue entry id. The batch is acknowledged
 //! when Grok reports that entry running (`x.ai/queue/changed`), i.e. once it
-//! is part of the model's turn, or when the prompt request returns a result.
-//! A batch that never started (removed from the queue, transport lost) stays
+//! is part of the model's turn, when Grok injects it into the running turn
+//! (`x.ai/session/interjection`, follow-up behavior Steer), or when the prompt
+//! request returns a result. A batch that never started (removed from the queue, transport lost) stays
 //! unread and is queued again later: at-least-once, never silently dropped.
 //!
 //! When the leader restarts (it does so to apply an auto-update), the bridge
@@ -799,6 +800,15 @@ fn queue_outcome(params: &Value, flight: &InFlight) -> Option<Outcome> {
     None
 }
 
+/// Whether an `x.ai/session/interjection` is our prompt. With follow-up
+/// behavior Steer, Grok moves a queued prompt into a running turn with the
+/// same owner, so only into a turn hcom started: it announces it under our
+/// prompt id, then answers the prompt `removedFromQueue`.
+fn interjected(params: &Value, flight: &InFlight) -> bool {
+    params["sessionId"].as_str() == Some(flight.session.as_str())
+        && params["interjectionId"].as_str() == Some(flight.prompt_id.as_str())
+}
+
 /// Whether the session transcript shows the prompt text as sent: durable
 /// proof it ran when the live evidence was lost (bridge disconnect, a merge
 /// snapshot that never arrived).
@@ -1153,6 +1163,11 @@ pub(super) fn run(
                     {
                         outcome = queue_outcome(&params, flight);
                     }
+                    if method == "x.ai/session/interjection"
+                        && in_flight.as_ref().is_some_and(|f| interjected(&params, f))
+                    {
+                        outcome = Some(Outcome::Delivered);
+                    }
                     effects.extend(tracker.on_notification(&method, &params));
                 }
                 Event::Request { id, method, params } => {
@@ -1485,6 +1500,20 @@ mod tests {
     }
 
     #[test]
+    fn steer_injection_of_our_prompt_is_delivered() {
+        let ours = json!({"sessionId": "s", "text": BATCH, "interjectionId": "hcom-1"});
+        assert!(interjected(&ours, &flight(false)));
+        assert!(interjected(&ours, &flight(true)));
+        for other in [
+            json!({"sessionId": "s", "text": BATCH, "interjectionId": "user-1"}),
+            json!({"sessionId": "s", "text": BATCH}),
+            json!({"sessionId": "other", "text": BATCH, "interjectionId": "hcom-1"}),
+        ] {
+            assert!(!interjected(&other, &flight(true)), "{other}");
+        }
+    }
+
+    #[test]
     fn detached_batch_follows_the_reconnected_queue() {
         let mut detached = flight(false);
         detached.detached_at = Some(Instant::now());
@@ -1525,6 +1554,12 @@ mod tests {
         assert!(!ran_in_transcript(&path, BATCH));
         // Merged into a combined turn.
         std::fs::write(&path, format!("{}\n", chunk(&format!("fix it\n\n{BATCH}")))).unwrap();
+        assert!(ran_in_transcript(&path, BATCH));
+        // Injected by steer: the persisted chunk wraps the text.
+        let steer = format!(
+            "The user sent a message while you were working:\n<user_query>\n{BATCH}\n</user_query>\n..."
+        );
+        std::fs::write(&path, format!("{}\n", chunk(&steer))).unwrap();
         assert!(ran_in_transcript(&path, BATCH));
         assert!(!ran_in_transcript(&dir.path().join("missing"), BATCH));
     }
