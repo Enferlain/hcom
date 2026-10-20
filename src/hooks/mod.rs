@@ -22,35 +22,123 @@ pub mod utils;
 
 use serde_json::Value;
 
-/// Shared test helpers for hook test modules (claude, codex, gemini).
+/// Shared test helpers: process-wide env and Config isolation.
 #[cfg(test)]
 pub mod test_helpers {
+    use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    // Process-global serialization for tests that mutate HCOM_DIR/HOME.
-    // Env vars are process-wide; without this, parallel tests trample each
-    // other (e.g. one test's config write lands in another's tempdir).
-    // Recover from poison so a panic in one test doesn't cascade-fail the
-    // next — the shared state is just "one set of env vars at a time."
-    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn acquire_env_lock() -> MutexGuard<'static, ()> {
-        TEST_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    /// Env vars and the global Config are process-wide, so a test that changes
+    /// them must hold the `#[serial]` lock: every other `#[serial]` test is then
+    /// excluded, and tests without it never touch either. Fail loudly when the
+    /// attribute is missing instead of racing a parallel test.
+    #[track_caller]
+    pub fn assert_serial() {
+        assert!(
+            serial_test::is_locked_serially(None),
+            "this test changes process-wide env/Config: mark it #[serial]"
+        );
     }
+
+    /// Snapshot of env vars, restored on drop (in reverse, so a key captured
+    /// twice ends at its first value). Only for `#[serial]` tests.
+    #[must_use]
+    pub struct EnvVarGuard {
+        saved: Vec<(String, Option<OsString>)>,
+    }
+
+    impl EnvVarGuard {
+        /// Capture `keys` without changing them.
+        #[track_caller]
+        pub fn save<I, K>(keys: I) -> Self
+        where
+            I: IntoIterator<Item = K>,
+            K: AsRef<str>,
+        {
+            assert_serial();
+            let saved = keys
+                .into_iter()
+                .map(|key| key.as_ref().to_string())
+                .map(|key| {
+                    let value = std::env::var_os(&key);
+                    (key, value)
+                })
+                .collect();
+            Self { saved }
+        }
+
+        /// Capture `keys`, then unset them.
+        #[track_caller]
+        pub fn remove<I, K>(keys: I) -> Self
+        where
+            I: IntoIterator<Item = K>,
+            K: AsRef<str>,
+        {
+            let guard = Self::save(keys);
+            for (key, _) in &guard.saved {
+                // SAFETY: assert_serial excludes every other env-touching test.
+                unsafe { std::env::remove_var(key) };
+            }
+            guard
+        }
+
+        #[track_caller]
+        pub fn unset(key: &str) -> Self {
+            Self::remove([key])
+        }
+
+        #[track_caller]
+        pub fn set(key: &str, value: impl AsRef<OsStr>) -> Self {
+            let guard = Self::save([key]);
+            // SAFETY: assert_serial excludes every other env-touching test.
+            unsafe { std::env::set_var(key, value) };
+            guard
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.iter().rev() {
+                // SAFETY: still inside the #[serial] test that built the guard.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tool config dirs and delivery modes a developer's shell may export;
+    /// inheriting one would point a test at the real tool config, or switch
+    /// delivery loops to plugin mode when tests run inside an hcom agent.
+    const TOOL_CONFIG_OVERRIDES: [&str; 19] = [
+        "CLAUDE_CONFIG_DIR",
+        "OPENCODE_CONFIG_DIR",
+        "CODEX_HOME",
+        "CURSOR_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "GEMINI_CLI_HOME",
+        "KILO_CONFIG_DIR",
+        "KIMI_CODE_HOME",
+        "COPILOT_HOME",
+        "QODER_CONFIG_DIR",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_CONFIG_DIR",
+        "OMP_PROFILE",
+        "PI_PROFILE",
+        "HERMES_HOME",
+        crate::hooks::claude_mod::DELIVERY_ENV,
+        crate::hooks::copilot::EXTENSION_DELIVERY_ENV,
+    ];
 
     /// RAII guard that clears tool config overrides, restores the environment, and resets Config.
     pub struct EnvGuard {
-        saved_overrides: Vec<(&'static str, Option<std::ffi::OsString>)>,
-        saved_hcom: Option<String>,
-        saved_home: Option<String>,
-        saved_test_codex_cli_version: Option<String>,
-        // Declared last so it drops AFTER Drop::drop restores env vars,
-        // releasing the lock only once this test's env state is gone.
-        _lock: MutexGuard<'static, ()>,
+        // Option so Drop can restore env before rebuilding Config from it.
+        vars: Option<EnvVarGuard>,
     }
 
     impl Default for EnvGuard {
@@ -60,72 +148,24 @@ pub mod test_helpers {
     }
 
     impl EnvGuard {
+        #[track_caller]
         pub fn new() -> Self {
-            let lock = acquire_env_lock();
-            let saved_overrides = [
-                "CLAUDE_CONFIG_DIR",
-                "OPENCODE_CONFIG_DIR",
-                "CODEX_HOME",
-                "CURSOR_CONFIG_DIR",
-                "XDG_CONFIG_HOME",
-                "XDG_DATA_HOME",
-                "GEMINI_CLI_HOME",
-                "KILO_CONFIG_DIR",
-                "KIMI_CODE_HOME",
-                "COPILOT_HOME",
-                "QODER_CONFIG_DIR",
-                "PI_CODING_AGENT_DIR",
-                "PI_CODING_AGENT_SESSION_DIR",
-                "PI_CONFIG_DIR",
-                "OMP_PROFILE",
-                "PI_PROFILE",
-                "HERMES_HOME",
-                // Set when the tests run inside an hcom-launched agent; they
-                // switch delivery loops to plugin mode.
-                crate::hooks::claude_mod::DELIVERY_ENV,
-                crate::hooks::copilot::EXTENSION_DELIVERY_ENV,
-            ]
-            .into_iter()
-            .map(|key| (key, std::env::var_os(key)))
-            .collect::<Vec<_>>();
-            let guard = Self {
-                saved_overrides,
-                saved_hcom: std::env::var("HCOM_DIR").ok(),
-                saved_home: std::env::var("HOME").ok(),
-                saved_test_codex_cli_version: std::env::var("HCOM_TEST_CODEX_CLI_VERSION").ok(),
-                _lock: lock,
-            };
-            for (key, _) in &guard.saved_overrides {
+            let vars = EnvVarGuard::save(
+                ["HCOM_DIR", "HOME", "HCOM_TEST_CODEX_CLI_VERSION"]
+                    .into_iter()
+                    .chain(TOOL_CONFIG_OVERRIDES),
+            );
+            for key in TOOL_CONFIG_OVERRIDES {
+                // SAFETY: EnvVarGuard::save asserted the #[serial] lock.
                 unsafe { std::env::remove_var(key) };
             }
-            guard
+            Self { vars: Some(vars) }
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            unsafe {
-                match &self.saved_hcom {
-                    Some(v) => std::env::set_var("HCOM_DIR", v),
-                    None => std::env::remove_var("HCOM_DIR"),
-                }
-                match &self.saved_home {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-                match &self.saved_test_codex_cli_version {
-                    Some(v) => std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", v),
-                    None => std::env::remove_var("HCOM_TEST_CODEX_CLI_VERSION"),
-                }
-            }
-            for (key, value) in &self.saved_overrides {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
+            drop(self.vars.take());
             crate::config::Config::reset();
             crate::config::Config::init();
         }
@@ -133,6 +173,7 @@ pub mod test_helpers {
 
     /// Create an isolated test env: tempdir with .hcom dir, env vars set.
     /// Returns (tempdir, hcom_dir, test_home, guard).
+    #[track_caller]
     pub fn isolated_test_env() -> (tempfile::TempDir, PathBuf, PathBuf, EnvGuard) {
         let guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
@@ -142,6 +183,7 @@ pub mod test_helpers {
         // Claim this tempdir as a disposable root so Config trusts it (temp-tree
         // geography alone is not enough — see paths::test_roots).
         crate::paths::test_roots::register(&test_home);
+        // SAFETY: EnvGuard::new asserted the #[serial] lock.
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
@@ -158,13 +200,13 @@ pub mod test_helpers {
     #[test]
     #[serial_test::serial]
     fn isolated_hooks_clear_inherited_config_overrides() {
-        let (_dir, _hcom_dir, home, guard) = isolated_test_env();
+        let (_dir, _hcom_dir, home, _guard) = isolated_test_env();
         assert_eq!(
             std::env::var_os("CODEX_HOME"),
             Some(home.join(".codex").into_os_string())
         );
-        for (key, _) in &guard.saved_overrides {
-            if *key != "CODEX_HOME" {
+        for key in TOOL_CONFIG_OVERRIDES {
+            if key != "CODEX_HOME" {
                 assert!(
                     std::env::var_os(key).is_none(),
                     "inherited {key} escaped isolation"

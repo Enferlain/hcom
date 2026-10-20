@@ -3085,13 +3085,9 @@ mod tests {
     fn test_lookup_opencode_family_session_falls_back_to_session_v2() {
         let _guard = crate::hooks::test_helpers::EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
-        let saved_db = std::env::var("OPENCODE_DB").ok();
-        let saved_xdg = std::env::var("XDG_DATA_HOME").ok();
         let db_path = dir.path().join("oc.db");
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", dir.path());
-            std::env::set_var("OPENCODE_DB", &db_path);
-        }
+        let _xdg = crate::hooks::test_helpers::EnvVarGuard::set("XDG_DATA_HOME", dir.path());
+        let _db = crate::hooks::test_helpers::EnvVarGuard::set("OPENCODE_DB", &db_path);
 
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         // v2-only DB: no `session` table at all.
@@ -3118,17 +3114,6 @@ mod tests {
             lookup_opencode_family_session("opencode", "ses_missing"),
             None
         );
-
-        unsafe {
-            match saved_db {
-                Some(v) => std::env::set_var("OPENCODE_DB", v),
-                None => std::env::remove_var("OPENCODE_DB"),
-            }
-            match saved_xdg {
-                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-                None => std::env::remove_var("XDG_DATA_HOME"),
-            }
-        }
     }
 
     #[test]
@@ -4101,18 +4086,8 @@ mod tests {
     /// Point Claude's config dir at `dir` for the duration of `f` by setting
     /// CLAUDE_CONFIG_DIR. Restored on exit. serial_test required.
     fn with_claude_config_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let prev = std::env::var("CLAUDE_CONFIG_DIR").ok();
-        // SAFETY: tests using this must be serial_test::serial — only one
-        // test at a time touches this env var.
-        unsafe {
-            std::env::set_var("CLAUDE_CONFIG_DIR", dir);
-        }
-        let out = f();
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", v) },
-            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
-        }
-        out
+        let _dir = crate::hooks::test_helpers::EnvVarGuard::set("CLAUDE_CONFIG_DIR", dir);
+        f()
     }
 
     #[test]
@@ -4379,17 +4354,8 @@ mod tests {
         std::fs::write(&session_path, format!(r#"{{"projectHash":"{hex}"}}"#)).unwrap();
 
         // Stub GEMINI_CLI_HOME so recover_gemini_cwd reads from our fake tree.
-        let prev = std::env::var("GEMINI_CLI_HOME").ok();
-        // SAFETY: test is single-threaded enough for this module; serial_test
-        // isn't in scope here, but other tests don't touch GEMINI_CLI_HOME.
-        unsafe {
-            std::env::set_var("GEMINI_CLI_HOME", base);
-        }
+        let _gemini_home = crate::hooks::test_helpers::EnvVarGuard::set("GEMINI_CLI_HOME", base);
         let result = extract_cwd_from_transcript(session_path.to_str().unwrap(), "gemini");
-        match prev {
-            Some(v) => unsafe { std::env::set_var("GEMINI_CLI_HOME", v) },
-            None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
-        }
 
         assert_eq!(result, Some(fake_cwd.to_string()));
     }
@@ -4672,15 +4638,8 @@ mod tests {
         std::fs::create_dir_all(&gemini).unwrap();
         let path = gemini.join("test.json");
         std::fs::write(&path, r#"{"projectHash":"deadbeef"}"#).unwrap();
-        let prev = std::env::var("GEMINI_CLI_HOME").ok();
-        unsafe {
-            std::env::set_var("GEMINI_CLI_HOME", base);
-        }
+        let _gemini_home = crate::hooks::test_helpers::EnvVarGuard::set("GEMINI_CLI_HOME", base);
         let result = extract_cwd_from_transcript(path.to_str().unwrap(), "gemini");
-        match prev {
-            Some(v) => unsafe { std::env::set_var("GEMINI_CLI_HOME", v) },
-            None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
-        }
         assert_eq!(result, None);
     }
 }

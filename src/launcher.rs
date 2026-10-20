@@ -2836,55 +2836,24 @@ fn cleanup_instance(db: &HcomDb, name: &str, process_id: &str) {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::collections::BTreeMap;
 
-    struct EnvVarGuard {
-        saved: BTreeMap<String, Option<std::ffi::OsString>>,
-    }
+    use crate::hooks::test_helpers::EnvVarGuard;
 
-    impl EnvVarGuard {
-        fn clean_detection_env() -> Self {
-            let mut keys: Vec<String> = tool_marker_vars()
-                .iter()
-                .copied()
-                .chain(["HCOM_LAUNCHED", "CI", "GITHUB_ACTIONS", "CARGO_TEST_PARENT"])
-                .map(str::to_string)
-                .collect();
-            keys.extend(
-                std::env::vars_os()
-                    .map(|(key, _)| key)
-                    .filter_map(|key| key.into_string().ok())
-                    .filter(|key| key.starts_with("CARGO_")),
-            );
-            Self::remove(keys)
-        }
-
-        fn remove<I>(keys: I) -> Self
-        where
-            I: IntoIterator<Item = String>,
-        {
-            let mut saved = BTreeMap::new();
-            for key in keys {
-                saved
-                    .entry(key.clone())
-                    .or_insert_with(|| std::env::var_os(&key));
-                unsafe { std::env::remove_var(key) };
-            }
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.saved {
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        }
+    /// Unset every variable launch-context detection reads.
+    fn clean_detection_env() -> EnvVarGuard {
+        let mut keys: Vec<String> = tool_marker_vars()
+            .iter()
+            .copied()
+            .chain(["HCOM_LAUNCHED", "CI", "GITHUB_ACTIONS", "CARGO_TEST_PARENT"])
+            .map(str::to_string)
+            .collect();
+        keys.extend(
+            std::env::vars_os()
+                .map(|(key, _)| key)
+                .filter_map(|key| key.into_string().ok())
+                .filter(|key| key.starts_with("CARGO_")),
+        );
+        EnvVarGuard::remove(keys)
     }
 
     #[test]
@@ -3314,14 +3283,14 @@ mod tests {
     #[test]
     #[serial]
     fn test_clean_detection_env_clears_and_restores_all_markers() {
-        let _original = EnvVarGuard::clean_detection_env();
+        let _original = clean_detection_env();
         for var in tool_marker_vars() {
             unsafe { std::env::set_var(var, "1") };
         }
         assert!(contaminated_parent());
 
         {
-            let _clean = EnvVarGuard::clean_detection_env();
+            let _clean = clean_detection_env();
             for var in tool_marker_vars() {
                 assert!(std::env::var_os(var).is_none(), "{var} was not cleared");
             }
@@ -3340,7 +3309,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_contaminated_parent_detection() {
-        let _guard = EnvVarGuard::clean_detection_env();
+        let _guard = clean_detection_env();
         assert!(!contaminated_parent());
 
         for rule in crate::shared::tool_detection::TOOL_DETECTION_RULES {

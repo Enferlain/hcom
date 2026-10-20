@@ -52,7 +52,9 @@ impl Config {
     /// Reset global config (test-only).
     /// Allows tests to reinitialize config with different env vars.
     #[cfg(test)]
+    #[track_caller]
     pub fn reset() {
+        crate::hooks::test_helpers::assert_serial();
         *CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 

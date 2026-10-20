@@ -3262,36 +3262,7 @@ mod tests {
         );
     }
 
-    struct EnvGuard(Vec<(&'static str, Option<String>)>);
-
-    impl EnvGuard {
-        fn clear(vars: &'static [&'static str]) -> Self {
-            let saved = vars
-                .iter()
-                .map(|&var| (var, std::env::var(var).ok()))
-                .collect::<Vec<_>>();
-            for &var in vars {
-                unsafe {
-                    std::env::remove_var(var);
-                }
-            }
-            Self(saved)
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (var, value) in &self.0 {
-                unsafe {
-                    if let Some(value) = value {
-                        std::env::set_var(var, value);
-                    } else {
-                        std::env::remove_var(var);
-                    }
-                }
-            }
-        }
-    }
+    use crate::hooks::test_helpers::EnvVarGuard;
 
     #[test]
     fn test_native_termux_runtime_requires_all_native_signals() {
@@ -3738,8 +3709,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_normalize_terminal_mode_for_launch_resolves_socket_for_auto_detected_kitty() {
-        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
-        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
+        let _env = EnvVarGuard::remove(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvVarGuard::remove(DETECT_ONLY_VARS);
         unsafe {
             std::env::set_var("KITTY_WINDOW_ID", "window-1");
             std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
@@ -3754,8 +3725,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_resolve_terminal_mode_for_tips_uses_normalized_auto_detected_mode() {
-        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
-        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
+        let _env = EnvVarGuard::remove(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvVarGuard::remove(DETECT_ONLY_VARS);
         unsafe {
             std::env::set_var("KITTY_WINDOW_ID", "window-1");
             std::env::set_var("KITTY_LISTEN_ON", "unix:/tmp/kitty-test");
@@ -3770,8 +3741,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_detect_terminal_from_ptyxis_version() {
-        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
-        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
+        let _env = EnvVarGuard::remove(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvVarGuard::remove(DETECT_ONLY_VARS);
         unsafe {
             std::env::set_var("PTYXIS_VERSION", "50.1");
         }
@@ -3782,9 +3753,9 @@ mod tests {
     #[test]
     #[serial]
     fn test_auto_detected_ptyxis_requires_host_launcher_for_new_window() {
-        let _env = EnvGuard::clear(TERMINAL_CONTEXT_VARS);
-        let _detect = EnvGuard::clear(DETECT_ONLY_VARS);
-        let _path = EnvGuard::clear(&["PATH"]);
+        let _env = EnvVarGuard::remove(TERMINAL_CONTEXT_VARS);
+        let _detect = EnvVarGuard::remove(DETECT_ONLY_VARS);
+        let _path = EnvVarGuard::unset("PATH");
         let empty_path = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("PTYXIS_VERSION", "50.1");

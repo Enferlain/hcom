@@ -696,18 +696,8 @@ mod tests {
         std::fs::create_dir_all(&bin_dir).unwrap();
         std::fs::write(bin_dir.join("agy"), "").unwrap();
 
-        let old_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
+        let _home = crate::hooks::test_helpers::EnvVarGuard::set("HOME", dir.path());
         assert!(is_antigravity_installed());
-        unsafe {
-            if let Some(home) = old_home {
-                std::env::set_var("HOME", home);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
     }
 
     // B-2: preset availability must match the validate/launch platform gate —

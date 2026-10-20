@@ -871,38 +871,7 @@ mod reservation_tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            // SAFETY: tests using this guard are marked #[serial].
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            // SAFETY: tests using this guard are marked #[serial].
-            unsafe { std::env::remove_var(key) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: tests using this guard are marked #[serial].
-            unsafe {
-                match &self.previous {
-                    Some(v) => std::env::set_var(self.key, v),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
+    use crate::hooks::test_helpers::EnvVarGuard;
 
     fn setup_db() -> (TempDir, HcomDb) {
         let tmp = TempDir::new().unwrap();

@@ -1290,38 +1290,7 @@ mod tests {
     use serial_test::serial;
     use std::path::PathBuf;
 
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            // SAFETY: tests using this guard are marked #[serial].
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            // SAFETY: tests using this guard are marked #[serial].
-            unsafe { std::env::remove_var(key) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: tests using this guard are marked #[serial].
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
+    use crate::hooks::test_helpers::EnvVarGuard;
 
     fn setup_test_db() -> (HcomDb, PathBuf) {
         use std::sync::atomic::{AtomicU64, Ordering};

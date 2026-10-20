@@ -318,20 +318,16 @@ mod tests {
     #[test]
     #[serial]
     fn resolver_shell_seeds_prefix_so_rc_derived_tmpdir_survives() {
+        use crate::hooks::test_helpers::EnvVarGuard;
         let shell = test_shell_path();
-        let original = std::env::var_os("PREFIX");
-        unsafe { std::env::set_var("PREFIX", "/seeded/prefix") };
-
-        let seeded = clean_shell_seed_env(&shell);
-
-        unsafe { std::env::remove_var("PREFIX") };
-        let unset = clean_shell_seed_env(&shell);
-
-        // Restore before asserting: this is real process-global state that
-        // sibling tests spawn login shells against.
-        if let Some(value) = original {
-            unsafe { std::env::set_var("PREFIX", value) };
-        }
+        let seeded = {
+            let _prefix = EnvVarGuard::set("PREFIX", "/seeded/prefix");
+            clean_shell_seed_env(&shell)
+        };
+        let unset = {
+            let _prefix = EnvVarGuard::unset("PREFIX");
+            clean_shell_seed_env(&shell)
+        };
 
         assert_eq!(
             seeded.get("PREFIX").map(String::as_str),
