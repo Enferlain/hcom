@@ -1263,7 +1263,7 @@ fn resume_fork_help(usage_line: &str, blurb: &str, see_also_line: &str) -> Strin
          \x20 {usage_line}\n\
          \n\
          <target> can be:\n\
-         \x20 <name>                            hcom name (4-letter)\n\
+         \x20 <name>                            hcom name (e.g. luna)\n\
          \x20 <uuid>                            claude/codex/gemini session UUID\n\
          \x20 ses_<id>                          opencode/kilo session ID\n\
          \x20 <thread-name>                     claude /rename title or codex thread_name\n\

@@ -28,7 +28,7 @@ pub fn edit_distance(a: &str, b: &str) -> usize {
 
 /// Candidates close to `input`, nearest first, at most `max` of them.
 ///
-/// Tolerance scales with length: short words (agent names are 4 letters)
+/// Tolerance scales with length: short words (like 4-letter agent names)
 /// allow one edit, longer ones two. A candidate that starts with the input
 /// (`sta` → `status`) also matches, since users abbreviate.
 pub fn suggest<'a, I>(input: &str, candidates: I, max: usize) -> Vec<String>

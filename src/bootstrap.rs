@@ -117,7 +117,7 @@ const RULES: &str = r#"## RULES
 1. No filler messages (greetings, thanks, congrats).
 2. Don't delegate to existing agents unless asked. Need help? Spawn your own agents."#;
 
-const IDENTITY_TAIL: &str = r#"Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
+const IDENTITY_TAIL: &str = r#"Agent names are {name_shape}. When user mentions one, they mean an agent.
 User says 'the pi/claude/codex agent' or unclear → run `hcom list` to resolve name
 {active_instances}
 
@@ -415,6 +415,7 @@ struct BootstrapContext {
     hcom_cmd: String,
     is_headless: bool,
     active_instances: String,
+    name_shape: &'static str,
     scripts: String,
     launch_tools: String,
     launched_by: String,
@@ -448,6 +449,7 @@ fn build_context(
         hcom_cmd: crate::runtime_env::build_hcom_command(),
         is_headless: hcom_ctx.is_background,
         active_instances: get_active_instances(db, instance_name),
+        name_shape: crate::instance_names::describe_generated_names(db),
         scripts: get_scripts(&hcom_ctx.hcom_dir),
         launch_tools: launch_tool_names(),
         launched_by: launched_by_line(hcom_ctx.launched_by.as_deref(), instance_name),
@@ -465,6 +467,7 @@ fn render_template(template: &str, ctx: &BootstrapContext) -> String {
         .replace("{tag}", &ctx.tag)
         .replace("{hcom_cmd}", &ctx.hcom_cmd)
         .replace("{active_instances}", &ctx.active_instances)
+        .replace("{name_shape}", ctx.name_shape)
         .replace("{scripts}", &ctx.scripts)
         .replace("{launch_tools}", &ctx.launch_tools)
         .replace("{launched_by}", &ctx.launched_by)

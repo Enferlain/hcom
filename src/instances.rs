@@ -122,7 +122,12 @@ mod tests {
     #[test]
     fn test_name_pool_populated() {
         let pool = name_pool();
-        assert!(pool.len() > 1000, "pool should have >1000 names");
+        // Every CVCV combination except banned words.
+        assert_eq!(
+            pool.len(),
+            CVCV_SPACE - 2,
+            "only sudo and meta are banned CVCV"
+        );
         let top_100: HashSet<&str> = pool[..100].iter().map(|x| x.name.as_str()).collect();
         assert!(top_100.contains("luna"), "luna should be in top 100");
         assert!(top_100.contains("nova"), "nova should be in top 100");
@@ -186,6 +191,37 @@ mod tests {
             !name.starts_with('l'),
             "greedy pick under spread penalty should avoid `l`, got {name}"
         );
+    }
+
+    #[test]
+    fn test_allocate_name_expands_past_exhausted_pool() {
+        let taken: HashSet<String> = name_pool().iter().map(|x| x.name.clone()).collect();
+        let alive: HashSet<String> = ["luna", "nova"].iter().map(|s| s.to_string()).collect();
+        for _ in 0..20 {
+            let name = allocate_name(&|n| taken.contains(n), &alive, 200, 1200, 30.0).unwrap();
+            assert_eq!(name.len(), 6, "expected a 6-letter name, got {name}");
+            assert!(
+                name.bytes()
+                    .enumerate()
+                    .all(|(i, b)| (i % 2 == 1) == matches!(b, b'a' | b'e' | b'i' | b'o' | b'u')),
+                "{name} should alternate C/V"
+            );
+            assert!(!taken.contains(&name));
+        }
+    }
+
+    #[test]
+    fn test_allocate_name_finds_last_free_short_name() {
+        // The only free 4-letter name is the lowest-ranked one, far outside
+        // the sampling window. It must still win over a longer name.
+        let pool = name_pool();
+        let last = pool.last().unwrap().name.clone();
+        let taken: HashSet<String> = pool[..pool.len() - 1]
+            .iter()
+            .map(|x| x.name.clone())
+            .collect();
+        let name = allocate_name(&|n| taken.contains(n), &HashSet::new(), 200, 1200, 30.0).unwrap();
+        assert_eq!(name, last);
     }
 
     #[test]

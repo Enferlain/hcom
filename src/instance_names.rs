@@ -5,8 +5,10 @@ use std::collections::HashSet;
 use crate::db::HcomDb;
 use crate::shared::time::now_epoch_i64;
 
-// Names are 4-letter CVCV (consonant-vowel-consonant-vowel) patterns.
-// Curated "gold" names score highest, generated names fill the pool.
+// Names alternate consonant and vowel. 4-letter CVCV names come from a scored
+// pool where curated "gold" names rank highest; once every one of those is
+// taken, longer CVCVCV... names are generated. Names are never reassigned, so
+// expanding is what keeps allocation available.
 
 const CONSONANTS: &[u8] = b"bdfghklmnprstvz";
 const VOWELS: &[u8] = b"aeiou";
@@ -81,13 +83,14 @@ pub(crate) fn score_name(name: &str, gold: &HashSet<&str>, banned: &HashSet<&str
         score -= 15;
     }
 
-    // Avoid doubled vowels (e.g., "mama" pattern)
-    if bytes.len() >= 4 && bytes[1] == bytes[3] {
+    // Avoid a repeated final vowel (e.g., "mama" pattern)
+    let n = bytes.len();
+    if n >= 4 && bytes[n - 3] == bytes[n - 1] {
         score -= 8;
     }
 
     // Name-like endings (a, e, o)
-    if bytes.len() >= 4 && matches!(bytes[3], b'a' | b'e' | b'o') {
+    if n >= 4 && matches!(bytes[n - 1], b'a' | b'e' | b'o') {
         score += 6;
     }
 
@@ -101,7 +104,7 @@ pub(crate) struct ScoredName {
 }
 
 /// Build scored pool of all valid CVCV names, with gold names ranked highest.
-pub(crate) fn build_name_pool(limit: usize) -> Vec<ScoredName> {
+pub(crate) fn build_name_pool() -> Vec<ScoredName> {
     let gold = gold_names();
     let banned = banned_names();
     let mut candidates = Vec::new();
@@ -122,7 +125,6 @@ pub(crate) fn build_name_pool(limit: usize) -> Vec<ScoredName> {
     }
 
     candidates.sort_by_key(|b| std::cmp::Reverse(b.score));
-    candidates.truncate(limit);
     candidates
 }
 
@@ -130,7 +132,7 @@ pub(crate) fn build_name_pool(limit: usize) -> Vec<ScoredName> {
 pub(crate) fn name_pool() -> &'static Vec<ScoredName> {
     use std::sync::OnceLock;
     static POOL: OnceLock<Vec<ScoredName>> = OnceLock::new();
-    POOL.get_or_init(|| build_name_pool(5000))
+    POOL.get_or_init(build_name_pool)
 }
 
 /// Check if name is too similar to alive instances (Hamming distance <= 2).
@@ -152,9 +154,15 @@ pub(crate) fn is_too_similar(name: &str, alive_names: &HashSet<String>) -> bool 
     false
 }
 
+/// Lengths tried, in order, once no 4-letter name is available.
+const LONG_NAME_LENGTHS: &[usize] = &[6, 8, 10, 12];
+/// Random candidates drawn per long length; the best-scoring free one wins.
+const LONG_NAME_SAMPLES: usize = 64;
+
 /// Allocate a name with bias toward high-scoring names.
-/// Three tiers: (1) weighted sampling + similarity, (2) greedy + similarity,
-/// (3) greedy without similarity (last resort).
+/// Tiers: (1) weighted sampling of free 4-letter names + similarity,
+/// (2) greedy 4-letter + similarity, (3) generated longer names + similarity,
+/// (4) any free name (last resort).
 pub(crate) fn allocate_name(
     is_taken: &dyn Fn(&str) -> bool,
     alive_names: &HashSet<String>,
@@ -163,8 +171,14 @@ pub(crate) fn allocate_name(
     temperature: f64,
 ) -> Result<String> {
     use rand::RngExt;
-    let pool = name_pool();
     let mut rng = rand::rng();
+
+    // Drop taken names up front: sampling a window that is all taken can
+    // never succeed, and with permanent reservations the top fills first.
+    let free: Vec<&ScoredName> = name_pool()
+        .iter()
+        .filter(|item| !is_taken(&item.name))
+        .collect();
 
     // Diversity penalties relative to currently-alive names: spread first
     // letters across the alphabet and avoid stacking matching trailing vowels.
@@ -193,57 +207,107 @@ pub(crate) fn allocate_name(
         s
     };
 
-    let window_size = top_window.min(pool.len()).max(50);
-    let mut window: Vec<(i32, &ScoredName)> = pool[..window_size]
-        .iter()
-        .map(|item| (adjust(item), item))
-        .collect();
-    window.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+    if !free.is_empty() {
+        let window_size = top_window.min(free.len()).max(50.min(free.len()));
+        let mut window: Vec<(i32, &ScoredName)> = free[..window_size]
+            .iter()
+            .map(|item| (adjust(item), *item))
+            .collect();
+        window.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
 
-    // Compute softmax weights (numerically stable)
-    let max_score = window.iter().map(|(s, _)| *s).max().unwrap_or(0) as f64;
-    let weights: Vec<f64> = window
-        .iter()
-        .map(|(s, _)| ((*s as f64 - max_score) / temperature).exp())
-        .collect();
-    let total_weight: f64 = weights.iter().sum();
+        // Compute softmax weights (numerically stable)
+        let max_score = window.iter().map(|(s, _)| *s).max().unwrap_or(0) as f64;
+        let weights: Vec<f64> = window
+            .iter()
+            .map(|(s, _)| ((*s as f64 - max_score) / temperature).exp())
+            .collect();
+        let total_weight: f64 = weights.iter().sum();
 
-    // Tier 1: Weighted sampling with similarity check
-    for _ in 0..attempts {
-        let r: f64 = rng.random::<f64>() * total_weight;
-        let mut cumulative = 0.0;
-        let mut chosen_idx = 0;
-        for (i, w) in weights.iter().enumerate() {
-            cumulative += w;
-            if cumulative >= r {
-                chosen_idx = i;
-                break;
+        // Tier 1: Weighted sampling with similarity check
+        for _ in 0..attempts {
+            let r: f64 = rng.random::<f64>() * total_weight;
+            let mut cumulative = 0.0;
+            let mut chosen_idx = 0;
+            for (i, w) in weights.iter().enumerate() {
+                cumulative += w;
+                if cumulative >= r {
+                    chosen_idx = i;
+                    break;
+                }
+            }
+            let choice = &window[chosen_idx].1.name;
+            if !is_too_similar(choice, alive_names) {
+                return Ok(choice.clone());
             }
         }
-        let choice = &window[chosen_idx].1.name;
-        if !is_taken(choice) && !is_too_similar(choice, alive_names) {
-            return Ok(choice.clone());
-        }
-    }
 
-    // Tier 2: Greedy by adjusted score, with similarity check
-    let mut sorted_full: Vec<(i32, &ScoredName)> =
-        pool.iter().map(|item| (adjust(item), item)).collect();
-    sorted_full.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
-    for (_, item) in &sorted_full {
-        if !is_taken(&item.name) && !is_too_similar(&item.name, alive_names) {
+        // Tier 2: Greedy by adjusted score, with similarity check
+        let mut sorted_free: Vec<(i32, &ScoredName)> =
+            free.iter().map(|item| (adjust(item), *item)).collect();
+        sorted_free.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+        if let Some((_, item)) = sorted_free
+            .iter()
+            .find(|(_, item)| !is_too_similar(&item.name, alive_names))
+        {
             return Ok(item.name.clone());
         }
     }
 
-    // Tier 3: Greedy without similarity (last resort)
-    for (_, item) in &sorted_full {
-        if !is_taken(&item.name) {
-            return Ok(item.name.clone());
+    // Tier 3: Longer generated names, shortest length first
+    let gold = gold_names();
+    let banned = banned_names();
+    let mut fallback: Option<String> = None;
+    for &len in LONG_NAME_LENGTHS {
+        let best = (0..LONG_NAME_SAMPLES)
+            .map(|_| random_cv_name(&mut rng, len))
+            .filter(|name| !banned.contains(name.as_str()) && !is_taken(name))
+            .inspect(|name| {
+                fallback.get_or_insert_with(|| name.clone());
+            })
+            .filter(|name| !is_too_similar(name, alive_names))
+            .max_by_key(|name| score_name(name, &gold, &banned));
+        if let Some(name) = best {
+            return Ok(name);
         }
     }
 
-    Err(anyhow::anyhow!("No available names left in pool"))
+    // Tier 4: any free name, ignoring similarity (last resort)
+    if let Some(item) = free.first() {
+        return Ok(item.name.clone());
+    }
+    fallback.ok_or_else(|| anyhow::anyhow!("No available names left"))
+}
+
+fn random_cv_name(rng: &mut impl rand::Rng, len: usize) -> String {
+    use rand::RngExt;
+    (0..len)
+        .map(|i| {
+            let alphabet = if i % 2 == 0 { CONSONANTS } else { VOWELS };
+            alphabet[rng.random_range(0..alphabet.len())] as char
+        })
+        .collect()
+}
+
+/// Below this many free 4-letter names, agents are told names can be longer.
+const SHORT_POOL_LOW_WATER: usize = 300;
+
+/// Name shape for the bootstrap line. Stays the short default until the
+/// 4-letter pool nears exhaustion, then switches before any longer name is
+/// handed out, so no agent is told "4-letter" once longer names can exist.
+pub(crate) fn describe_generated_names(db: &HcomDb) -> &'static str {
+    let free_short = collect_taken_names(db)
+        .map(|(_, taken)| {
+            name_pool()
+                .iter()
+                .filter(|item| !taken.contains(&item.name))
+                .count()
+        })
+        .unwrap_or(usize::MAX);
+    if free_short < SHORT_POOL_LOW_WATER {
+        "CVCV-style words (4 or 6 letters)"
+    } else {
+        "4-letter CVCV words"
+    }
 }
 
 pub(crate) fn collect_taken_names(db: &HcomDb) -> Result<(HashSet<String>, HashSet<String>)> {
@@ -299,13 +363,9 @@ pub const PLACEHOLDER_CONTEXT: &str = "new";
 pub(crate) fn allocate_unreserved_name(db: &HcomDb) -> Result<String> {
     let (alive_names, taken_names) = collect_taken_names(db)?;
 
-    allocate_name(
-        &|n| taken_names.contains(n) || db.get_instance_full(n).ok().flatten().is_some(),
-        &alive_names,
-        200,
-        1200,
-        30.0,
-    )
+    // `taken_names` already holds every instance row, collected under the
+    // name_gen lock, so no per-candidate DB lookup is needed.
+    allocate_name(&|n| taken_names.contains(n), &alive_names, 200, 1200, 30.0)
 }
 
 /// Generate a unique instance name with flock-based reservation.
@@ -892,5 +952,44 @@ mod reservation_tests {
         // Default HcomConfig::timeout is 86400 (schema-equivalent default),
         // preserved for anyone who hasn't set HCOM_TIMEOUT.
         assert_eq!(wait_timeout, Some(86400));
+    }
+
+    /// Issue #166: once every 4-letter name has a stopped snapshot, new
+    /// agents still get longer names, and the bootstrap wording has already
+    /// switched away from "4-letter".
+    #[test]
+    fn exhausted_short_pool_reserves_longer_names() {
+        let (_tmp, db) = setup_db();
+        assert_eq!(describe_generated_names(&db), "4-letter CVCV words");
+
+        let stop = |names: &[ScoredName]| {
+            let tx = db.conn().unchecked_transaction().unwrap();
+            let data = serde_json::json!({"action": "stopped"}).to_string();
+            for item in names {
+                tx.execute(
+                    "INSERT INTO events (timestamp, type, instance, data)
+                     VALUES ('2026-01-01T00:00:00Z', 'life', ?1, ?2)",
+                    rusqlite::params![item.name, data],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        };
+        let pool = name_pool();
+        let split = pool.len() - SHORT_POOL_LOW_WATER;
+        stop(&pool[..split]);
+        assert_eq!(describe_generated_names(&db), "4-letter CVCV words");
+        stop(&pool[split..split + 1]);
+        assert_eq!(
+            describe_generated_names(&db),
+            "CVCV-style words (4 or 6 letters)"
+        );
+        stop(&pool[split + 1..]);
+
+        let first = reserve_generated_name(&db).unwrap();
+        let second = reserve_generated_name(&db).unwrap();
+        assert_eq!(first.len(), 6, "got {first}");
+        assert_eq!(second.len(), 6, "got {second}");
+        assert_ne!(first, second);
     }
 }
