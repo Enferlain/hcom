@@ -464,18 +464,20 @@ fn poll_messages_inner(
     timeout_secs: u64,
     is_background: bool,
 ) -> Result<PollResult> {
-    // Check instance exists
-    let instance_data = db
+    // Check instance exists. Its created_at is the launch this poll speaks
+    // for, read before the notify port is advertised so a stop+resume racing
+    // the registration is still seen as a different launch.
+    let Some(instance_data) = db
         .get_instance_full(instance_name)
-        .context("DB error checking instance")?;
-    if instance_data.is_none() {
+        .context("DB error checking instance")?
+    else {
         return Ok(PollResult {
             delivered: false,
             output: None,
             timed_out: false,
             ack: None,
         });
-    }
+    };
 
     // Setup TCP notification socket
     let (notify_server, tcp_mode) = setup_tcp_notification(instance_name);
@@ -503,6 +505,7 @@ fn poll_messages_inner(
     let result = poll_loop(
         db,
         instance_name,
+        instance_data.created_at,
         timeout,
         start,
         is_background,
@@ -521,6 +524,7 @@ fn poll_messages_inner(
 fn poll_loop(
     db: &HcomDb,
     instance_name: &str,
+    created_at: f64,
     timeout: Duration,
     start: Instant,
     is_background: bool,
@@ -533,19 +537,22 @@ fn poll_loop(
         ack: None,
     };
     let mut waited = false;
-    let mut created_at = None;
     while start.elapsed() < timeout {
+        // Poll for messages BEFORE select to catch transition gap
+        let raw_messages = db.get_unread_messages(instance_name);
+
         // Stopped (row deleted) or stopped and resumed (row recreated): the
-        // waiting process no longer speaks for this name.
+        // waiting process no longer speaks for this name. Checked after the
+        // read: created_at only moves forward, so a row unchanged now was ours
+        // during the read, while checking first would let a resume in between
+        // hand this poll mail meant for the new launch.
         let Some(instance_data) = db.get_instance_full(instance_name)? else {
             return Ok(empty());
         };
-        if *created_at.get_or_insert(instance_data.created_at) != instance_data.created_at {
+        if instance_data.created_at != created_at {
             return Ok(empty());
         }
 
-        // Poll for messages BEFORE select to catch transition gap
-        let raw_messages = db.get_unread_messages(instance_name);
         if !raw_messages.is_empty() {
             // Orphan detection: don't deliver if parent died.
             // Only check after we've waited at least once — on the first iteration stdin
@@ -1918,7 +1925,8 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let start = Instant::now();
         let timeout = Duration::from_millis(180);
-        let result = poll_loop(&db, "polltest", timeout, start, true, Some(&listener)).unwrap();
+        let result =
+            poll_loop(&db, "polltest", 0.0, timeout, start, true, Some(&listener)).unwrap();
         assert!(result.timed_out);
         assert!(start.elapsed() >= timeout);
         let writes: i64 = db
