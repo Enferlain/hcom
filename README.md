@@ -303,6 +303,7 @@ hcom send -b @luna -- hey      # one-off message to an agent
 hcom list                      # show all active agents
 hcom term [name]               # view/inject into an agent's PTY screen
 hcom events --wait <filters>   # Block until match for scripting
+hcom events --follow           # Stream events as JSON Lines
 hcom update                    # update hcom version
 ```
 

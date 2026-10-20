@@ -3,6 +3,7 @@
 //!
 //! Modes:
 //! - Query: `hcom events [--last N] [--all] [--full] [--wait SEC] [--sql EXPR] [filters...]`
+//! - Follow: `hcom events --follow [--last N | --after-id ID] [--full] [--sql EXPR] [filters...]`
 //! - Subscribe: `hcom events sub [list | SQL | filters...] [--once] [--for name]`
 //! - Unsubscribe: `hcom events unsub <id>`
 //! - Launch status: `hcom events launch [batch_id] [--timeout N]`
@@ -40,6 +41,12 @@ pub struct EventsArgs {
     /// Block until match (default: 60s when flag present without value)
     #[arg(long, num_args(0..=1), default_missing_value = "60")]
     pub wait: Option<u64>,
+    /// Stream matching events as JSON Lines until interrupted
+    #[arg(long)]
+    pub follow: bool,
+    /// With --follow: start after this event id (resume from a saved cursor)
+    #[arg(long = "after-id")]
+    pub after_id: Option<i64>,
     /// Raw SQL WHERE clause
     #[arg(long)]
     pub sql: Option<String>,
@@ -833,6 +840,142 @@ fn cmd_events_launch(db: &HcomDb, args: &EventsLaunchArgs, instance_name: Option
     }
 }
 
+// ── Follow Mode ──────────────────────────────────────────────────────────
+
+/// How often follow mode checks for new events.
+const FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Max events fetched per follow query, so a large backlog after `--after-id`
+/// streams in chunks instead of loading at once.
+const FOLLOW_BATCH: i64 = 500;
+
+/// Write one JSON line. False once stdout is gone (reader exited), which ends
+/// the stream.
+fn write_event_line(out: &mut impl std::io::Write, value: &Value) -> bool {
+    writeln!(out, "{}", serde_json::to_string(value).unwrap_or_default()).is_ok()
+}
+
+/// Follow mode: stream matching events as JSON Lines in id order until
+/// interrupted or stdout's reader goes away.
+///
+/// Starts at the newest event, or after `after_id`; `last` first replays that
+/// many recent matches. Polls on a short tick instead of registering a wake
+/// endpoint, because a follower normally ends with Ctrl-C and would strand the
+/// endpoint row. When the DB file is replaced (`hcom reset`), the stream
+/// reopens it and prints `{"db_reset": true}`: event ids restart, so saved
+/// cursors are no longer valid.
+fn events_follow(
+    filter_query: &str,
+    last: Option<usize>,
+    after_id: Option<i64>,
+    full_output: bool,
+    filters: &HashMap<String, Vec<String>>,
+) -> i32 {
+    let mut db = match HcomDb::open() {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
+    let render = |event: &Value| {
+        if full_output {
+            event.clone()
+        } else {
+            streamline_event(event, filters)
+        }
+    };
+    let mut out = std::io::stdout().lock();
+
+    let newest = db.get_last_event_id();
+    let mut cursor = match after_id {
+        Some(id) if id > newest => {
+            eprintln!(
+                "Error: --after-id {id} is past the newest event ({newest}); the database was likely reset. Rerun without --after-id."
+            );
+            return 1;
+        }
+        Some(id) => id,
+        None => newest,
+    };
+
+    if let Some(n) = last {
+        let backlog = match query_events(&db, &format!(" AND id <= {cursor}{filter_query}"), n, &[])
+        {
+            Ok(events) => events,
+            Err(e) => {
+                eprintln!("{e}");
+                return 2;
+            }
+        };
+        for event in backlog.iter().rev() {
+            if !write_event_line(&mut out, &render(event)) {
+                return 0;
+            }
+        }
+    }
+
+    let query = format!("SELECT * FROM events_v WHERE id > ?{filter_query} ORDER BY id LIMIT ?");
+    loop {
+        if db.reconnect_if_stale() {
+            cursor = 0;
+            if !write_event_line(&mut out, &json!({"db_reset": true})) {
+                return 0;
+            }
+        }
+
+        let mut fetched = 0;
+        let mut stmt = match db.conn().prepare(&query) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                eprintln!("Error in SQL WHERE clause: {e}");
+                return 2;
+            }
+        };
+        // Query errors are fatal: a bad --sql (e.g. an unbound `?`) would
+        // otherwise poll forever with no output. The caller can restart from
+        // the last id it saw.
+        let mut rows = match stmt.query(rusqlite::params![cursor, FOLLOW_BATCH]) {
+            Ok(rows) => rows,
+            Err(e) => {
+                eprintln!("Error in SQL WHERE clause: {e}");
+                return 2;
+            }
+        };
+        loop {
+            let row = match rows.next() {
+                Ok(Some(row)) => row,
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("Error reading events: {e}");
+                    return 2;
+                }
+            };
+            fetched += 1;
+            // Advance past unparseable rows too, or the stream would stall on them.
+            if let Ok(id) = row.get::<_, i64>("id") {
+                cursor = id;
+            }
+            if let Ok(event) = parse_event_row(row)
+                && !write_event_line(&mut out, &render(&event))
+            {
+                return 0;
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        if fetched < FOLLOW_BATCH {
+            // Like `tail -f`: when the reader is gone (`| head -1` done), exit
+            // now rather than on the next matching event, which may never come.
+            if crate::sys::io::stdout_reader_gone() {
+                return 0;
+            }
+            std::thread::sleep(FOLLOW_POLL_INTERVAL);
+        }
+    }
+}
+
 // ── Wait Mode ────────────────────────────────────────────────────────────
 
 /// Wait mode: block until matching event or timeout.
@@ -1066,6 +1209,27 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
         }
     }
 
+    if args.follow {
+        let conflict = if args.wait.is_some() {
+            Some("--follow cannot be combined with --wait")
+        } else if args.remote_fetch {
+            Some("--follow cannot be combined with --remote-fetch")
+        } else if args.all {
+            Some("--follow cannot be combined with --all")
+        } else if args.after_id.is_some() && args.last.is_some() {
+            Some("--last and --after-id are mutually exclusive")
+        } else {
+            None
+        };
+        if let Some(message) = conflict {
+            eprintln!("Error: {message}");
+            return 1;
+        }
+    } else if args.after_id.is_some() {
+        eprintln!("Error: --after-id requires --follow");
+        return 1;
+    }
+
     // Query mode — use typed fields directly
     let search_all = args.all;
     let full_output = args.full;
@@ -1077,8 +1241,8 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
     let mut filters = args.filters.to_filter_map();
     resolve_filter_names(&mut filters, db);
     // --all also searches archives, where an agent may exist only historically;
-    // --wait may legitimately target an agent that hasn't started yet.
-    if !args.remote_fetch && !search_all && wait_timeout.is_none() {
+    // --wait/--follow may legitimately target an agent that hasn't started yet.
+    if !args.remote_fetch && !search_all && wait_timeout.is_none() && !args.follow {
         warn_unknown_agent_filters(db, &filters);
     }
 
@@ -1173,6 +1337,16 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
     // Add user SQL WHERE clause
     if let Some(ref sql) = sql_where {
         filter_query.push_str(&format!(" AND ({sql})"));
+    }
+
+    if args.follow {
+        return events_follow(
+            &filter_query,
+            args.last,
+            args.after_id,
+            full_output,
+            &filters,
+        );
     }
 
     // Wait mode

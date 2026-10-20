@@ -658,6 +658,8 @@ request itself contains `DONE` and must not count as a worker response.
   `Names:` launch output when you need to address or clean them up.
 - `hcom events --wait` and `hcom events sub` are useful alternatives to sleeps
   when the next step depends on an hcom event.
+- `hcom events --follow` streams matching events as JSON Lines for a long-lived
+  watcher; save the last `id` and pass `--after-id` to resume after a restart.
 
 ## Generic Workflow Pattern Ideas
 

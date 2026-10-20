@@ -74,6 +74,23 @@ const EVENTS_QUERY: &[HelpEntry] = &[
     ),
 ];
 
+const EVENTS_FOLLOW: &[HelpEntry] = &[
+    ("Follow (streams until Ctrl-C or the reader exits):", ""),
+    (
+        "events --follow [filters]",
+        "New matching events as JSON Lines, oldest first",
+    ),
+    ("  --last N", "Replay the N most recent matches first"),
+    (
+        "  --after-id ID",
+        "Resume after a saved event id (replays every match since)",
+    ),
+    (
+        "",
+        "A {\"db_reset\": true} line means hcom reset ran and ids restarted",
+    ),
+];
+
 const EVENTS_SHORTCUTS: &[HelpEntry] = &[
     ("Shortcuts:", ""),
     ("  --idle NAME", "--agent NAME --status listening"),
@@ -173,6 +190,7 @@ const EVENTS_PAGE: &[&[HelpEntry]] = &[
     FILTERS_HEADER,
     FILTER_HELP,
     EVENTS_SHORTCUTS,
+    EVENTS_FOLLOW,
     EVENTS_LAUNCH,
     EVENTS_SUB,
     EVENTS_UNSUB,

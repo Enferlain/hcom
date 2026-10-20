@@ -2237,3 +2237,136 @@ fn config_reports_file_parse_errors_in_get_and_list_modes() {
         );
     }
 }
+
+/// Spawn `hcom events --follow <args>` and forward its stdout lines over a
+/// channel, so tests can wait for each line with a timeout.
+fn spawn_follow(
+    h: &Hcom,
+    args: &[&str],
+) -> (std::process::Child, std::sync::mpsc::Receiver<String>) {
+    use std::io::BufRead;
+    let mut child = h
+        .cmd()
+        .args(["events", "--follow"])
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn events --follow");
+    let stdout = child.stdout.take().expect("follow stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    (child, rx)
+}
+
+fn next_follow_line(rx: &std::sync::mpsc::Receiver<String>) -> serde_json::Value {
+    let line = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("events --follow produced no line within 10s");
+    serde_json::from_str(&line).unwrap_or_else(|e| panic!("follow line is not JSON ({e}): {line}"))
+}
+
+#[test]
+fn events_follow_streams_new_matches_and_resumes_from_cursor() {
+    let h = Hcom::new();
+    let agent = h.start();
+    let send = |text: &str| {
+        let (code, _, stderr) = h.run(["send", "-b", &format!("@{agent}"), "--", text]);
+        assert_eq!(code, 0, "send failed: {stderr}");
+    };
+
+    send("first");
+    // --last 1 replays the existing message; receiving it proves the follower
+    // has fixed its cursor, so the next send is guaranteed to stream.
+    let (mut follower, rx) = spawn_follow(&h, &["--type", "message", "--last", "1"]);
+    let first = next_follow_line(&rx);
+    assert_eq!(first["data"]["text"], "first", "backlog line: {first}");
+    send("second");
+    let second = next_follow_line(&rx);
+    assert_eq!(second["data"]["text"], "second", "streamed line: {second}");
+    assert!(second["id"].as_i64() > first["id"].as_i64());
+    let _ = follower.kill();
+    let _ = follower.wait();
+
+    // A saved cursor replays everything after it, in id order.
+    let cursor = first["id"].as_i64().expect("event id").to_string();
+    let (mut resumed, rx) = spawn_follow(&h, &["--type", "message", "--after-id", &cursor]);
+    let replayed = next_follow_line(&rx);
+    assert_eq!(replayed["id"], second["id"], "resumed line: {replayed}");
+    let _ = resumed.kill();
+    let _ = resumed.wait();
+}
+
+#[cfg(unix)]
+#[test]
+fn events_follow_exits_when_reader_closes() {
+    let h = Hcom::new();
+    let mut child = h
+        .cmd()
+        .args(["events", "--follow"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn events --follow");
+    // Close the read end without any event arriving: an idle follower must
+    // notice on its own instead of waiting for a write to fail.
+    drop(child.stdout.take());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("events --follow kept running after its reader closed");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "follow exit status: {status}");
+}
+
+#[test]
+fn events_follow_rejects_conflicting_flags() {
+    let h = Hcom::new();
+    for (args, expected) in [
+        (
+            vec!["events", "--after-id", "1"],
+            "--after-id requires --follow",
+        ),
+        (
+            vec!["events", "--follow", "--wait", "5"],
+            "--follow cannot be combined with --wait",
+        ),
+        (
+            vec!["events", "--follow", "--after-id", "1", "--last", "2"],
+            "--last and --after-id are mutually exclusive",
+        ),
+        (
+            vec!["events", "--follow", "--after-id", "999999"],
+            "is past the newest event",
+        ),
+    ] {
+        let (code, _, stderr) = h.run(&args);
+        assert_eq!(code, 1, "{args:?}: stderr={stderr}");
+        assert!(stderr.contains(expected), "{args:?}: stderr={stderr}");
+    }
+}
+
+#[test]
+fn events_follow_exits_on_query_error() {
+    let h = Hcom::new();
+    // An unbound `?` passes prepare but fails at query time; follow must
+    // report it instead of polling forever.
+    let (code, _, stderr) = h.run(["events", "--follow", "--sql", "type = ?"]);
+    assert_eq!(code, 2, "stderr={stderr}");
+    assert!(stderr.contains("SQL"), "stderr={stderr}");
+}
