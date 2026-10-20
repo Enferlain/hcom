@@ -365,6 +365,12 @@ impl Hcom {
             fs::create_dir_all(dir)
                 .unwrap_or_else(|e| panic!("create isolated directory {}: {e}", dir.display()));
         }
+        // A fresh empty update flag means "checked just now, nothing newer", so
+        // no command spawns the detached GitHub check, which outlives the
+        // fixture's process-group cleanup.
+        let flags = hcom_dir.join(".tmp/flags");
+        fs::create_dir_all(&flags).expect("create isolated flags dir");
+        fs::write(flags.join("update_check"), "").expect("seed update check flag");
 
         // The scripted Codex shell call uses `hcom ...`; make the exact
         // CARGO_BIN_EXE_hcom binary discoverable before any ambient PATH.

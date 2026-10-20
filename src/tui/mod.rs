@@ -260,8 +260,7 @@ mod tests {
 
     fn make_test_app(limit: Rc<Cell<usize>>) -> App {
         crate::config::Config::init();
-        let mut app = App::new();
-        app.rpc_client = None;
+        let mut app = crate::tui::test_helpers::offline_app();
         let data = DataState::empty();
         app.data = data.clone();
         app.source = Box::new(DummySource::new(data, limit));
@@ -310,7 +309,26 @@ mod tests {
 
 #[cfg(test)]
 pub mod test_helpers {
+    use crate::tui::app::App;
+    use crate::tui::data::DataSource;
     use crate::tui::model::{Agent, AgentStatus, Tool, epoch_now};
+    use crate::tui::state::DataState;
+
+    struct NullSource;
+    impl DataSource for NullSource {
+        fn load(&mut self) -> DataState {
+            DataState::empty()
+        }
+        fn load_all_stopped(&mut self) -> Vec<Agent> {
+            vec![]
+        }
+    }
+
+    /// An `App` with no database and no RPC worker. `App::new()` would read
+    /// the live `$HCOM_DIR` db, which serial tests repoint at their own.
+    pub fn offline_app() -> App {
+        App::with_source(Box::new(NullSource), None)
+    }
 
     /// Create a test Agent with sensible defaults. `age_secs` controls how old the agent appears.
     pub fn make_test_agent(name: &str, age_secs: f64) -> Agent {

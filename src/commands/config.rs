@@ -2506,6 +2506,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial] // resets the process-wide Config other tests read
     #[cfg(target_os = "macos")]
     fn test_terminal_help_text_lists_cmux_as_managed() {
         crate::config::Config::reset();
@@ -2537,6 +2538,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial] // "default" reads HCOM_TIMEOUT, which serial tests set
     fn test_config_instance_set_timeout_default_resets() {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
@@ -2556,7 +2558,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(timeout, 86400);
+        // The configured default, not a literal: a developer's shell may export HCOM_TIMEOUT.
+        let expected = crate::config::HcomConfig::load(None).timeout;
+        assert_ne!(expected, 15);
+        assert_eq!(timeout, expected);
     }
 
     #[test]

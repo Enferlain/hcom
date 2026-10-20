@@ -1382,8 +1382,7 @@ mod tests {
 
     fn test_app() -> App {
         crate::config::Config::init();
-        let mut app = App::new();
-        app.rpc_client = None;
+        let mut app = crate::tui::test_helpers::offline_app();
         app.data.agents = vec![make_agent("nova"), make_agent("luna")];
         app.data.remote_agents.clear();
         app.data.stopped_agents.clear();

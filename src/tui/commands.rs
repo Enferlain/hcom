@@ -114,53 +114,6 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 
-    /// Find the hcom binary for testing. In test context, current_exe()
-    /// returns the test runner, not hcom. Look in cargo target dir instead.
-    fn test_binary() -> Option<PathBuf> {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        for profile in ["debug", "release"] {
-            let bin = manifest_dir.join("target").join(profile).join("hcom");
-            if bin.exists() {
-                return Some(bin);
-            }
-        }
-        None
-    }
-
-    fn run_test_command(argv: &[&str]) -> Option<Response> {
-        let binary = test_binary()?;
-        let args: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
-        let output = Command::new(&binary)
-            .args(&args)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .ok()?;
-        Some(Response {
-            exit_code: output.status.code().unwrap_or(1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
-    }
-
-    #[test]
-    fn run_native_version() {
-        let resp = match run_test_command(&["--version"]) {
-            Some(r) => r,
-            None => {
-                eprintln!("skipping: hcom binary not found in target/");
-                return;
-            }
-        };
-        assert_eq!(resp.exit_code, 0);
-        assert!(
-            resp.stdout.starts_with("hcom "),
-            "expected 'hcom ...' got: {}",
-            resp.stdout
-        );
-    }
-
     #[test]
     fn response_from_run_native_has_correct_fields() {
         // Test the Response construction without needing the binary

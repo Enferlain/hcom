@@ -726,6 +726,7 @@ fn per_run_cleanup_uses_profile_and_preserves_other_effective_dirs() {
 }
 
 #[test]
+#[serial_test::serial]
 fn remove_deletes_hcom_plugin() {
     with_isolated_omp_env(|_| {
         let path = get_omp_plugin_path();
@@ -739,6 +740,7 @@ fn remove_deletes_hcom_plugin() {
 }
 
 #[test]
+#[serial_test::serial]
 fn remove_preserves_non_hcom_file() {
     with_isolated_omp_env(|_| {
         let path = get_omp_plugin_path();
@@ -751,6 +753,7 @@ fn remove_preserves_non_hcom_file() {
 }
 
 #[test]
+#[serial_test::serial]
 fn replayed_legacy_extension_arg_is_stripped_before_injection() {
     with_isolated_omp_env(|_| {
         // Older hcom baked `-e ~/.omp/agent/extensions/hcom.ts` into stored
@@ -789,6 +792,7 @@ fn remove_and_cleanup_cover_project_local_legacy_install() {
 }
 
 #[test]
+#[serial_test::serial]
 fn strip_leaves_prompt_text_after_separator() {
     with_isolated_omp_env(|_| {
         let mut args: Vec<String> = vec![
@@ -804,6 +808,7 @@ fn strip_leaves_prompt_text_after_separator() {
 }
 
 #[test]
+#[serial_test::serial]
 fn strip_keeps_user_extension_at_pi_plugin_path() {
     with_isolated_omp_env(|_| {
         let pi_path = crate::hooks::pi::get_pi_plugin_path();

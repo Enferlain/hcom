@@ -1100,7 +1100,7 @@ mod usage_tests {
     #[test]
     fn detail_selection_uses_action_identity() {
         crate::config::Config::init();
-        let mut app = App::new();
+        let mut app = crate::tui::test_helpers::offline_app();
         let mut agent = crate::tui::test_helpers::make_test_agent("nova", 0.0);
         agent.device_name = Some("BOX".into());
         for (selected, expected) in [("nova", false), ("nova:BOX", true)] {
@@ -1177,7 +1177,7 @@ mod usage_tests {
     #[test]
     fn expanded_stopped_section_keeps_live_share_and_section_cursor_visible() {
         crate::config::Config::init();
-        let mut app = App::new();
+        let mut app = crate::tui::test_helpers::offline_app();
         app.data.agents = (0..10)
             .map(|i| crate::tui::test_helpers::make_test_agent(&format!("live{i}"), 0.0))
             .collect();
@@ -1208,7 +1208,7 @@ mod usage_tests {
     #[test]
     fn context_stays_in_heading_and_is_omitted_when_narrow() {
         crate::config::Config::init();
-        let mut app = App::new();
+        let mut app = crate::tui::test_helpers::offline_app();
         let mut agent = crate::tui::test_helpers::make_test_agent("nahe", 3240.0);
         agent.tool = crate::tui::model::Tool::Qoder;
         agent.status_time = agent.created_at;

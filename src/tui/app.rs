@@ -32,9 +32,16 @@ impl Default for App {
 
 impl App {
     pub fn new() -> Self {
-        let mut source = data::create_data_source();
+        Self::with_source(data::create_data_source(), Some(RpcClient::start()))
+    }
+
+    /// Build the app over any data source. Tests pass an offline source: the
+    /// default one opens whatever `$HCOM_DIR` the process points at.
+    pub(crate) fn with_source(
+        mut source: Box<dyn DataSource>,
+        rpc_client: Option<RpcClient>,
+    ) -> Self {
         let data = source.load();
-        let rpc_client = Some(RpcClient::start());
 
         Self {
             data,

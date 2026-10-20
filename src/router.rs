@@ -1662,9 +1662,7 @@ mod tests {
 
     #[test]
     fn is_same_file_works() {
-        let tmp = std::env::temp_dir().join("hcom_test_same_file");
-        let _ = std::fs::write(&tmp, "test");
-        assert!(is_same_file(&tmp, &tmp));
-        let _ = std::fs::remove_file(&tmp);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        assert!(is_same_file(tmp.path(), tmp.path()));
     }
 }

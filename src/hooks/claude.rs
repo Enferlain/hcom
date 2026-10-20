@@ -3226,6 +3226,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn each_claude_launch_pins_its_own_supervisor_environment() {
         // Publishing settings reads HCOM_DIR, which parallel tests also change.
         let (dir, _hcom_dir, _test_home, _guard) = isolated_test_env();

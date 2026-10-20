@@ -1616,6 +1616,7 @@ mod tests {
     /// call opencode-start for the session again. It must not rebind the
     /// resumed agent or take its notify endpoint.
     #[test]
+    #[serial]
     fn test_handle_start_rebind_rejects_detached_process() {
         crate::config::Config::init();
         let (_env_dir, hcom_dir, test_home, _guard) =
@@ -1728,6 +1729,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_handle_start_initializes_cursor_to_launch_tail() {
         crate::config::Config::init();
         let (_env_dir, hcom_dir, test_home, _guard) =
@@ -1766,6 +1768,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_standby_port_registers_until_session_binds() {
         crate::config::Config::init();
         let (_env_dir, hcom_dir, test_home, _guard) =

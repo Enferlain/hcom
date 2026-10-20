@@ -315,6 +315,18 @@ fn help_prints_and_exits_zero() {
 }
 
 #[test]
+fn version_prints_and_exits_zero() {
+    let h = Hcom::new();
+    let (code, stdout, stderr) = h.run(["--version"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert_eq!(
+        stdout.trim(),
+        concat!("hcom ", env!("CARGO_PKG_VERSION")),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
 fn status_json_in_fresh_dir() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["status", "--json"]);

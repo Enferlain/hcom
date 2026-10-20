@@ -351,7 +351,9 @@ mod tests {
     }
 
     fn init_config() {
-        // Config::init is idempotent-ish but needs to be called before paths::hcom_dir()
+        // Rebuild from the current env: a cached Config can still name an
+        // earlier test's (since deleted) HCOM_DIR.
+        crate::config::Config::reset();
         crate::config::Config::init();
     }
 

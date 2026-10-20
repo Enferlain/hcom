@@ -448,8 +448,7 @@ mod tests {
     }
 
     fn test_app() -> App {
-        let mut app = App::new();
-        app.rpc_client = None;
+        let mut app = crate::tui::test_helpers::offline_app();
 
         let mut data = DataState::empty();
         data.agents = vec![make_agent("nova")];
