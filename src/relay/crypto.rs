@@ -184,6 +184,8 @@ mod tests {
         let k = key();
         let pt = b"hello world";
         let env = seal(&k, "relay-1", "relay-1/dev-a", pt, 1_700_000_000).unwrap();
+        // relay::push sizes batches by this exact overhead before sealing.
+        assert_eq!(env.len(), HEADER_LEN + pt.len() + TAG_LEN);
         let out = open(&k, "relay-1", "relay-1/dev-a", &env).unwrap();
         assert_eq!(out, pt);
     }

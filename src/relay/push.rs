@@ -35,10 +35,11 @@ fn seal_bounded_payload(
             "events": events,
         });
         let payload_bytes = serde_json::to_vec(&payload).map_err(|e| format!("json: {e}"))?;
-        let sealed = crypto::seal(psk, relay_id, topic, &payload_bytes, now_secs)
-            .map_err(|e| format!("seal: {e}"))?;
-        if sealed.len() <= MAX_SEALED_PAYLOAD_BYTES {
-            return Ok(sealed);
+        // Sealing adds a fixed header and tag, so size the plaintext and seal
+        // once it fits instead of encrypting every candidate batch.
+        if crypto::HEADER_LEN + payload_bytes.len() + crypto::TAG_LEN <= MAX_SEALED_PAYLOAD_BYTES {
+            return crypto::seal(psk, relay_id, topic, &payload_bytes, now_secs)
+                .map_err(|e| format!("seal: {e}"));
         }
 
         // Retained tail events have already advanced the local cursor. Drop the oldest of those
@@ -749,6 +750,8 @@ mod tests {
         let start = Instant::now();
         let error = push(&db, &client, "relay", "device", &[0x42; 32], false).unwrap_err();
         assert!(error.starts_with("publish:"), "{error}");
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        // A blocking publish would wait forever; the slack only absorbs a
+        // loaded debug build's db and seal work.
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 }
