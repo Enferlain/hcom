@@ -12,6 +12,11 @@ UTC release dates from [PyPI](https://pypi.org/project/hcom/#history).
 
 - Made native delivery the default for idle Claude and Copilot agents. Configure in config: `claude_delivery` / `copilot_delivery`.
 
+### Fixed
+
+- Fixed `hcom r` dropping the agent's event subscriptions and thread memberships; a subscription that matched while the agent was stopped now notifies on resume.
+- Fixed Antigravity and OMP agents losing their event subscriptions at the end of a turn while still running.
+
 ## 0.7.30 — 2026-10-15
 
 ### Added

@@ -196,7 +196,14 @@ pub(crate) fn handle_stop(db: &HcomDb, argv: &[String]) -> (i32, String) {
     };
     let reason = parse_flag(argv, "--reason").unwrap_or_else(|| "unknown".to_string());
     if has_flag(argv, "--soft") {
-        match common::soft_finalize_session(db, &name, &reason, None, true) {
+        match common::soft_finalize_session(
+            db,
+            &name,
+            &reason,
+            None,
+            true,
+            common::SoftStop::ProcessContinues,
+        ) {
             Ok(()) => ok(json!({ "ok": true, "soft": true })),
             Err(e) => error(format!("Stop failed: {e}")),
         }

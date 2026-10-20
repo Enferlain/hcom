@@ -42,9 +42,9 @@ pub(crate) fn cleanup_antigravity_pty_exit(
                     &format!("{}", e),
                 );
             }
-            if let Err(e) = db.cleanup_subscriptions(current_name) {
-                log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
-            }
+            // Subscriptions stay with the kept row. Its hard stop (dead-process
+            // or stale-row cleanup, or `hcom r`) saves them for resume and
+            // removes them.
         } else {
             super::cleanup_deleted_instance(db, current_name);
         }

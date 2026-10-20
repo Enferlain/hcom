@@ -1799,6 +1799,19 @@ fn initialize_launch_instance(
         if db.get_instance_full(instance_name)?.is_none() {
             bail!("Failed to initialize instance '{instance_name}'");
         }
+        // Only a tracked resume carries a cursor: the same identity returns,
+        // so it gets back the subscriptions its stop saved, like its unread
+        // position. Done before spawn so replayed matches queue as unread.
+        if params.resume_cursor.is_some()
+            && let Err(e) =
+                crate::db::subscriptions::restore_stopped_subscriptions(db, instance_name)
+        {
+            crate::log::log_warn(
+                "launcher",
+                "resume.restore_subscriptions_fail",
+                &format!("instance={instance_name} err={e}"),
+            );
+        }
         Ok(())
     })
 }
@@ -4101,6 +4114,33 @@ mod tests {
             db.ack_hook_delivery("luna", queued_id, false, None)
                 .unwrap();
             assert!(db.get_unread_messages("luna").is_empty());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn launch_registration_restores_subscriptions_only_for_tracked_resume() {
+        let _env = EnvVarGuard::remove(["HCOM_LAUNCH_EVENT_ID".to_string()]);
+        for resume in [true, false] {
+            let db = launcher_test_db();
+            let saved = json!({"id": "sub-saved", "caller": "luna", "sql": "0", "last_id": 0});
+            db.log_event(
+                "life",
+                "luna",
+                &json!({"action": "stopped", "snapshot": {"subscriptions": [saved]}}),
+            )
+            .unwrap();
+            let params = LaunchParams {
+                prior_session_id: resume.then(|| "resumed-session".into()),
+                resume_cursor: resume.then_some(0),
+                ..Default::default()
+            };
+            initialize_launch_instance(&db, &params, "luna", "codex", "", "/tmp", 0).unwrap();
+            assert_eq!(
+                db.kv_get("events_sub:sub-saved").unwrap().is_some(),
+                resume,
+                "only a tracked resume inherits the stopped identity's subscriptions"
+            );
         }
     }
 

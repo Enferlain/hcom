@@ -2767,9 +2767,8 @@ fn finalize_pty_stop(
         );
     }
 
-    if let Err(e) = db.cleanup_subscriptions(current_name) {
-        log_warn("native", "delivery.cleanup_subs_fail", &format!("{}", e));
-    }
+    // Subscriptions are removed by finalize_instance_stop, which first saves
+    // them into the snapshot for `hcom r`.
     let mut event_data = serde_json::json!({
         "action": "stopped",
         "by": by,

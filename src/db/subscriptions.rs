@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 
 use super::HcomDb;
@@ -222,8 +222,8 @@ fn kv_store_sub(db: &HcomDb, key: &str, sub: &serde_json::Value) {
 }
 
 /// Clear agy grace timers when the target is working again (deliver/tool/active).
-fn clear_agy_reqwatch_idle_grace(db: &HcomDb, target: &str) {
-    for (key, sub, filters) in load_reqwatch_subs(db) {
+fn clear_agy_reqwatch_idle_grace(db: &HcomDb, target: &str, only: Option<&HashSet<String>>) {
+    for (key, sub, filters) in load_reqwatch_subs(db, only) {
         if filters.get("target_tool").and_then(|v| v.as_str()) != Some("antigravity") {
             continue;
         }
@@ -246,7 +246,7 @@ fn clear_agy_reqwatch_idle_grace(db: &HcomDb, target: &str) {
 /// event arrived. The conditional delete is the claim: concurrent sweepers can
 /// observe the same row, but only one can remove it and emit the one-shot notice.
 fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
-    for (key, sub, filters) in load_reqwatch_subs(db) {
+    for (key, sub, filters) in load_reqwatch_subs(db, None) {
         if filters.get("target_tool").and_then(|v| v.as_str()) != Some("antigravity")
             || !super::reqwatch_policy::idle_grace_expired(&sub, now)
         {
@@ -368,6 +368,164 @@ pub(crate) fn cleanup_subscriptions(db: &HcomDb, name: &str) -> Result<u32> {
     Ok(deleted as u32)
 }
 
+/// Every subscription row an instance owns, thread memberships included, for
+/// its stop snapshot. Read inside the stop transaction, before deletion.
+///
+/// Live matching runs as each event is logged but moves `last_id` only on a
+/// hit, so a live sub has already seen every event up to now. Save it with
+/// the newest event id as its cursor: resume must replay only the stopped
+/// gap, not re-run older events with hindsight (a collision sub would match
+/// an edit that only collided with a later one).
+fn owned_subscriptions(db: &HcomDb, name: &str) -> Result<Vec<serde_json::Value>> {
+    let newest = db.get_last_event_id();
+    let mut stmt = db.conn.prepare(
+        "SELECT value FROM kv
+         WHERE key LIKE 'events_sub:%'
+           AND json_extract(value, '$.caller') = ?",
+    )?;
+    let rows = stmt.query_map(params![name], |row| row.get::<_, String>(0))?;
+    Ok(rows
+        .filter_map(|r| r.ok())
+        .filter_map(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+        .map(|mut sub| {
+            let last_id = sub.get("last_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            sub["last_id"] = json!(last_id.max(newest));
+            sub
+        })
+        .collect())
+}
+
+/// Subscriptions a stop snapshot should keep for `hcom r`: those the row owns
+/// now, plus any an earlier soft stop of the same row (same `created_at`)
+/// saved and deleted while keeping the row. The live row wins on conflict.
+pub(crate) fn subscriptions_to_save(
+    db: &HcomDb,
+    name: &str,
+    created_at: f64,
+) -> Result<Vec<serde_json::Value>> {
+    let owned = owned_subscriptions(db, name)?;
+    let last_stop: Option<String> = db
+        .conn
+        .query_row(
+            "SELECT data FROM events
+             WHERE type = 'life' AND instance = ?
+               AND json_extract(data, '$.action') = 'stopped'
+             ORDER BY id DESC LIMIT 1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let soft_saved = last_stop
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|d| d["snapshot"]["created_at"].as_f64() == Some(created_at))
+        .and_then(|d| d["snapshot"]["subscriptions"].as_array().cloned())
+        .unwrap_or_default();
+    let owned_ids: HashSet<String> = owned
+        .iter()
+        .filter_map(|s| s.get("id").and_then(|v| v.as_str()).map(String::from))
+        .collect();
+    let mut merged = owned;
+    merged.extend(soft_saved.into_iter().filter(|s| {
+        s.get("id")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| !owned_ids.contains(id))
+    }));
+    Ok(merged)
+}
+
+/// Most events a resume replays against restored subscriptions; a longer gap
+/// replays only its newest events.
+const RESUME_REPLAY_LIMIT: i64 = 1000;
+
+/// Restore the subscriptions saved in `name`'s latest stop snapshot, then
+/// replay the events it missed while stopped against them, so a match that
+/// happened during the gap still notifies. Only for a tracked resume of the
+/// same identity: a reused name must not inherit them. Returns the number
+/// of subscriptions restored.
+pub(crate) fn restore_stopped_subscriptions(db: &HcomDb, name: &str) -> Result<u32> {
+    let saved: Option<String> = db
+        .conn
+        .query_row(
+            "SELECT json_extract(data, '$.snapshot.subscriptions') FROM events
+             WHERE type = 'life' AND instance = ?
+               AND json_extract(data, '$.action') = 'stopped'
+             ORDER BY id DESC LIMIT 1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(serde_json::Value::Array(subs)) = saved.and_then(|s| serde_json::from_str(&s).ok())
+    else {
+        return Ok(0);
+    };
+
+    // Each restored sub's saved cursor: an event at or before it predates the
+    // sub's position and must neither match nor transition it.
+    let mut cursors: HashMap<String, i64> = HashMap::new();
+    for sub in &subs {
+        let Some(id) = sub.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if sub.get("caller").and_then(|v| v.as_str()) != Some(name) {
+            continue;
+        }
+        let key = format!("events_sub:{id}");
+        kv_store_sub(db, &key, sub);
+        if !subscription_is_delivery_only(sub) {
+            cursors.insert(
+                key,
+                sub.get("last_id").and_then(|v| v.as_i64()).unwrap_or(0),
+            );
+        }
+    }
+    let restored = subs.len() as u32;
+    let Some(&replay_from) = cursors.values().min() else {
+        return Ok(restored);
+    };
+
+    let mut stmt = db.conn.prepare(
+        "SELECT id, type, instance, data FROM
+           (SELECT id, type, instance, data FROM events WHERE id > ? ORDER BY id DESC LIMIT ?)
+         ORDER BY id",
+    )?;
+    let events: Vec<(i64, String, String, String)> = stmt
+        .query_map(params![replay_from, RESUME_REPLAY_LIMIT], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    // An on-hit reaction logs a new event whose live processing would move
+    // restored cursors past historical events not yet replayed. Hold
+    // reactions until the historical batch is drained.
+    let mut reactions = Vec::new();
+    for (event_id, event_type, instance, data) in events {
+        let data: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
+        if is_system_feedback(&event_type, &instance, &data) {
+            continue;
+        }
+        let eligible: HashSet<String> = cursors
+            .iter()
+            .filter(|(_, cursor)| **cursor < event_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        apply_request_watch_transitions(db, &event_type, &instance, &data, Some(&eligible));
+        fire_matching_subscriptions(
+            db,
+            event_id,
+            &event_type,
+            &instance,
+            &data,
+            Some(&eligible),
+            Some(&mut reactions),
+        );
+    }
+    for reaction in reactions {
+        reaction.send(db);
+    }
+    Ok(restored)
+}
+
 /// Remove delivery-only thread memberships for an instance name reuse.
 pub(crate) fn cleanup_thread_memberships_for_name_reuse(db: &HcomDb, name: &str) -> Result<u32> {
     let deleted = db.conn.execute(
@@ -469,6 +627,24 @@ pub(crate) fn add_thread_memberships(
     }
 }
 
+/// Recursion guard: events that could cause notification loops.
+fn is_system_feedback(event_type: &str, instance: &str, data: &serde_json::Value) -> bool {
+    if instance.starts_with("sys_") {
+        return true;
+    }
+    if event_type == "message" {
+        let sender = data.get("from").and_then(|v| v.as_str()).unwrap_or("");
+        let sender_kind = data
+            .get("sender_kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if sender == "[hcom-events]" || sender_kind == "system" {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check subscriptions and send matching notifications.
 /// Called inline from log_event(). Errors logged, never propagated.
 pub(crate) fn process_logged_event(
@@ -478,21 +654,27 @@ pub(crate) fn process_logged_event(
     instance: &str,
     data: &serde_json::Value,
 ) {
-    // Recursion guard: skip events that could cause notification loops.
-    if instance.starts_with("sys_") {
+    if is_system_feedback(event_type, instance, data) {
         return;
     }
-    if event_type == "message" {
-        let sender = data.get("from").and_then(|v| v.as_str()).unwrap_or("");
-        let sender_kind = data
-            .get("sender_kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if sender == "[hcom-events]" || sender_kind == "system" {
-            return;
-        }
-    }
 
+    apply_request_watch_transitions(db, event_type, instance, data, None);
+    fire_matching_subscriptions(db, event_id, event_type, instance, data, None, None);
+
+    // A grace expiry is not itself an event. Sweep after handling the current
+    // event so replies, active/blocked transitions, and stop events win first.
+    sweep_expired_reqwatch_graces(db, crate::shared::time::now_epoch_f64());
+}
+
+/// Request-watch state an event changes before matching: replies cancel
+/// watches, and agy grace resets. Limited to `only` (subscription keys).
+fn apply_request_watch_transitions(
+    db: &HcomDb,
+    event_type: &str,
+    instance: &str,
+    data: &serde_json::Value,
+    only: Option<&HashSet<String>>,
+) {
     if event_type == "message" {
         let msg_sender = data.get("from").and_then(|v| v.as_str()).unwrap_or("");
         let reply_to_id = data.get("reply_to_local").and_then(|v| v.as_i64());
@@ -508,14 +690,20 @@ pub(crate) fn process_logged_event(
                 })
                 .unwrap_or_default();
             if !msg_sender.is_empty() && !msg_delivered_to.is_empty() {
-                cancel_request_watches_by_flow(db, msg_sender, &msg_delivered_to, reply_to_id);
+                cancel_request_watches_by_flow(
+                    db,
+                    msg_sender,
+                    &msg_delivered_to,
+                    reply_to_id,
+                    only,
+                );
             }
         }
 
         if let Some(rid) = reply_to_id
             && !msg_sender.is_empty()
         {
-            cancel_request_watches_by_reply_id(db, msg_sender, rid);
+            cancel_request_watches_by_reply_id(db, msg_sender, rid, only);
         }
     }
 
@@ -523,10 +711,41 @@ pub(crate) fn process_logged_event(
     if event_type == "status" {
         let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if status == "active" || status == "blocked" {
-            clear_agy_reqwatch_idle_grace(db, instance);
+            clear_agy_reqwatch_idle_grace(db, instance, only);
         }
     }
+}
 
+/// An `--on-hit` message a subscription sends when it fires.
+struct OnHitReaction {
+    caller: String,
+    caller_kind: String,
+    text: String,
+    chain: Vec<String>,
+}
+
+impl OnHitReaction {
+    fn send(&self, db: &HcomDb) {
+        if let Err(e) =
+            send_reaction_message(db, &self.caller, &self.caller_kind, &self.text, &self.chain)
+        {
+            crate::log::log_error("db", "check_event_subscriptions.on_hit", &format!("{e}"));
+        }
+    }
+}
+
+/// Fire subscriptions matching one logged event, optionally limited to `only`
+/// (subscription keys). Advances cursors and removes `--once` hits. On-hit
+/// reactions are sent now, or queued in `defer_reactions` when given.
+fn fire_matching_subscriptions(
+    db: &HcomDb,
+    event_id: i64,
+    event_type: &str,
+    instance: &str,
+    data: &serde_json::Value,
+    only: Option<&HashSet<String>>,
+    mut defer_reactions: Option<&mut Vec<OnHitReaction>>,
+) {
     let rows: Vec<(String, String)> = match db.conn.prepare_cached(
         "SELECT key, value FROM kv
          WHERE key LIKE 'events_sub:%'
@@ -548,6 +767,9 @@ pub(crate) fn process_logged_event(
     }
 
     for (key, value) in &rows {
+        if only.is_some_and(|keys| !keys.contains(key)) {
+            continue;
+        }
         let mut sub: serde_json::Value = match serde_json::from_str(value) {
             Ok(v) => v,
             Err(_) => continue,
@@ -755,8 +977,15 @@ pub(crate) fn process_logged_event(
                 .unwrap_or("external");
             let mut chain = reaction_chain.clone();
             chain.push(sub_id.to_string());
-            if let Err(e) = send_reaction_message(db, caller, caller_kind, on_hit_text, &chain) {
-                crate::log::log_error("db", "check_event_subscriptions.on_hit", &format!("{e}"));
+            let reaction = OnHitReaction {
+                caller: caller.to_string(),
+                caller_kind: caller_kind.to_string(),
+                text: on_hit_text.to_string(),
+                chain,
+            };
+            match defer_reactions.as_deref_mut() {
+                Some(queue) => queue.push(reaction),
+                None => reaction.send(db),
             }
         }
 
@@ -791,15 +1020,12 @@ pub(crate) fn process_logged_event(
             }
         }
     }
-
-    // A grace expiry is not itself an event. Sweep after handling the current
-    // event so replies, active/blocked transitions, and stop events win first.
-    sweep_expired_reqwatch_graces(db, crate::shared::time::now_epoch_f64());
 }
 
 /// Load all reqwatch subscriptions as (key, parsed_sub, filters) tuples.
 pub(crate) fn load_reqwatch_subs(
     db: &HcomDb,
+    only: Option<&HashSet<String>>,
 ) -> Vec<(String, serde_json::Value, serde_json::Value)> {
     let rows: Vec<(String, String)> = match db
         .conn
@@ -816,6 +1042,7 @@ pub(crate) fn load_reqwatch_subs(
     };
 
     rows.into_iter()
+        .filter(|(key, _)| only.is_none_or(|keys| keys.contains(key)))
         .filter_map(|(key, value)| {
             let sub: serde_json::Value = serde_json::from_str(&value).ok()?;
             let filters = sub.get("filters")?.clone();
@@ -830,8 +1057,9 @@ pub(crate) fn cancel_request_watches_by_flow(
     sender: &str,
     delivered_to: &[String],
     reply_to_id: Option<i64>,
+    only: Option<&HashSet<String>>,
 ) {
-    for (key, sub, filters) in &load_reqwatch_subs(db) {
+    for (key, sub, filters) in &load_reqwatch_subs(db, only) {
         let target = filters.get("target").and_then(|v| v.as_str()).unwrap_or("");
         let sub_caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -857,8 +1085,13 @@ pub(crate) fn cancel_request_watches_by_flow(
 }
 
 /// Cancel request-watch subs by explicit reply_to match.
-pub(crate) fn cancel_request_watches_by_reply_id(db: &HcomDb, sender: &str, reply_to_id: i64) {
-    for (key, _sub, filters) in &load_reqwatch_subs(db) {
+pub(crate) fn cancel_request_watches_by_reply_id(
+    db: &HcomDb,
+    sender: &str,
+    reply_to_id: i64,
+    only: Option<&HashSet<String>>,
+) {
+    for (key, _sub, filters) in &load_reqwatch_subs(db, only) {
         let target = filters.get("target").and_then(|v| v.as_str()).unwrap_or("");
         let req_id = filters
             .get("request_id")
@@ -2013,7 +2246,13 @@ mod tests {
             .unwrap();
 
         // Simulate responder replying to requester with reply_to matching request_id
-        cancel_request_watches_by_flow(&db, "responder", &["requester".to_string()], Some(42));
+        cancel_request_watches_by_flow(
+            &db,
+            "responder",
+            &["requester".to_string()],
+            Some(42),
+            None,
+        );
 
         // Subscription should be deleted
         assert!(
@@ -2051,7 +2290,13 @@ mod tests {
             .unwrap();
 
         // Reply with wrong request_id — should NOT cancel
-        cancel_request_watches_by_flow(&db, "responder", &["requester".to_string()], Some(99));
+        cancel_request_watches_by_flow(
+            &db,
+            "responder",
+            &["requester".to_string()],
+            Some(99),
+            None,
+        );
 
         assert!(
             db.kv_get("events_sub:reqwatch-test2").unwrap().is_some(),
@@ -2775,6 +3020,380 @@ mod tests {
         assert_eq!(deleted, 1);
         assert!(db.kv_get("events_sub:sub-normal").unwrap().is_none());
         assert!(db.kv_get("events_sub:sub-thread").unwrap().is_some());
+
+        cleanup_test_db(db_path);
+    }
+
+    fn notices_to(db: &HcomDb, name: &str) -> i64 {
+        db.conn
+            .query_row(
+                "SELECT COUNT(*) FROM events_v WHERE type = 'message'
+                   AND msg_from = '[hcom-events]'
+                   AND json_extract(data, '$.text') LIKE '@' || ? || ' %'",
+                params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn stop_for_resume(db: &HcomDb, name: &str) {
+        let created_at: f64 = db
+            .conn
+            .query_row(
+                "SELECT created_at FROM instances WHERE name = ?",
+                params![name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let event = json!({"action": "stopped", "snapshot": {"name": name}});
+        assert!(
+            db.finalize_instance_stop(name, created_at, None, None, &event)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_resume_restores_once_sub_and_replays_missed_match() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 1.0), ('libe', 1.0)",
+                [],
+            )
+            .unwrap();
+        let sub = json!({
+            "id": "sub-idle", "caller": "mula", "once": true,
+            "sql": "type = 'status' AND instance = 'libe' AND status_val = 'listening'",
+            "last_id": db.get_last_event_id(),
+        });
+        db.kv_set("events_sub:sub-idle", Some(&sub.to_string()))
+            .unwrap();
+
+        stop_for_resume(&db, "mula");
+        assert!(db.kv_get("events_sub:sub-idle").unwrap().is_none());
+
+        // The match happens while mula is stopped.
+        db.log_status_event("libe", "listening", "", None, None)
+            .unwrap();
+        assert_eq!(notices_to(&db, "mula"), 0);
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 2.0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(restore_stopped_subscriptions(&db, "mula").unwrap(), 1);
+        assert_eq!(
+            notices_to(&db, "mula"),
+            1,
+            "missed match notifies on resume"
+        );
+        assert!(
+            db.kv_get("events_sub:sub-idle").unwrap().is_none(),
+            "once sub is consumed by the replayed match"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_resume_restores_continuous_sub_without_refiring_old_matches() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 1.0), ('libe', 1.0)",
+                [],
+            )
+            .unwrap();
+        let sub = json!({
+            "id": "sub-watch", "caller": "mula",
+            "sql": "type = 'status' AND instance = 'libe' AND status_val = 'listening'",
+            "last_id": db.get_last_event_id(),
+        });
+        db.kv_set("events_sub:sub-watch", Some(&sub.to_string()))
+            .unwrap();
+
+        // Matched (and notified) while mula was alive.
+        db.log_status_event("libe", "listening", "", None, None)
+            .unwrap();
+        assert_eq!(notices_to(&db, "mula"), 1);
+
+        stop_for_resume(&db, "mula");
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 2.0)",
+                [],
+            )
+            .unwrap();
+        restore_stopped_subscriptions(&db, "mula").unwrap();
+        assert_eq!(
+            notices_to(&db, "mula"),
+            1,
+            "no replay of an already-notified match"
+        );
+        assert!(db.kv_get("events_sub:sub-watch").unwrap().is_some());
+
+        // Still live after restore.
+        db.log_status_event("libe", "listening", "", None, None)
+            .unwrap();
+        assert_eq!(notices_to(&db, "mula"), 2);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_resume_does_not_rematch_events_seen_live_before_stop() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 1.0), ('libe', 1.0)",
+                [],
+            )
+            .unwrap();
+        // Like the collision preset: a libe event matches only once a later
+        // event exists, so live matching (at log time) never hits it and
+        // never moves last_id.
+        let sub = json!({
+            "id": "sub-later", "caller": "mula",
+            "sql": "type = 'status' AND instance = 'libe' AND EXISTS (
+                      SELECT 1 FROM events_v e
+                      WHERE e.id > events_v.id AND e.instance = 'nemo')",
+            "last_id": db.get_last_event_id(),
+        });
+        db.kv_set("events_sub:sub-later", Some(&sub.to_string()))
+            .unwrap();
+        db.log_status_event("libe", "listening", "", None, None)
+            .unwrap();
+        db.log_status_event("nemo", "listening", "", None, None)
+            .unwrap();
+        assert_eq!(notices_to(&db, "mula"), 0);
+
+        stop_for_resume(&db, "mula");
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 2.0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(restore_stopped_subscriptions(&db, "mula").unwrap(), 1);
+        assert_eq!(
+            notices_to(&db, "mula"),
+            0,
+            "events seen live before the stop must not be replayed"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_resume_restores_thread_membership_dropped_by_name_reuse_cleanup() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 1.0)",
+                [],
+            )
+            .unwrap();
+        let member = json!({
+            "id": "sub-thread", "caller": "mula", "thread_name": "uvx",
+            "auto_thread_member": true, "delivery_only": true, "last_id": 0,
+        });
+        db.kv_set("events_sub:sub-thread", Some(&member.to_string()))
+            .unwrap();
+
+        stop_for_resume(&db, "mula");
+        // Re-creating the row runs the name-reuse cleanup.
+        db.cleanup_thread_memberships_for_name_reuse("mula")
+            .unwrap();
+        assert!(db.kv_get("events_sub:sub-thread").unwrap().is_none());
+
+        assert_eq!(restore_stopped_subscriptions(&db, "mula").unwrap(), 1);
+        assert!(db.kv_get("events_sub:sub-thread").unwrap().is_some());
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_resume_restores_subs_deleted_by_earlier_soft_stop_of_same_row() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 1.0)",
+                [],
+            )
+            .unwrap();
+        let sub = json!({"id": "sub-watch", "caller": "mula", "sql": "0", "last_id": 0});
+        db.kv_set("events_sub:sub-watch", Some(&sub.to_string()))
+            .unwrap();
+
+        // Soft stop (as soft_finalize_session): save, delete, keep the row.
+        let saved = subscriptions_to_save(&db, "mula", 1.0).unwrap();
+        db.cleanup_subscriptions("mula").unwrap();
+        db.log_event(
+            "life",
+            "mula",
+            &json!({"action": "stopped", "snapshot": {"created_at": 1.0, "subscriptions": saved}}),
+        )
+        .unwrap();
+
+        // The row's hard stop finds nothing owned but carries the soft save.
+        stop_for_resume(&db, "mula");
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 2.0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(restore_stopped_subscriptions(&db, "mula").unwrap(), 1);
+        assert!(db.kv_get("events_sub:sub-watch").unwrap().is_some());
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_resume_replay_skips_events_before_each_subs_cursor() {
+        let (db, db_path) = setup_full_test_db();
+        // An older sub makes replay start early.
+        let old = json!({"id": "sub-old", "caller": "gora", "sql": "0", "last_id": 0});
+        db.kv_set("events_sub:sub-old", Some(&old.to_string()))
+            .unwrap();
+        // nabe messages gora before gora's request exists.
+        db.log_event(
+            "message",
+            "nabe",
+            &json!({"from": "nabe", "sender_kind": "instance", "scope": "mentions",
+                    "text": "fyi", "mentions": ["gora"], "delivered_to": ["gora"]}),
+        )
+        .unwrap();
+        let request_id = setup_reqwatch_pair(&db, "gora", "nabe", "claude");
+        let sub_key = format!("events_sub:reqwatch-{request_id}-nabe");
+
+        stop_for_resume(&db, "gora");
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES ('gora', 'claude', 2.0)",
+                [],
+            )
+            .unwrap();
+        restore_stopped_subscriptions(&db, "gora").unwrap();
+
+        assert!(
+            db.kv_get(&sub_key).unwrap().is_some(),
+            "a message older than the request must not cancel its watch"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_resume_replay_defers_on_hit_until_history_is_replayed() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 1.0), ('libe', 1.0)",
+                [],
+            )
+            .unwrap();
+        let last = db.get_last_event_id();
+        // A reacts to libe idling; B watches every message.
+        let a = json!({"id": "sub-a", "caller": "mula", "last_id": last,
+            "sql": "type = 'status' AND instance = 'libe' AND status_val = 'listening'",
+            "on_hit_text": "libe idle", "caller_kind": "instance"});
+        let b = json!({"id": "sub-b", "caller": "mula", "last_id": last,
+            "sql": "type = 'message'"});
+        db.kv_set("events_sub:sub-a", Some(&a.to_string())).unwrap();
+        db.kv_set("events_sub:sub-b", Some(&b.to_string())).unwrap();
+        stop_for_resume(&db, "mula");
+
+        db.log_status_event("libe", "listening", "", None, None)
+            .unwrap();
+        let missed = db
+            .log_event(
+                "message",
+                "libe",
+                &json!({"from": "libe", "sender_kind": "instance", "scope": "broadcast",
+                        "text": "done"}),
+            )
+            .unwrap();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('mula', 2.0)",
+                [],
+            )
+            .unwrap();
+        restore_stopped_subscriptions(&db, "mula").unwrap();
+
+        let notified: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events_v WHERE type = 'message'
+                   AND msg_from = '[hcom-events]'
+                   AND json_extract(data, '$.text') LIKE '%sub-b%'
+                   AND json_extract(data, '$.text') LIKE '%#' || ? || ' %'",
+                params![missed],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            notified, 1,
+            "B's missed message survives A's on-hit reaction"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_resume_replay_resets_agy_grace_before_matching() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "gora", "nabe", "antigravity");
+        let sub_key = format!("events_sub:reqwatch-{request_id}-nabe");
+        let before = count_reqwatch_without_reply_notifications(&db, "gora");
+
+        // Grace armed by an idle spell, then expired before gora stops.
+        db.log_event(
+            "status",
+            "nabe",
+            &json!({"status": "listening", "context": ""}),
+        )
+        .unwrap();
+        let mut sub: serde_json::Value =
+            serde_json::from_str(&db.kv_get(&sub_key).unwrap().unwrap()).unwrap();
+        sub["idle_grace_until"] = json!(1.0);
+        kv_store_sub(&db, &sub_key, &sub);
+        stop_for_resume(&db, "gora");
+
+        // While gora is stopped nabe works again, then starts a new idle spell.
+        db.log_event(
+            "status",
+            "nabe",
+            &json!({"status": "active", "context": "tool:x"}),
+        )
+        .unwrap();
+        db.log_event(
+            "status",
+            "nabe",
+            &json!({"status": "listening", "context": ""}),
+        )
+        .unwrap();
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES ('gora', 'claude', 2.0)",
+                [],
+            )
+            .unwrap();
+        restore_stopped_subscriptions(&db, "gora").unwrap();
+
+        assert_eq!(
+            count_reqwatch_without_reply_notifications(&db, "gora"),
+            before,
+            "the new idle spell gets a fresh grace, not the stale expired one"
+        );
+        let rearmed: serde_json::Value =
+            serde_json::from_str(&db.kv_get(&sub_key).unwrap().unwrap()).unwrap();
+        assert!(rearmed["idle_grace_until"].as_f64().unwrap() > 1.0);
 
         cleanup_test_db(db_path);
     }

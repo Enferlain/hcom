@@ -543,7 +543,14 @@ fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> H
     // that's about to take another turn. Real teardown is the PTY exit. Other gemini
     // tools have a genuine SessionEnd == process death, so they hard-finalize.
     if is_agy {
-        if let Err(e) = common::soft_finalize_session(db, &instance.name, &reason, None, false) {
+        if let Err(e) = common::soft_finalize_session(
+            db,
+            &instance.name,
+            &reason,
+            None,
+            false,
+            common::SoftStop::ProcessContinues,
+        ) {
             crate::log::log_error(
                 "hooks",
                 "sessionend.soft_failed",
