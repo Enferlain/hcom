@@ -26,6 +26,11 @@
 //! is part of the model's turn, or when the prompt request returns a result.
 //! A batch that never started (removed from the queue, transport lost) stays
 //! unread and is queued again later: at-least-once, never silently dropped.
+//!
+//! When the leader restarts (it does so to apply an auto-update), the bridge
+//! reconnects to the new one, replays the session loads and announces it with
+//! `x.ai/leader_reconnected`. Requests the old leader had not answered never
+//! will be, so hcom handles it as a lost connection.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -58,7 +63,7 @@ const ROSTER_FAST_WINDOW: Duration = Duration::from_secs(5);
 const ROSTER_SLOW_POLL: Duration = Duration::from_secs(15);
 /// Wait before re-queueing a batch whose prompt was dropped before it ran
 /// (user removed it from the queue, prompt error, transport lost).
-const REQUEUE_DELAY: Duration = Duration::from_secs(10);
+const REQUEUE_DELAY: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 /// Wait before loading the bound session again after a failed load.
 const LOAD_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Prompts hcom queues carry this `promptId` prefix.
@@ -746,13 +751,20 @@ struct InFlight {
     /// prompt when its client disconnects, so the batch is followed through
     /// the reconnected client's queue snapshots, not treated as dropped.
     detached_at: Option<Instant>,
+    /// Whether the latest roster since the drop shows its session idle.
+    /// Reconnecting brings no queue snapshot, and Grok runs a queued prompt
+    /// as soon as its session is idle, so only an idle session proves the
+    /// batch is no longer waiting behind a turn. (A row the user holds for
+    /// editing at the front can still park it, for up to Grok's edit-hold
+    /// TTL; that stays a possible duplicate.)
+    idle_after_detach: bool,
 }
 
 /// How long to wait after `removedFromQueue` for the snapshot showing a merge.
 const MERGE_EVIDENCE_WAIT: Duration = Duration::from_secs(2);
 /// How long a batch whose connection dropped waits for a queue snapshot
-/// before the transcript decides.
-const DETACHED_WAIT: Duration = Duration::from_secs(30);
+/// before the transcript decides, once its session is idle.
+const DETACHED_WAIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 30 });
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -838,6 +850,15 @@ fn roster_sessions(result: &Value) -> &[Value] {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
+}
+
+/// Whether the roster shows `session` in a turn: running, or waiting on an
+/// approval or question (`needs_input` wins over `working` mid-turn).
+fn roster_busy(sessions: &[Value], session: &str) -> bool {
+    sessions.iter().any(|entry| {
+        entry["sessionId"] == session
+            && matches!(entry["activity"].as_str(), Some("working" | "needs_input"))
+    })
 }
 
 /// Point the instance at `session`, as a hook-based SessionStart would.
@@ -1070,7 +1091,14 @@ pub(super) fn run(
                                 log_warn("native", "grok.acp.roster_failed", &error.to_string())
                             }
                             None => {
-                                effects.extend(tracker.on_roster(roster_sessions(&value["result"])))
+                                let sessions = roster_sessions(&value["result"]);
+                                if let Some(flight) = in_flight.as_mut()
+                                    && flight.detached_at.is_some()
+                                {
+                                    flight.idle_after_detach =
+                                        !roster_busy(sessions, &flight.session);
+                                }
+                                effects.extend(tracker.on_roster(sessions))
                             }
                         },
                         Some(Pending::Load(session)) => match value.get("error") {
@@ -1115,6 +1143,10 @@ pub(super) fn run(
                     }
                 }
                 Event::Notification { method, params } => {
+                    if method == "x.ai/leader_reconnected" {
+                        closed = Some("Grok leader restarted".into());
+                        break;
+                    }
                     if method == "x.ai/queue/changed"
                         && let Some(flight) = in_flight.as_ref()
                         && params["sessionId"].as_str() == Some(flight.session.as_str())
@@ -1219,6 +1251,7 @@ pub(super) fn run(
             if let Some(flight) = in_flight.as_mut() {
                 flight.request_id = None;
                 flight.detached_at.get_or_insert_with(Instant::now);
+                flight.idle_after_detach = false;
             }
             log_warn("native", "grok.acp.disconnected", &error);
         }
@@ -1233,6 +1266,7 @@ pub(super) fn run(
         if outcome.is_none()
             && in_flight
                 .as_ref()
+                .filter(|flight| flight.idle_after_detach)
                 .and_then(|flight| flight.detached_at)
                 .is_some_and(|at| at.elapsed() >= DETACHED_WAIT)
         {
@@ -1366,6 +1400,7 @@ pub(super) fn run(
                         ack: prepared.ack,
                         removed_at: None,
                         detached_at: None,
+                        idle_after_detach: false,
                     });
                 }
                 Err(error) => {
@@ -1404,6 +1439,7 @@ mod tests {
             },
             removed_at: removed.then(Instant::now),
             detached_at: None,
+            idle_after_detach: false,
         }
     }
 
@@ -1462,6 +1498,18 @@ mod tests {
             queue_outcome(&gone, &detached),
             Some(Outcome::Dropped(_))
         ));
+    }
+
+    #[test]
+    fn roster_busy_includes_pending_approvals() {
+        let roster = |activity: &str| {
+            vec![json!({"sessionId": "s", "resident": true, "activity": activity})]
+        };
+        assert!(roster_busy(&roster("working"), "s"));
+        // An approval mid-turn reports needs_input, not working.
+        assert!(roster_busy(&roster("needs_input"), "s"));
+        assert!(!roster_busy(&roster("idle"), "s"));
+        assert!(!roster_busy(&roster("working"), "other"));
     }
 
     #[test]
@@ -1871,5 +1919,179 @@ mod tests {
         assert_eq!(launch.child_env(), [("GROK_SUBAGENTS".into(), "0".into())]);
         let plain = Launch::new("grok", &[], &["--", "--no-subagents"]).unwrap();
         assert!(plain.child_env().is_empty());
+    }
+
+    /// Stands in for `grok agent --leader --leader-socket <sock> stdio`. On
+    /// the first bridge the leader restarts as hcom's batch goes out: the
+    /// bridge announces `x.ai/leader_reconnected`, the old leader never
+    /// answers the prompt, and the new one has an empty queue. With a
+    /// `queued` flag file beside it, only the bridge drops instead: the
+    /// batch stays queued behind a turn that ends after `DETACHED_WAIT`. As
+    /// with Grok, loading a session sends no queue snapshot; only the
+    /// roster shows the turn. Every prompt the second bridge receives is
+    /// counted in `requeued`.
+    #[cfg(unix)]
+    const FAKE_BRIDGE: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+run=$(( $(cat "$dir/runs" 2>/dev/null || echo 0) + 1 ))
+echo "$run" > "$dir/runs"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*|*'"method":"session/load"'*)
+      echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
+      case "$line" in *session/load*)
+        if [ -f "$dir/turn" ]; then
+          # The turn ends and the held batch runs.
+          held=$(cat "$dir/prompt")
+          (sleep 4; rm -f "$dir/turn"; echo "{\"jsonrpc\":\"2.0\",\"method\":\"_x.ai/queue/changed\",\"params\":{\"sessionId\":\"s1\",\"runningPromptId\":\"$held\",\"runningKind\":\"prompt\",\"entries\":[]}}") &
+        fi;;
+      esac ;;
+    *'"method":"_x.ai/sessions/list"'*)
+      activity=idle
+      [ -f "$dir/turn" ] && activity=working
+      echo "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"sessions\":[{\"sessionId\":\"s1\",\"resident\":true,\"activity\":\"$activity\",\"lastChangeUnixMs\":1}]}}" ;;
+    *'"method":"session/prompt"'*)
+      prompt=$(printf '%s' "$line" | sed -n 's/.*"promptId":"\([^"]*\)".*/\1/p')
+      if [ "$run" = 1 ]; then
+        echo "$prompt" > "$dir/prompt"
+        if [ -f "$dir/queued" ]; then
+          touch "$dir/turn"
+          exit 0
+        fi
+        echo '{"jsonrpc":"2.0","method":"x.ai/leader_reconnected","params":{}}'
+      else
+        echo "$prompt" >> "$dir/requeued"
+        echo "{\"jsonrpc\":\"2.0\",\"method\":\"_x.ai/queue/changed\",\"params\":{\"sessionId\":\"s1\",\"runningPromptId\":\"$prompt\",\"runningKind\":\"prompt\",\"entries\":[]}}"
+      fi ;;
+  esac
+done
+"#;
+
+    /// Runs one delivery through the fake bridge with the given flag files
+    /// until the batch is acked or 30 s pass. Returns whether it was acked,
+    /// how many bridges hcom started, and the prompts the second one got.
+    #[cfg(unix)]
+    fn deliver_across_restart(flags: &[&str]) -> (bool, String, Vec<String>) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db_path = hcom_dir.join("test.db");
+        let mut db = HcomDb::open_at(&db_path).unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        db.save_instance_named(
+            "nova",
+            &serde_json::Map::from_iter([
+                ("tool".into(), json!("grok")),
+                ("session_id".into(), json!("s1")),
+                ("directory".into(), json!(work.to_string_lossy())),
+                ("status".into(), json!(ST_LISTENING)),
+                ("created_at".into(), json!(1.0)),
+            ]),
+        )
+        .unwrap();
+        db.set_session_binding("s1", "nova").unwrap();
+        db.set_process_binding("proc-1", "s1", "nova").unwrap();
+        let message = json!({"from": "luna", "text": "are you there?",
+                             "scope": "mentions", "mentions": ["nova"]});
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-01-01T00:00:00Z', 'luna', ?1)",
+                rusqlite::params![message.to_string()],
+            )
+            .unwrap();
+        let message_id = db.conn().last_insert_rowid();
+
+        let bridge = dir.path().join("grok");
+        std::fs::write(&bridge, FAKE_BRIDGE).unwrap();
+        std::fs::set_permissions(&bridge, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for flag in flags {
+            std::fs::write(dir.path().join(flag), "").unwrap();
+        }
+        let launch = Launch {
+            command: bridge.to_string_lossy().into_owned(),
+            prefix: Vec::new(),
+            socket: dir
+                .path()
+                .join("leader.sock")
+                .to_string_lossy()
+                .into_owned(),
+            no_subagents: false,
+        };
+
+        let running = Arc::new(AtomicBool::new(true));
+        let watcher = {
+            let running = running.clone();
+            let db_path = db_path.clone();
+            std::thread::spawn(move || {
+                let db = HcomDb::open_at(&db_path).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while db.get_cursor("nova") < message_id && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                running.store(false, Ordering::Release);
+            })
+        };
+        let notify = NotifyServer::new().unwrap();
+        let state = DeliveryState {
+            screen: Arc::new(RwLock::new(Default::default())),
+            grok_acp: None,
+            launch_phase_active: Arc::new(AtomicBool::new(false)),
+            inject_port: 0,
+            user_activity_cooldown_ms: 0,
+        };
+        let mut name = "nova".to_string();
+        run(
+            &launch,
+            &running,
+            &mut db,
+            &notify,
+            &state,
+            "proc-1",
+            &mut name,
+            &ToolConfig::for_tool(crate::tool::Tool::Grok),
+            &None,
+            &None,
+            &None,
+            &mut super::super::host_label::HostLabel::resolve(),
+            &mut LaunchOutcome::Ready,
+        );
+        watcher.join().unwrap();
+
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap_or_default();
+        (
+            db.get_cursor("nova") == message_id,
+            read("runs").trim().to_string(),
+            read("requeued").lines().map(str::to_string).collect(),
+        )
+    }
+
+    /// Observed: the leader auto-updated and restarted while idle, and the
+    /// batch queued across the restart was never answered. It stayed in
+    /// flight, no later mail was queued, and unread climbed until someone
+    /// typed into the agent's terminal.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn batch_lost_in_a_leader_restart_is_queued_again() {
+        let (acked, runs, requeued) = deliver_across_restart(&[]);
+        assert!(acked, "the batch was never acked");
+        assert_eq!(runs, "2", "hcom should reconnect exactly once");
+        assert_eq!(requeued.len(), 1, "the lost batch is queued again once");
+    }
+
+    /// Observed: only the bridge dropped while the batch waited behind a long
+    /// tool call. Reconnecting brought no queue snapshot, hcom queued the
+    /// batch again, and Grok ran both copies once the tool finished.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn batch_queued_behind_a_turn_across_a_bridge_drop_is_not_queued_twice() {
+        let (acked, runs, requeued) = deliver_across_restart(&["queued"]);
+        assert!(acked, "the batch was never acked");
+        assert_eq!(runs, "2", "hcom should reconnect exactly once");
+        assert!(requeued.is_empty(), "the queued batch was sent again");
     }
 }
