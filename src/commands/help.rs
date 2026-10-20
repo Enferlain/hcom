@@ -824,6 +824,10 @@ const TERM_SCREEN: &[HelpEntry] = &[
         "    Fields: lines[], size[rows,cols], cursor[row,col], ready, prompt_empty, input_text",
     ),
     (
+        "",
+        "    prompt_empty/input_text are null when no composer is read (not parsed for this tool)",
+    ),
+    (
         "  --clean",
         "No status header or line numbers ([name] labels kept for all)",
     ),

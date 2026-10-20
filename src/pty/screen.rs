@@ -1385,10 +1385,13 @@ impl ScreenTracker {
         j.push_str(&format!("  \"size\": [{}, {}],\n", rows, cols));
         j.push_str(&format!("  \"cursor\": [{}, {}],\n", cursor.0, cursor.1));
         j.push_str(&format!("  \"ready\": {},\n", self.is_ready()));
-        j.push_str(&format!(
-            "  \"prompt_empty\": {},\n",
-            self.is_prompt_empty(tool)
-        ));
+        // null when no composer was read (no parser for this tool, or a menu
+        // in its place): unknown, which scripts must not read as "has text".
+        let prompt_empty = match &input_text {
+            Some(text) => text.is_empty().to_string(),
+            None => "null".to_string(),
+        };
+        j.push_str(&format!("  \"prompt_empty\": {prompt_empty},\n"));
         match input_text {
             Some(ref t) => j.push_str(&format!("  \"input_text\": {}\n", json_escape(t))),
             None => j.push_str("  \"input_text\": null\n"),
@@ -2452,6 +2455,24 @@ mod tests {
         ]);
         assert_eq!(t.get_qoder_input_text(), None);
         assert!(!t.is_prompt_empty("qoder"));
+    }
+
+    #[test]
+    fn screen_dump_prompt_empty_is_null_when_no_composer_is_read() {
+        let dump = |t: &ScreenTracker, tool| -> serde_json::Value {
+            serde_json::from_str(&t.get_screen_dump(tool, 0)).unwrap()
+        };
+        let mut t = make_tracker(24, 80, "> ");
+        t.process("╭──────────────────────────╮\r\n".as_bytes());
+        t.process("│ >                        │\r\n".as_bytes());
+        t.process("╰──────────────────────────╯\r\n".as_bytes());
+        let parsed = dump(&t, "kimi");
+        assert_eq!(parsed["prompt_empty"], true);
+        assert_eq!(parsed["input_text"], "");
+        // Same screen, but Grok has no composer parser: unknown, not "has text".
+        let unparsed = dump(&t, "grok");
+        assert!(unparsed["prompt_empty"].is_null());
+        assert!(unparsed["input_text"].is_null());
     }
 
     // ---- Kimi input extraction ----

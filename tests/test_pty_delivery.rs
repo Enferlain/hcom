@@ -452,8 +452,8 @@ fn validate_screen_schema(screen: &serde_json::Value) {
     assert_eq!(cursor.len(), 2, "cursor should be [r,c]");
     assert!(screen["ready"].is_boolean(), "ready should be bool");
     assert!(
-        screen["prompt_empty"].is_boolean(),
-        "prompt_empty should be bool"
+        screen["prompt_empty"].is_null() || screen["prompt_empty"].is_boolean(),
+        "prompt_empty should be bool or null"
     );
     assert!(
         screen["input_text"].is_null() || screen["input_text"].is_string(),
@@ -494,15 +494,13 @@ fn validate_ready_pattern(screen: &serde_json::Value, tool: &str) {
 }
 
 fn validate_prompt_consistency(screen: &serde_json::Value) {
-    let input_text = screen["input_text"].as_str().unwrap_or("");
-    let prompt_empty = screen["prompt_empty"].as_bool().unwrap();
-
-    if prompt_empty && !input_text.is_empty() {
-        panic!("prompt_empty=true but input_text={input_text:?}");
-    }
-    if !prompt_empty && input_text.is_empty() {
-        eprintln!("  WARN: prompt_empty=false but input_text is empty");
-    }
+    let input_text = screen["input_text"].as_str();
+    let prompt_empty = screen["prompt_empty"].as_bool();
+    assert_eq!(
+        prompt_empty,
+        input_text.map(str::is_empty),
+        "prompt_empty must follow input_text (null when no composer is read)"
+    );
 }
 
 fn validate_tool_ui_elements(screen: &serde_json::Value, tool: &str) {
