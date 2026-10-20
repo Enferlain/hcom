@@ -21,11 +21,17 @@ use crate::log::log_info;
 use crate::router::GlobalFlags;
 use crate::shared::ST_INACTIVE;
 use crate::transcript::{claude_projects_dir, qoder_projects_dir};
+use rusqlite::OptionalExtension;
 
 /// Where to load the resume/fork plan from.
 enum ResumeSource<'a> {
     /// Resume an hcom-tracked instance by name (active or stopped).
-    Instance { name: &'a str },
+    /// `stop_event` pins the life.stopped event to load the conversation
+    /// from, set when the request named a session rather than the agent.
+    Instance {
+        name: &'a str,
+        stop_event: Option<i64>,
+    },
     /// Adopt a session from its on-disk transcript (first-time bring-in under hcom).
     Disk {
         session_id: String,
@@ -80,11 +86,14 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
 /// Parse resume/fork argv: `r|f <name> [extra-args...]`
 pub fn parse_resume_argv(argv: &[String], cmd: &str) -> Result<(String, Vec<String>)> {
     let mut i = 0;
+    let mut saw_cmd = false;
 
-    // Skip command name and global flags
+    // Skip the command name (once: a generated name like "resume" is a valid
+    // target) and global flags
     while i < argv.len() {
         match argv[i].as_str() {
-            s if s == cmd || s == "resume" || s == "fork" || s == "f" => {
+            s if !saw_cmd && (s == cmd || s == "resume" || s == "fork" || s == "f") => {
+                saw_cmd = true;
                 i += 1;
             }
             "--name" => {
@@ -262,6 +271,9 @@ fn resolve_name_to_plan(
 ) -> Result<(String, PreparedResume)> {
     let mut current = crate::identity::resolve_display_name_or_stopped(db, name)
         .unwrap_or_else(|| name.to_string());
+    // A session ID selects one stopped snapshot. Carry it to the plan rather
+    // than re-resolving by name, which would load the name's newest stop.
+    let mut stop_event: Option<i64> = None;
 
     // A loop over reclaim hops (binding → events → redirect to instance name).
     // Bounded by MAX_HOPS in case of pathological DB state.
@@ -278,15 +290,19 @@ fn resolve_name_to_plan(
                 );
             }
             // Stale binding: events are authoritative. Fall through.
-            if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&current) {
+            if let Ok(Some((instance_name, event_id))) =
+                db.find_stopped_event_by_session_id(&current)
+            {
                 current = instance_name;
+                stop_event = Some(event_id);
                 continue;
             }
             let plan = build_adopt_plan(db, &current, fork, extra_args, flags)?;
             return Ok((current, plan));
         }
 
-        if matches!(db.get_instance_full(&current), Ok(None) | Err(_))
+        if stop_event.is_none()
+            && matches!(db.get_instance_full(&current), Ok(None) | Err(_))
             && crate::relay::control::split_device_suffix(&current).is_none()
             && let Some(session_id) = resolve_thread_name(&current)?
         {
@@ -302,15 +318,27 @@ fn resolve_name_to_plan(
                 );
             }
             // Stale binding: fall through to events.
-            if let Ok(Some(instance_name)) = db.find_stopped_instance_by_session_id(&session_id) {
+            if let Ok(Some((instance_name, event_id))) =
+                db.find_stopped_event_by_session_id(&session_id)
+            {
                 current = instance_name;
+                stop_event = Some(event_id);
                 continue;
             }
             let plan = build_adopt_plan(db, &session_id, fork, extra_args, flags)?;
             return Ok((session_id, plan));
         }
 
-        let plan = prepare_resume_plan(db, &current, fork, extra_args, flags)?;
+        let plan = prepare_resume_plan_from_source(
+            db,
+            ResumeSource::Instance {
+                name: &current,
+                stop_event,
+            },
+            fork,
+            extra_args,
+            flags,
+        )?;
         return Ok((current, plan));
     }
 
@@ -327,7 +355,16 @@ fn prepare_resume_plan(
     extra_args: &[String],
     flags: &GlobalFlags,
 ) -> Result<PreparedResume> {
-    prepare_resume_plan_from_source(db, ResumeSource::Instance { name }, fork, extra_args, flags)
+    prepare_resume_plan_from_source(
+        db,
+        ResumeSource::Instance {
+            name,
+            stop_event: None,
+        },
+        fork,
+        extra_args,
+        flags,
+    )
 }
 
 /// Refuse to resume an agent whose process is still running; a verifiably
@@ -375,14 +412,14 @@ fn prepare_resume_plan_from_source(
         snapshot_dir,
         display_name,
     ) = match source {
-        ResumeSource::Instance { name } => {
+        ResumeSource::Instance { name, stop_event } => {
             if !fork {
                 ensure_not_running(db, name)?;
             }
-            let (tool, sid, largs, tag, bg, leid, snap) = if fork {
-                load_instance_data(db, name)?
-            } else {
-                load_stopped_snapshot(db, name)?
+            let (tool, sid, largs, tag, bg, leid, snap) = match stop_event {
+                Some(event_id) => load_pinned_snapshot(db, name, event_id)?,
+                None if fork => load_instance_data(db, name)?,
+                None => load_stopped_snapshot(db, name)?,
             };
             let tool = resolve_adhoc_resume_tool(name, tool, &sid, fork)?;
             (tool, sid, largs, tag, bg, leid, snap, name.to_string())
@@ -939,10 +976,7 @@ fn resume_system_prompt(tool: &str, name: &str, fork: bool, child_name: Option<&
 }
 
 /// Load data from an active or stopped instance.
-fn load_instance_data(
-    db: &HcomDb,
-    name: &str,
-) -> Result<(String, String, String, String, bool, i64, String)> {
+fn load_instance_data(db: &HcomDb, name: &str) -> Result<SnapshotData> {
     // Try active instance first
     if let Ok(Some(inst)) = db.get_instance_full(name) {
         return Ok((
@@ -960,76 +994,52 @@ fn load_instance_data(
     load_stopped_snapshot(db, name)
 }
 
+type SnapshotData = (String, String, String, String, bool, i64, String);
+
+/// Load the conversation from one specific stop, and the participant's
+/// cursor and tag from its newest stop. Both stops belong to the same agent
+/// (names are never reassigned), so messages it already received after the
+/// pinned stop are not redelivered.
+fn load_pinned_snapshot(db: &HcomDb, name: &str, event_id: i64) -> Result<SnapshotData> {
+    let data: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT data FROM events
+             WHERE id = ? AND type = 'life' AND instance = ?
+               AND json_extract(data, '$.action') = 'stopped'",
+            rusqlite::params![event_id, name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(mut pinned) = data.as_deref().and_then(parse_stopped_snapshot) else {
+        bail!("Stopped snapshot #{event_id} for '{name}' is missing or unreadable");
+    };
+    if let Ok((_, _, _, tag, _, cursor, _)) = load_stopped_snapshot(db, name) {
+        pinned.3 = tag;
+        pinned.5 = pinned.5.max(cursor);
+    }
+    Ok(pinned)
+}
+
 /// Load stopped snapshot from life events.
-fn load_stopped_snapshot(
-    db: &HcomDb,
-    name: &str,
-) -> Result<(String, String, String, String, bool, i64, String)> {
+fn load_stopped_snapshot(db: &HcomDb, name: &str) -> Result<SnapshotData> {
     // Filter action='stopped' in SQL so we can't miss it past a LIMIT window
     // (old 10-row LIMIT could drop the snapshot after many relaunches).
-    let mut stmt = db.conn().prepare(
-        "SELECT data FROM events
-         WHERE type='life'
-           AND instance=?
-           AND json_extract(data, '$.action') = 'stopped'
-         ORDER BY id DESC LIMIT 1",
-    )?;
+    let data: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT data FROM events
+             WHERE type='life'
+               AND instance=?
+               AND json_extract(data, '$.action') = 'stopped'
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .optional()?;
 
-    let rows: Vec<String> = stmt
-        .query_map(rusqlite::params![name], |row| row.get::<_, String>(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for data_str in &rows {
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(data_str)
-            && data.get("action").and_then(|v| v.as_str()) == Some("stopped")
-            && let Some(snapshot) = data.get("snapshot")
-        {
-            let tool = snapshot
-                .get("tool")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let session_id = snapshot
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let launch_args = snapshot
-                .get("launch_args")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let tag = snapshot
-                .get("tag")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let background = snapshot
-                .get("background")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                != 0;
-            let last_event_id = snapshot
-                .get("last_event_id")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let directory = snapshot
-                .get("directory")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            return Ok((
-                tool,
-                session_id,
-                launch_args,
-                tag,
-                background,
-                last_event_id,
-                directory,
-            ));
-        }
+    if let Some(snapshot) = data.as_deref().and_then(parse_stopped_snapshot) {
+        return Ok(snapshot);
     }
 
     let known = crate::identity::known_agent_names(db);
@@ -1037,6 +1047,31 @@ fn load_stopped_snapshot(
         "No agent named '{name}' to resume (not a known hcom agent, session UUID, or thread name){}\n  Stopped agents: hcom list --stopped",
         crate::shared::suggest::did_you_mean(name, known.iter().map(String::as_str))
     )
+}
+
+fn parse_stopped_snapshot(data_str: &str) -> Option<SnapshotData> {
+    let data = serde_json::from_str::<serde_json::Value>(data_str).ok()?;
+    if data.get("action").and_then(|v| v.as_str()) != Some("stopped") {
+        return None;
+    }
+    let snapshot = data.get("snapshot")?;
+    let text = |key: &str| {
+        snapshot
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let int = |key: &str| snapshot.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+    Some((
+        text("tool"),
+        text("session_id"),
+        text("launch_args"),
+        text("tag"),
+        int("background") != 0,
+        int("last_event_id"),
+        text("directory"),
+    ))
 }
 
 /// Build tool-specific resume/fork args from the integration spec.
@@ -2674,7 +2709,10 @@ mod tests {
             for fork in [false, true] {
                 let tracked = prepare_resume_plan_from_source(
                     &db,
-                    ResumeSource::Instance { name: "luna" },
+                    ResumeSource::Instance {
+                        name: "luna",
+                        stop_event: None,
+                    },
                     fork,
                     &[],
                     &GlobalFlags::default(),
@@ -2696,6 +2734,44 @@ mod tests {
                 assert_eq!(adopted.launch.resume_cursor, None);
             }
         }
+    }
+
+    /// Issue #166 comment: a session ID selects one stopped snapshot. It must
+    /// not collapse to the name and load whichever stop is newest under it.
+    #[test]
+    fn session_id_resume_keeps_the_selected_snapshot() {
+        let db = test_db();
+        let old_sid = "11111111-1111-4111-8111-111111111111";
+        let new_sid = "22222222-2222-4222-8222-222222222222";
+        for (sid, cursor, tag) in [(old_sid, 10, "old"), (new_sid, 50, "new")] {
+            db.log_event(
+                "life",
+                "luna",
+                &json!({"action": "stopped", "snapshot": {
+                    "tool": "codex", "session_id": sid, "tag": tag,
+                    "last_event_id": cursor, "directory": "/tmp", "launch_args": "[]"
+                }}),
+            )
+            .unwrap();
+        }
+
+        for fork in [false, true] {
+            let (name, plan) =
+                resolve_name_to_plan(&db, old_sid, fork, &[], &GlobalFlags::default()).unwrap();
+            assert_eq!(name, "luna");
+            assert_eq!(plan.session_id, old_sid, "fork={fork}");
+            assert!(plan.launch.args.iter().any(|a| a == old_sid), "fork={fork}");
+            if !fork {
+                // Same agent: keep its newest cursor and tag so messages it
+                // already received after the old stop aren't redelivered.
+                assert_eq!(plan.launch.resume_cursor, Some(50));
+                assert_eq!(plan.launch.tag.as_deref(), Some("new"));
+            }
+        }
+
+        let (_, by_name) =
+            resolve_name_to_plan(&db, "luna", false, &[], &GlobalFlags::default()).unwrap();
+        assert_eq!(by_name.session_id, new_sid);
     }
 
     #[test]
@@ -2779,6 +2855,13 @@ mod tests {
     #[test]
     fn test_parse_resume_argv_empty_fails() {
         assert!(parse_resume_argv(&s(&["r"]), "r").is_err());
+
+        // Generated names can be command words ("resume" is CVCVCV).
+        let (name, extra) = parse_resume_argv(&s(&["r", "resume", "--model", "x"]), "r").unwrap();
+        assert_eq!(name, "resume");
+        assert_eq!(extra, s(&["--model", "x"]));
+        let (name, _) = parse_resume_argv(&s(&["f", "resume"]), "f").unwrap();
+        assert_eq!(name, "resume");
     }
 
     #[test]

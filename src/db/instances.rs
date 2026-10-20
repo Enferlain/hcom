@@ -757,15 +757,27 @@ impl HcomDb {
     /// across the `session_bindings` cascade, so they're the right thing to
     /// consult when reclaiming hcom identity by UUID after stop/kill.
     pub fn find_stopped_instance_by_session_id(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .find_stopped_event_by_session_id(session_id)?
+            .map(|(name, _)| name))
+    }
+
+    /// Like `find_stopped_instance_by_session_id`, plus the id of that
+    /// life.stopped event, so a caller can load exactly that snapshot instead
+    /// of whichever stop is newest for the name.
+    pub fn find_stopped_event_by_session_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, i64)>> {
         self.conn
             .query_row(
-                "SELECT instance FROM events
+                "SELECT instance, id FROM events
                  WHERE type = 'life'
                    AND json_extract(data, '$.action') = 'stopped'
                    AND json_extract(data, '$.snapshot.session_id') = ?
                  ORDER BY id DESC LIMIT 1",
                 params![session_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()
             .map_err(Into::into)
