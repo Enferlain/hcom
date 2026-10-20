@@ -895,11 +895,8 @@ fn resolve_runner_binaries(
 /// by absolute path, silently routes every hook and agent command elsewhere.
 fn warn_if_agent_hcom_differs(runner_dirs: &[String]) {
     static WARNED: std::sync::Once = std::sync::Once::new();
-    // Dev mode re-execs whichever hcom runs into the dev build; uvx hooks
-    // never resolve `hcom` by name.
-    if crate::router::resolve_effective_dev_root(&crate::paths::db_path()).is_some()
-        || crate::runtime_env::get_hcom_prefix().len() > 1
-    {
+    // Dev mode re-execs whichever hcom runs into the dev build.
+    if crate::router::resolve_effective_dev_root(&crate::paths::db_path()).is_some() {
         return;
     }
     let Ok(exe) = std::env::current_exe() else {

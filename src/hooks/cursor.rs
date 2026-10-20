@@ -835,10 +835,11 @@ mod tests {
         )
         .unwrap();
 
+        let legacy = std::fs::read_to_string(&hooks_path).unwrap();
         try_setup_cursor_hooks(false).unwrap();
 
         let root: Value =
-            serde_json::from_str(&std::fs::read_to_string(hooks_path).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
         let stop = root["hooks"]["stop"].as_array().unwrap();
         assert_eq!(
             stop.iter()
@@ -856,6 +857,11 @@ mod tests {
                 .count(),
             1
         );
+        std::fs::write(&hooks_path, legacy).unwrap();
+        assert!(remove_cursor_hooks());
+        let remaining = std::fs::read_to_string(&hooks_path).unwrap();
+        assert!(!remaining.contains("uvx"));
+        assert!(remaining.contains("./custom-stop.sh"));
     }
 
     #[test]

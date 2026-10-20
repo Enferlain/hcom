@@ -13,30 +13,29 @@ static HCOM_PREFIX: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(
         return vec!["hcom".into()];
     }
 
-    if let Ok(exe) = std::env::current_exe()
-        && let Ok(resolved) = exe.canonicalize()
-        && is_uvx_ephemeral_exe(&resolved)
-    {
-        return vec!["uvx".into(), "hcom".into()];
-    }
-
     vec!["hcom".into()]
 });
 
-/// True when `exe` lives in a disposable `uvx` environment, which won't be on
-/// PATH for later hook invocations. uv creates those venvs inside its cache
-/// (`<cache>/archive-v0/<id>/bin/hcom`), and the cache root carries a
-/// `CACHEDIR.TAG`. `uv tool install`, `uv venv`, pip, brew, etc. install
-/// outside a tagged cache, so plain `hcom` is right for them.
-fn is_uvx_ephemeral_exe(exe: &std::path::Path) -> bool {
+/// True for uv's disposable `<cache>/archive-vN/<id>/bin/hcom` envs.
+/// Require both the uv archive bucket and its tagged cache root: a venv in
+/// an unrelated tagged cache (or a persistent uv tool env) is not ephemeral.
+pub(crate) fn is_uvx_ephemeral_exe(exe: &std::path::Path) -> bool {
     let Some(env_root) = exe.parent().and_then(|bin| bin.parent()) else {
         return false;
     };
+    let Some(bucket) = env_root.parent() else {
+        return false;
+    };
+    let is_archive = bucket
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("archive-v"))
+        .is_some_and(|version| !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()));
     env_root.join("pyvenv.cfg").is_file()
-        && env_root
-            .ancestors()
-            .skip(1)
-            .any(|dir| dir.join("CACHEDIR.TAG").is_file())
+        && is_archive
+        && bucket
+            .parent()
+            .is_some_and(|cache| cache.join("CACHEDIR.TAG").is_file())
 }
 
 /// Detect hcom invocation prefix based on execution context.
@@ -573,6 +572,16 @@ mod tests {
         let tool = venv(temp.path().join(".local/share/uv/tools/hcom"));
         std::fs::write(tool.parent().unwrap().join("../uv-receipt.toml"), "").unwrap();
         assert!(!super::is_uvx_ephemeral_exe(&tool));
+
+        let unrelated = venv(cache.join("other/venv"));
+        assert!(!super::is_uvx_ephemeral_exe(&unrelated));
+        let invalid_bucket = venv(cache.join("archive-version/venv"));
+        assert!(!super::is_uvx_ephemeral_exe(&invalid_bucket));
+        let brew = venv(temp.path().join("Cellar/hcom/0.7.30/libexec"));
+        assert!(!super::is_uvx_ephemeral_exe(&brew));
+        let pip = venv(temp.path().join("pip-venv"));
+        std::fs::remove_file(pip.parent().unwrap().parent().unwrap().join("CACHEDIR.TAG")).unwrap();
+        assert!(!super::is_uvx_ephemeral_exe(&pip));
 
         let project_venv = venv(temp.path().join("project/.venv"));
         assert!(!super::is_uvx_ephemeral_exe(&project_venv));

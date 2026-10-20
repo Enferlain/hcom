@@ -577,10 +577,106 @@ fn is_same_file(a: &Path, b: &Path) -> bool {
 
 // ── Dispatch ────────────────────────────────────────────────────────────
 
+const PERSISTENT_INSTALL_INSTRUCTION: &str =
+    "hcom: uvx is no longer supported; run uv tool install hcom, then restart this session.";
+
+/// Handle ephemeral invocations before dev-root lookup, update checks, or
+/// normal command dispatch. Legacy removal is dispatched directly, though tool
+/// cleanup (such as Hermes) may still open state.
+fn dispatch_ephemeral(action: &Action) -> i32 {
+    let mut exit_code = 1;
+    match action {
+        Action::Hook { hook, .. } => {
+            if Tool::from_hook_name(hook) == Some(Tool::Gemini)
+                && env::var_os("ANTIGRAVITY_AGENT").is_some()
+            {
+                // Antigravity requires decisions on these events. Its docs
+                // do not promise nonzero hook exits fail open, so stay safe.
+                if matches!(hook.as_str(), "gemini-beforetool" | "gemini-sessionend") {
+                    print!("{{\"decision\":\"allow\"}}");
+                }
+                exit_code = 0;
+            } else if hook == "copilot-pretooluse" {
+                // Copilot denies tool execution on ANY nonzero PreToolUse exit.
+                exit_code = 0;
+            }
+        }
+        Action::Pty { args }
+            if args
+                .first()
+                .is_some_and(|arg| matches!(arg.as_str(), "--help" | "-h")) =>
+        {
+            return match crate::run_pty(args) {
+                Ok(()) => 0,
+                Err(_) => 1,
+            };
+        }
+        Action::Version => {
+            println!("hcom {}", env!("CARGO_PKG_VERSION"));
+            return 0;
+        }
+        Action::Help => {
+            crate::commands::help::print_help();
+            return 0;
+        }
+        Action::TopicHelp { args } => return print_topic_help(args),
+        Action::Command { args, .. } | Action::Launch { args } => {
+            let (stripped, _, help) = extract_global_flags_full(args);
+            if help {
+                // Never run a script to ask for help under uvx.
+                let topic_args = if stripped.first().is_some_and(|s| s.parse::<u32>().is_ok()) {
+                    &stripped[1..]
+                } else {
+                    &stripped[..]
+                };
+                return print_topic_help(topic_args);
+            }
+            if let Action::Command { cmd, .. } = action
+                && cmd == "hooks"
+                && matches!(
+                    stripped.get(1).map(String::as_str),
+                    Some("remove" | "uninstall")
+                )
+            {
+                return crate::commands::hooks::cmd_hooks_remove(&stripped[2..]);
+            }
+        }
+        _ => {}
+    }
+    eprintln!("{PERSISTENT_INSTALL_INSTRUCTION}");
+    exit_code
+}
+
 /// Main entry point: resolve action and dispatch.
 pub fn dispatch() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
     let argv = &args[1..]; // strip binary name
+
+    let action = resolve_action(argv);
+    if env::current_exe()
+        .ok()
+        .and_then(|exe| exe.canonicalize().ok())
+        .is_some_and(|exe| crate::runtime_env::is_uvx_ephemeral_exe(&exe))
+    {
+        // Normalize global flags only for the ephemeral help/version surface;
+        // installed dispatch retains its existing argument resolution.
+        let (stripped, _) = extract_global_flags(argv);
+        let ephemeral_action = resolve_action(&stripped);
+        let code = dispatch_ephemeral(&ephemeral_action);
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
+
+    // Internal background update workers must pass the same install gate.
+    if argv.first().map(String::as_str) == Some("__update-check") {
+        let mut args = env::args_os().skip(2);
+        if let (Some(flag), Some(current)) = (args.next(), args.next()) {
+            crate::update::run_background_check(Path::new(&flag), &current.to_string_lossy());
+        }
+        return Ok(());
+    }
 
     // Skip dev_root re-exec for `config dev_root` so a stale pointer can't
     // trap the user. Also keep `update` on the invoked (installed) binary;
@@ -588,8 +684,6 @@ pub fn dispatch() -> anyhow::Result<()> {
     if !is_config_dev_root_invocation(argv) && !is_update_invocation(argv) {
         maybe_reexec_dev_root();
     }
-
-    let action = resolve_action(argv);
 
     // Check for updates on CLI commands (not hooks/pty/relay — those need to be fast/silent).
     // Skip for `hcom update` itself — it handles its own output.
@@ -1137,6 +1231,16 @@ mod tests {
             "send", "@lovi", "--", "update"
         ])));
         assert!(!is_update_invocation(&[]));
+    }
+
+    #[test]
+    fn installed_resolution_does_not_normalize_global_help_or_version() {
+        for flag in ["--help", "-h", "--version", "-v", "help"] {
+            assert!(matches!(
+                resolve_action(&sv(&["--name", "test", flag])),
+                Action::Command { .. }
+            ));
+        }
     }
 
     // ── resolve_action tests ────────────────────────────────────────────

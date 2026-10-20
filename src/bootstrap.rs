@@ -417,7 +417,7 @@ static HCOM_WORD: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\bhcom\b").expect("valid regex"));
 
 /// Rewrite bare `hcom` command references to the alternate command (e.g.
-/// `uvx hcom`), leaving `<hcom>` tags untouched.
+/// a dev binary), leaving `<hcom>` tags untouched.
 fn rewrite_hcom_command(text: &str, hcom_cmd: &str) -> String {
     const COMMAND: &str = "__HCOM_CMD__";
     const OPEN_TAG: &str = "__HCOM_OPEN_TAG__";
@@ -908,10 +908,10 @@ mod tests {
 
     #[test]
     fn test_rewrite_hcom_command_keeps_tags() {
-        let text = "run `hcom list`, <hcom>x</hcom>, already uvx hcom send";
+        let text = "run `hcom list`, <hcom>x</hcom>, already /dev/hcom send";
         assert_eq!(
-            rewrite_hcom_command(text, "uvx hcom"),
-            "run `uvx hcom list`, <hcom>x</hcom>, already uvx hcom send"
+            rewrite_hcom_command(text, "/dev/hcom"),
+            "run `/dev/hcom list`, <hcom>x</hcom>, already /dev/hcom send"
         );
     }
 

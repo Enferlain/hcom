@@ -66,6 +66,7 @@ fn is_hcom_kimi_command_matches_canonical_commands() {
 }
 
 #[test]
+#[serial]
 fn merge_hooks_strips_stale_uvx_prefix_rows() {
     let mut doc = DocumentMut::new();
     // Simulate a prior uvx-based install left in config.toml.
@@ -84,6 +85,7 @@ fn merge_hooks_strips_stale_uvx_prefix_rows() {
             arr.push(table);
         }
     }
+    let legacy = doc.to_string();
     merge_hcom_hooks(&mut doc);
     let Item::ArrayOfTables(arr) = doc.get("hooks").unwrap() else {
         panic!("expected [[hooks]]");
@@ -105,6 +107,16 @@ fn merge_hooks_strips_stale_uvx_prefix_rows() {
             "replacement must be current-prefix hcom command: {cmd}"
         );
     }
+    let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+    let path = get_kimi_settings_path();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, legacy).unwrap();
+    assert!(super::remove_kimi_hooks());
+    assert!(
+        !std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains("uvx")
+    );
 }
 
 #[test]

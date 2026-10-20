@@ -174,6 +174,14 @@ pub fn is_hcom_command(command: &str, suffixes: &[&str]) -> bool {
         && suffixes.contains(&parts.get(4).unwrap().as_str())
 }
 
+/// Legacy commands remain recognizable for cleanup, but must be refreshed by
+/// persistent setup because uvx may resolve to a disposable environment.
+pub(crate) fn uses_legacy_uvx(command: &str) -> bool {
+    static UVX: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\buvx\s+hcom\b").unwrap());
+    UVX.is_match(command)
+}
+
 /// How a tool gets hcom's hooks. Static per tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookMode {

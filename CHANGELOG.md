@@ -4,6 +4,10 @@ UTC release dates from [PyPI](https://pypi.org/project/hcom/#history).
 
 ## Unreleased
 
+### Breaking changes
+
+- Dropped ephemeral `uvx hcom` support. Run `uv tool install hcom` and restart affected sessions; hooks and agents need a persistent `hcom` on PATH. Legacy hooks can still be removed with `uvx hcom hooks remove`.
+
 ### Changed
 
 - Made native delivery the default for idle Claude and Copilot agents. Configure in config: `claude_delivery` / `copilot_delivery`.

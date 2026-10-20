@@ -356,7 +356,9 @@ fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFai
                     "PreInvocation".to_string(),
                 ));
             }
-            if !command.contains("gemini-sessionstart") {
+            if !command.contains("gemini-sessionstart")
+                || crate::hooks::runtime::uses_legacy_uvx(command)
+            {
                 return Err(VerifyFailReason::HookCommandMissing {
                     event: "PreInvocation".to_string(),
                     cmd_suffix: "gemini-sessionstart".to_string(),
@@ -369,7 +371,9 @@ fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFai
                     "PreInvocation".to_string(),
                 ));
             }
-            if !command.contains("gemini-beforeagent") {
+            if !command.contains("gemini-beforeagent")
+                || crate::hooks::runtime::uses_legacy_uvx(command)
+            {
                 return Err(VerifyFailReason::HookCommandMissing {
                     event: "PreInvocation".to_string(),
                     cmd_suffix: "gemini-beforeagent".to_string(),
@@ -425,7 +429,9 @@ fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFai
                     "PostInvocation".to_string(),
                 ));
             }
-            if !command.contains("gemini-afteragent") {
+            if !command.contains("gemini-afteragent")
+                || crate::hooks::runtime::uses_legacy_uvx(command)
+            {
                 return Err(VerifyFailReason::HookCommandMissing {
                     event: "PostInvocation".to_string(),
                     cmd_suffix: "gemini-afteragent".to_string(),
@@ -473,7 +479,9 @@ fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFai
             if found_sessionend {
                 return Err(VerifyFailReason::HookDuplicated("Stop".to_string()));
             }
-            if !command.contains("gemini-sessionend") {
+            if !command.contains("gemini-sessionend")
+                || crate::hooks::runtime::uses_legacy_uvx(command)
+            {
                 return Err(VerifyFailReason::HookCommandMissing {
                     event: "Stop".to_string(),
                     cmd_suffix: "gemini-sessionend".to_string(),
@@ -540,7 +548,9 @@ fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFai
                 if found_beforetool {
                     return Err(VerifyFailReason::HookDuplicated("PreToolUse".to_string()));
                 }
-                if !command.contains("gemini-beforetool") {
+                if !command.contains("gemini-beforetool")
+                    || crate::hooks::runtime::uses_legacy_uvx(command)
+                {
                     return Err(VerifyFailReason::HookCommandMissing {
                         event: "PreToolUse".to_string(),
                         cmd_suffix: "gemini-beforetool".to_string(),
@@ -608,7 +618,9 @@ fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFai
                 if found_aftertool {
                     return Err(VerifyFailReason::HookDuplicated("PostToolUse".to_string()));
                 }
-                if !command.contains("gemini-aftertool") {
+                if !command.contains("gemini-aftertool")
+                    || crate::hooks::runtime::uses_legacy_uvx(command)
+                {
                     return Err(VerifyFailReason::HookCommandMissing {
                         event: "PostToolUse".to_string(),
                         cmd_suffix: "gemini-aftertool".to_string(),
@@ -904,6 +916,23 @@ mod tests {
 
         assert_eq!(content1, content2);
         assert!(verify_antigravity_hooks_installed(false));
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_uvx_hooks_are_replaced_and_removed() {
+        let (_dir, _test_home, path, _guard) = antigravity_test_env();
+        try_setup_antigravity_hooks(false).unwrap();
+        let legacy = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("hcom ", "uvx hcom ");
+        std::fs::write(&path, &legacy).unwrap();
+        assert!(!verify_antigravity_hooks_installed(false));
+        try_setup_antigravity_hooks(false).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("uvx"));
+        std::fs::write(&path, legacy).unwrap();
+        assert!(remove_antigravity_hooks());
+        assert!(!path.exists());
     }
 
     #[test]
