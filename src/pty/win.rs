@@ -636,6 +636,15 @@ impl Proxy {
                 |a: bool| shared::publish_approval_status(a, instance.as_deref(), &current_status);
 
             loop {
+                // Runtime debug toggle and periodic dump. Both rate-limit
+                // themselves to 5s; they run every iteration so sustained output
+                // (recv never times out) still picks up `hcom term debug on`.
+                screen.check_debug_flag();
+                screen.check_periodic_dump(
+                    target.name(),
+                    inject_port,
+                    "Periodic dump (win reader loop)",
+                );
                 match rx.recv_timeout(SNAPSHOT_DEBOUNCE) {
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         // Output has been quiet for SNAPSHOT_DEBOUNCE. If a frame
@@ -672,12 +681,6 @@ impl Proxy {
                         if !ready_signaled.load(Ordering::Acquire) {
                             trace.check_not_ready();
                         }
-                        screen.check_debug_flag();
-                        screen.check_periodic_dump(
-                            target.name(),
-                            inject_port,
-                            "Periodic dump (win reader loop)",
-                        );
                         continue;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {

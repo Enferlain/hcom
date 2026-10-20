@@ -902,6 +902,16 @@ impl Proxy {
                 break;
             }
 
+            // Runtime debug toggle and periodic dump. Both rate-limit themselves
+            // to 5s; they run every iteration so an agent that never goes quiet
+            // (poll never times out) still picks up `hcom term debug on`.
+            self.screen.check_debug_flag();
+            self.screen.check_periodic_dump(
+                self.config.target.name(),
+                self.inject_server.port(),
+                "Periodic dump (main loop)",
+            );
+
             child_exited |= self.child.try_wait()?.is_some();
             if output_writer.pump(&mut terminal_output).is_err() {
                 break; // Terminal closed: preserve the existing cleanup path.
@@ -1066,14 +1076,6 @@ impl Proxy {
                         }
                         delivery_started = true;
                     }
-                    // Check runtime debug flag toggle
-                    self.screen.check_debug_flag();
-                    // Periodic debug dump every 5 seconds
-                    self.screen.check_periodic_dump(
-                        self.config.target.name(),
-                        self.inject_server.port(),
-                        "Periodic dump (main loop)",
-                    );
                     // Fall through to title write — timeout means no PTY output, safe to write.
                 }
                 Ok(_) => {}
