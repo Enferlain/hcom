@@ -15,6 +15,26 @@ pub struct InstanceStatus {
     pub last_event_id: i64,
 }
 
+/// The write-time identity of a snapshotted interactive approval: the
+/// recorded owner plus the generation fields stamped when it was recorded.
+/// Guarded transitions apply only while the row still matches all of it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ApprovalToken {
+    pub owner: String,
+    pub status_time: i64,
+    pub detail: String,
+}
+
+impl ApprovalToken {
+    pub fn from_row(row: &InstanceRow) -> Self {
+        Self {
+            owner: row.pending_tool_use_id.clone(),
+            status_time: row.status_time,
+            detail: row.status_detail.clone(),
+        }
+    }
+}
+
 /// Full instance row from the instances table.
 #[derive(Debug, Clone)]
 pub struct InstanceRow {
@@ -49,6 +69,9 @@ pub struct InstanceRow {
     pub launch_context: Option<String>,
     pub name_announced: i64,
     pub idle_since: Option<String>,
+    /// Tool use id that owns the current `blocked:approval` state, when the
+    /// provider's approval payload carried one. Empty when unknown.
+    pub pending_tool_use_id: String,
 }
 
 impl InstanceRow {
@@ -119,6 +142,9 @@ impl InstanceRow {
             launch_context: row
                 .get::<_, Option<String>>("launch_context")?
                 .filter(|s| !s.is_empty()),
+            pending_tool_use_id: row
+                .get::<_, Option<String>>("pending_tool_use_id")?
+                .unwrap_or_default(),
             name_announced: row.get::<_, Option<i64>>("name_announced")?.unwrap_or(0),
             idle_since: row
                 .get::<_, Option<String>>("idle_since")?
@@ -136,7 +162,7 @@ pub(super) const INSTANCE_COLUMNS: &str =
      background_log_file, name_announced, agent_id,
      origin_device_id, hints, subagent_timeout, tool, launch_args,
      terminal_preset_requested, terminal_preset_effective,
-     idle_since, pid, launch_context";
+     idle_since, pid, launch_context, pending_tool_use_id";
 
 impl InstanceRow {
     /// Process identity recorded with this snapshot's PID, if any.
@@ -232,6 +258,153 @@ impl HcomDb {
         }
 
         Ok(())
+    }
+
+    /// Atomically move an instance out of its interactive-approval block,
+    /// but only while the row still matches the snapshotted approval
+    /// identity in [`ApprovalToken`].
+    ///
+    /// The WHERE clause re-verifies status/context/owner/status_time/detail
+    /// at write time, so a PermissionRequest that replaced the approval
+    /// between the caller's snapshot and this write is left intact — a stale
+    /// terminal hook for the old tool cannot clear the new approval.
+    /// `new_detail` overwrites status_detail; `None` preserves it (the PTY
+    /// release keeps the gated-command preview). Returns true when exactly
+    /// this approval was resolved (one row affected).
+    pub fn resolve_owned_approval(
+        &self,
+        name: &str,
+        token: &ApprovalToken,
+        status: &str,
+        context: &str,
+        new_detail: Option<&str>,
+    ) -> Result<bool> {
+        let now = now_epoch_i64();
+        let applied = match new_detail {
+            Some(detail) => {
+                let sql = format!(
+                    "UPDATE instances
+                     SET status = ?1, status_context = ?2, status_detail = ?3,
+                         status_time = ?4, pending_tool_use_id = ''{last_stop}
+                     WHERE name = ?5 AND status = 'blocked'
+                       AND (status_context = 'approval' OR status_context = 'pty:approval')
+                       AND pending_tool_use_id = ?6 AND status_time = ?7
+                       AND status_detail = ?8",
+                    last_stop = if status == ST_LISTENING {
+                        ", last_stop = ?4"
+                    } else {
+                        ""
+                    }
+                );
+                self.conn.execute(
+                    sql.as_str(),
+                    params![
+                        status,
+                        context,
+                        detail,
+                        now,
+                        name,
+                        token.owner,
+                        token.status_time,
+                        token.detail
+                    ],
+                )?
+            }
+            None => {
+                let sql = format!(
+                    "UPDATE instances
+                     SET status = ?1, status_context = ?2,
+                         status_time = ?3, pending_tool_use_id = ''{last_stop}
+                     WHERE name = ?4 AND status = 'blocked'
+                       AND (status_context = 'approval' OR status_context = 'pty:approval')
+                       AND pending_tool_use_id = ?5 AND status_time = ?6
+                       AND status_detail = ?7",
+                    last_stop = if status == ST_LISTENING {
+                        ", last_stop = ?3"
+                    } else {
+                        ""
+                    }
+                );
+                self.conn.execute(
+                    sql.as_str(),
+                    params![
+                        status,
+                        context,
+                        now,
+                        name,
+                        token.owner,
+                        token.status_time,
+                        token.detail
+                    ],
+                )?
+            }
+        };
+        Ok(applied == 1)
+    }
+
+    /// Record a PermissionRequest's approval in ONE atomic write: status,
+    /// context, detail, status_time, and the owning tool_use_id land
+    /// together, so no reader can observe a half-recorded approval (owner
+    /// without blocked state, or vice versa). Unconditional by design — a
+    /// permission prompt currently showing is authoritative and replaces any
+    /// prior row state, including an older approval.
+    pub fn record_pending_approval(
+        &self,
+        name: &str,
+        tool_use_id: &str,
+        detail: &str,
+    ) -> Result<()> {
+        let now = now_epoch_i64();
+        self.conn.execute(
+            "UPDATE instances
+             SET status = 'blocked', status_context = 'approval', status_detail = ?1,
+                 status_time = ?2, pending_tool_use_id = ?3
+             WHERE name = ?4",
+            params![detail, now, tool_use_id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Record the legacy free-text permission notification's approval in one
+    /// CONDITIONAL write: applies only while no interactive approval is
+    /// current at write time, so a hook-owned PermissionRequest arriving
+    /// concurrently cannot be clobbered. Returns true when applied.
+    pub fn record_legacy_pending_approval(&self, name: &str) -> Result<bool> {
+        let now = now_epoch_i64();
+        let applied = self.conn.execute(
+            "UPDATE instances
+             SET status = 'blocked', status_context = 'approval', status_detail = '',
+                 status_time = ?1, pending_tool_use_id = ''
+             WHERE name = ?2
+               AND NOT (status = 'blocked'
+                        AND (status_context = 'approval' OR status_context = 'pty:approval'))",
+            params![now, name],
+        )?;
+        Ok(applied == 1)
+    }
+
+    /// Write a status transition that must not overwrite a pending
+    /// interactive approval: the WHERE clause fails the update when one is
+    /// current at write time, so a PermissionRequest that lands between the
+    /// caller's snapshot and this write cannot be clobbered by a later
+    /// PreToolUse status write. Returns true when the write applied.
+    pub fn set_status_if_no_approval(
+        &self,
+        name: &str,
+        status: &str,
+        context: &str,
+        detail: &str,
+    ) -> Result<bool> {
+        let now = now_epoch_i64();
+        let applied = self.conn.execute(
+            "UPDATE instances
+             SET status = ?1, status_context = ?2, status_detail = ?3, status_time = ?4
+             WHERE name = ?5
+               AND NOT (status = 'blocked'
+                        AND (status_context = 'approval' OR status_context = 'pty:approval'))",
+            params![status, context, detail, now, name],
+        )?;
+        Ok(applied == 1)
     }
 
     /// Record an explicit kill before signalling the process.
@@ -646,6 +819,11 @@ impl HcomDb {
                    AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1",
                 params![name],
             )?;
+            // Automatically created thread memberships die with the instance:
+            // a name reused by a fresh worker must not inherit the stopped
+            // generation's thread routing. Explicit (non-automatic)
+            // delivery-only memberships survive the filters above.
+            subscriptions::cleanup_auto_thread_memberships(tx, name)?;
             tx.execute(
                 "INSERT INTO events (timestamp, type, instance, data)
                  VALUES (?, 'life', ?, ?)",
@@ -659,6 +837,55 @@ impl HcomDb {
         // them only after the stopped event and deletion are durable.
         if let Some(event_id) = event_id {
             subscriptions::process_logged_event(self, event_id, "life", name, event_data);
+        }
+        Ok(won)
+    }
+
+    /// Atomically claim a subagent's one-shot connection gate and, for the
+    /// winner, insert the parent-visible `connected` life event in the same
+    /// transaction.
+    ///
+    /// The conditional `name_announced` 0→1 UPDATE is the ownership CAS (the
+    /// same shape as `finalize_instance_stop`): a manual `hcom start` racing
+    /// the SubagentStop activation ack — or a retried/duplicate ack — all
+    /// target one row, so exactly one caller wins and emits. Losers get
+    /// `Ok(false)` and need no follow-up; they still own whatever output they
+    /// already produced (the bootstrap text). The claim and the event commit
+    /// or roll back together, so the signal can be neither duplicated nor
+    /// lost between the two writes.
+    pub fn claim_subagent_connection(&self, name: &str, parent: &str, via: &str) -> Result<bool> {
+        let mut event_data = serde_json::json!({
+            "action": "connected",
+            "by": via,
+            "reason": "subagent_joined",
+        });
+        if !parent.is_empty() {
+            event_data["parent"] = serde_json::Value::String(parent.to_string());
+        }
+        let data = serde_json::to_string(&event_data)?;
+        let mut event_id = None;
+
+        let won = self.with_immediate_transaction(|tx| {
+            let claimed = tx.execute(
+                "UPDATE instances SET name_announced = 1 WHERE name = ? AND name_announced = 0",
+                params![name],
+            )?;
+            if claimed == 0 {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES (?, 'life', ?, ?)",
+                params![chrono_now_iso(), name, data],
+            )?;
+            event_id = Some(tx.last_insert_rowid());
+            Ok(true)
+        })?;
+
+        // Subscription notifications are best-effort external effects. Run
+        // them only after the claim and event are durable.
+        if let Some(event_id) = event_id {
+            subscriptions::process_logged_event(self, event_id, "life", name, &event_data);
         }
         Ok(won)
     }
@@ -752,6 +979,7 @@ impl HcomDb {
             "idle_since": row.get::<_, String>(28).unwrap_or_default(),
             "pid": row.get::<_, Option<i64>>(29).unwrap_or(None),
             "launch_context": row.get::<_, String>(30).unwrap_or_default(),
+            "pending_tool_use_id": row.get::<_, String>(31).unwrap_or_default(),
         }))
     }
 
@@ -1074,6 +1302,7 @@ impl HcomDb {
             "idle_since",
             "terminal_preset_requested",
             "terminal_preset_effective",
+            "pending_tool_use_id",
         ];
         if VALID_COLUMNS.contains(&key) {
             Ok(key)
@@ -1147,6 +1376,108 @@ mod tests {
     fn reopen_broken_schema(db_path: &std::path::Path) -> HcomDb {
         // Use open_raw here: open_at would repair the table we deliberately dropped.
         HcomDb::open_raw(db_path).unwrap()
+    }
+
+    #[test]
+    fn subagent_connection_claim_is_one_shot_across_connections() {
+        let (db, path) = setup_full_test_db();
+        db.conn().execute(
+            "INSERT INTO instances(name,parent_name,agent_id,created_at) VALUES ('child','parent','agent',1)",
+            [],
+        ).unwrap();
+        let connections: Vec<_> = (0..4).map(|_| HcomDb::open_raw(&path).unwrap()).collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(connections.len()));
+        let workers: Vec<_> = connections
+            .into_iter()
+            .enumerate()
+            .map(|(index, db)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.claim_subagent_connection(
+                        "child",
+                        "parent",
+                        if index % 2 == 0 { "hook" } else { "start" },
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        let wins = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(wins, 1);
+        assert!(
+            !db.claim_subagent_connection("child", "parent", "retry")
+                .unwrap()
+        );
+        assert!(
+            !db.claim_subagent_connection("missing", "parent", "hook")
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_instance_full("child")
+                .unwrap()
+                .unwrap()
+                .name_announced,
+            1
+        );
+        let events: Vec<String> = db.conn().prepare(
+            "SELECT data FROM events WHERE type='life' AND instance='child' AND json_extract(data,'$.action')='connected'"
+        ).unwrap().query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(events.len(), 1);
+        let event: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(event["parent"], "parent");
+        assert_eq!(event["reason"], "subagent_joined");
+        assert!(matches!(event["by"].as_str(), Some("hook" | "start")));
+        drop(db);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn subagent_connection_event_failure_rolls_back_claim_and_allows_retry() {
+        let (db, path) = setup_full_test_db();
+        db.conn().execute(
+            "INSERT INTO instances(name,parent_name,agent_id,created_at) VALUES ('child','parent','agent',1)",
+            [],
+        ).unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_connected BEFORE INSERT ON events
+             WHEN json_extract(NEW.data,'$.action')='connected'
+             BEGIN SELECT RAISE(ABORT,'connection event failed'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.claim_subagent_connection("child", "parent", "hook")
+                .is_err()
+        );
+        assert_eq!(
+            db.get_instance_full("child")
+                .unwrap()
+                .unwrap()
+                .name_announced,
+            0
+        );
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        db.conn()
+            .execute_batch("DROP TRIGGER reject_connected")
+            .unwrap();
+        assert!(
+            db.claim_subagent_connection("child", "parent", "start")
+                .unwrap()
+        );
+        assert!(
+            !db.claim_subagent_connection("child", "parent", "hook")
+                .unwrap()
+        );
+        drop(db);
+        cleanup_test_db(path);
     }
 
     #[test]

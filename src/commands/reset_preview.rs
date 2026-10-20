@@ -49,10 +49,9 @@ fn load_preview_state(db: &HcomDb) -> ResetPreviewState {
 }
 
 fn hook_tool_specs() -> impl Iterator<Item = &'static crate::integration_spec::IntegrationSpec> {
-    crate::integration_spec::ALL
-        .iter()
-        .copied()
-        .filter(|spec| spec.released && !spec.hooks.names.is_empty())
+    crate::integration_spec::ALL.iter().copied().filter(|spec| {
+        spec.released && !spec.hooks.names.is_empty() && spec.tool != crate::tool::Tool::Hermes
+    })
 }
 
 fn hook_preview_lines() -> String {

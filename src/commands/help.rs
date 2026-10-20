@@ -64,6 +64,7 @@ const EVENTS_QUERY: &[HelpEntry] = &[
         "Last 20 events as JSON Lines (one object per line)",
     ),
     ("  --last N", "Limit count (default: 20)"),
+    ("  --cursor", "Print the current durable event cursor"),
     ("  --all", "Include archived sessions"),
     ("  --full", "Full event JSON (default: streamlined)"),
     ("  --wait [SEC]", "Block until match (default: 60s)"),
@@ -71,6 +72,45 @@ const EVENTS_QUERY: &[HelpEntry] = &[
     (
         "  --remote-fetch --device ID",
         "One-shot fetch from remote device",
+    ),
+];
+
+const EVENTS_WAIT: &[HelpEntry] = &[
+    ("Cursor and worker waits:", ""),
+    (
+        "  --after-id ID",
+        "Wait for events after this exclusive durable cursor",
+    ),
+    (
+        "  --result-from NAME",
+        "Correlate one worker attempt; requires --wait, --thread and --after-id",
+    ),
+    (
+        "",
+        "Result exits: 0 result, 1 deadline, 2 error, 3 stopped without result, 4 blocked, 5 launch failure",
+    ),
+];
+
+const EVENTS_STREAM: &[HelpEntry] = &[
+    ("Continuous observation:", ""),
+    (
+        "events stream [filters]",
+        "Stream ordered events; flush each record",
+    ),
+    (
+        "  --after-id ID",
+        "Resume after an exclusive cursor (default: current cursor)",
+    ),
+    ("  --timeout SEC", "Stop observing after this many seconds"),
+    ("  --full", "Full event JSON"),
+    (
+        "  --follow NAME",
+        "Follow one exact worker generation; requires --after-id",
+    ),
+    ("  --compact", "Bounded typed progress; requires --follow"),
+    (
+        "  --heartbeat SEC",
+        "Quiet heartbeat interval; requires --compact",
     ),
 ];
 
@@ -170,6 +210,8 @@ const EVENTS_SQL_POINTER: &[HelpEntry] = &[("", ""), ("", "SQL columns: hcom eve
 
 const EVENTS_PAGE: &[&[HelpEntry]] = &[
     EVENTS_QUERY,
+    EVENTS_WAIT,
+    EVENTS_STREAM,
     FILTERS_HEADER,
     FILTER_HELP,
     EVENTS_SHORTCUTS,
@@ -255,7 +297,10 @@ const LIST_HELP: &[HelpEntry] = &[
 const SEND_HELP: &[HelpEntry] = &[
     ("  send @name -- message text", "Direct message"),
     ("  send @name1 @name2 -- message", "Multiple targets"),
-    ("  send -- message text", "Broadcast to all"),
+    (
+        "  send --broadcast -- message text",
+        "Explicit broadcast to all",
+    ),
     ("  send @name", "Message from stdin (pipe or heredoc)"),
     ("  send @name --file <path>", "Message from file"),
     (
@@ -288,7 +333,7 @@ const SEND_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "  broadcast + --thread reuses prior thread members; seed with @mentions first",
+        "  --thread without @targets reuses prior members; seed with @mentions first",
     ),
     ("", ""),
     ("Sender:", ""),
@@ -505,6 +550,18 @@ const LISTEN_HELP: &[HelpEntry] = &[
     ("  [timeout]", "Timeout in seconds (alias for --timeout)"),
     ("  --timeout N", "Timeout in seconds (default: 86400)"),
     ("  --json", "Output messages as JSON"),
+    (
+        "  --after-id ID",
+        "Filtered mode: match events after this exclusive cursor",
+    ),
+    (
+        "  --timeout-ok",
+        "Filtered mode: return 0 on timeout (default: 1)",
+    ),
+    (
+        "",
+        "Filtered --json returns a versioned match/timeout result; inbox messages remain unread",
+    ),
     ("", ""),
     ("Filter flags:", ""),
     ("", "Supports all filter flags from 'events' command"),
@@ -792,7 +849,19 @@ const HOOKS_ABOUT: &[HelpEntry] = &[
     ),
 ];
 
-const HOOKS_PAGE: &[&[HelpEntry]] = &[HOOKS_STATUS, HOOKS_ADD, HOOKS_REMOVE, BLANK, HOOKS_ABOUT];
+const HOOKS_NATIVE: &[HelpEntry] = &[(
+    "hooks native <add|remove|status> <claude|codex> [--json]",
+    "Manage native tool hooks (internal native run dispatcher)",
+)];
+
+const HOOKS_PAGE: &[&[HelpEntry]] = &[
+    HOOKS_STATUS,
+    HOOKS_ADD,
+    HOOKS_REMOVE,
+    HOOKS_NATIVE,
+    BLANK,
+    HOOKS_ABOUT,
+];
 
 const TERM_SCREEN: &[HelpEntry] = &[
     ("term", "Screen dump (all PTY instances)"),
@@ -840,6 +909,7 @@ const SUBCOMMAND_HELP: &[(&str, &[&[HelpEntry]])] = &[
     ("relay daemon", &[RELAY_DAEMON]),
     ("hooks add", &[HOOKS_ADD]),
     ("hooks remove", &[HOOKS_REMOVE]),
+    ("hooks native", &[HOOKS_NATIVE]),
     ("term inject", &[TERM_INJECT]),
     ("term debug", &[TERM_DEBUG]),
 ];
@@ -1117,6 +1187,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "qodercli",
     "grok",
     "grok-build",
+    "hermes",
 ];
 
 fn forkable_tool_names() -> String {

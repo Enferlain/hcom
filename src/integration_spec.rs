@@ -105,6 +105,11 @@ pub enum InitialPromptShape {
     Positional,
     /// `opencode --prompt <text>`, `agy --prompt-interactive <text>`.
     Flag(&'static str),
+    /// `hermes chat -q <prompt>`.
+    SubcommandFlag {
+        sub: &'static str,
+        flag: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -441,6 +446,55 @@ const QODER_HELP_EXAMPLES: &[HelpEntry] = &[
         "hcom qoder --permission-mode accept_edits",
         "Flags forwarded to qodercli",
     ),
+];
+
+const HERMES_HOOKS: &[&str] = &[
+    "hermes-sessionstart",
+    "hermes-status",
+    "hermes-read",
+    "hermes-beforetool",
+    "hermes-stop",
+];
+
+const HERMES_HELP_EXAMPLES: &[HelpEntry] = &[
+    (
+        "hcom 1 hermes --dir ~/Projects/myapp",
+        "launch Hermes in a project dir",
+    ),
+    (
+        "hcom 1 hermes --tag worker",
+        "launch a tagged Hermes worker",
+    ),
+    ("hcom r <name>", "resume a stopped Hermes session"),
+];
+
+pub const HERMES_INSTANCE_STATE_ENV: &[&str] = &[
+    "HERMES_SESSION_ID",
+    "HERMES_SESSION_KEY",
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_SOURCE",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_CHAT_TYPE",
+    "HERMES_SESSION_CHAT_NAME",
+    "HERMES_SESSION_THREAD_ID",
+    "HERMES_SESSION_USER_ID",
+    "HERMES_SESSION_USER_ID_ALT",
+    "HERMES_SESSION_USER_NAME",
+    "HERMES_SESSION_SCOPE_ID",
+    "HERMES_UI_SESSION_ID",
+    "HERMES_SESSION_MESSAGE_ID",
+    "HERMES_SESSION_PROFILE",
+    "HERMES_SESSION_PARENT_CHAT_ID",
+    "HERMES_SESSION_ASYNC_DELIVERY",
+    "HERMES_SESSION_HISTORY_DELIVERY",
+    "HERMES_CRON_AUTO_DELIVER_PLATFORM",
+    "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
+    "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+    "HERMES_CRON_SESSION",
+    "HERMES_KANBAN_TASK",
+    "HERMES_DELEGATED_CHILD_CONTEXT",
+    "HERMES_BROWSER_CONTROL_PRINCIPAL",
+    "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY",
 ];
 
 // ── Per-tool integration constants ──────────────────────────────────────
@@ -1245,6 +1299,61 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static HERMES: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Hermes,
+    name: "hermes",
+    label: "Hermes Agent",
+    aliases: &[],
+    cli_binary: "hermes",
+    tui_prefix: "hrm ",
+    adhoc_icon: None,
+    released: true,
+    ready_patterns: &["\u{276f} "],
+    pty: PtySpec {
+        delivery_start_timeout_secs: 30,
+        console_input: ConsoleInput::Vt,
+    },
+    instance_state_env: HERMES_INSTANCE_STATE_ENV,
+    hooks: HooksSpec {
+        names: HERMES_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::Argv,
+    },
+    gates: GatesSpec {
+        require_idle: false,
+        require_ready_prompt: false,
+        require_prompt_empty: false,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        launch_requires_ready: true,
+        launch_ready_on_plugin_bind: true,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_HERMES_ARGS"),
+        config_dir_env: Some("HERMES_HOME"),
+        initial_prompt: InitialPromptShape::SubcommandFlag {
+            sub: "chat",
+            flag: "-q",
+        },
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        fork: None,
+    }),
+    help: HelpSpec {
+        unique_examples: HERMES_HELP_EXAMPLES,
+        extra_env: &[],
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["terminal"],
+        file: &["write_file", "apply_patch", "edit"],
+        delegate: &["delegate_task"],
+    },
+};
+
 pub static ADHOC: IntegrationSpec = IntegrationSpec {
     tool: Tool::Adhoc,
     name: "adhoc",
@@ -1312,6 +1421,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &COPILOT,
     &QODER,
     &GROK,
+    &HERMES,
     &ADHOC,
 ];
 
@@ -1332,6 +1442,7 @@ impl Tool {
             Tool::Copilot => &COPILOT,
             Tool::Qoder => &QODER,
             Tool::Grok => &GROK,
+            Tool::Hermes => &HERMES,
             Tool::Adhoc => &ADHOC,
         }
     }
@@ -1383,11 +1494,34 @@ mod tests {
             Tool::Grok,
             Tool::Pi,
             Tool::Omp,
+            Tool::Hermes,
             Tool::Adhoc,
         ] {
             let spec = tool.spec();
             assert_eq!(spec.tool, tool, "spec.tool mismatch for {tool:?}");
         }
+    }
+
+    #[test]
+    fn hermes_spec_launch_parity() {
+        assert_eq!(HERMES.tool, Tool::Hermes);
+        assert_eq!(HERMES.name, "hermes");
+        assert_eq!(HERMES.cli_binary, "hermes");
+        assert_eq!(HERMES.ready_patterns, ["\u{276f} "]);
+        assert_eq!(HERMES.instance_state_env, HERMES_INSTANCE_STATE_ENV);
+        assert!(HERMES.instance_state_env.contains(&"HERMES_SESSION_ID"));
+        assert!(HERMES.instance_state_env.contains(&"HERMES_SESSION_KEY"));
+        assert_eq!(HERMES.launch.config_dir_env, Some("HERMES_HOME"));
+        assert_eq!(HERMES.launch.args_env, Some("HCOM_HERMES_ARGS"));
+        assert!(HERMES.launch.uses_pty_default);
+        assert!(HERMES.gates.launch_ready_on_plugin_bind);
+        assert!(matches!(
+            HERMES.launch.initial_prompt,
+            InitialPromptShape::SubcommandFlag {
+                sub: "chat",
+                flag: "-q"
+            }
+        ));
     }
 
     #[test]
@@ -1451,7 +1585,8 @@ mod tests {
         assert!(names.contains(&"qoder"));
         assert!(names.contains(&"grok"));
         assert!(names.contains(&"omp"));
-        assert_eq!(names.len(), 13);
+        assert!(names.contains(&"hermes"));
+        assert_eq!(names.len(), 14);
     }
 
     #[test]

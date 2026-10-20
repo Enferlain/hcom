@@ -1,6 +1,7 @@
 //! Identity resolution — 3-tier binding (process → session → ad-hoc).
 
 use regex::Regex;
+use serde_json::Value;
 use std::sync::LazyLock;
 
 use crate::db::{HcomDb, InstanceRow};
@@ -537,18 +538,23 @@ fn resolve_identity_with_expectation(
                             .get("session_id")
                             .and_then(|v| v.as_str())
                             .is_some_and(|s| !s.is_empty());
+                        let is_codex = d.get("tool").and_then(Value::as_str) == Some("codex");
 
                         // Opportunistic Codex session binding for command-time recovery.
                         // Native SessionStart is the primary binding path; this keeps
                         // resume/orphan flows tolerant if a command arrives first.
-                        // Uses bind_session_to_process for proper resume/placeholder handling.
+                        // Uses checked binder expected "codex" with create_if_unbound=false.
+                        // Inherited CODEX_THREAD_ID for non-Codex process rows is ignored to preserve
+                        // authoritative process identity.
                         let mut final_name = inst_name.clone();
-                        if !has_session
+                        if is_codex
+                            && !has_session
                             && let Some(thread_id) = codex_thread_id
                             && !thread_id.is_empty()
-                            && let Some(resolved) = crate::instance_binding::bind_session_to_process(
-                                db, thread_id, process_id,
-                            )
+                            && let crate::instance_binding::ToolCheckedBind::Bound(resolved) =
+                                crate::instance_binding::bind_session_to_process_for_tool(
+                                    db, thread_id, process_id, "codex", false,
+                                )
                         {
                             final_name = resolved;
                         }
@@ -607,7 +613,27 @@ fn resolve_identity_with_expectation(
         }
     }
 
-    // 5. No identity
+    // Wrapperless Codex shells cannot inherit an hcom process id. Only an
+    // already enrolled Codex session may identify their sender; this lookup
+    // must never create or adopt an identity or accept a foreign tool row.
+    if let Some(thread_id) = codex_thread_id.filter(|id| !id.is_empty())
+        && let Some(instance_name) = db
+            .get_session_binding(thread_id)
+            .map_err(|e| HcomError::DatabaseError(e.to_string()))?
+        && let Some(instance_data) = db
+            .get_instance(&instance_name)
+            .map_err(|e| HcomError::DatabaseError(e.to_string()))?
+        && instance_data.get("tool").and_then(Value::as_str) == Some("codex")
+    {
+        return Ok(SenderIdentity {
+            kind: SenderKind::Instance,
+            name: instance_name,
+            session_id: Some(thread_id.to_string()),
+            instance_data: Some(instance_data),
+        });
+    }
+
+    // 6. No identity
     if identity_expected {
         crate::log::log_warn(
             "identity",
@@ -623,6 +649,49 @@ fn resolve_identity_with_expectation(
         "No hcom identity. Run 'hcom start' first, then use --name <yourname> on commands."
             .to_string(),
     ))
+}
+
+/// Resolve an ordinary Hermes terminal command's identity from the
+/// `HERMES_SESSION_ID` its host exports into every terminal subprocess.
+///
+/// Strictly a lookup — the Hermes counterpart of the wrapperless-Codex path
+/// below: the session id must already be bound (by the plugin's
+/// `hermes-sessionstart`) to an existing, hermes-owned instance row. Stale
+/// or unknown ids, deleted rows, rows owned by other tools, and DB errors
+/// all return `None` so callers fail safe with no identity. This never
+/// adopts, binds, or creates anything.
+pub fn resolve_hermes_session_identity(db: &HcomDb, session_id: &str) -> Option<SenderIdentity> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let name = db.get_session_binding(session_id).ok().flatten()?;
+    let instance_data = db.get_instance(&name).ok().flatten()?;
+    if instance_data.get("tool").and_then(|v| v.as_str()) != Some("hermes") {
+        // A Hermes session id resolving to another tool's row is a binding
+        // collision (or a foreign id) — not ours to act on. The prefix is
+        // char-based: a byte slice could land mid-UTF-8-char and panic.
+        crate::log::log_warn(
+            "identity",
+            "resolve.hermes_session_foreign_row",
+            &format!(
+                "session_id={}, name={}",
+                session_id.chars().take(8).collect::<String>(),
+                name
+            ),
+        );
+        return None;
+    }
+    crate::log::log_info(
+        "identity",
+        "resolve",
+        &format!("method=hermes_session_id, name={name}"),
+    );
+    Some(SenderIdentity {
+        kind: SenderKind::Instance,
+        name,
+        session_id: Some(session_id.to_string()),
+        instance_data: Some(instance_data),
+    })
 }
 
 pub fn resolve_identity(
@@ -887,6 +956,12 @@ mod tests {
         let (db, _dir) = make_test_db();
         // Instance without session_id
         insert_instance(&db, "luna", None, None);
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'codex' WHERE name = 'luna'",
+                [],
+            )
+            .unwrap();
         insert_process_binding(&db, "pid-123", "luna");
 
         let identity =
@@ -988,13 +1063,19 @@ mod tests {
         // Must switch identity to canonical instance, not stay on placeholder.
         let (db, _dir) = make_test_db();
         insert_instance(&db, "canonical", Some("thread-resume"), None);
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'codex' WHERE name = 'canonical'",
+                [],
+            )
+            .unwrap();
         insert_session_binding(&db, "thread-resume", "canonical");
         insert_instance(&db, "placeholder", None, None);
         // Real launch placeholders are pending/new (PLACEHOLDER_STATUS/CONTEXT); set that
         // here so deletion is gated on genuine placeholder-ness, not merely a null session.
         db.conn()
             .execute(
-                "UPDATE instances SET status = 'pending', status_context = 'new' WHERE name = 'placeholder'",
+                "UPDATE instances SET tool = 'codex', status = 'pending', status_context = 'new' WHERE name = 'placeholder'",
                 [],
             )
             .unwrap();
@@ -1057,6 +1138,7 @@ mod tests {
             last_seen: 0,
             status_context: String::new(),
             status_detail: String::new(),
+            pending_tool_use_id: String::new(),
             directory: String::new(),
             created_at: 0.0,
             transcript_path: String::new(),
@@ -1191,5 +1273,234 @@ mod tests {
         let unknown = describe_missing_agent(&db, "zzzz");
         assert!(!unknown.contains("Did you mean"), "{unknown}");
         assert!(unknown.contains("hcom list --stopped"), "{unknown}");
+    }
+    #[test]
+    fn wrapperless_codex_requires_an_existing_codex_owned_binding() {
+        let (db, _dir) = make_test_db();
+        assert!(
+            resolve_identity_with_expectation(&db, None, None, None, None, Some("unknown"), false)
+                .is_err()
+        );
+        insert_instance(&db, "foreign", Some("foreign-thread"), None);
+        insert_session_binding(&db, "foreign-thread", "foreign");
+        assert!(
+            resolve_identity_with_expectation(
+                &db,
+                None,
+                None,
+                None,
+                None,
+                Some("foreign-thread"),
+                false
+            )
+            .is_err()
+        );
+        insert_instance(&db, "codex-owner", Some("codex-thread"), None);
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'codex' WHERE name = 'codex-owner'",
+                [],
+            )
+            .unwrap();
+        insert_session_binding(&db, "codex-thread", "codex-owner");
+        let sender = resolve_identity_with_expectation(
+            &db,
+            None,
+            None,
+            None,
+            None,
+            Some("codex-thread"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(sender.name, "codex-owner");
+        assert_eq!(sender.session_id.as_deref(), Some("codex-thread"));
+        assert_eq!(db.iter_instances_full().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn wrapperless_codex_does_not_override_explicit_or_process_identity() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "explicit", Some("explicit-session"), None);
+        insert_instance(&db, "codex-owner", Some("codex-thread"), None);
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'codex' WHERE name = 'codex-owner'",
+                [],
+            )
+            .unwrap();
+        insert_session_binding(&db, "codex-thread", "codex-owner");
+        insert_process_binding(&db, "owned-process", "explicit");
+        for (name, process) in [(Some("explicit"), None), (None, Some("owned-process"))] {
+            assert_eq!(
+                resolve_identity_with_expectation(
+                    &db,
+                    name,
+                    None,
+                    None,
+                    process,
+                    Some("codex-thread"),
+                    false
+                )
+                .unwrap()
+                .name,
+                "explicit"
+            );
+        }
+    }
+
+    #[test]
+    fn hermes_session_lookup_requires_existing_tool_owned_enrollment() {
+        let (db, _dir) = make_test_db();
+        assert!(resolve_hermes_session_identity(&db, "unknown").is_none());
+        insert_instance(&db, "foreign", Some("foreign-session"), None);
+        insert_session_binding(&db, "foreign-session", "foreign");
+        assert!(resolve_hermes_session_identity(&db, "foreign-session").is_none());
+        insert_instance(&db, "hermes-owner", Some("hermes-session"), None);
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'hermes' WHERE name = 'hermes-owner'",
+                [],
+            )
+            .unwrap();
+        insert_session_binding(&db, "hermes-session", "hermes-owner");
+        assert_eq!(
+            resolve_hermes_session_identity(&db, "hermes-session")
+                .unwrap()
+                .name,
+            "hermes-owner"
+        );
+        assert_eq!(db.iter_instances_full().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_opportunistic_codex_binding_enforces_tool_and_rejects_foreign_session() {
+        let (db, _dir) = make_test_db();
+
+        // 1. Non-Codex process row (e.g. claude) with no session.
+        // Inherited CODEX_THREAD_ID must be ignored for non-Codex process rows,
+        // preserving authoritative process identity.
+        insert_instance(&db, "claude-proc", None, None);
+        insert_process_binding(&db, "proc-claude-1", "claude-proc");
+
+        insert_instance(&db, "codex-target", Some("codex-thread-1"), None);
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'codex' WHERE name = 'codex-target'",
+                [],
+            )
+            .unwrap();
+        insert_session_binding(&db, "codex-thread-1", "codex-target");
+
+        let identity = resolve_identity_with_expectation(
+            &db,
+            None,
+            None,
+            None,
+            Some("proc-claude-1"),
+            Some("codex-thread-1"),
+            false,
+        )
+        .expect("resolution succeeds");
+        assert_eq!(
+            identity.name, "claude-proc",
+            "non-codex process row ignores inherited codex thread"
+        );
+        assert_eq!(
+            identity.session_id, None,
+            "non-codex process row remains unbound to foreign thread"
+        );
+        assert_eq!(
+            db.get_process_binding("proc-claude-1").unwrap().as_deref(),
+            Some("claude-proc"),
+            "process binding must not be changed"
+        );
+
+        // 2. Codex process row with no session, but CODEX_THREAD_ID belongs to a foreign (claude) instance.
+        // Opportunistic binding must be rejected, preserving the codex process row without
+        // retiring it, switching identity, or mutating the foreign row.
+        insert_instance(&db, "codex-proc", None, None);
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'codex' WHERE name = 'codex-proc'",
+                [],
+            )
+            .unwrap();
+        insert_process_binding(&db, "proc-codex-1", "codex-proc");
+
+        insert_instance(&db, "foreign-claude", Some("claude-thread-1"), None);
+        insert_session_binding(&db, "claude-thread-1", "foreign-claude");
+
+        let identity = resolve_identity_with_expectation(
+            &db,
+            None,
+            None,
+            None,
+            Some("proc-codex-1"),
+            Some("claude-thread-1"),
+            false,
+        )
+        .expect("resolution succeeds");
+        assert_eq!(
+            identity.name, "codex-proc",
+            "codex process row rejects foreign session binding and preserves process identity"
+        );
+        assert_eq!(
+            identity.session_id, None,
+            "rejected foreign session is not bound"
+        );
+        assert_eq!(
+            db.get_process_binding("proc-codex-1").unwrap().as_deref(),
+            Some("codex-proc"),
+            "codex process binding must not be switched"
+        );
+        let codex_proc_row = db.get_instance_full("codex-proc").unwrap().unwrap();
+        assert_ne!(
+            codex_proc_row.status, "inactive",
+            "codex row must not be retired on foreign rejection"
+        );
+        let foreign_row = db.get_instance_full("foreign-claude").unwrap().unwrap();
+        assert_eq!(
+            foreign_row.tool, "claude",
+            "foreign row tool must not be mutated"
+        );
+        assert_eq!(
+            db.get_session_binding("claude-thread-1")
+                .unwrap()
+                .as_deref(),
+            Some("foreign-claude"),
+            "foreign session binding must remain intact"
+        );
+
+        // 3. Codex process row with no session and a valid codex thread.
+        // Successfully binds and resolves to canonical codex target.
+        insert_instance(&db, "codex-proc-2", None, None);
+        db.conn()
+            .execute(
+                "UPDATE instances SET tool = 'codex' WHERE name = 'codex-proc-2'",
+                [],
+            )
+            .unwrap();
+        insert_process_binding(&db, "proc-codex-2", "codex-proc-2");
+
+        let identity = resolve_identity_with_expectation(
+            &db,
+            None,
+            None,
+            None,
+            Some("proc-codex-2"),
+            Some("codex-thread-1"),
+            false,
+        )
+        .expect("resolution succeeds");
+        assert_eq!(
+            identity.name, "codex-target",
+            "valid codex thread binds to canonical codex instance"
+        );
+        assert_eq!(
+            identity.session_id.as_deref(),
+            Some("codex-thread-1"),
+            "session id is resolved"
+        );
     }
 }

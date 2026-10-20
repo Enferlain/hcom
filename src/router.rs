@@ -127,6 +127,7 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
         Tool::Kilo => crate::hooks::opencode::dispatch_opencode_hook(hook, args),
         Tool::Pi => crate::hooks::pi::dispatch_pi_hook(hook, args),
         Tool::Omp => crate::hooks::omp::dispatch_omp_hook(hook, args),
+        Tool::Hermes => crate::hooks::hermes::dispatch_hermes_hook(hook, args),
         Tool::Antigravity => (
             crate::hooks::gemini::dispatch_gemini_hook(hook),
             String::new(),
@@ -782,7 +783,7 @@ fn launch_new_terminal() -> i32 {
 /// Opens DB, builds CommandContext, calls the appropriate cmd_* function.
 /// Args are the full argv[1..] (includes the command name and global flags).
 fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
-    use crate::cli_context::build_ctx_for_command;
+    use crate::cli_context::build_ctx_for_native_tool;
     use crate::db::HcomDb;
 
     // Extract global flags (--name, --go, --help) from anywhere in args,
@@ -831,20 +832,42 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     let process_id = std::env::var("HCOM_PROCESS_ID")
         .ok()
         .filter(|s| !s.is_empty());
-    let codex_thread_id = crate::shared::context::HcomContext::from_os().codex_thread_id;
+    let native_ctx = crate::shared::context::HcomContext::from_os();
+    // A wrapperless thread is identity evidence only for a Codex caller.
+    // Nested Claude/Hermes shells can inherit the parent's Codex thread.
+    // Keep the upstream process-bound resolution path's inputs unchanged.
+    let codex_thread_id = native_ctx
+        .codex_thread_id
+        .as_deref()
+        .filter(|_| native_ctx.tool == crate::tool::Tool::Codex || process_id.is_some());
+    let hermes_session_id = native_ctx.raw_env.get("HERMES_SESSION_ID");
+    let native_claude_session_id =
+        crate::hooks::native::is_opted_in(&native_ctx, crate::hooks::native::NativeTool::Claude)
+            .then(|| {
+                [
+                    "CLAUDE_CODE_SESSION_ID",
+                    crate::hooks::common::NATIVE_CLAUDE_SESSION_ENV,
+                ]
+                .iter()
+                .find_map(|key| native_ctx.raw_env.get(*key).filter(|sid| !sid.is_empty()))
+            })
+            .flatten();
     // Flags only: anything after `--` is message text.
     let has_from_flag = cmd_argv
         .iter()
         .take_while(|a| a.as_str() != "--")
         .any(|a| a == "--from" || a.starts_with("--from=") || a == "-b");
     let is_inside_ai = crate::shared::is_inside_ai_tool();
-    let ctx = match build_ctx_for_command(
+    let ctx = match build_ctx_for_native_tool(
         &db,
         Some(cmd),
         flags.name.as_deref(),
         flags.go,
         process_id.as_deref(),
-        codex_thread_id.as_deref(),
+        codex_thread_id,
+        hermes_session_id.map(String::as_str),
+        native_claude_session_id.map(String::as_str),
+        native_ctx.tool,
     ) {
         Ok(ctx) => ctx,
         Err(e) => {

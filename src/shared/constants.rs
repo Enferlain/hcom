@@ -66,6 +66,25 @@ pub const ST_INACTIVE: &str = "inactive";
 pub const ST_LAUNCHING: &str = "launching";
 pub const ST_ERROR: &str = "error";
 
+/// Prefix of the operational status contexts a filtered `hcom listen` writes
+/// while it is parked waiting for a match.
+pub const FILTER_WAIT_PREFIX: &str = "filter-wait:";
+/// Normal-display replacement for any `filter-wait:*` status context.
+pub const FILTER_WAIT_DISPLAY: &str = "event filter";
+
+/// Map a stored status context to its display form.
+///
+/// Internal wait bookkeeping (`filter-wait:*`) is meaningless to a human
+/// scanning `hcom list` or the TUI, so the normal view masks it; the verbose
+/// view keeps the raw context for diagnostics.
+pub fn display_status_context(ctx: &str, verbose: bool) -> &str {
+    if !verbose && ctx.starts_with(FILTER_WAIT_PREFIX) {
+        FILTER_WAIT_DISPLAY
+    } else {
+        ctx
+    }
+}
+
 /// Valid status values (ordered for display priority).
 pub const STATUS_ORDER: &[&str] = &[
     ST_ACTIVE,
@@ -175,6 +194,15 @@ pub fn status_bg(status: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_status_context_masks_internal_filter_wait_markers() {
+        let marker = "filter-wait:4242:1760000000:0";
+        assert_eq!(display_status_context(marker, false), FILTER_WAIT_DISPLAY);
+        assert_eq!(display_status_context(marker, true), marker);
+        assert_eq!(display_status_context("tool:Bash", false), "tool:Bash");
+        assert_eq!(display_status_context("", false), "");
+    }
 
     #[test]
     fn test_mention_pattern_basic() {

@@ -576,11 +576,16 @@ fn listen_delivers_capped_prefix() {
     assert_eq!(cursor(&db, &receiver), ids[99]);
 }
 
-/// A filter listen that returns on a recent match, before reading the inbox,
-/// still gets the router's delivery.
+/// Filter listen for matching events leaves the instance's inbox unread.
 #[test]
-fn early_filter_listen_match_still_delivers() {
+fn early_filter_listen_match_preserves_inbox_for_normal_delivery() {
     let (h, db, sender, receiver) = setup("adhoc");
+    let before = cursor(&db, &receiver);
+    let after_id = db
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
     let id = queue(&db, &sender, &receiver, "early-sentinel");
     let (code, out, err) = h.run([
         "listen",
@@ -588,12 +593,22 @@ fn early_filter_listen_match_still_delivers() {
         &receiver,
         "--timeout",
         "1",
+        "--after-id",
+        &after_id.to_string(),
         "--sql",
         "type='message'",
     ]);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("[Match found]"), "{out}");
-    assert!(out.contains("early-sentinel"), "{out}");
+    assert_eq!(
+        cursor(&db, &receiver),
+        before,
+        "filtered listen must not advance receiver inbox cursor"
+    );
+
+    // Subsequent normal send/delivery consumes the unread message
+    let reply_out = send(&h, &receiver, &sender, "reply");
+    assert!(reply_out.contains("early-sentinel"), "{reply_out}");
     assert_eq!(cursor(&db, &receiver), id);
 }
 
@@ -618,61 +633,87 @@ fn failed_command_delivery_write_fails_command() {
     assert_eq!(cursor(&db, &receiver), before);
 }
 
-/// Filter listen shows system messages it acknowledges instead of dropping them.
+/// Filter listen does not drop or consume system messages in the inbox.
 #[test]
-fn filter_listen_shows_system_messages() {
-    let (h, db, _sender, receiver) = setup("adhoc");
-    let id = queue(&db, "[hcom-launcher]", &receiver, "launcher-sentinel");
-    let (_, out, err) = h.run([
-        "listen",
-        "--name",
-        &receiver,
-        "--timeout",
-        "1",
-        "--sql",
-        "type='status' AND 0",
-    ]);
-    assert!(out.contains("launcher-sentinel"), "{out}\n{err}");
-    assert_eq!(cursor(&db, &receiver), id);
-}
-
-/// A listen that exits before reading the inbox leaves delivery to the router.
-#[test]
-fn listen_exiting_before_reading_still_delivers() {
+fn filter_listen_preserves_system_messages_for_normal_delivery() {
     let (h, db, sender, receiver) = setup("adhoc");
-    let id = queue(&db, &sender, &receiver, "unread-sentinel");
-    let (_, out, err) = h.run([
+    let before = cursor(&db, &receiver);
+    let id = queue(&db, "[hcom-launcher]", &receiver, "launcher-sentinel");
+    let (code, _out, err) = h.run([
         "listen",
         "--name",
         &receiver,
         "--timeout",
         "0",
+        "--timeout-ok",
         "--sql",
         "type='status' AND 0",
     ]);
-    assert!(out.contains("unread-sentinel"), "{out}\n{err}");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(cursor(&db, &receiver), before);
+
+    // When normal delivery runs, the system message is intact and delivered
+    let reply_out = send(&h, &receiver, &sender, "ack");
+    assert!(reply_out.contains("launcher-sentinel"), "{reply_out}");
     assert_eq!(cursor(&db, &receiver), id);
 }
 
-/// Filter listen keeps reading past a capped batch (a match may sit beyond it).
+/// A filter listen timeout preserves unread messages for subsequent normal delivery.
 #[test]
-fn filter_listen_reads_past_capped_batch() {
+fn filtered_listen_timeout_preserves_inbox_for_normal_delivery() {
     let (h, db, sender, receiver) = setup("adhoc");
-    let ids: Vec<i64> = (0..60)
-        .map(|i| queue(&db, &sender, &receiver, &format!("sentinel-{i:03}-end")))
-        .collect();
-    let (_, out, err) = h.run([
+    let before = cursor(&db, &receiver);
+    let id = queue(&db, &sender, &receiver, "unread-sentinel");
+    let (code, _out, err) = h.run([
         "listen",
         "--name",
         &receiver,
         "--timeout",
-        "2",
+        "0",
+        "--timeout-ok",
         "--sql",
         "type='status' AND 0",
     ]);
-    assert!(out.contains("sentinel-059-end"), "{out}\n{err}");
-    assert!(!out.contains("more unread"), "{out}");
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(cursor(&db, &receiver), before);
+
+    // Next normal command delivers the message
+    let out = send(&h, &receiver, &sender, "reply");
+    assert!(out.contains("unread-sentinel"), "{out}");
+    assert_eq!(cursor(&db, &receiver), id);
+}
+
+/// Filter listen leaves an existing multi-batch inbox backlog unread.
+#[test]
+fn filtered_listen_preserves_capped_backlog_for_normal_delivery() {
+    let (h, db, sender, receiver) = setup("adhoc");
+    let before = cursor(&db, &receiver);
+    let ids: Vec<i64> = (0..60)
+        .map(|i| queue(&db, &sender, &receiver, &format!("sentinel-{i:03}-end")))
+        .collect();
+    let (code, _out, err) = h.run([
+        "listen",
+        "--name",
+        &receiver,
+        "--timeout",
+        "0",
+        "--timeout-ok",
+        "--sql",
+        "type='status' AND 0",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(cursor(&db, &receiver), before);
+
+    // Draining the first batch via standard send respects MAX_MESSAGES_PER_DELIVERY cap (50)
+    let first = send(&h, &receiver, &sender, "reply-1");
+    assert_eq!(cursor(&db, &receiver), ids[49]);
+    assert!(first.contains("sentinel-049-end"));
+    assert!(!first.contains("sentinel-050-end"));
+
+    // Second batch drains remaining 10
+    let second = send(&h, &receiver, &sender, "reply-2");
     assert_eq!(cursor(&db, &receiver), ids[59]);
+    assert!(second.contains("sentinel-059-end"));
 }
 
 /// A message arriving while listen writes its batch gets a notice.

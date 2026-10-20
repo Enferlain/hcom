@@ -280,6 +280,184 @@ fn detect_current_tool() -> &'static str {
     crate::shared::detect_current_tool_from_env()
 }
 
+fn native_event_command(
+    tool: crate::hooks::native::NativeTool,
+    event: &str,
+) -> Option<&'static str> {
+    use crate::hooks::native::NativeTool;
+    match (tool, event) {
+        (NativeTool::Claude, "SessionStart") => Some("sessionstart"),
+        (NativeTool::Claude, "UserPromptSubmit") => Some("userpromptsubmit"),
+        (NativeTool::Claude, "PreToolUse") => Some("pre"),
+        (NativeTool::Claude, "PostToolUse") => Some("post"),
+        (NativeTool::Claude, "PostToolUseFailure") => Some("post-failure"),
+        (NativeTool::Claude, "Stop") => Some("poll"),
+        (NativeTool::Claude, "StopFailure") => Some("stop-failure"),
+        (NativeTool::Claude, "PermissionRequest") => Some("permission-request"),
+        (NativeTool::Claude, "PermissionDenied") => Some("permission-denied"),
+        (NativeTool::Claude, "SubagentStart") => Some("subagent-start"),
+        (NativeTool::Claude, "SubagentStop") => Some("subagent-stop"),
+        (NativeTool::Claude, "Notification") => Some("notify"),
+        (NativeTool::Claude, "SessionEnd") => Some("sessionend"),
+        (NativeTool::Codex, "SessionStart") => Some("codex-sessionstart"),
+        (NativeTool::Codex, "UserPromptSubmit") => Some("codex-userpromptsubmit"),
+        (NativeTool::Codex, "PreToolUse") => Some("codex-pretooluse"),
+        (NativeTool::Codex, "PostToolUse") => Some("codex-posttooluse"),
+        (NativeTool::Codex, "Stop") => Some("codex-stop"),
+        (NativeTool::Codex, "Interrupt") => Some("codex-interrupt"),
+        _ => None,
+    }
+}
+
+struct NativeMarkerGuard(Option<std::ffi::OsString>);
+
+impl NativeMarkerGuard {
+    fn enter(tool: crate::hooks::native::NativeTool) -> Self {
+        let previous = std::env::var_os(crate::hooks::common::NATIVE_PARTICIPATION_ENV);
+        // The CLI dispatches one native hook per process; environment-mutating
+        // unit tests of this guard are serialized.
+        unsafe {
+            std::env::set_var(
+                crate::hooks::common::NATIVE_PARTICIPATION_ENV,
+                tool.marker(),
+            );
+        }
+        Self(previous)
+    }
+}
+
+impl Drop for NativeMarkerGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(previous) => {
+                    std::env::set_var(crate::hooks::common::NATIVE_PARTICIPATION_ENV, previous)
+                }
+                None => std::env::remove_var(crate::hooks::common::NATIVE_PARTICIPATION_ENV),
+            }
+        }
+    }
+}
+
+fn cmd_native_hooks(argv: &[String]) -> i32 {
+    use crate::hooks::native::{self, NativeTool};
+    let Some(operation) = argv.first().map(String::as_str) else {
+        eprintln!("Usage: hcom hooks native <add|remove|status> <claude|codex>");
+        return 1;
+    };
+    let Some(tool) = argv
+        .get(1)
+        .and_then(|value| value.parse::<NativeTool>().ok())
+    else {
+        eprintln!("Error: native hooks require a tool: claude or codex");
+        return 1;
+    };
+    if operation == "run" {
+        let Some(hook) = argv
+            .get(2)
+            .and_then(|event| native_event_command(tool, event))
+        else {
+            eprintln!("Error: invalid native hook event for {tool}");
+            return 1;
+        };
+        if argv.len() != 3 {
+            eprintln!("Error: native hook run accepts only a tool and event");
+            return 1;
+        }
+        let _marker = NativeMarkerGuard::enter(tool);
+        return match tool {
+            NativeTool::Claude => crate::hooks::claude::dispatch_claude_hook(hook),
+            NativeTool::Codex => crate::hooks::codex::dispatch_codex_hook_native(hook),
+        };
+    }
+    let json = argv.get(2).is_some_and(|arg| arg == "--json");
+    if argv.len() != if json { 3 } else { 2 } {
+        eprintln!("Error: unexpected native hooks arguments");
+        return 1;
+    }
+    let result = match operation {
+        "add" => native::install(tool),
+        "remove" => native::remove(tool),
+        "status" => native::status(tool),
+        _ => {
+            eprintln!("Usage: hcom hooks native <add|remove|status> <claude|codex>");
+            return 1;
+        }
+    };
+    match result {
+        Ok(status) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "tool": status.tool.as_str(), "path": status.path,
+                        "installed": status.installed, "owned_hooks": status.owned_hooks,
+                        "expected_hooks": status.expected_hooks,
+                        "trust_configured": status.trust_configured,
+                    })
+                );
+            } else {
+                println!(
+                    "{tool} native hooks: {} ({}/{})  {}",
+                    if status.installed {
+                        "installed"
+                    } else {
+                        "not installed"
+                    },
+                    status.owned_hooks,
+                    status.expected_hooks,
+                    status.path.display()
+                );
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            1
+        }
+    }
+}
+
+fn cmd_hermes_backend_status() -> i32 {
+    use crate::hooks::hermes;
+    println!("Hermes backend extension (hcom-owned):");
+    match hermes::backend_ownership_pub() {
+        Ok(hermes::BackendOwnership::Foreign) => {
+            println!("  files:      foreign; hcom will leave them intact");
+            return 0;
+        }
+        Ok(hermes::BackendOwnership::Absent) => {
+            println!("  files:      missing (hcom hooks add hermes)")
+        }
+        Ok(hermes::BackendOwnership::Ours) => println!(
+            "  files:      present (hcom-managed){}",
+            if hermes::hermes_backend_files_current() {
+                ""
+            } else {
+                "; update available (hcom hooks add hermes)"
+            }
+        ),
+        Err(error) => println!("  files:      unreadable ({error})"),
+    }
+    let readiness = hermes::evaluate_hermes_plugin_readiness();
+    println!(
+        "  enabled:    {}",
+        if readiness.ready { "yes" } else { "no" }
+    );
+    if !readiness.ready {
+        println!("  readiness:  {}", readiness.diagnostic);
+    }
+    println!(
+        "  allow_gateway_injection: {}",
+        match hermes::hermes_gateway_injection_enabled() {
+            Some(true) => "granted",
+            Some(false) => "denied; non-CLI sessions cannot receive injected turns",
+            None => "not set; non-CLI sessions cannot receive injected turns",
+        }
+    );
+    0
+}
+
 pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) -> i32 {
     let argv = &args.args;
     if argv.is_empty() {
@@ -297,7 +475,11 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
     let sub_argv = argv[1..].to_vec();
 
     match first {
+        "status" if sub_argv.first().is_some_and(|tool| tool == "hermes") => {
+            cmd_hermes_backend_status()
+        }
         "status" => cmd_hooks_status(),
+        "native" => cmd_native_hooks(&sub_argv),
         "add" | "install" => cmd_hooks_add(&sub_argv),
         "remove" | "uninstall" => cmd_hooks_remove(&sub_argv),
         _ => {

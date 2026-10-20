@@ -55,9 +55,15 @@ fn initialize_last_event_id(db: &HcomDb, instance_name: &str) {
             Some(lei) if lei <= current_max => lei,
             _ => current_max,
         };
-        let mut updates = serde_json::Map::new();
-        updates.insert("last_event_id".into(), serde_json::json!(new_id));
-        instances::update_instance_position(db, instance_name, &updates);
+        if new_id > 0
+            && let Err(e) = db.advance_instance_cursor(instance_name, new_id)
+        {
+            log_error(
+                "hooks",
+                "omp.init_cursor",
+                &format!("instance={instance_name} err={e}"),
+            );
+        }
     }
 }
 
@@ -214,9 +220,24 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
                     serde_json::json!({"error": format!("Invalid --up-to: {}", up_to)}).to_string(),
                 );
             };
-            let mut updates = serde_json::Map::new();
-            updates.insert("last_event_id".into(), serde_json::json!(ack_id));
-            instances::update_instance_position(db, &name, &updates);
+            if ack_id < 0 {
+                return (
+                    0,
+                    serde_json::json!({"error": format!("Invalid --up-to: {}", up_to)}).to_string(),
+                );
+            }
+            if let Err(e) = db.advance_instance_cursor(&name, ack_id) {
+                log_error(
+                    "hooks",
+                    "omp.ack_cursor",
+                    &format!("instance={name} err={e}"),
+                );
+                return (
+                    0,
+                    serde_json::json!({"error": format!("Failed to advance cursor: {e}")})
+                        .to_string(),
+                );
+            }
             return (0, serde_json::json!({"acked_to": ack_id}).to_string());
         }
         if messages.is_empty() {
@@ -228,10 +249,18 @@ fn handle_read(db: &HcomDb, argv: &[String]) -> (i32, String) {
             .max()
             .filter(|id| *id > 0)
             .unwrap_or_else(|| db.get_last_event_id());
-        if ack_id > 0 {
-            let mut updates = serde_json::Map::new();
-            updates.insert("last_event_id".into(), serde_json::json!(ack_id));
-            instances::update_instance_position(db, &name, &updates);
+        if ack_id > 0
+            && let Err(e) = db.advance_instance_cursor(&name, ack_id)
+        {
+            log_error(
+                "hooks",
+                "omp.ack_cursor",
+                &format!("instance={name} err={e}"),
+            );
+            return (
+                0,
+                serde_json::json!({"error": format!("Failed to advance cursor: {e}")}).to_string(),
+            );
         }
         return (0, serde_json::json!({"acked": messages.len()}).to_string());
     }
@@ -337,4 +366,191 @@ pub fn dispatch_omp_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
         ),
     );
     (exit_code, output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_test_db() -> (HcomDb, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let db_path = std::env::temp_dir().join(format!(
+            "test_omp_handlers_{}_{}.db",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db = HcomDb::open_at(&db_path).unwrap();
+        (db, db_path)
+    }
+
+    fn cleanup_db(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    fn save_omp_instance(db: &HcomDb, name: &str) {
+        let mut row = serde_json::Map::new();
+        row.insert("name".into(), serde_json::json!(name));
+        row.insert("tool".into(), serde_json::json!("omp"));
+        row.insert("status".into(), serde_json::json!(ST_LISTENING));
+        row.insert("status_context".into(), serde_json::json!(""));
+        row.insert("status_detail".into(), serde_json::json!(""));
+        row.insert("created_at".into(), serde_json::json!(1.0));
+        db.save_instance_named(name, &row).unwrap();
+    }
+
+    fn argv_of(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    static BLOCKED_SIGNALED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn test_busy_handler(_count: i32) -> bool {
+        BLOCKED_SIGNALED.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        true
+    }
+
+    #[test]
+    fn concurrent_ack_does_not_rewind_cursor() {
+        let (_db_orig, path) = setup_test_db();
+        let db_main = HcomDb::open_at(&path).unwrap();
+        save_omp_instance(&db_main, "tuna");
+
+        // Pre-open the independent thread connection before acquiring writer lock
+        let db_thread = HcomDb::open_at(&path).unwrap();
+
+        let ext_conn = rusqlite::Connection::open(&path).unwrap();
+        ext_conn
+            .busy_timeout(std::time::Duration::from_millis(5000))
+            .unwrap();
+
+        BLOCKED_SIGNALED.store(false, std::sync::atomic::Ordering::SeqCst);
+        db_thread
+            .conn()
+            .busy_handler(Some(test_busy_handler))
+            .unwrap();
+
+        // Step 1: Writer holds uncommitted transaction setting cursor = 10
+        ext_conn
+            .execute_batch(
+                "BEGIN IMMEDIATE; UPDATE instances SET last_event_id = 10 WHERE name = 'tuna';",
+            )
+            .unwrap();
+
+        // Step 2: Background thread runs handle_read with --ack --up-to 5
+        let handle = std::thread::spawn(move || {
+            handle_read(
+                &db_thread,
+                &argv_of(&["--name", "tuna", "--ack", "--up-to", "5"]),
+            )
+        });
+
+        // Wait until db_thread is confirmed blocked waiting for ext_conn's write lock
+        let start = std::time::Instant::now();
+        while !BLOCKED_SIGNALED.load(std::sync::atomic::Ordering::SeqCst) {
+            if start.elapsed() > std::time::Duration::from_secs(3) {
+                panic!("db_thread did not trigger busy handler within timeout");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Step 3: Commit writer's transaction with cursor = 10
+        ext_conn.execute_batch("COMMIT;").unwrap();
+
+        // Step 4: Background thread finishes
+        let (_, out) = handle.join().expect("background thread finished");
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        assert!(doc.get("error").is_none(), "ack succeeded: {out}");
+
+        // Step 5: Verify last_event_id in DB is 10, proving MAX prevented regression
+        let inst = db_main.get_instance_full("tuna").unwrap().unwrap();
+        assert_eq!(
+            inst.last_event_id, 10,
+            "cursor was not rewound by concurrent ack of older event 5"
+        );
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn duplicate_or_stale_ack_does_not_rewind_cursor() {
+        let (db, path) = setup_test_db();
+        save_omp_instance(&db, "tuna");
+
+        // Advance to 10
+        let (_, out) = handle_read(&db, &argv_of(&["--name", "tuna", "--ack", "--up-to", "10"]));
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(doc["acked_to"].as_i64(), Some(10));
+        assert_eq!(
+            db.get_instance_full("tuna").unwrap().unwrap().last_event_id,
+            10
+        );
+
+        // Stale / older ack of 5
+        let (_, out) = handle_read(&db, &argv_of(&["--name", "tuna", "--ack", "--up-to", "5"]));
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        assert!(doc.get("error").is_none());
+        assert_eq!(
+            db.get_instance_full("tuna").unwrap().unwrap().last_event_id,
+            10,
+            "cursor never moves backwards on stale ack"
+        );
+
+        // Duplicate ack of 10
+        let (_, out) = handle_read(&db, &argv_of(&["--name", "tuna", "--ack", "--up-to", "10"]));
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        assert!(doc.get("error").is_none());
+        assert_eq!(
+            db.get_instance_full("tuna").unwrap().unwrap().last_event_id,
+            10,
+            "cursor unchanged on duplicate ack"
+        );
+
+        // Invalid negative cursor
+        let (_, out) = handle_read(&db, &argv_of(&["--name", "tuna", "--ack", "--up-to", "-3"]));
+        let doc: Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            doc.get("error").is_some(),
+            "negative cursor must be rejected"
+        );
+
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn initialize_last_event_id_monotonic() {
+        let (db, path) = setup_test_db();
+        save_omp_instance(&db, "tuna");
+
+        // Log events so last_event_id > 0
+        db.log_event("message", "src", &serde_json::json!({"text": "m1"}))
+            .unwrap();
+        let e2 = db
+            .log_event("message", "src", &serde_json::json!({"text": "m2"}))
+            .unwrap();
+
+        initialize_last_event_id(&db, "tuna");
+        assert_eq!(
+            db.get_instance_full("tuna").unwrap().unwrap().last_event_id,
+            e2
+        );
+
+        // Advance cursor further
+        db.advance_instance_cursor("tuna", e2 + 10).unwrap();
+        assert_eq!(
+            db.get_instance_full("tuna").unwrap().unwrap().last_event_id,
+            e2 + 10
+        );
+
+        // Second initialize_last_event_id must not regress the cursor
+        initialize_last_event_id(&db, "tuna");
+        assert_eq!(
+            db.get_instance_full("tuna").unwrap().unwrap().last_event_id,
+            e2 + 10
+        );
+        cleanup_db(&path);
+    }
 }

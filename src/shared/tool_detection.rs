@@ -121,6 +121,15 @@ const OMP_NATIVE: &[EnvPredicate] = &[EnvPredicate {
     var: "HCOM_OMP",
     condition: EnvMatch::Equals("1"),
 }];
+/// Ordinary Hermes exports HERMES_SESSION_ID into every terminal subprocess
+/// (hermes tools/environments/local.py `_inject_session_context_env`); an
+/// empty value is the host's cross-session leak guard (stripped/foreign) and
+/// must not match. Deliberately last among native markers so any tool
+/// nested inside a Hermes terminal keeps its own, more specific identity.
+const HERMES_NATIVE: &[EnvPredicate] = &[EnvPredicate {
+    var: "HERMES_SESSION_ID",
+    condition: EnvMatch::NonEmpty,
+}];
 
 macro_rules! hcom_tool_predicate {
     ($name:literal, $ident:ident) => {
@@ -144,13 +153,20 @@ hcom_tool_predicate!("qoder", HCOM_TOOL_QODER);
 hcom_tool_predicate!("grok", HCOM_TOOL_GROK);
 hcom_tool_predicate!("pi", HCOM_TOOL_PI);
 hcom_tool_predicate!("omp", HCOM_TOOL_OMP);
+hcom_tool_predicate!("hermes", HCOM_TOOL_HERMES);
 
 /// Detection precedence: native markers first, then hcom's explicit fallback.
 pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
     ToolDetectionRule {
         tool: Tool::Claude,
         predicates: CLAUDE_NATIVE,
-        clear_for_child: &["CLAUDECODE", "CLAUDE_ENV_FILE"],
+        clear_for_child: &[
+            "CLAUDECODE",
+            "CLAUDE_ENV_FILE",
+            "CLAUDE_CODE_SESSION_ID",
+            "HCOM_NATIVE_PARTICIPATION",
+            "HCOM_CLAUDE_UNIX_SESSION_ID",
+        ],
     },
     ToolDetectionRule {
         tool: Tool::Antigravity,
@@ -221,6 +237,11 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
         clear_for_child: &["HCOM_OMP", "PI_CODING_AGENT", "PI_CODING_AGENT_SESSION_DIR"],
     },
     ToolDetectionRule {
+        tool: Tool::Hermes,
+        predicates: HERMES_NATIVE,
+        clear_for_child: &["HERMES_SESSION_ID"],
+    },
+    ToolDetectionRule {
         tool: Tool::Claude,
         predicates: HCOM_TOOL_CLAUDE,
         clear_for_child: &["HCOM_TOOL"],
@@ -283,6 +304,11 @@ pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
     ToolDetectionRule {
         tool: Tool::Omp,
         predicates: HCOM_TOOL_OMP,
+        clear_for_child: &["HCOM_TOOL"],
+    },
+    ToolDetectionRule {
+        tool: Tool::Hermes,
+        predicates: HCOM_TOOL_HERMES,
         clear_for_child: &["HCOM_TOOL"],
     },
 ];
@@ -393,5 +419,68 @@ mod tests {
     fn previously_missing_markers_are_in_child_clear_set() {
         assert!(tool_marker_vars().contains(&"CLAUDE_ENV_FILE"));
         assert!(tool_marker_vars().contains(&"HCOM_TOOL"));
+        for marker in [
+            "CLAUDE_CODE_SESSION_ID",
+            "HCOM_NATIVE_PARTICIPATION",
+            "HCOM_CLAUDE_UNIX_SESSION_ID",
+        ] {
+            assert!(
+                tool_marker_vars().contains(&marker),
+                "native enrollment must not leak into a launched child: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn hermes_native_marker_detects_via_session_id() {
+        // Ordinary Hermes bridges HERMES_SESSION_ID into terminal subprocesses.
+        assert_eq!(
+            detect_tool(&env(&[("HERMES_SESSION_ID", "ses-123")])),
+            Tool::Hermes
+        );
+        // The host's leak guard exports an explicitly-empty value for
+        // unbound/foreign contexts — that must not claim Hermes identity.
+        assert_eq!(detect_tool(&env(&[("HERMES_SESSION_ID", "")])), Tool::Adhoc);
+        assert_eq!(detect_tool(&env(&[])), Tool::Adhoc);
+    }
+
+    #[test]
+    fn hermes_marker_yields_to_more_specific_native_markers() {
+        // A tool nested inside a Hermes terminal keeps its own identity.
+        assert_eq!(
+            detect_tool(&env(&[("HERMES_SESSION_ID", "ses-1"), ("CLAUDECODE", "1")])),
+            Tool::Claude
+        );
+        assert_eq!(
+            detect_tool(&env(&[
+                ("HERMES_SESSION_ID", "ses-1"),
+                ("CODEX_THREAD_ID", "thread-9")
+            ])),
+            Tool::Codex
+        );
+        assert_eq!(
+            detect_tool(&env(&[("HERMES_SESSION_ID", "ses-1"), ("GEMINI_CLI", "1")])),
+            Tool::Gemini
+        );
+    }
+
+    #[test]
+    fn hcom_tool_fallback_detects_hermes_like_every_other_tool() {
+        assert_eq!(detect_tool(&env(&[("HCOM_TOOL", "hermes")])), Tool::Hermes);
+        // Native marker still beats the fallback for Hermes itself.
+        assert_eq!(
+            detect_tool(&env(&[
+                ("HERMES_SESSION_ID", "ses-1"),
+                ("HCOM_TOOL", "claude")
+            ])),
+            Tool::Hermes
+        );
+    }
+
+    #[test]
+    fn hermes_session_id_is_scrubbed_from_child_environments() {
+        // launcher/terminal scrub lists are derived from tool_marker_vars();
+        // the marker must not leak into tools spawned from a Hermes session.
+        assert!(tool_marker_vars().contains(&"HERMES_SESSION_ID"));
     }
 }

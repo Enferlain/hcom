@@ -755,6 +755,7 @@ impl ScreenTracker {
             // Grok: prompt-empty gate uses generic scrape when available; no
             // tool-specific VT100 input parser yet.
             Ok(Tool::Grok) => None,
+            Ok(Tool::Hermes) => None,
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }

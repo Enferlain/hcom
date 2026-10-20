@@ -90,6 +90,7 @@ pub enum Tool {
     Copilot,
     Qoder,
     Grok,
+    Hermes,
     Adhoc,
     /// Persisted value written by a newer or third-party integration.
     Unknown(String),
@@ -112,6 +113,7 @@ impl Tool {
             Self::Copilot => Some(crate::tool::Tool::Copilot),
             Self::Qoder => Some(crate::tool::Tool::Qoder),
             Self::Grok => Some(crate::tool::Tool::Grok),
+            Self::Hermes => Some(crate::tool::Tool::Hermes),
             Self::Adhoc => Some(crate::tool::Tool::Adhoc),
             Self::Unknown(_) => None,
         }
@@ -148,7 +150,8 @@ impl Tool {
             Self::Kimi => Self::Copilot,
             Self::Copilot => Self::Qoder,
             Self::Qoder => Self::Grok,
-            Self::Grok => Self::Claude,
+            Self::Grok => Self::Hermes,
+            Self::Hermes => Self::Claude,
             Self::Adhoc => Self::Adhoc,
             Self::Unknown(raw) => Self::Unknown(raw.clone()),
         }
@@ -157,7 +160,7 @@ impl Tool {
     /// Cycle backward (for launch panel). Adhoc is not launchable.
     pub fn prev(&self) -> Self {
         match self {
-            Self::Claude => Self::Grok,
+            Self::Claude => Self::Hermes,
             Self::Gemini => Self::Claude,
             Self::Codex => Self::Gemini,
             Self::OpenCode => Self::Codex,
@@ -170,6 +173,7 @@ impl Tool {
             Self::Copilot => Self::Kimi,
             Self::Qoder => Self::Copilot,
             Self::Grok => Self::Qoder,
+            Self::Hermes => Self::Grok,
             Self::Adhoc => Self::Adhoc,
             Self::Unknown(raw) => Self::Unknown(raw.clone()),
         }
@@ -1281,12 +1285,14 @@ mod tests {
         assert_eq!(Tool::Kimi.next(), Tool::Copilot);
         assert_eq!(Tool::Copilot.next(), Tool::Qoder);
         assert_eq!(Tool::Qoder.next(), Tool::Grok);
-        assert_eq!(Tool::Grok.next(), Tool::Claude);
+        assert_eq!(Tool::Grok.next(), Tool::Hermes);
+        assert_eq!(Tool::Hermes.next(), Tool::Claude);
     }
 
     #[test]
     fn tool_prev_cycles_backward() {
-        assert_eq!(Tool::Claude.prev(), Tool::Grok);
+        assert_eq!(Tool::Claude.prev(), Tool::Hermes);
+        assert_eq!(Tool::Hermes.prev(), Tool::Grok);
         assert_eq!(Tool::Grok.prev(), Tool::Qoder);
         assert_eq!(Tool::Qoder.prev(), Tool::Copilot);
         assert_eq!(Tool::Copilot.prev(), Tool::Kimi);

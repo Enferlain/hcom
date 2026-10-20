@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::core::launch_status::BlockedKind;
 use crate::db::HcomDb;
 use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
@@ -1285,14 +1286,37 @@ fn emit_launch_ready_once(
     } else {
         "ready_observed"
     };
-    if let Err(e) = db.set_status(current_name, ST_LISTENING, context) {
-        log_warn(
-            "native",
-            "delivery.launch_ready_status_fail",
-            &format!("Failed to mark launch ready for {}: {}", current_name, e),
-        );
-        return;
+
+    match crate::instance_lifecycle::restore_status_if_no_approval(
+        db,
+        current_name,
+        None,
+        ST_LISTENING,
+        context,
+        crate::instance_lifecycle::StatusUpdate::default(),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            log_info(
+                "native",
+                "delivery.launch_ready_refused_approval",
+                &format!(
+                    "Launch ready status update refused for {}: pending approval active",
+                    current_name
+                ),
+            );
+            return;
+        }
+        Err(e) => {
+            log_warn(
+                "native",
+                "delivery.launch_ready_status_fail",
+                &format!("Failed to mark launch ready for {}: {}", current_name, e),
+            );
+            return;
+        }
     }
+
     if let Err(e) = db.emit_ready_event(current_name, ST_LISTENING, context) {
         log_warn(
             "native",
@@ -1330,35 +1354,219 @@ fn emit_launch_failed_if_needed(
     mark_launch_phase_complete(state, outcome, LaunchOutcome::Failed);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockedClassification {
+    pub kind: BlockedKind,
+    pub evidence: Option<String>,
+}
+
+const DISTINCTIVE_TRUST_PROMPTS: &[&str] = &[
+    "do you trust the files in this folder?",
+    "do you trust the authors of the files in this workspace?",
+    "do you trust the contents of this project?",
+    "do you want to trust this folder?",
+];
+
+fn matching_line(tail: &str, patterns: &[&str]) -> Option<String> {
+    tail.lines().find_map(|line| {
+        let lower = line.to_lowercase();
+        patterns
+            .iter()
+            .any(|pattern| lower.contains(pattern))
+            .then(|| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+    })
+}
+
+fn has_distinctive_trust_prompt(tail: &str) -> bool {
+    matching_line(tail, DISTINCTIVE_TRUST_PROMPTS).is_some()
+}
+
+fn nonzero_exit_evidence(tail: &str) -> Option<String> {
+    const MARKER: &str = "process exited with code";
+    tail.lines().find_map(|line| {
+        let lower = line.to_lowercase();
+        let suffix = lower.split_once(MARKER)?.1.trim_start();
+        let token = suffix
+            .split(|ch: char| !(ch.is_ascii_digit() || ch == '-'))
+            .find(|part| !part.is_empty())?;
+        token
+            .parse::<i32>()
+            .ok()
+            // A routine inner command can exit nonzero while the provider is
+            // healthy. Reserve this signal for shell-style signal exits.
+            .filter(|code| *code < 0 || *code >= 128)
+            .map(|_| line.trim().to_string())
+    })
+}
+
+pub(crate) fn classify_launch_blocker(tail: &str, screen_approval: bool) -> BlockedClassification {
+    // Distinctive trust prompts outrank the generic approval signal because
+    // they identify the exact startup blocker and can safely bypass settling.
+    if let Some(evidence) = matching_line(tail, DISTINCTIVE_TRUST_PROMPTS) {
+        return BlockedClassification {
+            kind: BlockedKind::WorkspaceTrust,
+            evidence: Some(evidence),
+        };
+    }
+
+    // A provider's structured approval signal is stronger than arbitrary text
+    // in the proposed command (which may itself mention auth, quota, or errors).
+    if screen_approval {
+        return BlockedClassification {
+            kind: BlockedKind::Confirmation,
+            evidence: matching_line(
+                tail,
+                &[
+                    "requesting permission for:",
+                    "allow sandbox bypass for command execution?",
+                    "do you want to proceed?",
+                    "allow access to this file?",
+                    "allow this tool?",
+                    "approve command",
+                ],
+            )
+            .or_else(|| Some("approval prompt detected by provider".to_string())),
+        };
+    }
+
+    if let Some(evidence) = matching_line(
+        tail,
+        &[
+            "please login",
+            "please sign in",
+            "authentication required",
+            "invalid api key",
+            "missing api key",
+            "login with",
+            "not logged in",
+            "401 unauthorized",
+            "api key not found",
+            "provide an api key",
+        ],
+    ) {
+        return BlockedClassification {
+            kind: BlockedKind::Authentication,
+            evidence: Some(evidence),
+        };
+    }
+
+    if let Some(evidence) = matching_line(
+        tail,
+        &[
+            "quota exceeded",
+            "rate limit reached",
+            "insufficient credits",
+            "credit balance is too low",
+            "429 too many requests",
+            "out of credits",
+            "exceeded your current quota",
+        ],
+    ) {
+        return BlockedClassification {
+            kind: BlockedKind::Quota,
+            evidence: Some(evidence),
+        };
+    }
+
+    if let Some(evidence) = matching_line(
+        tail,
+        &[
+            "panic:",
+            "panicked at",
+            "segmentation fault",
+            "core dumped",
+            "sigsegv",
+            "sigabrt",
+            "unhandled exception",
+            "process terminated unexpectedly",
+        ],
+    )
+    .or_else(|| nonzero_exit_evidence(tail))
+    {
+        return BlockedClassification {
+            kind: BlockedKind::Crashed,
+            evidence: Some(evidence),
+        };
+    }
+
+    if let Some(evidence) = matching_line(
+        tail,
+        &[
+            "do you want to proceed?",
+            "press enter to continue",
+            "allow this tool?",
+            "approve command",
+            "waiting for user approval",
+            "permission requested",
+            "grant permission",
+            "[y/n]",
+            "(y/n)",
+        ],
+    ) {
+        return BlockedClassification {
+            kind: BlockedKind::Confirmation,
+            evidence: Some(evidence),
+        };
+    }
+
+    BlockedClassification {
+        kind: BlockedKind::Unknown,
+        evidence: None,
+    }
+}
+
 fn emit_launch_blocked_once(
     db: &HcomDb,
     state: &DeliveryState,
     current_name: &str,
     outcome: &mut LaunchOutcome,
     detail: &str,
+    classification: &BlockedClassification,
 ) {
     if !outcome.is_pending() || std::env::var("HCOM_LAUNCHED").as_deref() != Ok("1") {
         return;
     }
 
-    if let Err(e) = db.set_status(current_name, ST_BLOCKED, "launch_blocked") {
-        log_warn(
-            "native",
-            "delivery.launch_blocked_status_fail",
-            &format!(
-                "Failed to set launch_blocked status for {}: {}",
-                current_name, e
-            ),
-        );
-        return;
-    }
-
-    if let Err(e) = db.emit_launch_blocked_event(
+    match crate::instance_lifecycle::restore_status_if_no_approval(
+        db,
         current_name,
+        None,
         ST_BLOCKED,
         "launch_blocked",
+        crate::instance_lifecycle::StatusUpdate::default(),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            log_info(
+                "native",
+                "delivery.launch_blocked_refused_approval",
+                &format!(
+                    "Launch blocked status update refused for {}: pending approval active",
+                    current_name
+                ),
+            );
+            return;
+        }
+        Err(e) => {
+            log_warn(
+                "native",
+                "delivery.launch_blocked_status_fail",
+                &format!(
+                    "Failed to set launch_blocked status for {}: {}",
+                    current_name, e
+                ),
+            );
+            return;
+        }
+    }
+
+    if let Err(e) = db.emit_launch_blocked_event_with_evidence(
+        current_name,
         "screen_settled_not_ready",
         detail,
+        classification.kind.as_str(),
+        classification.evidence.as_deref(),
     ) {
         log_warn(
             "native",
@@ -1402,7 +1610,7 @@ fn maybe_emit_launch_blocked(
     // Gemini's animated startup banner keeps emitting output for ~60s, defeating
     // the settle heuristic. Its trust prompt is distinctive — fire immediately
     // when it appears rather than waiting for the banner animation to stop.
-    let trust_prompt_visible = tail_text.contains("Do you trust the files in this folder?");
+    let trust_prompt_visible = has_distinctive_trust_prompt(tail_text);
     if !trust_prompt_visible && screen.last_output.elapsed() < settle_threshold {
         return;
     }
@@ -1414,12 +1622,13 @@ fn maybe_emit_launch_blocked(
         return;
     };
 
+    let classification = classify_launch_blocker(tail, screen.approval);
     let detail = format!(
         "launch blocked: screen settled before readiness; run `hcom term {}`\n{}",
         current_name, tail
     );
     drop(screen);
-    emit_launch_blocked_once(db, state, current_name, outcome, &detail);
+    emit_launch_blocked_once(db, state, current_name, outcome, &detail, &classification);
 }
 
 /// Inject text to PTY via TCP (text only, no Enter).
@@ -2734,6 +2943,34 @@ fn cleanup_pty_exit_default(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    struct EnvVarGuard {
+        var: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(var: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(var);
+            unsafe {
+                std::env::set_var(var, value);
+            }
+            Self { var, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(ref val) = self.original {
+                    std::env::set_var(self.var, val);
+                } else {
+                    std::env::remove_var(self.var);
+                }
+            }
+        }
+    }
 
     /// Helper: create DeliveryState with given screen state
     fn make_state(screen: ScreenState, cooldown_ms: u64) -> DeliveryState {
@@ -3474,5 +3711,261 @@ mod tests {
             .unwrap();
 
         assert_eq!(build_wake_inject_text(&db, "keno", 24), "<hcom>");
+    }
+
+    #[test]
+    fn test_classify_launch_blocker_all_kinds() {
+        // Workspace Trust
+        let res = classify_launch_blocker("Do you trust the files in this folder?", false);
+        assert_eq!(res.kind, BlockedKind::WorkspaceTrust);
+        assert!(res.evidence.is_some());
+
+        let res = classify_launch_blocker(
+            "Do you trust the authors of the files in this workspace?",
+            false,
+        );
+        assert_eq!(res.kind, BlockedKind::WorkspaceTrust);
+
+        let res = classify_launch_blocker("Do you trust the contents of this project?", false);
+        assert_eq!(res.kind, BlockedKind::WorkspaceTrust);
+
+        // Authentication
+        let res = classify_launch_blocker("Please login with `claude login`", false);
+        assert_eq!(res.kind, BlockedKind::Authentication);
+        assert!(res.evidence.is_some());
+
+        let res = classify_launch_blocker("Missing API key: ANTHROPIC_API_KEY", false);
+        assert_eq!(res.kind, BlockedKind::Authentication);
+
+        // Quota
+        let res = classify_launch_blocker("429 Too Many Requests: quota exceeded", false);
+        assert_eq!(res.kind, BlockedKind::Quota);
+        assert!(res.evidence.is_some());
+
+        let res = classify_launch_blocker("Rate limit reached for model", false);
+        assert_eq!(res.kind, BlockedKind::Quota);
+
+        // Crashed
+        let res = classify_launch_blocker("thread 'main' panicked at 'fatal crash'", false);
+        assert_eq!(res.kind, BlockedKind::Crashed);
+        assert!(res.evidence.is_some());
+
+        let res = classify_launch_blocker("Segmentation fault (core dumped)", false);
+        assert_eq!(res.kind, BlockedKind::Crashed);
+
+        // Confirmation (screen approval)
+        let res = classify_launch_blocker("normal output", true);
+        assert_eq!(res.kind, BlockedKind::Confirmation);
+        assert_eq!(
+            res.evidence,
+            Some("approval prompt detected by provider".to_string())
+        );
+        let res = classify_launch_blocker("Allow access to this file?", true);
+        assert_eq!(res.kind, BlockedKind::Confirmation);
+        assert_eq!(res.evidence, Some("Allow access to this file?".to_string()));
+        let res = classify_launch_blocker("Allow sandbox bypass for command execution?", true);
+        assert_eq!(res.kind, BlockedKind::Confirmation);
+        assert_eq!(
+            res.evidence,
+            Some("Allow sandbox bypass for command execution?".to_string())
+        );
+
+        // Structured approval outranks command text containing other blocker
+        // words, while a distinctive trust prompt remains more specific.
+        let res = classify_launch_blocker(
+            "Requesting permission for: export ANTHROPIC_API_KEY=example",
+            true,
+        );
+        assert_eq!(res.kind, BlockedKind::Confirmation);
+        assert_eq!(
+            res.evidence,
+            Some("Requesting permission for: export ANTHROPIC_API_KEY=example".to_string())
+        );
+        let res = classify_launch_blocker("Do you trust the files in this folder?", true);
+        assert_eq!(res.kind, BlockedKind::WorkspaceTrust);
+
+        // Confirmation (prompt pattern)
+        let res = classify_launch_blocker("Do you want to proceed? [y/N]", false);
+        assert_eq!(res.kind, BlockedKind::Confirmation);
+
+        // Successful exits and ordinary progress prose are not blockers.
+        let res = classify_launch_blocker("process exited with code 0", false);
+        assert_eq!(res.kind, BlockedKind::Unknown);
+        let res = classify_launch_blocker("process exited with code 17", false);
+        assert_eq!(res.kind, BlockedKind::Unknown);
+        let res = classify_launch_blocker("process exited with code 137", false);
+        assert_eq!(res.kind, BlockedKind::Crashed);
+        assert_eq!(
+            res.evidence,
+            Some("process exited with code 137".to_string())
+        );
+        let res = classify_launch_blocker("Authenticating with GitHub...", false);
+        assert_eq!(res.kind, BlockedKind::Unknown);
+        let res = classify_launch_blocker("Read the Workspace Trust documentation", false);
+        assert_eq!(res.kind, BlockedKind::Unknown);
+        assert!(!has_distinctive_trust_prompt(
+            "Read the Workspace Trust documentation"
+        ));
+
+        // Unknown fallback
+        let res = classify_launch_blocker("some random settled output that is not ready", false);
+        assert_eq!(res.kind, BlockedKind::Unknown);
+        assert_eq!(res.evidence, None);
+
+        let res = classify_launch_blocker("", false);
+        assert_eq!(res.kind, BlockedKind::Unknown);
+        assert_eq!(res.evidence, None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_launch_ready_recovery_refused_when_approval_pending() {
+        let _env_guard = EnvVarGuard::set("HCOM_LAUNCHED", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+
+        // 1. Setup instance in launch state with a pending approval
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('mira', 'claude', 'blocked', 'approval', 100, 0)",
+                [],
+            )
+            .unwrap();
+        db.record_pending_approval("mira", "tool-call-123", "Bash: rm -rf /")
+            .unwrap();
+
+        let state = make_state(safe_screen(), 0);
+        let mut outcome = LaunchOutcome::Pending;
+        let classification = BlockedClassification {
+            kind: BlockedKind::Confirmation,
+            evidence: Some("permission requested".to_string()),
+        };
+
+        // Blocker producer attempt while blocked approval is pending
+        emit_launch_blocked_once(
+            &db,
+            &state,
+            "mira",
+            &mut outcome,
+            "screen settled before readiness",
+            &classification,
+        );
+
+        // Blocker must be refused: outcome stays Pending, launch active, row unmutated
+        assert_eq!(outcome, LaunchOutcome::Pending);
+        assert!(state.launch_phase_active.load(Ordering::Acquire));
+
+        let (status, context, detail, pending_tool): (String, String, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT status, status_context, status_detail, pending_tool_use_id FROM instances WHERE name='mira'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, ST_BLOCKED);
+        assert_eq!(context, "approval");
+        assert_eq!(detail, "Bash: rm -rf /");
+        assert_eq!(pending_tool, "tool-call-123");
+
+        let blocked_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type='life' AND json_extract(data, '$.action')='launch_blocked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_events, 0);
+
+        // Ready recovery attempt immediately following refused blocker
+        emit_launch_ready_once(&db, &state, "mira", &mut outcome);
+
+        // Ready recovery must ALSO be refused: outcome stays Pending
+        assert_eq!(outcome, LaunchOutcome::Pending);
+        assert!(state.launch_phase_active.load(Ordering::Acquire));
+
+        let (status, context, detail, pending_tool): (String, String, String, String) = db
+            .conn()
+            .query_row(
+                "SELECT status, status_context, status_detail, pending_tool_use_id FROM instances WHERE name='mira'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, ST_BLOCKED);
+        assert_eq!(context, "approval");
+        assert_eq!(detail, "Bash: rm -rf /");
+        assert_eq!(pending_tool, "tool-call-123");
+
+        let ready_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type='life' AND json_extract(data, '$.action')='ready'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ready_events, 0);
+
+        // 2. Clear approval (e.g. resolved or transitioned to normal blocked)
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'blocked', status_context = 'screen_settled_not_ready', pending_tool_use_id = '' WHERE name='mira'",
+                [],
+            )
+            .unwrap();
+
+        // Now blocker producer succeeds
+        emit_launch_blocked_once(
+            &db,
+            &state,
+            "mira",
+            &mut outcome,
+            "screen settled before readiness",
+            &classification,
+        );
+        assert_eq!(outcome, LaunchOutcome::Blocked);
+
+        let blocked_events_after: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type='life' AND json_extract(data, '$.action')='launch_blocked'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_events_after, 1);
+
+        // Now ready recovery succeeds
+        emit_launch_ready_once(&db, &state, "mira", &mut outcome);
+        assert_eq!(outcome, LaunchOutcome::Ready);
+        assert!(!state.launch_phase_active.load(Ordering::Acquire));
+
+        let (status_after, context_after): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT status, status_context FROM instances WHERE name='mira'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status_after, ST_LISTENING);
+        assert_eq!(context_after, "launch_blocked_cleared");
+
+        let ready_events_after: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type='life' AND json_extract(data, '$.action')='ready'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ready_events_after, 1);
     }
 }

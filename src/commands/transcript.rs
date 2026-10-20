@@ -33,7 +33,64 @@ fn run_search_tool(program: &str, args: &[&str]) -> Result<Option<std::process::
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(format!(
             "required search tool `{program}` was not found on PATH"
         )),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            // A bare name that only hit EACCES on an inaccessible PATH
+            // directory (common on WSL with /mnt/c entries) is still "not
+            // found"; an explicit path, or a real candidate we cannot
+            // execute, keeps the permission error.
+            let is_bare_name = Path::new(program)
+                .parent()
+                .is_none_or(|p| p.as_os_str().is_empty());
+            if !is_bare_name
+                || search_tool_candidate_on_path(program, std::env::var_os("PATH").as_deref())
+            {
+                Err(format!("could not run `{program}`: {err}"))
+            } else {
+                Err(format!(
+                    "required search tool `{program}` was not found on PATH"
+                ))
+            }
+        }
         Err(err) => Err(format!("could not run `{program}`: {err}")),
+    }
+}
+
+/// Whether a PATH entry holds a file that could be `program`, so a spawn
+/// PermissionDenied came from a real candidate rather than an inaccessible
+/// PATH directory alone. Candidate enumeration matches `which` (PATHEXT on
+/// Windows) via [`crate::terminal::which_candidates`].
+fn search_tool_candidate_on_path(program: &str, path_env: Option<&std::ffi::OsStr>) -> bool {
+    let Some(path_env) = path_env else {
+        // execvp falls back to the default confstr PATH when PATH is unset.
+        #[cfg(unix)]
+        return ["/usr/bin", "/bin"]
+            .iter()
+            .any(|dir| is_candidate_file(&Path::new(dir).join(program)));
+        #[cfg(not(unix))]
+        return false;
+    };
+    std::env::split_paths(path_env).any(|dir| {
+        // An empty PATH entry denotes the current directory (execvp semantics).
+        let dir = if dir.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            dir
+        };
+        crate::terminal::which_candidates(&dir, program)
+            .iter()
+            .any(|candidate| is_candidate_file(candidate))
+    })
+}
+
+/// A candidate counts only if it is a regular file, or a symlink whose target
+/// cannot be resolved for lack of permission — both fail to exec with EACCES,
+/// so the spawn error must be surfaced rather than downgraded to "not found".
+/// Dangling symlinks (ENOENT) do not count; exec fails NotFound for them.
+fn is_candidate_file(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file(),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => path.is_symlink(),
+        Err(_) => false,
     }
 }
 
@@ -200,7 +257,13 @@ pub(crate) fn detect_agent_type(path: &str) -> &'static str {
 }
 
 fn transcript_search_key(path: &str, session_id: Option<&str>) -> String {
-    format!("{path}\u{0}{}", session_id.unwrap_or(""))
+    let canonical = std::fs::canonicalize(path).ok();
+    let canonical = canonical.as_ref().map(|p| p.to_string_lossy());
+    format!(
+        "{}\u{0}{}",
+        canonical.as_deref().unwrap_or(path),
+        session_id.unwrap_or("")
+    )
 }
 
 /// Attribute a `--all` disk match to a canonical tool.
@@ -415,7 +478,7 @@ fn cmd_transcript_search(
     let pattern = &args.pattern;
 
     // Collect transcript paths: (name, path, agent)
-    let mut paths: Vec<(String, String, String)> = Vec::new();
+    let mut paths: Vec<(String, String, String, Option<String>)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
     if all_mode {
@@ -441,10 +504,37 @@ fn cmd_transcript_search(
                 }
             }
         }
-        let database_sources: Vec<(Tool, PathBuf)> = selected_tools
+        let mut database_sources: Vec<(Tool, PathBuf)> = selected_tools
             .iter()
             .filter_map(|tool| transcript::database_search_path(*tool).map(|path| (*tool, path)))
             .collect();
+
+        // Hermes sessions may belong to different profiles from the caller.
+        // Include their recorded databases, deduplicating equivalent paths.
+        if selected_tools.contains(&Tool::Hermes)
+            && let Ok(mut stmt) = db.conn().prepare(
+                "SELECT DISTINCT transcript_path FROM instances WHERE lower(tool) = 'hermes' AND transcript_path IS NOT NULL AND transcript_path != '' \
+                 UNION \
+                 SELECT DISTINCT json_extract(data, '$.snapshot.transcript_path') \
+                 FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' \
+                 AND lower(json_extract(data, '$.snapshot.tool')) = 'hermes' \
+                 AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL AND json_extract(data, '$.snapshot.transcript_path') != ''",
+            )
+            && let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0))
+        {
+            for path in rows.flatten() {
+                let path = PathBuf::from(path);
+                let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if path.exists()
+                    && !database_sources.iter().any(|(_, existing)| {
+                        std::fs::canonicalize(existing).unwrap_or_else(|_| existing.clone())
+                            == canonical
+                    })
+                {
+                    database_sources.push((Tool::Hermes, canonical));
+                }
+            }
+        }
 
         if search_dirs.is_empty() && database_sources.is_empty() {
             println!("No transcript directories or databases found on disk.");
@@ -659,16 +749,17 @@ fn cmd_transcript_search(
     } else {
         // Active instances
         if let Ok(mut stmt) = db.conn().prepare(
-            "SELECT name, transcript_path, tool FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''"
+            "SELECT name, transcript_path, tool, session_id FROM instances WHERE transcript_path IS NOT NULL AND transcript_path != ''"
         )
             && let Ok(rows) = stmt.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             }) {
-                for (name, path, tool) in rows.flatten() {
+                for (name, path, tool, session_id) in rows.flatten() {
                     if let Some(filter_tool) = agent_filter
                         && transcript::tool_from_agent_or_path(&tool, &path).ok() != Some(filter_tool)
                     {
@@ -676,23 +767,24 @@ fn cmd_transcript_search(
                     }
                     if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
                     seen.insert(name.clone());
-                    paths.push((name, path, tool));
+                    paths.push((name, path, tool, session_id));
                 }
             }
 
         // Stopped instances from life event snapshots (C2/C3 fix)
         if !live_mode
             && let Ok(mut stmt) = db.conn().prepare(
-                "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL"
+                "SELECT instance, json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.tool'), json_extract(data, '$.snapshot.session_id') FROM events WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped' AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL"
             )
                 && let Ok(rows) = stmt.query_map([], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 }) {
-                    for (name, path, tool) in rows.flatten() {
+                    for (name, path, tool, session_id) in rows.flatten() {
                         if seen.contains(&name) { continue; }
                         if let Some(filter_tool) = agent_filter
                             && transcript::tool_from_agent_or_path(&tool, &path).ok() != Some(filter_tool)
@@ -701,14 +793,14 @@ fn cmd_transcript_search(
                         }
                         if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
                         seen.insert(name.clone());
-                        paths.push((name, path, tool));
+                        paths.push((name, path, tool, session_id));
                     }
                 }
     }
 
     // Search using ripgrep (with line-level matches + snippets) — hcom-tracked/live paths
     let mut results = Vec::new();
-    for (name, path, agent) in &paths {
+    for (name, path, agent, session_id) in &paths {
         if !Path::new(path).exists() {
             continue;
         }
@@ -717,6 +809,33 @@ fn cmd_transcript_search(
         // match offset so the snippet can be centered on the hit; the grep
         // fallback has no column, so parse_match_line locates the pattern itself.
         let remaining = limit - results.len();
+        if transcript::tool_from_agent_or_path(agent, path).ok() == Some(Tool::Hermes) {
+            let Some(session_id) = session_id.as_deref().filter(|sid| !sid.trim().is_empty())
+            else {
+                continue;
+            };
+            match transcript::hermes::search_hermes_session(Path::new(path), session_id, pattern) {
+                Ok(Some(found)) => results.push(json!({
+                    "hcom_name": name,
+                    "agent": agent,
+                    "path": path,
+                    "line": 0,
+                    "text": found.text,
+                    "matches": found.matches,
+                    "session_id": found.session_id,
+                    "label": found.label,
+                })),
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    return 1;
+                }
+            }
+            if results.len() >= limit {
+                break;
+            }
+            continue;
+        }
         let max_count = remaining.to_string();
         let mut has_column = true;
         let output = match run_search_tool(
@@ -1691,6 +1810,7 @@ View transport messages with: hcom events --remote-fetch --device ABCD --partici
             ("/home/user/.codex/sessions/x/rollout.jsonl", "codex"),
             ("/home/user/.local/share/opencode/opencode.db", "opencode"),
             ("/home/user/.local/share/kilo/kilo.db", "kilo"),
+            ("/home/user/.hermes/state.db", "hermes"),
             (
                 "/home/user/Library/Application Support/Antigravity/session.jsonl",
                 "antigravity",
@@ -2150,10 +2270,151 @@ View transport messages with: hcom events --remote-fetch --device ABCD --partici
     }
 
     #[test]
+    #[serial_test::serial]
     fn missing_search_tool_is_an_error_not_an_empty_result() {
         let err =
             run_search_tool("__hcom_definitely_missing_search_tool__", &["pattern"]).unwrap_err();
         assert!(err.contains("was not found on PATH"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn search_tool_candidate_scan_tolerates_inaccessible_path_entries() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let inacc_dir = temp_dir.path().join("inaccessible");
+        std::fs::create_dir(&inacc_dir).unwrap();
+        std::fs::set_permissions(&inacc_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let acc_dir = temp_dir.path().join("accessible");
+        std::fs::create_dir(&acc_dir).unwrap();
+        // A real candidate, but not executable.
+        let bad_tool = acc_dir.join("bad_tool");
+        std::fs::write(&bad_tool, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&bad_tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A directory named like a tool is not an executable candidate.
+        std::fs::create_dir(acc_dir.join("sub_dir")).unwrap();
+
+        let path_env = OsString::from(format!("{}:{}", inacc_dir.display(), acc_dir.display()));
+
+        // A missing bare tool stays missing even though one PATH entry EACCESes.
+        assert!(!search_tool_candidate_on_path(
+            "__hcom_definitely_missing_search_tool__",
+            Some(&path_env)
+        ));
+        // A real (even non-executable) candidate file is found.
+        assert!(search_tool_candidate_on_path("bad_tool", Some(&path_env)));
+        // A directory named like the tool does not count.
+        assert!(!search_tool_candidate_on_path("sub_dir", Some(&path_env)));
+
+        // Restore so the tempdir can be removed on hosts where deletion needs it.
+        let _ = std::fs::set_permissions(&inacc_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn missing_search_tool_with_inaccessible_path_entry_is_still_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct EnvGuard {
+            original_path: Option<std::ffi::OsString>,
+            inacc_dir: PathBuf,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.inacc_dir,
+                    std::fs::Permissions::from_mode(0o700),
+                );
+                // SAFETY: serialized test restoring process env
+                unsafe {
+                    match &self.original_path {
+                        Some(val) => std::env::set_var("PATH", val),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        // PATH shape matching the WSL failure: an inaccessible directory
+        // ahead of an accessible one holding a real candidate.
+        let inacc_dir = temp_dir.path().join("inaccessible");
+        std::fs::create_dir(&inacc_dir).unwrap();
+        std::fs::set_permissions(&inacc_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let acc_dir = temp_dir.path().join("accessible");
+        std::fs::create_dir(&acc_dir).unwrap();
+        let unexec_file = acc_dir.join("test_unexec_search_tool");
+        std::fs::write(&unexec_file, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&unexec_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let orig_path = std::env::var_os("PATH");
+        // Bound as `_guard` so it stays alive until test end and restores
+        // PATH even on assertion panic.
+        let _guard = EnvGuard {
+            original_path: orig_path.clone(),
+            inacc_dir: inacc_dir.clone(),
+        };
+        let test_path = match &orig_path {
+            Some(p) => format!(
+                "{}:{}:{}",
+                inacc_dir.display(),
+                acc_dir.display(),
+                p.to_string_lossy()
+            ),
+            None => format!("{}:{}", inacc_dir.display(), acc_dir.display()),
+        };
+        // SAFETY: serialized test mutating process env
+        unsafe {
+            std::env::set_var("PATH", &test_path);
+        }
+
+        // Missing bare tool: the actionable missing-tool diagnostic, not
+        // "could not run: Permission denied" leaked from the PATH entry.
+        let missing_err =
+            run_search_tool("__hcom_definitely_missing_search_tool__", &["pattern"]).unwrap_err();
+        assert!(
+            missing_err.contains("was not found on PATH"),
+            "expected 'was not found on PATH', got: {missing_err}"
+        );
+
+        // Real non-executable candidate: keeps the permission error.
+        let unexec_err = run_search_tool("test_unexec_search_tool", &["pattern"]).unwrap_err();
+        assert!(
+            unexec_err.contains("could not run `test_unexec_search_tool`"),
+            "expected 'could not run `test_unexec_search_tool`', got: {unexec_err}"
+        );
+        assert!(
+            unexec_err.contains("Permission denied") || unexec_err.contains("os error 13"),
+            "expected permission error detail, got: {unexec_err}"
+        );
+        assert!(
+            !unexec_err.contains("was not found on PATH"),
+            "must not report a real candidate as missing, got: {unexec_err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_executable_search_tool_at_explicit_path_keeps_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let tool = temp_dir.path().join("hcom_unexecutable_search_tool");
+        std::fs::write(&tool, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Explicit paths never do PATH search, so PermissionDenied is real.
+        let err = run_search_tool(tool.to_str().unwrap(), &["pattern"]).unwrap_err();
+        assert!(
+            err.contains("could not run") && !err.contains("was not found on PATH"),
+            "expected permission error for explicit path, got: {err}"
+        );
     }
 
     fn insert_test_instance(db: &HcomDb, name: &str, transcript_path: &str, tool: &str) {

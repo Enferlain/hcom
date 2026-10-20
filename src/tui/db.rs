@@ -343,6 +343,7 @@ fn parse_tool(s: &str) -> Tool {
         Ok(crate::tool::Tool::Copilot) => Tool::Copilot,
         Ok(crate::tool::Tool::Qoder) => Tool::Qoder,
         Ok(crate::tool::Tool::Grok) => Tool::Grok,
+        Ok(crate::tool::Tool::Hermes) => Tool::Hermes,
         Ok(crate::tool::Tool::Adhoc) => Tool::Adhoc,
         Err(_) => Tool::Unknown(s.to_string()),
     }
@@ -1011,7 +1012,7 @@ fn parse_status_or_life_row(
     if event_type == "life" {
         let action = json_str(&json, "action", "unknown");
         let kind = match action {
-            "ready" | "started" => ActivityKind::Started,
+            "ready" | "started" | "connected" => ActivityKind::Started,
             "stopped" | "killed" => ActivityKind::Stopped,
             _ => ActivityKind::StateChange,
         };
@@ -1094,7 +1095,7 @@ fn parse_status_or_life_row(
                 }
                 detail_text = text;
             }
-            "created" | "started" => {
+            "created" | "started" | "connected" => {
                 let mut parts = Vec::new();
                 if !by.is_empty() {
                     parts.push(format!("by {}", by));
@@ -1912,6 +1913,21 @@ mod tests {
         assert_eq!(ev.kind, EventKind::Tool);
         assert_eq!(ev.tool, "Read");
         assert_eq!(ev.detail, "src/lib.rs");
+    }
+
+    #[test]
+    fn parse_subagent_connection_as_start_activity() {
+        let event = parse_status_or_life_row(
+            9,
+            "2026-02-18T00:09:30+00:00",
+            "child",
+            "life",
+            r#"{"action":"connected","reason":"subagent_joined","by":"hook","parent":"parent"}"#,
+        )
+        .unwrap();
+        assert_eq!(event.kind, EventKind::Activity(ActivityKind::Started));
+        assert_eq!(event.agent, "child");
+        assert_eq!(event.detail, "connected (by hook, subagent_joined)");
     }
 
     #[test]

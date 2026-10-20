@@ -1081,6 +1081,7 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
         crate::tool::Tool::Grok => merge_grok_args(original, resume),
         crate::tool::Tool::Pi => merge_pi_args(original, resume),
         crate::tool::Tool::Omp => merge_omp_args(original, resume),
+        crate::tool::Tool::Hermes => merge_hermes_args(original, resume),
         crate::tool::Tool::Adhoc => {
             unreachable!("Adhoc sessions do not support resume argument merging")
         }
@@ -2235,6 +2236,88 @@ fn merge_omp_args(original: &[String], resume: &[String]) -> Vec<String> {
         }
     }
 
+    let mut final_args = resume.to_vec();
+    final_args.extend(preserved);
+    final_args
+}
+
+/// Prior controls are stripped and the fresh resume args are prepended so
+/// they take precedence. Prompt-seeding flags (`-q/--query`, `--query-file`)
+/// are stripped so an old seed prompt is never replayed onto the resumed
+/// session, bare positionals are dropped (same rationale as Pi), and
+/// everything else — `--in DIR` included — is preserved with its value.
+fn merge_hermes_args(original: &[String], resume: &[String]) -> Vec<String> {
+    let mut preserved = Vec::new();
+    let mut i = 0;
+    while i < original.len() {
+        let token = &original[i];
+        let token_str = token.as_str();
+
+        // Resume with a required value.
+        if matches!(token_str, "-r" | "--resume") {
+            i += 1;
+            if i < original.len() && !original[i].starts_with('-') {
+                i += 1;
+            }
+            continue;
+        }
+        // Attached/`=` session controls (-rlatest, --resume=x, -cN,
+        // --continue=x). Bare `-c/--continue` is stripped WITHOUT consuming a
+        // following token: its optional value is an old session name that must
+        // not be replayed, and a non-value there is dropped as a positional —
+        // both outcomes already end in "not preserved".
+        if matches!(token_str, "-c" | "--continue")
+            || token_str.starts_with("--resume=")
+            || token_str.starts_with("--continue=")
+            || (token_str.len() > 2
+                && token_str.starts_with('-')
+                && !token_str.starts_with("--")
+                && (token_str.starts_with("-r") || token_str.starts_with("-c")))
+        {
+            i += 1;
+            continue;
+        }
+        // Do not replay an old seed prompt (also covers HCOM_HERMES_ARGS
+        // forwarding `-q/--query/--query-file` into the stored launch args).
+        if matches!(token_str, "-q" | "--query" | "--query-file") {
+            i += 1;
+            if i < original.len() && !original[i].starts_with('-') {
+                i += 1;
+            }
+            continue;
+        }
+        if token_str.starts_with("--query=")
+            || token_str.starts_with("--query-file=")
+            || (token_str.len() > 2 && token_str.starts_with("-q") && !token_str.starts_with("--"))
+        {
+            i += 1;
+            continue;
+        }
+        // Keep working-directory anchoring across the resume.
+        if token_str == "--in" {
+            preserved.push(token.clone());
+            if i + 1 < original.len() && !original[i + 1].starts_with('-') {
+                preserved.push(original[i + 1].clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // Old seed prompts are positional; do not replay them (see Pi).
+        if !token_str.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        // Any other flag: preserve, keeping a sibling non-flag as its value.
+        preserved.push(token.clone());
+        if i + 1 < original.len() && !original[i + 1].starts_with('-') {
+            preserved.push(original[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
     let mut final_args = resume.to_vec();
     final_args.extend(preserved);
     final_args
@@ -4515,5 +4598,103 @@ mod tests {
             None => unsafe { std::env::remove_var("GEMINI_CLI_HOME") },
         }
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_merge_hermes_args_strips_resume_aliases_and_values() {
+        let resume = s(&["--resume", "new"]);
+        // Long form, short alias, and `=`/attached forms all must go.
+        assert_eq!(
+            merge_hermes_args(&s(&["--model", "gpt-x", "--resume", "old"]), &resume),
+            s(&["--resume", "new", "--model", "gpt-x"])
+        );
+        assert_eq!(
+            merge_hermes_args(&s(&["-r", "old", "--verbose"]), &resume),
+            s(&["--resume", "new", "--verbose"])
+        );
+        assert_eq!(
+            merge_hermes_args(&s(&["--resume=old"]), &resume),
+            s(&["--resume", "new"])
+        );
+        assert_eq!(
+            merge_hermes_args(&s(&["-rlatest"]), &resume),
+            s(&["--resume", "new"])
+        );
+        // A flag directly after --resume must not be eaten as its value.
+        assert_eq!(
+            merge_hermes_args(&s(&["--resume", "--verbose"]), &resume),
+            s(&["--resume", "new", "--verbose"])
+        );
+    }
+
+    #[test]
+    fn test_merge_hermes_args_strips_continue_with_optional_value() {
+        let resume = s(&["--resume", "new"]);
+        // `--continue [NAME]` is nargs='?': the value is optional. Bare flag,
+        // valued form, `=` form, and attached form must all be stripped — and
+        // an old session name must never be replayed as a positional.
+        assert_eq!(
+            merge_hermes_args(&s(&["--continue", "--model", "gpt-x"]), &resume),
+            s(&["--resume", "new", "--model", "gpt-x"])
+        );
+        assert_eq!(
+            merge_hermes_args(&s(&["--continue", "oldses", "-v"]), &resume),
+            s(&["--resume", "new", "-v"])
+        );
+        assert_eq!(
+            merge_hermes_args(&s(&["--continue=oldses"]), &resume),
+            s(&["--resume", "new"])
+        );
+        assert_eq!(
+            merge_hermes_args(&s(&["-c", "oldses"]), &resume),
+            s(&["--resume", "new"])
+        );
+    }
+
+    #[test]
+    fn test_merge_hermes_args_preserves_in_dir() {
+        let resume = s(&["--resume", "new"]);
+        // `--in DIR` anchors the resumed session's working directory and must
+        // survive the merge with its value intact.
+        assert_eq!(
+            merge_hermes_args(&s(&["--in", "/work/proj", "--verbose"]), &resume),
+            s(&["--resume", "new", "--in", "/work/proj", "--verbose"])
+        );
+    }
+
+    #[test]
+    fn test_merge_hermes_args_strips_seed_prompt_replay() {
+        let resume = s(&["--resume", "new"]);
+        // An old `-q/--query/--query-file` seed must not be replayed onto the
+        // resumed session (it would re-send a stale task).
+        assert_eq!(
+            merge_hermes_args(&s(&["-q", "old task", "--verbose"]), &resume),
+            s(&["--resume", "new", "--verbose"])
+        );
+        assert_eq!(
+            merge_hermes_args(&s(&["--query", "old task"]), &resume),
+            s(&["--resume", "new"])
+        );
+        assert_eq!(
+            merge_hermes_args(&s(&["--query=old task"]), &resume),
+            s(&["--resume", "new"])
+        );
+        assert_eq!(
+            merge_hermes_args(&s(&["-qold task"]), &resume),
+            s(&["--resume", "new"])
+        );
+        assert_eq!(
+            merge_hermes_args(&s(&["--query-file", "old.md"]), &resume),
+            s(&["--resume", "new"])
+        );
+        // A genuinely bare positional (not preceded by a flag) is dropped,
+        // and no-prompt launch flags are preserved untouched. Same lookahead
+        // pairing as Pi/Omp: a flag keeps a following non-flag token as its
+        // value — ambiguity between a flag's value and a stray positional is
+        // resolved in favor of the flag, like every other tool merge here.
+        assert_eq!(
+            merge_hermes_args(&s(&["stale positional", "--verbose", "-Q"]), &resume),
+            s(&["--resume", "new", "--verbose", "-Q"])
+        );
     }
 }

@@ -32,13 +32,14 @@ mod sessions;
 pub(crate) mod subscriptions;
 
 pub use events::Message;
+pub use instances::ApprovalToken;
 pub use instances::InstanceRow;
 #[allow(unused_imports)]
 pub use instances::InstanceStatus;
 pub use instances::observe_pid_identity;
 
 /// Schema version - bump on any schema change.
-const SCHEMA_VERSION: i32 = 18;
+const SCHEMA_VERSION: i32 = 19;
 pub const DEV_ROOT_KV_KEY: &str = "config:dev_root";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -67,6 +68,10 @@ const MIGRATIONS: &[(i32, &str)] = &[
              ON claude_actor_capabilities(expires_at);
          CREATE INDEX IF NOT EXISTS idx_claude_actor_session
              ON claude_actor_capabilities(session_id);",
+    ),
+    (
+        19,
+        "ALTER TABLE instances ADD COLUMN pending_tool_use_id TEXT DEFAULT '';",
     ),
 ];
 
@@ -380,6 +385,7 @@ impl HcomDb {
                 idle_since TEXT DEFAULT '',
                 pid INTEGER DEFAULT NULL,
                 launch_context TEXT DEFAULT '',
+                pending_tool_use_id TEXT DEFAULT '',
                 FOREIGN KEY (parent_session_id) REFERENCES instances(session_id) ON DELETE SET NULL
             );
 
@@ -722,8 +728,11 @@ impl HcomDb {
             .unwrap_or_default();
 
         // (migration version, a column that migration introduces)
-        const COLUMN_MIGRATIONS: &[(i32, &str)] =
-            &[(17, "terminal_preset_requested"), (18, "last_seen")];
+        const COLUMN_MIGRATIONS: &[(i32, &str)] = &[
+            (17, "terminal_preset_requested"),
+            (18, "last_seen"),
+            (19, "pending_tool_use_id"),
+        ];
         for (migration, column) in COLUMN_MIGRATIONS {
             if !columns.contains(*column) {
                 return migration - 1;

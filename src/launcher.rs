@@ -49,6 +49,7 @@ pub enum LaunchTool {
     Qoder,
     Grok,
     Omp,
+    Hermes,
 }
 
 impl LaunchTool {
@@ -69,6 +70,7 @@ impl LaunchTool {
             "copilot" => Ok(LaunchTool::Copilot),
             "qoder" | "qodercli" => Ok(LaunchTool::Qoder),
             "grok" | "grok-build" => Ok(LaunchTool::Grok),
+            "hermes" => Ok(LaunchTool::Hermes),
             _ => bail!("Unknown tool: {}", s),
         }
     }
@@ -89,6 +91,7 @@ impl LaunchTool {
             LaunchTool::Copilot => "copilot",
             LaunchTool::Qoder => "qoder",
             LaunchTool::Grok => "grok",
+            LaunchTool::Hermes => "hermes",
         }
     }
 
@@ -111,6 +114,7 @@ impl LaunchTool {
             LaunchTool::Copilot => crate::tool::Tool::Copilot,
             LaunchTool::Qoder => crate::tool::Tool::Qoder,
             LaunchTool::Grok => crate::tool::Tool::Grok,
+            LaunchTool::Hermes => crate::tool::Tool::Hermes,
         }
     }
 
@@ -182,7 +186,8 @@ impl LaunchBackend {
             | LaunchTool::Kimi
             | LaunchTool::Copilot
             | LaunchTool::Qoder
-            | LaunchTool::Grok => LaunchBackend::HeadlessPty,
+            | LaunchTool::Grok
+            | LaunchTool::Hermes => LaunchBackend::HeadlessPty,
         }
     }
 }
@@ -747,6 +752,27 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
         LaunchTool::Copilot => unreachable!("Copilot uses per-run hooks"),
         LaunchTool::Qoder => unreachable!("Qoder uses per-run hooks"),
         LaunchTool::Grok => unreachable!("Grok has no hooks"),
+        LaunchTool::Hermes => {
+            let readiness = crate::hooks::hermes::evaluate_hermes_backend_readiness();
+            if !readiness.ready || !crate::hooks::hermes::hermes_backend_files_current() {
+                if let Err(e) = crate::hooks::hermes::try_setup_hermes_backend() {
+                    let diag = install_diag_context(tool, &[]);
+                    bail!(
+                        "Failed to setup the Hermes backend extension: {e}\n\
+                         Run: hcom hooks add hermes\n{diag}"
+                    );
+                }
+                let readiness = crate::hooks::hermes::evaluate_hermes_backend_readiness();
+                if !readiness.ready {
+                    let diag = install_diag_context(tool, &[]);
+                    bail!(
+                        "Hermes backend is not ready (owned files + enablement + gateway injection are all required). {}\n{diag}",
+                        readiness.diagnostic
+                    );
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1744,6 +1770,13 @@ fn append_initial_prompt_args(
             args.push(flag.to_string());
             args.push(prompt);
         }
+        crate::integration_spec::InitialPromptShape::SubcommandFlag { sub, flag } => {
+            if args.first().map(String::as_str) != Some(sub) {
+                args.push(sub.to_string());
+            }
+            args.push(flag.to_string());
+            args.push(prompt);
+        }
     }
     Ok(())
 }
@@ -2644,6 +2677,33 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         inside_ai_tool,
                     )
                 }
+                LaunchTool::Hermes => {
+                    instances::update_instance_position(
+                        db,
+                        &instance_name,
+                        &serde_json::Map::from_iter([(
+                            "launch_args".to_string(),
+                            json!(&stored_launch_args),
+                        )]),
+                    );
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "hermes",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &params.args,
+                        &params,
+                        inside_ai_tool,
+                    )
+                }
             }
         })();
 
@@ -2745,6 +2805,7 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
         LaunchTool::Qoder => {
             validate_rejected_args("Qoder", "hcom qoder", args, QODER_REJECTED_ARGS)
         }
+        LaunchTool::Hermes => Vec::new(),
         LaunchTool::Grok => {
             let mut errors = validate_rejected_args("Grok", "hcom grok", args, GROK_REJECTED_ARGS);
             let borrowed: Vec<_> = args.iter().map(String::as_str).collect();
@@ -2869,6 +2930,7 @@ mod tests {
             LaunchTool::from_str("grok-build").unwrap(),
             LaunchTool::Grok
         );
+        assert_eq!(LaunchTool::from_str("hermes").unwrap(), LaunchTool::Hermes);
         assert!(LaunchTool::from_str("unknown").is_err());
     }
 
@@ -2923,6 +2985,34 @@ mod tests {
     }
 
     #[test]
+    fn hermes_seeded_prompt_uses_chat_subcommand_with_query_flag() {
+        // Top-level `hermes -q PROMPT` exits 2 (verified on 0.21.3): `-q` is
+        // defined only under the `chat` subcommand. The seeded launch must be
+        // `hermes <args...> chat -q PROMPT`; the complete appended argv is
+        // asserted below, including that caller args stay top-level (before
+        // the subcommand) rather than being consumed by it. No-prompt
+        // launches never reach this code path (the launcher injects only
+        // under `params.initial_prompt`), so they remain plain `hermes`.
+        let mut args: Vec<String> = vec!["--in".into(), "/work/proj".into(), "--yolo".into()];
+        append_initial_prompt_args(&LaunchTool::Hermes, &mut args, "fix the flaky test".into())
+            .unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "--in",
+                "/work/proj",
+                "--yolo",
+                "chat",
+                "-q",
+                "fix the flaky test"
+            ]
+        );
+        let mut explicit_chat = vec!["chat".into(), "--yolo".into()];
+        append_initial_prompt_args(&LaunchTool::Hermes, &mut explicit_chat, "seed".into()).unwrap();
+        assert_eq!(explicit_chat, vec!["chat", "--yolo", "-q", "seed"]);
+    }
+
+    #[test]
     fn hcom_prompt_alone_is_injected_for_every_shape() {
         for (tool, expected) in [
             (
@@ -2933,6 +3023,10 @@ mod tests {
             (
                 LaunchTool::Claude,
                 vec!["--".to_string(), "hcom".to_string()],
+            ),
+            (
+                LaunchTool::Hermes,
+                vec!["chat".to_string(), "-q".to_string(), "hcom".to_string()],
             ),
         ] {
             let mut args = Vec::new();
@@ -3034,6 +3128,7 @@ mod tests {
         assert_eq!(LaunchTool::Gemini.as_str(), "gemini");
         assert_eq!(LaunchTool::Antigravity.as_str(), "antigravity");
         assert_eq!(LaunchTool::Copilot.as_str(), "copilot");
+        assert_eq!(LaunchTool::Hermes.as_str(), "hermes");
     }
 
     #[test]
@@ -3043,6 +3138,7 @@ mod tests {
         assert_eq!(LaunchTool::Codex.base_tool(), "codex");
         assert_eq!(LaunchTool::Antigravity.base_tool(), "antigravity");
         assert_eq!(LaunchTool::Copilot.base_tool(), "copilot");
+        assert_eq!(LaunchTool::Hermes.base_tool(), "hermes");
     }
 
     #[test]
@@ -3054,6 +3150,7 @@ mod tests {
         assert!(LaunchTool::OpenCode.uses_pty());
         assert!(LaunchTool::Kilo.uses_pty());
         assert!(LaunchTool::Copilot.uses_pty());
+        assert!(LaunchTool::Hermes.uses_pty());
     }
 
     #[test]
@@ -3068,6 +3165,7 @@ mod tests {
             LaunchTool::Kilo,
             LaunchTool::Antigravity,
             LaunchTool::Copilot,
+            LaunchTool::Hermes,
         ] {
             assert_eq!(
                 LaunchBackend::resolve(&tool, false),
@@ -3108,6 +3206,7 @@ mod tests {
             LaunchTool::Kilo,
             LaunchTool::Antigravity,
             LaunchTool::Copilot,
+            LaunchTool::Hermes,
         ] {
             assert_eq!(
                 LaunchBackend::resolve(&tool, true),

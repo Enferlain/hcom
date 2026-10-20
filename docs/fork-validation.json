@@ -1,0 +1,286 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-10-20T16:03:45.879672+00:00",
+  "checkout": ".",
+  "upstream_base": "f687a9cf71d3fdfc5bde2634f2ffcd19520d6a14",
+  "status": "implemented_validated_reviewed",
+  "scope": "Pinned upstream foundation plus distinct retained local contracts in fork-features.json; local workspace isolation excluded.",
+  "gates": [
+    {
+      "gate": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 2.36,
+      "log": ".rebuild-artifacts/rebuild/oct20-final-fmt.log"
+    },
+    {
+      "gate": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 14.14,
+      "log": ".rebuild-artifacts/rebuild/oct20-final-clippy.log"
+    },
+    {
+      "gate": "tests",
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "seconds": 228.44,
+      "log": ".rebuild-artifacts/rebuild/oct20-final-tests.log",
+      "results": [
+        "test result: ok. 2728 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 127.52s",
+        "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s",
+        "test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.07s",
+        "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.32s",
+        "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.27s",
+        "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.20s",
+        "test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.66s",
+        "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.18s",
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s",
+        "test result: ok. 5 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+        "test result: ok. 4 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.34s",
+        "test result: ok. 0 passed; 0 failed; 11 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+        "test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+      ]
+    },
+    {
+      "gate": "release",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "seconds": 176.07,
+      "log": ".rebuild-artifacts/rebuild/oct20-final-release.log"
+    }
+  ],
+  "rust_suites": [
+    {
+      "target": "unittests src/main.rs",
+      "passed": 2728,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "target": "tests/bundled_scripts.rs",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "tests/cli_smoke.rs",
+      "passed": 44,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "tests/event_observation.rs",
+      "passed": 19,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "tests/hermes_start.rs",
+      "passed": 14,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "tests/hermes_transcript.rs",
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "tests/message_contracts.rs",
+      "passed": 16,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "tests/native_participation.rs",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "tests/pty_backpressure.rs",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "tests/real_tool_claude.rs",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "target": "tests/real_tool_codex.rs",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "target": "tests/send_delivery.rs",
+      "passed": 23,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "tests/test_pty_delivery.rs",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 11
+    },
+    {
+      "target": "tests/test_relay_roundtrip.rs",
+      "passed": 6,
+      "failed": 0,
+      "ignored": 1
+    }
+  ],
+  "rust_totals": {
+    "passed": 2880,
+    "failed": 0,
+    "ignored": 18
+  },
+  "supplementary": [
+    {
+      "check": "Hermes backend Python fixtures",
+      "command": "PYTHONPATH=src python3 -m unittest hermes_backend.hcom.test_extension",
+      "passed": 26,
+      "log": ".rebuild-artifacts/rebuild/oct20-hermes-python.log"
+    },
+    {
+      "check": "TypeScript typecheck",
+      "command": "bash scripts/typecheck.sh",
+      "status": "passed",
+      "log": ".rebuild-artifacts/rebuild/oct20-typecheck.log"
+    },
+    {
+      "check": "external wrapper shell syntax",
+      "command": "bash -n ~/.hcom/scripts/{agy,glm,glm-usage}.sh",
+      "status": "passed"
+    },
+    {
+      "check": "external wrapper protocol",
+      "status": "source_checked_and_correlated_event_cli_fixtures_passed",
+      "limit": "No end-to-end provider wrapper run or profile change."
+    },
+    {
+      "check": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "environment": {
+    "rustc": "1.97.1",
+    "cargo": "1.97.1",
+    "node": "24.21.0",
+    "note": "Typecheck passed with the Node24 environment warning; repository declares Node22."
+  },
+  "release_artifact": {
+    "path": "target/release/hcom",
+    "sha256": "cf7c15b05f00a5723c253df82413f09fb4cc2292ae4954b644c125b6a3f6844e",
+    "installed": false
+  },
+  "source_guards": [
+    {
+      "checkout": "original-fork",
+      "guarded_files": 293,
+      "changed": []
+    },
+    {
+      "checkout": "accepted-selective-sync",
+      "guarded_files": 295,
+      "changed": []
+    }
+  ],
+  "review": {
+    "status": "accepted",
+    "method": "review-mcp review_with_context",
+    "diff_target": "HEAD",
+    "rounds": [
+      {
+        "scope": "Full retained-feature rebuild; tracked diff and explicit untracked modules/tests",
+        "report": "docs/reviews/upstream-rebuild-2026-10-20.md#full-review",
+        "result": "Four actionable findings; scoped corrections required.",
+        "raw_report": ".rebuild-artifacts/rebuild/oct20-independent-review.json"
+      },
+      {
+        "scope": "Typed binding, monotonic Hermes cursor, soft-stop waits and comment corrections",
+        "report": "docs/reviews/upstream-rebuild-2026-10-20.md#follow-up-review",
+        "result": "Original binding/soft-stop/comment findings addressed; production envelope matcher and OMP monotonic cursor corrections required.",
+        "raw_report": ".rebuild-artifacts/rebuild/oct20-focused-review.json"
+      },
+      {
+        "scope": "Production envelope matcher and OMP ACK/init corrections",
+        "report": "docs/reviews/upstream-rebuild-2026-10-20.md#final-review",
+        "result": "Scoped acceptance for both findings; no new concrete findings.",
+        "raw_report": ".rebuild-artifacts/rebuild/oct20-final-review.json"
+      }
+    ],
+    "resolutions": [
+      "Codex/Hermes use existing tool-checked binder with no foreign retirement or ownership switch.",
+      "Removed obsolete OMP-only Hermes binding fallback.",
+      "Hermes and OMP ACK/init use existing single-statement atomic MAX cursor primitive.",
+      "Soft stops excluded from terminal-stop recovery and blocker suppression; hard stops preserved.",
+      "Recovery matcher accepts production hcom envelopes with exact thread equality; rejects prefix/suffix collisions and ambiguous quoting.",
+      "Stale Hermes workspace-isolation comments corrected."
+    ],
+    "limits": [
+      "Source-level independent review with formatter-derived fixtures; live provider transcripts excluded.",
+      "Final reviewer focused on corrective delta; prior whole-tree review remains baseline evidence."
+    ]
+  },
+  "not_run": [
+    {
+      "check": "Rust1.88 MSRV",
+      "reason": "Toolchain not installed."
+    },
+    {
+      "check": "live-provider sessions and real-terminal delivery",
+      "reason": "Hermetic fixtures only; 11 real-terminal delivery cases and 4 real-provider cases remain ignored, plus the existing unit and relay exclusions recorded in rust_suites."
+    },
+    {
+      "check": "native Windows execution",
+      "reason": "Linux/WSL execution environment."
+    }
+  ],
+  "path_convention": "Artifact/log/report paths are repository-relative. Raw logs preserve the original execution paths before relocation.",
+  "source_guard_manifests": [
+    ".rebuild-artifacts/inventory/local-before.json",
+    ".rebuild-artifacts/inventory/integration-before.json"
+  ],
+  "artifact_relocation": "Build cache and raw evidence moved into ignored repository-local directories without changing file contents; release SHA256 verified unchanged.",
+  "publication_at_validation": {
+    "staged": false,
+    "committed": false,
+    "pushed": false,
+    "remote_dolt_synced": false
+  }
+}

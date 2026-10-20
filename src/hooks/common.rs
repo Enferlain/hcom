@@ -20,6 +20,18 @@ use crate::shared::constants::MAX_MESSAGES_PER_DELIVERY;
 use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_INACTIVE, ST_LISTENING};
 
+/// Environment handshake written by an explicitly installed native hook.
+///
+/// Native participation is deliberately opt-in.  A tool hook dispatcher sets
+/// this value only for the hcom-owned native command, and Claude's SessionStart
+/// path persists it through `CLAUDE_ENV_FILE` for the user's later `hcom
+/// start`.  Merely looking like a tool process is not enough to pass this
+/// boundary.
+pub const NATIVE_PARTICIPATION_ENV: &str = "HCOM_NATIVE_PARTICIPATION";
+pub const NATIVE_CLAUDE_VALUE: &str = "claude";
+pub const NATIVE_CODEX_VALUE: &str = "codex";
+pub const NATIVE_CLAUDE_SESSION_ENV: &str = "HCOM_CLAUDE_UNIX_SESSION_ID";
+
 /// Run a hook handler with panic safety.
 ///
 /// Catches panics in the handler closure, logs them, and returns the fallback
@@ -137,6 +149,25 @@ pub fn hook_gate_check(ctx: &HcomContext, db: &HcomDb) -> bool {
             true // On DB error, proceed rather than silently disabling hooks
         }
     }
+}
+
+/// Pre-gate check for an explicitly installed native hook.
+///
+/// This keeps the ordinary no-process gate unchanged.  Callers must provide
+/// the tool they are dispatching so a Claude marker cannot authorize a Codex
+/// hook (or vice versa).  The marker is a command/env handshake owned by hcom;
+/// no database row is created or selected here.
+pub fn native_hook_gate_check(ctx: &HcomContext, db: &HcomDb, expected_tool: &str) -> bool {
+    if ctx.process_id.is_some() || ctx.is_launched {
+        return true;
+    }
+    if let Some(tool) = ctx.raw_env.get(NATIVE_PARTICIPATION_ENV) {
+        // An explicit but mismatched marker is a failed handshake.  Do not
+        // fall through to the ordinary binding gate, which would turn a
+        // cross-tool marker into passive identity inference.
+        return tool == expected_tool;
+    }
+    hook_gate_check(ctx, db)
 }
 
 /// Convert a db::Message to a serde_json::Value object.
@@ -683,10 +714,27 @@ pub fn inject_bootstrap_once(
 
     let bootstrap_text = bootstrap::get_bootstrap(db, ctx, instance_name, tool);
 
-    // Mark as announced
-    let mut updates = serde_json::Map::new();
-    updates.insert("name_announced".into(), serde_json::json!(true));
-    instances::update_instance_position(db, instance_name, &updates);
+    if let Some(parent_name) = instance_data
+        .parent_name
+        .as_deref()
+        .filter(|parent| !parent.is_empty())
+    {
+        // Native subagents can announce through a hook at the same time as a
+        // manual `hcom start`.  The DB CAS emits one durable connected event;
+        // both callers may still return the bootstrap text they prepared.
+        if let Err(error) = db.claim_subagent_connection(instance_name, parent_name, "hook") {
+            log::log_error(
+                "hooks",
+                "subagent_connection_claim",
+                &format!("instance={instance_name} parent={parent_name}: {error}"),
+            );
+        }
+    } else {
+        // Root participants do not have a parent-visible connection event.
+        let mut updates = serde_json::Map::new();
+        updates.insert("name_announced".into(), serde_json::json!(true));
+        instances::update_instance_position(db, instance_name, &updates);
+    }
 
     Some(bootstrap_text)
 }
@@ -1746,6 +1794,19 @@ mod tests {
         let db = crate::db::HcomDb::open_raw(&db_path).unwrap();
         db.init_db().unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn native_gate_rejects_an_explicit_cross_tool_marker() {
+        let (_dir, db) = make_test_db();
+        let env = std::collections::HashMap::from([(
+            NATIVE_PARTICIPATION_ENV.to_string(),
+            NATIVE_CODEX_VALUE.to_string(),
+        )]);
+        let ctx =
+            crate::shared::context::HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+        assert!(!native_hook_gate_check(&ctx, &db, NATIVE_CLAUDE_VALUE));
+        assert!(native_hook_gate_check(&ctx, &db, NATIVE_CODEX_VALUE));
     }
 
     fn insert_test_instance(db: &crate::db::HcomDb, name: &str) {

@@ -180,6 +180,29 @@ RIGHT: hcom listen --timeout [sec] (blocking)
 
 You are now registered with hcom."#;
 
+// Hermes: the hcom-owned backend extension delivers mail as visible user
+// turns via inject_message. An attached CLI session is woken by the
+// extension's notify listener even while idle; hermes serve / non-CLI
+// sessions additionally require the allow_gateway_injection grant
+// (`hcom hooks add hermes` sets it). Delivery is not guaranteed in every
+// host state (a denied or absent injector leaves mail unread and retried),
+// so `hcom listen` stays the honest manual fallback.
+const DELIVERY_HERMES: &str = r#"## DELIVERY
+
+Messages arrive as visible user turns delivered by the hcom backend
+extension (inject_message), not as instant system events.
+- While you are in an active conversation, messages sent mid-turn are injected into your next turn — no action needed.
+- While idle, the extension's notify listener wakes your session and injects waiting mail automatically.
+- If injection is unavailable in your host (denied or no live session), mail stays unread — check with `hcom listen [timeout]` instead of sleeping.
+- Always substitute `sleep [timeout]` with `hcom listen [timeout]`
+- Your prompt may be a bare `<hcom>` line, or one carrying only routing metadata (`[intent #id] sender -> you`). That is a wake trigger, not a message: do not answer the envelope. The real messages are injected into the same turn by the extension — respond to those, not to the trigger.
+
+## WAITING RULES
+
+1. Never use `sleep [sec]` — use `hcom listen [sec]`
+2. Expecting an hcom reply while idle → `hcom listen --timeout [sec]`
+3. Waiting for agent progress → `hcom events sub`, subscribe, end your turn"#;
+
 const INLINE_SEND_NOTICE: &str = "Read hcom command output fully; it can consume incoming mail.";
 
 const CLAUDE_ONLY: &str = r#"## SUBAGENTS
@@ -495,7 +518,14 @@ fn render_bootstrap(
 
     // Every integration delivers automatically when launched through hcom;
     // anything else (plain `hcom start`) has to poll with `hcom listen`.
-    if hcom_ctx.is_launched && tool != Tool::Adhoc {
+    if tool == Tool::Hermes {
+        // Honest delivery: the backend extension injects visible user turns
+        // in BOTH modes — an hcom-launched session and an ordinary
+        // plugin-enabled one use the same inject_message path — so
+        // is_launched must not downgrade an ordinary session to the
+        // adhoc/manual section.
+        parts.push(DELIVERY_HERMES);
+    } else if hcom_ctx.is_launched && tool != Tool::Adhoc {
         parts.push(DELIVERY_AUTO);
         parts.extend(tool_delivery_section(tool));
     } else {
@@ -761,8 +791,8 @@ mod tests {
         }
     }
 
-    /// Every integration launched through hcom gets automatic delivery; the
-    /// same tool without a launch, or a plain `hcom start`, polls.
+    /// Launched integrations deliver automatically. Hermes uses its backend
+    /// extension for both launched and explicitly enrolled native sessions.
     #[test]
     fn test_delivery_section_follows_launch_state() {
         let (tmp, db) = setup_test_db();
@@ -775,6 +805,14 @@ mod tests {
                 spec.name,
                 false,
             );
+            if spec.tool == Tool::Hermes {
+                for text in [&launched, &unlaunched] {
+                    assert!(text.contains("extension (inject_message)"));
+                    assert!(text.contains("mail stays unread"));
+                    assert!(!text.contains("SUBAGENTS"));
+                }
+                continue;
+            }
             assert!(
                 unlaunched.contains("Messages do NOT arrive automatically"),
                 "{}",
@@ -959,6 +997,59 @@ mod tests {
             "scripts::SCRIPTS const is out of sync with scripts/bundled/. \
              Expected: {:?}, Actual: {:?}",
             expected, actual
+        );
+    }
+
+    #[test]
+    fn test_hermes_bootstrap_describes_visible_turn_delivery() {
+        // The backend extension can wake an idle session with an injected
+        // user turn, but must retain hcom listen as the manual fallback.
+        let (tmp, db) = setup_test_db();
+        let result = render(&db, tmp.path(), "hermes");
+
+        assert!(result.contains("Messages arrive as visible user turns"));
+        assert!(result.contains("While idle, the extension's notify listener wakes your session"));
+        assert!(result.contains("hcom listen"));
+        assert!(
+            !result.contains("Messages instantly and automatically arrive"),
+            "hermes bootstrap must not inherit the instant-delivery claim"
+        );
+        assert!(
+            !result.contains("Messages do NOT arrive automatically"),
+            "hermes launched bootstrap must use the hermes section, not the adhoc one"
+        );
+    }
+
+    #[test]
+    fn test_hermes_bootstrap_explains_metadata_only_wake_triggers() {
+        // The delivery loop seeds the first turn by typing a metadata-only
+        // <hcom> line into the PTY; the bootstrap must keep the model from
+        // answering that envelope instead of the injected messages.
+        let (tmp, db) = setup_test_db();
+        let result = render(&db, tmp.path(), "hermes");
+
+        assert!(result.contains("do not answer the envelope"));
+        assert!(result.contains("injected into the same turn"));
+    }
+
+    #[test]
+    fn test_hermes_bootstrap_plugin_managed_uses_hook_delivery() {
+        // An ordinary plugin-enabled Hermes session (is_launched=false) still
+        // uses backend user-turn injection; the adhoc section would teach
+        // the wrong delivery/waiting model.
+        let (tmp, db) = setup_test_db();
+        let result = render_bootstrap(
+            &db,
+            &test_ctx(tmp.path(), false, None, "", None),
+            "luna",
+            "hermes",
+            false,
+        );
+        assert!(result.contains("Messages arrive as visible user turns"));
+        assert!(result.contains("hcom listen"));
+        assert!(
+            !result.contains("Messages do NOT arrive automatically"),
+            "plugin-managed hermes must not get the adhoc delivery section"
         );
     }
 }

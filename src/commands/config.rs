@@ -115,6 +115,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
+        "HCOM_HERMES_ARGS",
+        "Default args for hermes on launch",
+        "string",
+    ),
+    (
         "HCOM_QODER_ARGS",
         "Default args for qodercli on launch",
         "string",
@@ -1592,6 +1597,16 @@ HCOM_COPILOT_ARGS - Default args passed to copilot on launch
 
 Example: hcom config copilot_args \"--model auto\"
 Clear:   hcom config copilot_args \"\"
+
+Prepended to launch-time cli args.",
+        ),
+
+        "HCOM_HERMES_ARGS" => Some(
+            "\
+HCOM_HERMES_ARGS - Default args passed to hermes on launch
+
+Example: hcom config hermes_args \"--model <model-id>\"
+Clear:   hcom config hermes_args \"\"
 
 Prepended to launch-time cli args.",
         ),

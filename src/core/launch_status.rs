@@ -11,6 +11,70 @@ use crate::instance_lifecycle;
 use rusqlite::params;
 use std::collections::HashSet;
 
+/// Typed classification of a launch blocker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedKind {
+    WorkspaceTrust,
+    Authentication,
+    Quota,
+    Confirmation,
+    Crashed,
+    Unknown,
+}
+
+impl BlockedKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BlockedKind::WorkspaceTrust => "workspace_trust",
+            BlockedKind::Authentication => "authentication",
+            BlockedKind::Quota => "quota",
+            BlockedKind::Confirmation => "confirmation",
+            BlockedKind::Crashed => "crashed",
+            BlockedKind::Unknown => "unknown",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "workspace_trust" => BlockedKind::WorkspaceTrust,
+            "authentication" => BlockedKind::Authentication,
+            "quota" => BlockedKind::Quota,
+            "confirmation" => BlockedKind::Confirmation,
+            "crashed" => BlockedKind::Crashed,
+            _ => BlockedKind::Unknown,
+        }
+    }
+}
+
+impl std::str::FromStr for BlockedKind {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(BlockedKind::from_str(s))
+    }
+}
+
+impl std::fmt::Display for BlockedKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Structured blocker record for an instance.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BlockerRecord {
+    pub instance: String,
+    pub kind: BlockedKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Result of a launch wait operation.
 #[derive(Debug, Clone)]
 pub struct LaunchResult {
@@ -22,6 +86,7 @@ pub struct LaunchResult {
     pub instances: Vec<String>,
     pub failures: Vec<String>,
     pub blockers: Vec<String>,
+    pub blocked_records: Vec<BlockerRecord>,
     pub launcher: Option<String>,
     pub timestamp: Option<String>,
     pub batch_id: Option<String>,
@@ -60,6 +125,7 @@ struct LaunchData {
     instances: Vec<String>,
     failures: Vec<String>,
     blockers: Vec<String>,
+    blocked_records: Vec<BlockerRecord>,
     launcher: String,
     timestamp: String,
     batch_id: Option<String>,
@@ -149,31 +215,71 @@ fn emit_row_finalized_event(db: &HcomDb, name: &str, launcher: &str, batch_id: &
     let _ = db.log_event("life", name, &event_data);
 }
 
-fn get_blocked_for_batch(db: &HcomDb, batch_id: &str) -> (i64, Vec<String>) {
+struct RawBlockerRow {
+    instance: String,
+    detail: Option<String>,
+    kind: Option<String>,
+    evidence: Option<String>,
+    reason: Option<String>,
+}
+
+fn get_blocked_for_batch(db: &HcomDb, batch_id: &str) -> (i64, Vec<String>, Vec<BlockerRecord>) {
     let conn = db.conn();
     let mut stmt = match conn.prepare(
-        "SELECT instance, json_extract(data, '$.detail') FROM events \
+        "SELECT instance, \
+                json_extract(data, '$.detail'), \
+                json_extract(data, '$.blocked_kind'), \
+                json_extract(data, '$.evidence'), \
+                json_extract(data, '$.reason') \
+         FROM events \
          WHERE type = 'life' \
          AND json_extract(data, '$.action') = 'launch_blocked' \
-         AND json_extract(data, '$.batch_id') = ?",
+         AND json_extract(data, '$.batch_id') = ? \
+         ORDER BY id ASC",
     ) {
         Ok(s) => s,
-        Err(_) => return (0, vec![]),
+        Err(_) => return (0, vec![], vec![]),
     };
-    let blockers: Vec<String> = match stmt.query_map(params![batch_id], |row| {
-        let name: String = row.get(0)?;
-        let detail: Option<String> = row.get(1).ok();
-        Ok(format!(
-            "{}: {}",
-            name,
-            detail.unwrap_or_else(|| "launch blocked".to_string())
-        ))
+    let rows: Vec<RawBlockerRow> = match stmt.query_map(params![batch_id], |row| {
+        Ok(RawBlockerRow {
+            instance: row.get(0)?,
+            detail: row.get(1).ok(),
+            kind: row.get(2).ok(),
+            evidence: row.get(3).ok(),
+            reason: row.get(4).ok(),
+        })
     }) {
         Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
         Err(_) => vec![],
     };
+
+    let mut blockers = Vec::new();
+    let mut blocked_records = Vec::new();
+
+    for row in rows {
+        let display_detail = row
+            .detail
+            .clone()
+            .unwrap_or_else(|| "launch blocked".to_string());
+        blockers.push(format!("{}: {}", row.instance, display_detail));
+
+        let kind = row
+            .kind
+            .as_deref()
+            .map(BlockedKind::from_str)
+            .unwrap_or(BlockedKind::Unknown);
+
+        blocked_records.push(BlockerRecord {
+            instance: row.instance,
+            kind,
+            evidence: row.evidence.filter(|s| !s.is_empty()),
+            detail: row.detail.filter(|s| !s.is_empty()),
+            reason: row.reason.filter(|s| !s.is_empty()),
+        });
+    }
+
     let count = blockers.len() as i64;
-    (count, blockers)
+    (count, blockers, blocked_records)
 }
 
 fn launch_failed_events_for_batch(
@@ -311,10 +417,12 @@ fn aggregate_batches(batches: &[BatchInfo], launcher: &str) -> LaunchData {
     let mut all_instances = Vec::new();
     let mut all_failures = Vec::new();
     let mut all_blockers = Vec::new();
+    let mut all_blocked_records = Vec::new();
     for b in batches {
         all_instances.extend(b.instances.clone());
         all_failures.extend(b.failures.clone());
         all_blockers.extend(b.blockers.clone());
+        all_blocked_records.extend(b.blocked_records.clone());
     }
     let batch_ids: Vec<String> = batches.iter().map(|b| b.batch_id.clone()).collect();
     LaunchData {
@@ -325,6 +433,7 @@ fn aggregate_batches(batches: &[BatchInfo], launcher: &str) -> LaunchData {
         instances: all_instances,
         failures: all_failures,
         blockers: all_blockers,
+        blocked_records: all_blocked_records,
         launcher: launcher.to_string(),
         timestamp: batches
             .first()
@@ -346,6 +455,7 @@ struct BatchInfo {
     instances: Vec<String>,
     failures: Vec<String>,
     blockers: Vec<String>,
+    blocked_records: Vec<BlockerRecord>,
     timestamp: String,
 }
 
@@ -425,7 +535,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
         let (ready_count, ready_instances) = get_ready_for_batch(db, batch_id);
         let (failed_count, failures) =
             get_failed_for_batch(db, batch_id, lnchr, *batch_event_id, &ready_instances);
-        let (blocked_count, blockers) = get_blocked_for_batch(db, batch_id);
+        let (blocked_count, blockers, blocked_records) = get_blocked_for_batch(db, batch_id);
         batches.push(BatchInfo {
             batch_id: batch_id.clone(),
             launcher: lnchr.clone(),
@@ -436,6 +546,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
             instances: ready_instances,
             failures,
             blockers,
+            blocked_records,
             timestamp: ts.clone(),
         });
     }
@@ -474,6 +585,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
                 instances: b.instances.clone(),
                 failures: b.failures.clone(),
                 blockers: b.blockers.clone(),
+                blocked_records: b.blocked_records.clone(),
                 timestamp: b.timestamp.clone(),
             })
             .collect();
@@ -498,6 +610,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
                 instances: b.instances.clone(),
                 failures: b.failures.clone(),
                 blockers: b.blockers.clone(),
+                blocked_records: b.blocked_records.clone(),
                 timestamp: b.timestamp.clone(),
             })
             .collect();
@@ -514,6 +627,7 @@ fn get_launch_status(db: &HcomDb, launcher: Option<&str>) -> Option<LaunchData> 
         instances: first.instances.clone(),
         failures: first.failures.clone(),
         blockers: first.blockers.clone(),
+        blocked_records: first.blocked_records.clone(),
         launcher: effective_launcher,
         timestamp: first.timestamp.clone(),
         batch_id: Some(first.batch_id.clone()),
@@ -567,7 +681,7 @@ fn get_launch_batch(db: &HcomDb, batch_id: &str) -> Option<LaunchData> {
         batch_event_id,
         &ready_instances,
     );
-    let (blocked_count, blockers) = get_blocked_for_batch(db, &resolved_batch_id);
+    let (blocked_count, blockers, blocked_records) = get_blocked_for_batch(db, &resolved_batch_id);
 
     Some(LaunchData {
         expected,
@@ -577,6 +691,7 @@ fn get_launch_batch(db: &HcomDb, batch_id: &str) -> Option<LaunchData> {
         instances: ready_instances,
         failures,
         blockers,
+        blocked_records,
         launcher,
         timestamp,
         batch_id: Some(resolved_batch_id),
@@ -665,6 +780,7 @@ pub fn wait_for_launch(
                 instances: vec![],
                 failures: vec![],
                 blockers: vec![],
+                blocked_records: vec![],
                 launcher: None,
                 timestamp: None,
                 batch_id: None,
@@ -704,6 +820,7 @@ pub fn wait_for_launch(
                     instances: vec![],
                     failures: vec![],
                     blockers: vec![],
+                    blocked_records: vec![],
                     launcher: None,
                     timestamp: None,
                     batch_id: None,
@@ -787,6 +904,7 @@ pub fn wait_for_launch(
         instances: status_data.instances,
         failures: status_data.failures,
         blockers: status_data.blockers,
+        blocked_records: status_data.blocked_records,
         launcher: Some(status_data.launcher),
         timestamp: Some(status_data.timestamp),
         batch_id: status_data.batch_id,
@@ -825,6 +943,12 @@ impl LaunchResult {
         }
         if !self.blockers.is_empty() {
             obj.insert("blockers".into(), serde_json::json!(self.blockers));
+        }
+        if !self.blocked_records.is_empty() {
+            obj.insert(
+                "blocked_records".into(),
+                serde_json::json!(self.blocked_records),
+            );
         }
         if let Some(ref launcher) = self.launcher {
             obj.insert("launcher".into(), serde_json::json!(launcher));
@@ -1059,6 +1183,7 @@ mod tests {
             instances: vec![],
             failures: vec![],
             blockers: vec![],
+            blocked_records: vec![],
             launcher: None,
             timestamp: None,
             batch_id: None,
@@ -1082,6 +1207,7 @@ mod tests {
             instances: vec!["luna".into(), "nova".into(), "peso".into()],
             failures: vec![],
             blockers: vec![],
+            blocked_records: vec![],
             launcher: Some("bigboss".into()),
             timestamp: Some("2024-01-01T00:00:00Z".into()),
             batch_id: Some("batch-123".into()),
@@ -1107,6 +1233,7 @@ mod tests {
             instances: vec!["luna".into()],
             failures: vec![],
             blockers: vec![],
+            blocked_records: vec![],
             launcher: Some("bigboss".into()),
             timestamp: Some("2024-01-01T00:00:00Z".into()),
             batch_id: Some("batch-123".into()),

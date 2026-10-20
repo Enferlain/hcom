@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use crate::shared::constants::{ST_BLOCKED, ST_LISTENING};
+use crate::shared::constants::ST_BLOCKED;
 
 /// Mapping of CLI flags to internal filter keys.
 const FLAG_MAP: &[(&str, &str)] = &[
@@ -32,7 +32,7 @@ const FLAG_MAP: &[(&str, &str)] = &[
 ];
 
 /// Flags that require type='status'.
-const STATUS_FLAGS: &[&str] = &["status", "context", "file", "cmd"];
+const STATUS_FLAGS: &[&str] = &["status", "context", "file", "cmd", "idle"];
 /// Flags that require type='message'.
 const MESSAGE_FLAGS: &[&str] = &[
     "from",
@@ -41,6 +41,7 @@ const MESSAGE_FLAGS: &[&str] = &[
     "intent",
     "thread",
     "reply_to",
+    "sender_instance_key",
 ];
 /// Flags that require type='life'.
 const LIFE_FLAGS: &[&str] = &["action"];
@@ -87,7 +88,26 @@ pub const FILE_OP_CONTEXTS: &[&str] = &[
 ];
 
 /// Shell tool contexts.
-pub const SHELL_TOOL_CONTEXTS: &str = "('tool:Bash', 'tool:run_shell_command', 'tool:shell', 'tool:run_command', 'tool:Shell', 'tool:run_terminal_cmd', 'tool:execute_command', 'tool:shell_command', 'tool:bash', 'tool:powershell', 'tool:run_terminal_command')";
+pub const SHELL_TOOL_CONTEXTS: &str = "('tool:Bash', 'tool:run_shell_command', 'tool:shell', 'tool:run_command', 'tool:Shell', 'tool:run_terminal_cmd', 'tool:execute_command', 'tool:shell_command', 'tool:bash', 'tool:powershell', 'tool:run_terminal_command', 'tool:terminal')";
+
+/// Shell tool contexts as a list for exact membership checks.
+///
+/// Must stay in sync with [`SHELL_TOOL_CONTEXTS`]; the `shell_tuple_matches_list`
+/// test pins the two forms to the same vocabulary.
+pub const SHELL_TOOL_CONTEXT_LIST: &[&str] = &[
+    "tool:Bash",
+    "tool:run_shell_command",
+    "tool:shell",
+    "tool:run_command",
+    "tool:Shell",
+    "tool:run_terminal_cmd",
+    "tool:execute_command",
+    "tool:shell_command",
+    "tool:bash",
+    "tool:powershell",
+    "tool:run_terminal_command",
+    "tool:terminal",
+];
 
 /// Parsed filter values — multiple values per key (OR semantics).
 pub type FilterMap = HashMap<String, Vec<String>>;
@@ -98,20 +118,14 @@ fn flag_to_key(flag: &str) -> Option<&'static str> {
 
 /// Expand shortcut flags to full flags.
 ///
-/// - `--idle NAME` -> `--agent NAME --status listening`
+/// - `--idle NAME` remains a typed task-idle predicate
 /// - `--blocked NAME` -> `--agent NAME --status blocked`
 pub fn expand_shortcuts(argv: &[String]) -> Vec<String> {
     let mut expanded = Vec::with_capacity(argv.len());
     let mut i = 0;
 
     while i < argv.len() {
-        if argv[i] == "--idle" && i + 1 < argv.len() {
-            expanded.push("--agent".into());
-            expanded.push(argv[i + 1].clone());
-            expanded.push("--status".into());
-            expanded.push(ST_LISTENING.into());
-            i += 2;
-        } else if argv[i] == "--blocked" && i + 1 < argv.len() {
+        if argv[i] == "--blocked" && i + 1 < argv.len() {
             expanded.push("--agent".into());
             expanded.push(argv[i + 1].clone());
             expanded.push("--status".into());
@@ -198,6 +212,15 @@ pub fn resolve_filter_names(filters: &mut FilterMap, db: &crate::db::HcomDb) {
 
 /// Validate that filters don't mix incompatible event types.
 pub fn validate_type_constraints(filters: &FilterMap) -> Result<(), String> {
+    if filters.contains_key("idle")
+        && (filters.contains_key("instance") || filters.contains_key("status"))
+    {
+        return Err(
+            "--idle cannot be combined with --agent, --status, or --blocked; repeat --idle for multiple agents"
+                .to_string(),
+        );
+    }
+
     let mut required_types = Vec::new();
 
     if STATUS_FLAGS.iter().any(|f| filters.contains_key(*f)) {
@@ -329,6 +352,17 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
         clauses.push(eq_or_in("status_val", values));
     }
 
+    // Task-idle shortcut. Transport waits deliberately write listening status
+    // for delivery/heartbeat purposes, but must not complete an --idle watch.
+    if let Some(values) = filters.get("idle") {
+        clauses.push(eq_or_in("instance", values));
+        clauses.push("status_val = 'listening'".into());
+        clauses.push("COALESCE(status_detail, '') != 'cmd:listen'".into());
+        clauses.push("COALESCE(status_context, '') NOT LIKE 'filter-wait:%'".into());
+        clauses.push("COALESCE(status_context, '') != 'start'".into());
+        clauses.push("COALESCE(status_context, '') != 'recovered'".into());
+    }
+
     // Context filter
     if let Some(values) = filters.get("context") {
         let context_clauses: Vec<String> = values
@@ -430,6 +464,15 @@ pub fn build_sql_from_flags(filters: &FilterMap) -> Result<String, String> {
         clauses.push(eq_or_in("msg_reply_to", values));
     }
 
+    // Internal exact-worker-generation filter used by --result-from. This is
+    // intentionally not exposed as a general composable CLI flag.
+    if let Some(values) = filters.get("sender_instance_key") {
+        clauses.push(eq_or_in(
+            "json_extract(data, '$.sender_instance_key')",
+            values,
+        ));
+    }
+
     // Life filters
     if let Some(values) = filters.get("action") {
         clauses.push(eq_or_in("life_action", values));
@@ -515,7 +558,7 @@ pub struct EventFilterArgs {
     pub participant: Vec<String>,
     #[arg(long)]
     pub mention: Vec<String>,
-    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["created", "started", "ready", "stopped", "batch_launched", "launch_failed", "launch_blocked"]))]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["created", "started", "connected", "ready", "stopped", "batch_launched", "launch_failed", "launch_blocked"]))]
     pub action: Vec<String>,
     #[arg(long, value_parser = parse_timestamp)]
     pub after: Vec<String>,
@@ -529,7 +572,7 @@ pub struct EventFilterArgs {
     pub reply_to: Vec<String>,
     #[arg(long)]
     pub collision: bool,
-    /// Shortcut: --idle NAME → --agent NAME --status listening
+    /// Shortcut: wait for a genuine task-idle transition from NAME
     #[arg(long)]
     pub idle: Vec<String>,
     /// Shortcut: --blocked NAME → --agent NAME --status blocked
@@ -542,13 +585,10 @@ impl EventFilterArgs {
     pub fn to_filter_map(&self) -> FilterMap {
         let mut map = FilterMap::new();
 
-        // Expand --idle/--blocked shortcuts into agent + status
+        // Expand --blocked into agent + status. Keep idle as a typed predicate
+        // so transport-wait status events can be excluded by SQL generation.
         let mut agents = self.agent.clone();
         let mut statuses = self.status.clone();
-        for name in &self.idle {
-            agents.push(name.clone());
-            statuses.push(crate::shared::constants::ST_LISTENING.to_string());
-        }
         for name in &self.blocked {
             agents.push(name.clone());
             statuses.push(crate::shared::constants::ST_BLOCKED.to_string());
@@ -563,6 +603,7 @@ impl EventFilterArgs {
         }
 
         insert_if_nonempty!("instance", agents);
+        insert_if_nonempty!("idle", self.idle.clone());
         insert_if_nonempty!("type", self.event_type.clone());
         insert_if_nonempty!("status", statuses);
         insert_if_nonempty!("context", self.context.clone());
@@ -621,7 +662,7 @@ mod tests {
     #[test]
     fn test_expand_idle() {
         let result = expand_shortcuts(&s(&["--idle", "peso"]));
-        assert_eq!(result, s(&["--agent", "peso", "--status", "listening"]));
+        assert_eq!(result, s(&["--idle", "peso"]));
     }
 
     #[test]
@@ -1028,8 +1069,59 @@ mod tests {
             ..Default::default()
         };
         let map = args.to_filter_map();
-        assert_eq!(map["instance"], vec!["peso"]);
-        assert_eq!(map["status"], vec!["listening"]);
+        assert_eq!(map["idle"], vec!["peso"]);
+        assert!(!map.contains_key("instance"));
+        assert!(!map.contains_key("status"));
+
+        let sql = build_sql_from_flags(&map).unwrap();
+        assert!(sql.contains("type = 'status'"));
+        assert!(sql.contains("instance = 'peso'"));
+        assert!(sql.contains("status_val = 'listening'"));
+        assert!(sql.contains("status_detail, '') != 'cmd:listen'"));
+        assert!(sql.contains("status_context, '') NOT LIKE 'filter-wait:%'"));
+        assert!(sql.contains("status_context, '') != 'start'"));
+        assert!(sql.contains("status_context, '') != 'recovered'"));
+    }
+
+    #[test]
+    fn test_filter_args_idle_rejects_ambiguous_composition() {
+        let with_agent = EventFilterArgs {
+            idle: vec!["peso".into()],
+            agent: vec!["luna".into()],
+            ..Default::default()
+        };
+        assert!(
+            build_sql_from_flags(&with_agent.to_filter_map())
+                .unwrap_err()
+                .contains("--idle cannot be combined")
+        );
+
+        let with_blocked = EventFilterArgs {
+            idle: vec!["peso".into()],
+            blocked: vec!["luna".into()],
+            ..Default::default()
+        };
+        assert!(
+            build_sql_from_flags(&with_blocked.to_filter_map())
+                .unwrap_err()
+                .contains("--idle cannot be combined")
+        );
+    }
+
+    #[test]
+    fn shell_tuple_matches_list() {
+        let tuple = format!(
+            "({})",
+            SHELL_TOOL_CONTEXT_LIST
+                .iter()
+                .map(|context| format!("'{context}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        assert_eq!(
+            tuple, SHELL_TOOL_CONTEXTS,
+            "the shell SQL tuple and its list must carry the same vocabulary in the same order"
+        );
     }
 
     #[test]

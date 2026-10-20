@@ -1,0 +1,378 @@
+{
+  "upstream_base": "f687a9cf71d3fdfc5bde2634f2ffcd19520d6a14",
+  "reference_fork": "e215adc1c0045077cb7abcbe5ae40c20dee2b0d7",
+  "policy": "Preserve required distinct local behavior; use upstream when it covers it; no isolation port.",
+  "features": [
+    {
+      "id": "transcript-path-diagnostic",
+      "feature": "Transcript search diagnostics on inaccessible PATH",
+      "contract": "Missing executable with inaccessible PATH, real nonexecutable candidate and explicit paths have distinct diagnostics. No missing tool becomes an empty successful result.",
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "low",
+      "validation": "Parent serial transcript40 tests passed; worker review-MCP found no blocking findings."
+    },
+    {
+      "id": "recent-kimi-bind-safety",
+      "feature": "Recent integration-only Kimi binding regression fixes",
+      "contract": "Competing connection lock, old session-binding removal, canonical primary repair, foreign ownership rejection and historical SessionEnd safety.",
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "medium",
+      "validation": "Parent serial binding34 tests passed, including contention/Kimi primary repair/Claude alias retention; worker review-MCP found no blockers."
+    },
+    {
+      "id": "claude-native-session-start-adoption",
+      "feature": "Claude native-session keyed explicit start versus hookless participation",
+      "contract": [
+        "Two explicit direct hcom starts in one Claude native session converge on one existing binding and do not mint a second row.",
+        "Without the explicit native-participation opt-in, a direct no-process Claude hook remains silent and does not claim a pending row.",
+        "If native participation is opted in, its session export/handshake is scoped to that authoritative opt-in and cannot by itself claim an unrelated pending row.",
+        "An hcom-launched Claude still binds and validates through the upstream process path.",
+        "If Claude-tagged vanilla participation is selected later, add an explicit product test for its ownership and cross-tool constraints instead of reviving the old fallback implicitly."
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Keeping the local export or no-process fallback would reopen the passive identity-stealing path that upstream intentionally removed; changing upstream adhoc semantics would also alter direct-start ownership and command resolution.",
+      "validation": "Native CLI 8 passed (4 participation cases plus 4 shared fixture checks); original target unit run included native/Codex/start/binding tests. Explicit opt-in, fresh-session precedence, inherited Codex thread exclusion, foreign-row rejection and no pending claim exercised. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "codex-wrapperless-vscode-adoption",
+      "feature": "Guarded wrapperless VS Code Codex session adoption",
+      "contract": [
+        "A VS Code SessionStart with no HCOM_PROCESS_ID creates one codex row and a session binding using the supplied transcript/cwd.",
+        "A repeated or concurrent SessionStart/UserPromptSubmit for that session returns the same row and never creates a duplicate.",
+        "The first ordinary UserPromptSubmit can deliver pending hcom context after adoption.",
+        "Wrong originator, missing session, SessionEnd, tool hooks, and stop hooks do not create identities or bypass the gate.",
+        "A failed transaction leaves no partially created row or session binding."
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "This is an intentional security tradeoff against upstream's process-participation boundary: a native VS Code source may enroll without process proof, so the exact originator, allowed events, native ID, lock scope, transcript/cwd provenance, and tool ownership check must stay narrow. Weakening any guard creates spoofing or cross-tool adoption; falling back to passive markers recreates the retired identity-stealing path.",
+      "validation": "Native CLI 8 passed (4 participation cases plus 4 shared fixture checks); original target unit run included native/Codex/start/binding tests. Explicit opt-in, fresh-session precedence, inherited Codex thread exclusion, foreign-row rejection and no pending claim exercised. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "codex-thread-sender-resolution",
+      "feature": "No-process Codex thread to sender identity resolution",
+      "contract": [
+        "A no-process command with a previously bound Codex thread resolves the same sender and session ID.",
+        "An unknown thread returns identity-required and creates no row.",
+        "Explicit session/name and process binding retain precedence over the thread lookup.",
+        "A thread bound to a non-Codex row is rejected or ignored rather than attributed to Codex.",
+        "No transcript text or marker is consulted by command identity resolution."
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "A permissive thread lookup can cross tool families or trust stale native IDs. Keeping it after authoritative paths and requiring an existing codex row is the narrow boundary; retaining the generic transcript fallback would undo upstream's ownership hardening.",
+      "validation": "Native CLI 8 passed (4 participation cases plus 4 shared fixture checks); original target unit run included native/Codex/start/binding tests. Explicit opt-in, fresh-session precedence, inherited Codex thread exclusion, foreign-row rejection and no pending claim exercised. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "tool-family-authoritative-binding",
+      "feature": "Tool-family ownership checks around sender and process/session binding",
+      "contract": [
+        "A process/session/stopped owner of another tool returns Rejected and leaves every binding and placeholder mutation unchanged.",
+        "A same-tool existing owner remains idempotent and a permitted unbound case creates the expected row only when create_if_unbound is true.",
+        "Claude generation attach preserves a live foreign process binding and removes only a stale conflict.",
+        "Wrapperless Codex adoption cannot overwrite a Claude, Kimi, Qoder, or stopped foreign row keyed by the same native ID.",
+        "Database failure rolls back both binding and any attempted orphan creation."
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "The checked API is easy to bypass by calling the older generic binder, and wrapperless adoption is especially sensitive because it has no process owner to narrow the claim. Broadly migrating all callers would alter existing placeholder/session-switch semantics and needs its own audit.",
+      "validation": "Native CLI 8 passed (4 participation cases plus 4 shared fixture checks); original target unit run included native/Codex/start/binding tests. Explicit opt-in, fresh-session precedence, inherited Codex thread exclusion, foreign-row rejection and no pending claim exercised. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "hermes-core-provider",
+      "feature": "Hermes Core Provider Integration & Spec Registration",
+      "contract": "src/integration_spec.rs:1333-1361 (hermes_spec_launch_parity and spec_name_round_trips_through_from_str)",
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Moderate. Spans core Tool enum, spec slices, and TUI cycling; requires port validation against upstream CLI binary updates and ready pattern changes.",
+      "validation": "Hermes-focused Rust units 93 passed after review corrections; Hermes start/rebind CLI 14, transcript CLI 7 passed (CLI totals include shared fixture checks). Python backend 26 unittest cases passed on unchanged backend sources. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "hermes-tool-detection",
+      "feature": "Hermes Tool Detection Predicates & Child Environment Scrubbing",
+      "contract": "src/shared/tool_detection.rs:353-404, src/launcher.rs:3479-3543, src/launcher.rs:3674-3760",
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Moderate. Involves 25 per-session environment variables scrubbed across runner scripts and PTY boundaries; requires synchronization if upstream Hermes alters its session injection naming.",
+      "validation": "Hermes-focused Rust units 93 passed after review corrections; Hermes start/rebind CLI 14, transcript CLI 7 passed (CLI totals include shared fixture checks). Python backend 26 unittest cases passed on unchanged backend sources. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "hermes-session-attribution",
+      "feature": "Hermes Subprocess Identity Attribution & Read-Only Resolution",
+      "contract": "src/cli_context.rs:708-930, src/identity.rs:1025-1106",
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Moderate. Hooks into build_ctx_for_command and command dispatch; requires validation to ensure upstream changes to identity precedence or new tool additions do not bypass or conflict with Hermes session attribution.",
+      "validation": "Hermes-focused Rust units 93 passed after review corrections; Hermes start/rebind CLI 14, transcript CLI 7 passed (CLI totals include shared fixture checks). Python backend 26 unittest cases passed on unchanged backend sources. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "hermes-hook-dispatch",
+      "feature": "Hermes Argv RPC Hook Dispatcher & Lifecycle Handlers",
+      "contract": "src/hooks/hermes.rs:2150-4799 (extensive unit tests covering all handlers, error conditions, and concurrency)",
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "High. Substantial integration surface area managing argv RPC, SQLite transactions, and instance lifecycle states across 5 hook handlers; must be validated under concurrency against upstream lifecycle changes.",
+      "validation": "Hermes-focused Rust units 93 passed after review corrections; Hermes start/rebind CLI 14, transcript CLI 7 passed (CLI totals include shared fixture checks). Python backend 26 unittest cases passed on unchanged backend sources. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "hermes-session-adoption",
+      "feature": "Ordinary Session Adoption & Stopped Row Recovery",
+      "contract": "src/hooks/hermes.rs:2200-2450 unit tests",
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "High. Involves cross-process file-level advisory locking and SQLite transactions to prevent race conditions during rapid concurrent launches; requires thorough multi-process concurrency validation.",
+      "validation": "Hermes-focused Rust units 93 passed after review corrections; Hermes start/rebind CLI 14, transcript CLI 7 passed (CLI totals include shared fixture checks). Python backend 26 unittest cases passed on unchanged backend sources. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "hermes-backend-plugin",
+      "feature": "Hcom-Owned Hermes Backend Extension Package",
+      "contract": "src/hermes_backend/hcom/test_extension.py (26 stdlib unittest cases)",
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "High. Substantial external seam tightly coupled to Hermes Python plugin framework, event model, and TCP notify loopback protocol; changes in either hcom or Hermes plugin APIs require synchronized updates and live testing.",
+      "validation": "Hermes-focused Rust units 93 passed after review corrections; Hermes start/rebind CLI 14, transcript CLI 7 passed (CLI totals include shared fixture checks). Python backend 26 unittest cases passed on unchanged backend sources. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "hermes-backend-ownership",
+      "feature": "Hermes Plugin Ownership, Installation, and Readiness Evaluation",
+      "contract": "src/hooks/hermes.rs:2500-2800 unit tests",
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Moderate-to-high. Directly manages external ~/.hermes/plugins/hcom/ directory, file writes, and ~/.hermes/config.yaml modification via CLI or file parsing; requires validation across Hermes versions.",
+      "validation": "Hermes-focused Rust units 93 passed after review corrections; Hermes start/rebind CLI 14, transcript CLI 7 passed (CLI totals include shared fixture checks). Python backend 26 unittest cases passed on unchanged backend sources. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "hermes-launch-resume-config",
+      "feature": "Hermes Launch Formatting, Resume Argument Merging, and Config",
+      "contract": "src/commands/resume.rs:2475-2570",
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Moderate. Dependent on Hermes CLI argument parser structure and flag conventions (-q/--query, --resume, --in).",
+      "validation": "Hermes-focused Rust units 93 passed after review corrections; Hermes start/rebind CLI 14, transcript CLI 7 passed (CLI totals include shared fixture checks). Python backend 26 unittest cases passed on unchanged backend sources. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "hermes-bootstrap",
+      "feature": "Hermes Runtime Bootstrap Guidance",
+      "contract": "src/bootstrap.rs:1250-1310",
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Low-to-moderate. Prompt template text; needs validation against model compliance with wake triggers.",
+      "validation": "Hermes-focused Rust units 93 passed after review corrections; Hermes start/rebind CLI 14, transcript CLI 7 passed (CLI totals include shared fixture checks). Python backend 26 unittest cases passed on unchanged backend sources. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "hermes-transcript",
+      "feature": "Hermes SQLite Transcript Parser & Multi-Profile Search",
+      "contract": "src/transcript/hermes.rs:500-900, src/commands/transcript.rs:2589-2650, 2815-2880",
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Moderate. Directly queries Hermes SQLite state.db schema; changes to Hermes internal database format require parser updates.",
+      "validation": "Hermes-focused Rust units 93 passed after review corrections; Hermes start/rebind CLI 14, transcript CLI 7 passed (CLI totals include shared fixture checks). Python backend 26 unittest cases passed on unchanged backend sources. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "filtered-listen-isolation",
+      "feature": "Inbox-isolated deterministic filtered listen",
+      "contract": [
+        "After-id is exclusive and catches results preceding arm; default cursor observes future events",
+        "Unrelated inbox remains unread; no temporary subscription or synthetic notice",
+        "Final scan precedes timeout; JSON discriminates match/timeout; timeout exit1 unless --timeout-ok",
+        "Normal CLI/TUI masks internal markers; verbose retains diagnostic detail",
+        "Short listens never change persistent wait_timeout"
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Medium; cross-cuts query/status/router behavior.",
+      "validation": "Parent source checked direct filtered querying, upstream normal-listen preservation, actual typed launch-blocker production and guarded approval recovery. Worker serial send_delivery23/message_contracts16 tests passed; focused classifier and approval recovery unit tests passed. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "events-wait-boundaries",
+      "feature": "Filtered event-wait cursor isolation",
+      "contract": [
+        "Filtered or explicit-cursor waits return only matching events",
+        "A prelaunch cursor catches an event before arm; no historical replay",
+        "Default snapshots and persistent subscription behavior remain unchanged",
+        "Filtered or explicit-cursor waits emit no unrelated preview; unfiltered waits retain upstream preview-once-and-continue behavior."
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Medium; foundational listener change.",
+      "validation": "Final event CLI19 and provider recovery15 checks passed; soft-stop and production-envelope recovery regressions included in full Rust suite. Parent source checked latest-turn/corruption/flag boundaries, generation correlation, runtime SQL error propagation and preserved upstream unread preview. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "durable-events-stream",
+      "feature": "Continuous durable event stream and generation follow",
+      "contract": [
+        "Ordered flush after each record; resume no replay",
+        "Soft stop retains generation; exact terminal stop ends follow; reused name excluded",
+        "Broken pipe/signals cleanly exit and clean only this endpoint",
+        "No subscription, inbox, request-watch or worker-state mutations"
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Medium-to-high; generation and listener lifetime semantics.",
+      "validation": "Final event CLI19 and provider recovery15 checks passed; soft-stop and production-envelope recovery regressions included in full Rust suite. Parent source checked latest-turn/corruption/flag boundaries, generation correlation, runtime SQL error propagation and preserved upstream unread preview. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "compact-progress-stream",
+      "feature": "Bounded typed worker progress and heartbeats",
+      "contract": [
+        "Typed schema and optional thread; no raw command/env/message/transcript fields",
+        "Hostile file detail excluded; accepted path-like text remains untrusted",
+        "Quiet heartbeats bounded; real phase transitions immediate",
+        "Independent request/reply remains functional while compact observer runs"
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Medium; output contract and provider detail mapping.",
+      "validation": "Final event CLI19 and provider recovery15 checks passed; soft-stop and production-envelope recovery regressions included in full Rust suite. Parent source checked latest-turn/corruption/flag boundaries, generation correlation, runtime SQL error propagation and preserved upstream unread preview. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "correlated-result-outcomes",
+      "feature": "Generation/thread/attempt-correlated result waits",
+      "contract": [
+        "Reject ambiguous generation or conflicting filters; require one thread and durable attempt cursor",
+        "ACKs, other threads/workers and reused names cannot satisfy result",
+        "Pre-arm blockers found; cleared blockers ignored; final poll precedes deadline",
+        "Exit0 result,1 deadline,2 SQL,3 unavailable,4 blocker,5 launch failure; preserve recovery/correlation evidence"
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "High; correlated state machine and lifecycle boundaries.",
+      "validation": "Final event CLI19 and provider recovery15 checks passed; soft-stop and production-envelope recovery regressions included in full Rust suite. Parent source checked latest-turn/corruption/flag boundaries, generation correlation, runtime SQL error propagation and preserved upstream unread preview. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "provider-result-recovery",
+      "feature": "Scoped stopped-worker transcript result recovery",
+      "contract": [
+        "Wrong session/thread, ambiguous or unsupported provider returns unavailable",
+        "Earlier resumed turn cannot replay as new result",
+        "Normal authored report takes precedence; recovery records provenance"
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "High; provider transcript formats and stop semantics.",
+      "validation": "Final event CLI19 and provider recovery15 checks passed; soft-stop and production-envelope recovery regressions included in full Rust suite. Parent source checked latest-turn/corruption/flag boundaries, generation correlation, runtime SQL error propagation and preserved upstream unread preview. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "typed-launch-blockers",
+      "feature": "Typed launch blockers and provider-aware PTY evidence",
+      "contract": [
+        "Ordinary text mentioning trust is not a blocker",
+        "Actual trust/approval/quota/auth states retain correct kind and evidence",
+        "Resolved blockers cannot terminate a later wait; recovery cannot clear an outstanding provider approval"
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "High; terminal prompt heuristics need provider fixtures/live verification.",
+      "validation": "Parent source checked direct filtered querying, upstream normal-listen preservation, actual typed launch-blocker production and guarded approval recovery. Worker serial send_delivery23/message_contracts16 tests passed; focused classifier and approval recovery unit tests passed. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "thread-membership-lifetime",
+      "feature": "Thread delivery membership with stop-scoped lifetime",
+      "contract": [
+        "Recipient-free followup targets seeded active members; unknown thread errors",
+        "External sender does not enroll itself",
+        "Auto membership expires on stop and name reuse; explicit delivery-only memberships and other owners subscriptions survive. Upstream cleanup of the stopping owners ordinary subscriptions remains.",
+        "Thread-resolved targeted requests receive watch coverage"
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Medium; small code delta but transactional lifecycle interactions.",
+      "validation": "Parent source checked direct filtered querying, upstream normal-listen preservation, actual typed launch-blocker production and guarded approval recovery. Worker serial send_delivery23/message_contracts16 tests passed; focused classifier and approval recovery unit tests passed. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "request-ack-result-separation",
+      "feature": "Receipt ACK versus completed request semantics",
+      "contract": [
+        "Correct ACK does not close completion watch; later inform does",
+        "Nested request is not a completion",
+        "Absent/empty legacy intent stays inform; ACK never required"
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Low-to-medium; well-bounded semantic correction.",
+      "validation": "Parent source checked direct filtered querying, upstream normal-listen preservation, actual typed launch-blocker production and guarded approval recovery. Worker serial send_delivery23/message_contracts16 tests passed; focused classifier and approval recovery unit tests passed. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "explicit-send-policy",
+      "feature": "Explicit broadcast and predictable send grammar",
+      "contract": [
+        "No accidental implicit global send",
+        "Exact bare target accepted; ambiguous input gives canonical syntax before stdin",
+        "--broadcast rejects explicit targets/thread conflict",
+        "Seeded thread followup remains recipient-free without global fanout"
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Medium; user-facing CLI change and wrapper compatibility.",
+      "validation": "Parent source checked direct filtered querying, upstream normal-listen preservation, actual typed launch-blocker production and guarded approval recovery. Worker serial send_delivery23/message_contracts16 tests passed; focused classifier and approval recovery unit tests passed. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "targeted-recipient-wake",
+      "feature": "Targeted message wake fan-out",
+      "contract": [
+        "Only actual targeted/thread recipients wake",
+        "Explicit broadcast still wakes all",
+        "No endpoint remains harmless; unrelated event subscribers still get relevant wake"
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Low; bounded optimization with observable wake behavior.",
+      "validation": "Parent source checked direct filtered querying, upstream normal-listen preservation, actual typed launch-blocker production and guarded approval recovery. Worker serial send_delivery23/message_contracts16 tests passed; focused classifier and approval recovery unit tests passed. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "approval-owner-race-safety",
+      "feature": "Tool-owned approval state and sibling-hook race safety",
+      "contract": [
+        "Sibling PostToolUse/failure/denial leaves owning approval blocked",
+        "Owner completion/denial resolves it; replaced approval survives stale token",
+        "Late approval survives nonapproval restore; DB errors fail closed",
+        "PTY falling edge does not clear a different replacement approval"
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "High; concurrency correctness across DB/hooks/PTY.",
+      "validation": "Worker serial focused suites: Claude101, PTY234, lifecycle41, DBinstances16 passed. Parent source checked guarded atomic row/event writes and upstream ACTIVE restoration. Combined gates passed; see fork-validation.json."
+    },
+    {
+      "id": "subagent-connected-signal",
+      "feature": "Atomic one-shot subagent connection life event",
+      "contract": [
+        "Concurrent manual start/hook ACK emits exactly one connected event",
+        "Failed transaction emits neither claim nor event",
+        "Bootstrap write/ACK contract remains intact",
+        "TUI and filters recognize connection as startup activity"
+      ],
+      "status": "implemented; combined gates and independent review passed",
+      "risk": "Medium; shared bootstrap/ack timing.",
+      "validation": "Parent concurrent four-connection CAS and event-failure rollback/retry tests passed (2 cases); direct source checks confirm manual start and hook use the same transactional claim."
+    }
+  ],
+  "external_assets": [
+    "permission-default",
+    "user-workflows",
+    "model-router",
+    "repo-workflow-assets",
+    "agy-model-guidance"
+  ],
+  "excluded": [
+    "isolation-workspace-types",
+    "isolation-workspace-runtime",
+    "passive-marker-binding",
+    "hermes-dashboard-mesh-reverted",
+    "inactive-github-prototype"
+  ],
+  "contract_reference": "Original source-line references describe the accepted reference checkout. Validation fields identify checks run against this rebuild.",
+  "review": {
+    "status": "accepted",
+    "method": "review-mcp review_with_context",
+    "diff_target": "HEAD",
+    "rounds": [
+      {
+        "scope": "Full retained-feature rebuild; tracked diff and explicit untracked modules/tests",
+        "report": "docs/reviews/upstream-rebuild-2026-10-20.md#full-review",
+        "result": "Four actionable findings; scoped corrections required.",
+        "raw_report": ".rebuild-artifacts/rebuild/oct20-independent-review.json"
+      },
+      {
+        "scope": "Typed binding, monotonic Hermes cursor, soft-stop waits and comment corrections",
+        "report": "docs/reviews/upstream-rebuild-2026-10-20.md#follow-up-review",
+        "result": "Original binding/soft-stop/comment findings addressed; production envelope matcher and OMP monotonic cursor corrections required.",
+        "raw_report": ".rebuild-artifacts/rebuild/oct20-focused-review.json"
+      },
+      {
+        "scope": "Production envelope matcher and OMP ACK/init corrections",
+        "report": "docs/reviews/upstream-rebuild-2026-10-20.md#final-review",
+        "result": "Scoped acceptance for both findings; no new concrete findings.",
+        "raw_report": ".rebuild-artifacts/rebuild/oct20-final-review.json"
+      }
+    ],
+    "resolutions": [
+      "Codex/Hermes use existing tool-checked binder with no foreign retirement or ownership switch.",
+      "Removed obsolete OMP-only Hermes binding fallback.",
+      "Hermes and OMP ACK/init use existing single-statement atomic MAX cursor primitive.",
+      "Soft stops excluded from terminal-stop recovery and blocker suppression; hard stops preserved.",
+      "Recovery matcher accepts production hcom envelopes with exact thread equality; rejects prefix/suffix collisions and ambiguous quoting.",
+      "Stale Hermes workspace-isolation comments corrected."
+    ],
+    "limits": [
+      "Source-level independent review with formatter-derived fixtures; live provider transcripts excluded.",
+      "Final reviewer focused on corrective delta; prior whole-tree review remains baseline evidence."
+    ]
+  },
+  "validation_report": "fork-validation.json"
+}

@@ -21,11 +21,11 @@ use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instance_names;
 use crate::instances;
-use crate::log::log_info;
+use crate::log::{log_info, log_warn};
 use crate::paths;
 use crate::pidtrack;
 use crate::router::GlobalFlags;
-use crate::shared::constants::ST_ACTIVE;
+use crate::shared::constants::{ST_ACTIVE, ST_LISTENING};
 use crate::shared::context::HcomContext;
 
 /// Parsed arguments for `hcom start`.
@@ -197,9 +197,11 @@ fn start_subagent(db: &HcomDb, info: &InstanceRow) -> Result<i32> {
     if !bootstrap.is_empty() {
         println!("{bootstrap}");
     }
-    let mut updates = serde_json::Map::new();
-    updates.insert("name_announced".into(), serde_json::json!(true));
-    instances::update_instance_position(db, &info.name, &updates);
+    // Claim and emit the parent-visible connection event together.  A
+    // SubagentStop activation hook can race this manual start, so the
+    // conditional DB update is the one-shot boundary; only its winner emits
+    // `life.connected`.
+    db.claim_subagent_connection(&info.name, parent_name, "start")?;
 
     Ok(0)
 }
@@ -391,43 +393,259 @@ fn start_rebind(
         return Ok(1);
     }
 
+    // Hermes reclaim: a FRESH ordinary Hermes session (no binding, no row
+    // holding its id) may take over a compatible STOPPED identity with `--as`
+    // and must end up bound to it by this session's id, so later commands
+    // resolve the reclaimed name. The decision and every mutation below run
+    // under the shared Hermes session-binding lock (same file as bare start
+    // and the plugin's adopt), failing closed, so a concurrent start/adopt
+    // cannot interleave and leave an unbound or double-bound target.
+    let hermes_session_id = (ctx.tool == crate::tool::Tool::Hermes)
+        .then(|| resolve_hermes_session_id(&ctx.raw_env))
+        .flatten();
+    let _hermes_binding_lock = hermes_session_id
+        .as_ref()
+        .map(|_| lock_hermes_session_binding(db))
+        .transpose()?;
+    // A Hermes context without HERMES_SESSION_ID (e.g. a manual HCOM_TOOL
+    // override) has no durable session id to bind a reclaimed identity
+    // through. The strict Hermes binding write below would fail only after
+    // the target row has already been deleted — or leave the reclaimed
+    // identity unresolvable — so fail closed before any mutation.
+    if ctx.tool == crate::tool::Tool::Hermes && hermes_session_id.is_none() {
+        bail!(
+            "This Hermes session exposes no HERMES_SESSION_ID, so a reclaimed identity \
+             could not be bound to it. Start from a real Hermes session — or fix the \
+             HCOM_TOOL override — and try again."
+        );
+    }
+    let mut hermes_stale_binding = false;
+    if let Some(ref session_id) = hermes_session_id {
+        if let Some(bound_name) = db.get_session_binding(session_id)? {
+            match db.get_instance_full(&bound_name)? {
+                Some(row) if row.tool == "hermes" => {
+                    bail!(
+                        "Hermes session {} already has hcom identity '{bound_name}'. Refusing \
+                         to rebind it; end that identity with `hcom kill {bound_name}` and \
+                         start again.",
+                        session_id.chars().take(8).collect::<String>()
+                    );
+                }
+                Some(_) => {
+                    bail!(
+                        "Hermes session {} is bound to '{bound_name}', which is not a Hermes \
+                         instance. Refusing to adopt or overwrite that binding.",
+                        session_id.chars().take(8).collect::<String>()
+                    );
+                }
+                // Stale binding: its row is gone, so it names nothing — but an
+                // inconsistent/legacy DB may still have ANOTHER row owning
+                // this sid. The holder check below refuses that case; only a
+                // sid with no holder may be taken over by the reclaim.
+                None => hermes_stale_binding = true,
+            }
+        }
+        // A row still holding this sid is the session's retained identity
+        // whether or not a (possibly stale) binding exists: it must be refused,
+        // never REPLACE-clobbered by the reclaim below.
+        if let Some(row) = hermes_row_holding_session_id(db, session_id)? {
+            if row.tool == "hermes" {
+                bail!(
+                    "Hermes session {} already has hcom identity '{}' (retained by a \
+                     soft-finalized session: row kept, binding dropped). A bare \
+                     `hcom start` recovers it; discard it with `hcom kill {}` before \
+                     reclaiming another name.",
+                    session_id.chars().take(8).collect::<String>(),
+                    row.name,
+                    row.name
+                );
+            } else {
+                bail!(
+                    "Hermes session {} is held by '{}' of another tool. Refusing to \
+                     overwrite it.",
+                    session_id.chars().take(8).collect::<String>(),
+                    row.name
+                );
+            }
+        }
+    }
+
+    // A remote Hermes mirror is a reflection owned by another device: the
+    // delete-skip for remote rows would leave it to be rewritten in place by
+    // the recreation below (session_id, tool, directory), so refuse before any
+    // mutation. Its lifecycle belongs to the owning device.
+    if hermes_session_id.is_some()
+        && let Some(row) = db.get_instance_full(&target_name)?
+        && row.tool == "hermes"
+        && crate::instances::is_remote_instance(&row)
+    {
+        bail!(
+            "Hermes identity '{target_name}' is a remote mirror owned by another device and \
+             cannot be reclaimed here. Reclaim it on the owning device."
+        );
+    }
+
+    // A Hermes reclaim takes over a STOPPED identity. A live one belongs to a
+    // session that may still be running elsewhere: taking it over would steal
+    // it, and "succeeding" while leaving this session unbound is worse.
+    if hermes_session_id.is_some()
+        && let Some(row) = db.get_instance_full(&target_name)?
+        && row.tool == "hermes"
+        && !matches!(row.status.as_str(), "inactive" | "stopped")
+    {
+        bail!(
+            "Hermes identity '{target_name}' is currently {} and cannot be reclaimed. Only \
+             stopped identities can be taken over with --as; if it is stale, `hcom kill \
+             {target_name}` first.",
+            row.status
+        );
+    }
+
     let explicit_current_name = explicit_name.unwrap_or("");
 
     // Resolve session_id from process binding or existing instance
-    let mut session_id: Option<String> = None;
-    if let Some(ref process_id) = ctx.process_id
-        && let Ok(Some((sid, _))) = db.get_process_binding_full(process_id)
+    let process_binding = ctx
+        .process_id
+        .as_deref()
+        .and_then(|pid| db.get_process_binding_full(pid).ok().flatten());
+    let process_sid = process_binding
+        .as_ref()
+        .and_then(|(sid, _)| sid.clone().filter(|s| !s.is_empty()));
+    let explicit_sid = if explicit_current_name.is_empty() {
+        None
+    } else {
+        db.get_instance_full(explicit_current_name)
+            .ok()
+            .flatten()
+            .and_then(|row| row.session_id.filter(|s| !s.is_empty()))
+    };
+
+    let session_id = if let Some(ref hermes_sid) = hermes_session_id {
+        // HERMES_SESSION_ID is authoritative for a Hermes reclaim. The
+        // stale-binding decision above was computed for it, later commands
+        // resolve this session by it, and rebind_session is an unconditional
+        // upsert — binding through any other sid could clobber a foreign
+        // binding. A process binding or explicit identity naming a different
+        // session is therefore a conflict: fail closed before any mutation.
+        if let Some(process_sid) = process_sid.as_deref()
+            && process_sid != hermes_sid.as_str()
+        {
+            let owner = process_binding
+                .as_ref()
+                .map(|(_, name)| name.clone())
+                .unwrap_or_default();
+            let owner_note = if owner.is_empty() {
+                String::new()
+            } else {
+                format!(" (identity '{owner}'; `hcom kill {owner}` clears it)")
+            };
+            bail!(
+                "Hermes session {} refuses to rebind to '{target_name}': this terminal's \
+                 process binding still points at session {}{owner_note} — a different \
+                 session than HERMES_SESSION_ID. Reclaim from the Hermes session that owns \
+                 the identity, or clear the stale process binding first.",
+                hermes_sid.chars().take(8).collect::<String>(),
+                process_sid.chars().take(8).collect::<String>()
+            );
+        }
+        if let Some(explicit_sid) = explicit_sid.as_deref()
+            && explicit_sid != hermes_sid.as_str()
+        {
+            bail!(
+                "Hermes session {} refuses to rebind to '{target_name}': the current \
+                 identity '{explicit_current_name}' belongs to session {} — a different \
+                 session than HERMES_SESSION_ID, so it cannot be replaced from here. Start \
+                 from the session that owns it, or drop it with \
+                 `hcom kill {explicit_current_name}` first.",
+                hermes_sid.chars().take(8).collect::<String>(),
+                explicit_sid.chars().take(8).collect::<String>()
+            );
+        }
+        if explicit_sid.is_none()
+            && db
+                .get_instance_full(explicit_current_name)
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            // A claimed current identity with no session id of its own cannot
+            // be vetted against HERMES_SESSION_ID: nothing proves it belongs to
+            // this session, and the replace-old-identity step below would
+            // delete the row on the caller's word alone.
+            bail!(
+                "Hermes session {} refuses to treat '{explicit_current_name}' as its current \
+                 identity: that row has no session id, so hcom cannot prove it belongs to \
+                 this session. If it is a leftover identity, drop it with \
+                 `hcom kill {explicit_current_name}` first.",
+                hermes_sid.chars().take(8).collect::<String>()
+            );
+        }
+        // Same contract for a fresh ordinary Hermes reclaim: the session id is
+        // what makes the takeover stick — the recreated row records it and the
+        // binding makes later commands resolve the reclaimed name.
+        Some(hermes_sid.clone())
+    } else {
+        let mut sid = process_sid.or(explicit_sid);
+        if sid.is_none() {
+            sid = resolve_launched_session_id(ctx);
+        }
+        let native_claude = is_native_claude_opted_in(ctx);
+        let adhoc_session = !native_claude
+            && !ctx.is_launched
+            && ctx.process_id.is_none()
+            && crate::hooks::runtime::is_per_run(ctx.tool);
+        if (native_claude || adhoc_session) && sid.is_none() {
+            sid = resolve_native_session_id(ctx);
+        }
+        sid
+    };
+
+    let native_claude = is_native_claude_opted_in(ctx);
+    let adhoc_session = !native_claude
+        && !ctx.is_launched
+        && ctx.process_id.is_none()
+        && crate::hooks::runtime::is_per_run(ctx.tool);
+    let native_owner = if native_claude {
+        session_id
+            .as_deref()
+            .map(|sid| ensure_native_claude_owner(db, sid))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    if native_claude {
+        if let Some(owner) = native_owner.as_deref()
+            && !explicit_current_name.is_empty()
+            && explicit_current_name != owner
+        {
+            bail!(
+                "Refusing native Claude rebind: session '{}' is already bound to '{}', not '{}'",
+                session_id.as_deref().unwrap_or(""),
+                owner,
+                explicit_current_name
+            );
+        }
+        if !explicit_current_name.is_empty() {
+            ensure_native_claude_rebind_source(db, explicit_current_name)?;
+        }
+    }
+    let tool = if ctx.tool == crate::tool::Tool::Hermes
+        || native_claude
+        || (!adhoc_session && (ctx.process_id.is_some() || session_id.is_some()))
     {
-        session_id = sid.filter(|s| !s.is_empty());
-    }
-    if session_id.is_none()
-        && !explicit_current_name.is_empty()
-        && let Ok(Some(current_data)) = db.get_instance_full(explicit_current_name)
-    {
-        session_id = current_data.session_id.filter(|s| !s.is_empty());
-    }
-    if session_id.is_none() {
-        session_id = resolve_launched_session_id(ctx);
-    }
-    // A direct per-run tool (plain `claude`/`codex`) has no hooks but still
-    // exposes its native session id; bare start binds its adhoc identity to
-    // it, so rebind must use it too or the old identity stays bound.
-    // Classified from the context alone: an id found via `--name`'s row must
-    // not turn a hookless direct session into a `claude`/`codex` row.
-    let adhoc_session =
-        !ctx.is_launched && ctx.process_id.is_none() && crate::hooks::runtime::is_per_run(ctx.tool);
-    if adhoc_session && session_id.is_none() {
-        session_id = resolve_native_session_id(ctx);
-    }
-    let tool = if !adhoc_session && (ctx.process_id.is_some() || session_id.is_some()) {
         ctx.tool.as_str()
     } else {
         "adhoc"
     };
     let current_name = if !explicit_current_name.is_empty() {
         explicit_current_name.to_string()
+    } else if let Some(owner) = native_owner {
+        owner
     } else if let Some(ref sid) = session_id {
-        db.get_session_binding(sid)?.unwrap_or_default()
+        db.get_session_binding(sid)?
+            .filter(|_| !hermes_stale_binding)
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -473,6 +691,10 @@ fn start_rebind(
 
     // Create fresh instance with the target name.
     let cwd_override = ctx.cwd.to_string_lossy().to_string();
+    let hermes_transcript_path = (ctx.tool == crate::tool::Tool::Hermes)
+        .then(|| crate::transcript::hermes::resolve_hermes_db_path_from_env(&ctx.raw_env))
+        .flatten()
+        .map(|p| p.to_string_lossy().to_string());
     instance_binding::initialize_instance_in_position_file(
         db,
         &target_name,
@@ -480,7 +702,7 @@ fn start_rebind(
         None, // parent_session_id
         None, // parent_name
         None, // agent_id
-        None, // transcript_path
+        hermes_transcript_path.as_deref(),
         Some(tool),
         false, // background
         None,  // tag
@@ -516,9 +738,30 @@ fn start_rebind(
 
     // Create bindings
     if let Some(ref sid) = session_id {
-        if let Err(e) = db.set_session_binding(sid, &target_name) {
+        if ctx.tool == crate::tool::Tool::Hermes {
+            // The reclaimed identity must end up owning this session, or the
+            // command has not done its job — fail instead of reporting
+            // success with the session unbound. set_session_binding stays
+            // strict (an owner that appeared despite the lock is never
+            // silently overwritten); a stale binding is reclaimed by force.
+            if hermes_stale_binding {
+                db.rebind_session(sid, &target_name)?;
+            } else {
+                db.set_session_binding(sid, &target_name)?;
+            }
+            // Plugin-less reclaim: nothing else will ever advance the
+            // recreated row's status, so mark the live session listening the
+            // way the plugin's adopt path does.
+            lifecycle::set_status(
+                db,
+                &target_name,
+                ST_LISTENING,
+                "start:reclaim",
+                Default::default(),
+            );
+        } else if let Err(e) = db.set_session_binding(sid, &target_name) {
             eprintln!("[hcom] warn: set_session_binding failed for {target_name}: {e}");
-        } else if !adhoc_session
+        } else if (native_claude || !adhoc_session)
             && ctx.tool == crate::tool::Tool::Claude
             && let Err(e) = db.mark_claude_session_validated(sid, &target_name)
         {
@@ -664,9 +907,87 @@ fn load_rebind_target_metadata(db: &HcomDb, name: &str) -> Result<RebindTargetMe
 /// Claude sets `CLAUDE_CODE_SESSION_ID` in Bash and PowerShell subprocesses,
 /// and it matches the `session_id` passed to hooks.
 fn resolve_claude_session_id(env: &HashMap<String, String>) -> Option<String> {
+    if env
+        .get(crate::hooks::common::NATIVE_PARTICIPATION_ENV)
+        .is_some_and(|tool| tool == crate::hooks::common::NATIVE_CLAUDE_VALUE)
+    {
+        // A fork/child can inherit the persisted parent export while Claude
+        // gives the current process a fresh session id.  The current Claude
+        // variable is authoritative; use the persisted value only when the
+        // process did not expose one.
+        return [
+            "CLAUDE_CODE_SESSION_ID",
+            crate::hooks::common::NATIVE_CLAUDE_SESSION_ENV,
+        ]
+        .into_iter()
+        .find_map(|key| env.get(key).filter(|value| !value.is_empty()).cloned());
+    }
     env.get("CLAUDE_CODE_SESSION_ID")
         .filter(|value| !value.is_empty())
         .cloned()
+}
+
+fn is_native_claude_opted_in(ctx: &HcomContext) -> bool {
+    ctx.tool == crate::tool::Tool::Claude
+        && ctx.process_id.is_none()
+        && !ctx.is_launched
+        && ctx
+            .raw_env
+            .get(crate::hooks::common::NATIVE_PARTICIPATION_ENV)
+            .is_some_and(|tool| tool == crate::hooks::common::NATIVE_CLAUDE_VALUE)
+}
+
+/// Native Claude may reuse only an existing binding whose row is itself a
+/// Claude participant.  A session binding is an index, not an authorization
+/// boundary: old/stopped or foreign rows must not be blessed by a new native
+/// Claude process.
+fn ensure_native_claude_owner(db: &HcomDb, session_id: &str) -> Result<Option<String>> {
+    let Some(owner_name) = db.get_session_binding(session_id)? else {
+        return Ok(None);
+    };
+    let Some(owner) = db.get_instance_full(&owner_name)? else {
+        bail!(
+            "Refusing native Claude start: session '{}' has a stale binding to '{}'",
+            session_id,
+            owner_name
+        );
+    };
+    if owner.tool != crate::tool::Tool::Claude.as_str() {
+        bail!(
+            "Refusing native Claude start: session '{}' is bound to '{}' ({})",
+            session_id,
+            owner.name,
+            owner.tool
+        );
+    }
+    Ok(Some(owner.name))
+}
+
+/// `--name` identifies the current actor during `start --as`.  Native Claude
+/// must not use it to delete or replace an active row, or a stopped snapshot,
+/// owned by another tool.
+fn ensure_native_claude_rebind_source(db: &HcomDb, name: &str) -> Result<()> {
+    if let Some(owner) = db.get_instance_full(name)? {
+        if owner.tool != crate::tool::Tool::Claude.as_str() {
+            bail!(
+                "Refusing native Claude rebind from '{}' (row tool is '{}')",
+                name,
+                owner.tool
+            );
+        }
+        return Ok(());
+    }
+    if let Ok(meta) = load_rebind_target_metadata(db, name)
+        && !meta.tool.is_empty()
+        && meta.tool != crate::tool::Tool::Claude.as_str()
+    {
+        bail!(
+            "Refusing native Claude rebind from stopped '{}' (snapshot tool is '{}')",
+            name,
+            meta.tool
+        );
+    }
+    Ok(())
 }
 
 /// Native session id of an `hcom <tool>` launch (how a launched session binds
@@ -687,26 +1008,328 @@ fn resolve_native_session_id(ctx: &HcomContext) -> Option<String> {
     }
 }
 
+/// Ordinary Hermes exports `HERMES_SESSION_ID` into every terminal subprocess
+/// (hermes `tools/environments/local.py _inject_session_context_env`), and it
+/// is the session's own durable id. It plays for Hermes the role
+/// `CLAUDE_CODE_SESSION_ID` plays above: without keying on it, every bare
+/// `hcom start` in one Hermes session mints a second identity. An empty export
+/// is not identity (it is also not a Hermes marker at all).
+fn resolve_hermes_session_id(env: &HashMap<String, String>) -> Option<String> {
+    env.get("HERMES_SESSION_ID")
+        .filter(|value| !value.is_empty())
+        .cloned()
+}
+
+/// Take the cross-process Hermes session-binding lock, shared with the
+/// plugin's adopt path (hooks/hermes.rs, same lock file), so that concurrent
+/// identity decisions for one Hermes session — two bare starts, or a bare
+/// start racing `hermes-sessionstart` — cannot both observe "unbound" and
+/// mint two identities, and a stale-binding reclaim cannot overwrite a
+/// binding another process just created. Fails closed: without the lock the
+/// decision-to-write sequence has no protection — the mint's INSERT OR
+/// REPLACE lands before set_session_binding's conflict check, and a stale
+/// reclaim's rebind is an unconditional upsert — so an unacquirable lock
+/// must abort the start, never proceed unlocked.
+fn lock_hermes_session_binding(db: &HcomDb) -> Result<std::fs::File> {
+    let lock_dir = db
+        .path()
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("db path has no parent dir"))?
+        .join(".tmp");
+    std::fs::create_dir_all(&lock_dir).inspect_err(|error| {
+        log_warn(
+            "start",
+            "hermes.binding_lock_dir_failed",
+            &error.to_string(),
+        );
+    })?;
+    let lock_path = lock_dir.join("hermes_adopt.lock");
+    let lock_file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            log_warn(
+                "start",
+                "hermes.binding_lock_open_failed",
+                &error.to_string(),
+            );
+            anyhow::anyhow!(
+                "cannot open Hermes session-binding lock at {}: {error}",
+                lock_path.display()
+            )
+        })?;
+    crate::sys::fs::lock_exclusive(&lock_file)
+        .inspect_err(|error| {
+            log_warn("start", "hermes.binding_lock_failed", &error.to_string());
+        })
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "cannot acquire Hermes session-binding lock at {}: {error}",
+                lock_path.display()
+            )
+        })?;
+    Ok(lock_file)
+}
+
+/// The instance row currently holding this session id, if any. A
+/// soft-finalized Hermes session keeps its row and session_id after
+/// `soft_finalize_session` drops only the binding, so a start that finds no
+/// binding must look here before minting: a fresh row with the same session_id
+/// would hit `UNIQUE(session_id)` and `save_instance_named`'s INSERT OR
+/// REPLACE would delete the retained row. Read errors propagate — swallowing
+/// one into "no row" would let the caller mint over a row it failed to see.
+fn hermes_row_holding_session_id(db: &HcomDb, session_id: &str) -> Result<Option<InstanceRow>> {
+    use rusqlite::OptionalExtension;
+    let name: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT name FROM instances WHERE session_id = ?",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(anyhow::Error::new)?;
+    match name {
+        Some(name) => Ok(db.get_instance_full(&name)?),
+        None => Ok(None),
+    }
+}
+
 /// Path C: Bare start — detect tool or create adhoc instance.
 fn start_bare(db: &HcomDb, ctx: &HcomContext, explicit_name: Option<&str>) -> Result<i32> {
     let explicit_name = explicit_name
         .map(|name| identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string()));
     let explicit_name = explicit_name.as_deref();
 
+    // Ordinary Hermes explicit start is idempotent by the same session-id
+    // contract as Claude, standing on its own — no plugin required: reuse only
+    // a binding whose row is hermes-owned, never touch one owned by another
+    // tool, recover the retained row of a soft-finalized session instead of
+    // minting over it, and reclaim a binding whose row is gone. Everything
+    // from the decision through the binding write below runs under the shared
+    // Hermes session-binding lock, so concurrent starts of one session
+    // converge on one identity. The lock fails closed: an unacquirable lock
+    // aborts the start before any decision or write, because unlocked the
+    // mint's INSERT OR REPLACE lands before the binding conflict check and a
+    // stale reclaim's rebind is an unconditional upsert.
+    let hermes_session_id = (ctx.tool == crate::tool::Tool::Hermes)
+        .then(|| resolve_hermes_session_id(&ctx.raw_env))
+        .flatten();
+    let hermes_transcript_path = (ctx.tool == crate::tool::Tool::Hermes)
+        .then(|| crate::transcript::hermes::resolve_hermes_db_path_from_env(&ctx.raw_env))
+        .flatten()
+        .map(|p| p.to_string_lossy().to_string());
+    let _hermes_binding_lock = hermes_session_id
+        .as_ref()
+        .map(|_| lock_hermes_session_binding(db))
+        .transpose()?;
+    let mut reclaim_hermes_binding = false;
+    if let Some(ref session_id) = hermes_session_id {
+        if let Some(bound_name) = db.get_session_binding(session_id)? {
+            match db.get_instance_full(&bound_name)? {
+                Some(row) if row.tool == "hermes" => {
+                    // An established identity is final for this session: a
+                    // different explicit name would create a second identity
+                    // (or fight the binding), so refuse before any mutation.
+                    if explicit_name.is_some_and(|explicit| explicit != bound_name) {
+                        bail!(
+                            "Hermes session {} already has hcom identity '{bound_name}'. \
+                             Refusing to create another identity for the same session.",
+                            session_id.chars().take(8).collect::<String>()
+                        );
+                    }
+                    if row.transcript_path.is_empty()
+                        && let Some(ref path) = hermes_transcript_path
+                    {
+                        let mut updates = serde_json::Map::new();
+                        updates.insert("transcript_path".into(), serde_json::json!(path));
+                        instances::update_instance_position(db, &row.name, &updates);
+                    }
+                    // A regressed row — inactive/stopped, or still on its
+                    // fresh "new" context — with the session factually live:
+                    // plugin-less Hermes has no hook to advance it, so heal it
+                    // to listening like the recover path. A genuinely
+                    // active/blocked/listening/launching row carries live
+                    // delivery or launch evidence this path must not overwrite.
+                    let regressed = matches!(row.status.as_str(), "inactive" | "stopped")
+                        || (row.status_context == "new"
+                            && !matches!(
+                                row.status.as_str(),
+                                "active" | "blocked" | "listening" | "launching"
+                            ));
+                    if regressed {
+                        lifecycle::set_status(
+                            db,
+                            &row.name,
+                            ST_LISTENING,
+                            "start:heal",
+                            Default::default(),
+                        );
+                    }
+                    println!("hcom already started for {bound_name}");
+                    return Ok(0);
+                }
+                // A Hermes session id resolving to another tool's row is a binding
+                // collision — not ours to adopt or overwrite. Reported as a bare
+                // refusal: an explicit `--as` can hit the same collision, so it is
+                // no remedy to advertise.
+                Some(_) => {
+                    bail!(
+                        "Hermes session {} is already bound to '{bound_name}', which is not a \
+                         Hermes instance. Refusing to adopt or overwrite that binding.",
+                        session_id.chars().take(8).collect::<String>()
+                    );
+                }
+                // Stale binding: its instance row was deleted, so it points at
+                // nothing — but an inconsistent/legacy DB may still have
+                // ANOTHER row owning this sid. The holder check below recovers
+                // that row; only a sid with no holder may be reclaimed by the
+                // mint, whose INSERT OR REPLACE would silently delete one.
+                None => reclaim_hermes_binding = true,
+            }
+        }
+        // A row still holding this sid is the session's retained identity
+        // whether or not a (possibly stale) binding exists (a soft-finalized
+        // session keeps row and session_id after its binding is dropped):
+        // recover it — minting instead would INSERT OR REPLACE it away on
+        // UNIQUE(session_id). In the stale-binding case rebind_instance_session
+        // also heals the binding to name the recovered row.
+        if let Some(row) = hermes_row_holding_session_id(db, session_id)? {
+            if row.tool != "hermes" {
+                bail!(
+                    "Hermes session {} is held by '{}', which is not a Hermes \
+                     instance. Refusing to adopt or overwrite it.",
+                    session_id.chars().take(8).collect::<String>(),
+                    row.name
+                );
+            }
+            if explicit_name.is_some_and(|explicit| explicit != row.name) {
+                bail!(
+                    "Hermes session {} already has hcom identity '{}'. Refusing to \
+                     create another identity for the same session.",
+                    session_id.chars().take(8).collect::<String>(),
+                    row.name
+                );
+            }
+            db.rebind_instance_session(&row.name, session_id)?;
+            if row.transcript_path.is_empty()
+                && let Some(ref path) = hermes_transcript_path
+            {
+                let mut updates = serde_json::Map::new();
+                updates.insert("transcript_path".into(), serde_json::json!(path));
+                instances::update_instance_position(db, &row.name, &updates);
+            }
+            // Plugin-less recovery: the session is factually live again, and
+            // no hook exists to advance the retained row's status — mark it
+            // listening the way the plugin's adopt path does.
+            lifecycle::set_status(
+                db,
+                &row.name,
+                ST_LISTENING,
+                "start:recover",
+                Default::default(),
+            );
+            println!("hcom already started for {}", row.name);
+            return Ok(0);
+        }
+
+        // An explicit name that is an existing hermes identity belongs to
+        // another session and cannot be claimed by bare `--name` regardless of
+        // status: a live one would be stolen outright, an inactive one falls
+        // through to the already-started return and reports success while
+        // leaving this session unbound, and a stopped one would be silently
+        // rebound while its old session's binding survives. Stopped/inactive
+        // identities are taken over with --as, which clears the previous
+        // binding first; live ones need `hcom kill` first. Remote mirrors are
+        // excluded here so they reach their own dedicated refusal below —
+        // local --as/kill guidance does not apply to another device's mirror.
+        if let Some(explicit) = explicit_name
+            && let Some(row) = db.get_instance_full(explicit)?
+            && row.tool == "hermes"
+            && !crate::instances::is_remote_instance(&row)
+        {
+            if matches!(row.status.as_str(), "inactive" | "stopped") {
+                bail!(
+                    "Hermes identity '{explicit}' already exists ({}) in another session and \
+                     cannot be claimed with --name. Reclaim it with \
+                     `hcom start --as {explicit}`, or choose a different name.",
+                    row.status
+                );
+            }
+            bail!(
+                "Hermes identity '{explicit}' is currently {} in another session and cannot \
+                 be claimed here. Only stopped identities can be reclaimed with \
+                 `hcom start --as {explicit}`; if it is stale, `hcom kill {explicit}` first.",
+                row.status
+            );
+        }
+        // An existing non-Hermes row is another tool's identity, not a name
+        // this Hermes session may take: the generic already-started return
+        // would report success while leaving this session unbound, and a
+        // stopped row would be silently overwritten by the mint below.
+        // Remote mirrors keep their own dedicated refusal further down.
+        if let Some(explicit) = explicit_name
+            && let Some(row) = db.get_instance_full(explicit)?
+            && row.tool != "hermes"
+            && !crate::instances::is_remote_instance(&row)
+        {
+            bail!(
+                "'{explicit}' is an existing {} identity and cannot be claimed from a \
+                 Hermes session with --name. Choose a different name.",
+                if row.tool.is_empty() {
+                    "other tool"
+                } else {
+                    row.tool.as_str()
+                }
+            );
+        }
+    }
+
     let launched_session_id = resolve_launched_session_id(ctx);
+    let native_claude = is_native_claude_opted_in(ctx);
     // A direct per-run tool has no hooks, but its native ID can still make a
     // repeated manual `hcom start` return the same adhoc identity.
-    let adhoc_session_id = (!ctx.is_launched
+    let native_session_id = native_claude
+        .then(|| resolve_native_session_id(ctx))
+        .flatten();
+    let adhoc_session_id = (!native_claude
+        && !ctx.is_launched
         && ctx.process_id.is_none()
         && crate::hooks::runtime::is_per_run(ctx.tool))
     .then(|| resolve_native_session_id(ctx))
     .flatten();
-    let session_id = launched_session_id.as_ref().or(adhoc_session_id.as_ref());
-    let tool = if ctx.process_id.is_some() {
+    let session_id = hermes_session_id
+        .as_ref()
+        .or(launched_session_id.as_ref())
+        .or(native_session_id.as_ref())
+        .or(adhoc_session_id.as_ref());
+    let tool = if ctx.tool == crate::tool::Tool::Hermes || native_claude || ctx.process_id.is_some()
+    {
         ctx.tool.as_str()
     } else {
         "adhoc"
     };
+
+    let native_owner = if native_claude {
+        session_id
+            .map(|sid| ensure_native_claude_owner(db, sid))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    if let Some(owner) = native_owner.as_deref()
+        && explicit_name.is_some_and(|name| name != owner)
+    {
+        bail!(
+            "Refusing native Claude start: session '{}' is already bound to '{}', not '{}'",
+            session_id.map(|sid| sid.as_str()).unwrap_or(""),
+            owner,
+            explicit_name.unwrap_or_default()
+        );
+    }
 
     if explicit_name.is_none()
         && let Some(session_id) = session_id
@@ -715,7 +1338,8 @@ fn start_bare(db: &HcomDb, ctx: &HcomContext, explicit_name: Option<&str>) -> Re
         // Only hcom writes session bindings, so a row keyed by this session's
         // own id is trusted identity evidence. Heal bindings created by older
         // versions before returning the existing row.
-        if launched_session_id.is_some() && ctx.tool == crate::tool::Tool::Claude {
+        if (launched_session_id.is_some() || native_claude) && ctx.tool == crate::tool::Tool::Claude
+        {
             db.mark_claude_session_validated(session_id, &bound_name)?;
         }
         println!("hcom already started for {bound_name}");
@@ -793,7 +1417,7 @@ fn start_bare(db: &HcomDb, ctx: &HcomContext, explicit_name: Option<&str>) -> Re
         None, // parent_session_id
         None, // parent_name
         None, // agent_id
-        None, // transcript_path
+        hermes_transcript_path.as_deref(),
         Some(tool),
         false, // background
         None,  // tag
@@ -804,9 +1428,27 @@ fn start_bare(db: &HcomDb, ctx: &HcomContext, explicit_name: Option<&str>) -> Re
     );
 
     if let Some(session_id) = session_id {
-        db.set_session_binding(session_id, &name)?;
-        if launched_session_id.is_some() && ctx.tool == crate::tool::Tool::Claude {
-            db.mark_claude_session_validated(session_id, &name)?;
+        if ctx.tool == crate::tool::Tool::Hermes {
+            // set_session_binding refuses an id already owned by another row, so
+            // neither a foreign binding nor a concurrent binder can be silently
+            // overwritten here; a stale one is reclaimed explicitly.
+            if reclaim_hermes_binding {
+                db.rebind_session(session_id, &name)?;
+            } else {
+                db.set_session_binding(session_id, &name)?;
+            }
+            // Plugin-less mint: ordinary Hermes has no hooks, so nothing else will
+            // ever advance the fresh row's status — mark the live session listening
+            // like recover/reclaim do, or the row sits inactive/new and ages to
+            // launch_failed while the session is alive.
+            lifecycle::set_status(db, &name, ST_LISTENING, "start:mint", Default::default());
+        } else {
+            db.set_session_binding(session_id, &name)?;
+            if (launched_session_id.is_some() || native_claude)
+                && ctx.tool == crate::tool::Tool::Claude
+            {
+                db.mark_claude_session_validated(session_id, &name)?;
+            }
         }
     }
 
@@ -982,6 +1624,37 @@ mod tests {
         );
         assert_eq!(resolve_claude_session_id(&env(Some(""))), None);
         assert_eq!(resolve_claude_session_id(&env(None)), None);
+
+        let mut unopted = HashMap::from([
+            (
+                crate::hooks::common::NATIVE_CLAUDE_SESSION_ENV.to_string(),
+                "hcom-session".to_string(),
+            ),
+            (
+                "CLAUDE_CODE_SESSION_ID".to_string(),
+                "native-session".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            resolve_claude_session_id(&unopted).as_deref(),
+            Some("native-session")
+        );
+        unopted.insert(
+            crate::hooks::common::NATIVE_PARTICIPATION_ENV.to_string(),
+            crate::hooks::common::NATIVE_CLAUDE_VALUE.to_string(),
+        );
+        assert_eq!(
+            resolve_claude_session_id(&unopted).as_deref(),
+            Some("native-session")
+        );
+        unopted.insert(
+            "CLAUDE_CODE_SESSION_ID".to_string(),
+            "fresh-child-session".to_string(),
+        );
+        assert_eq!(
+            resolve_claude_session_id(&unopted).as_deref(),
+            Some("fresh-child-session")
+        );
     }
 
     #[test]
@@ -1047,6 +1720,140 @@ mod tests {
             Some(rows[0].name.clone())
         );
         assert!(!home.join(".claude").join("settings.json").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn opted_in_native_claude_start_binds_a_claude_row_idempotently() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let env = HashMap::from([
+            ("CLAUDECODE".to_string(), "1".to_string()),
+            (
+                crate::hooks::common::NATIVE_PARTICIPATION_ENV.to_string(),
+                crate::hooks::common::NATIVE_CLAUDE_VALUE.to_string(),
+            ),
+            (
+                crate::hooks::common::NATIVE_CLAUDE_SESSION_ENV.to_string(),
+                "native-claude-session".to_string(),
+            ),
+        ]);
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp/native-claude"));
+
+        assert_eq!(start_bare(&db, &ctx, None).unwrap(), 0);
+        assert_eq!(start_bare(&db, &ctx, None).unwrap(), 0);
+        let rows = db.iter_instances_full().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, "claude");
+        assert_eq!(rows[0].session_id.as_deref(), Some("native-claude-session"));
+        assert_eq!(
+            db.get_session_binding("native-claude-session").unwrap(),
+            Some(rows[0].name.clone())
+        );
+        assert_eq!(
+            db.get_validated_claude_session_owner("native-claude-session")
+                .unwrap(),
+            Some(rows[0].name.clone())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn native_claude_start_rejects_foreign_live_or_stopped_binding_without_mutation() {
+        for status in ["active", "stopped"] {
+            let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+            let db = HcomDb::open().unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, session_id, tool, status, created_at)
+                     VALUES ('foreign-owner', 'foreign-session', 'hermes', ?1, ?2)",
+                    params![status, crate::shared::time::now_epoch_f64()],
+                )
+                .unwrap();
+            db.set_session_binding("foreign-session", "foreign-owner")
+                .unwrap();
+
+            let env = HashMap::from([
+                ("CLAUDECODE".to_string(), "1".to_string()),
+                (
+                    crate::hooks::common::NATIVE_PARTICIPATION_ENV.to_string(),
+                    crate::hooks::common::NATIVE_CLAUDE_VALUE.to_string(),
+                ),
+                (
+                    crate::hooks::common::NATIVE_CLAUDE_SESSION_ENV.to_string(),
+                    "foreign-session".to_string(),
+                ),
+            ]);
+            let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp/native-claude"));
+            let before = db.iter_instances_full().unwrap();
+            let error = start_bare(&db, &ctx, None).unwrap_err();
+
+            assert!(error.to_string().contains("bound to 'foreign-owner'"));
+            assert_eq!(db.iter_instances_full().unwrap().len(), before.len());
+            assert_eq!(
+                db.get_session_binding("foreign-session").unwrap(),
+                Some("foreign-owner".to_string())
+            );
+            assert_eq!(
+                db.get_validated_claude_session_owner("foreign-session")
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn native_claude_rebind_rejects_foreign_explicit_live_or_stopped_source() {
+        for stopped in [false, true] {
+            let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+            let db = HcomDb::open().unwrap();
+            let session = if stopped {
+                "native-session"
+            } else {
+                "foreign-session"
+            };
+            let env = HashMap::from([
+                ("CLAUDECODE".to_string(), "1".to_string()),
+                (
+                    crate::hooks::common::NATIVE_PARTICIPATION_ENV.to_string(),
+                    crate::hooks::common::NATIVE_CLAUDE_VALUE.to_string(),
+                ),
+                (
+                    crate::hooks::common::NATIVE_CLAUDE_SESSION_ENV.to_string(),
+                    session.to_string(),
+                ),
+            ]);
+            let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp/native-claude"));
+
+            if stopped {
+                log_stopped_snapshot(
+                    &db,
+                    "foreign-owner",
+                    "hermes",
+                    "/tmp/native-claude",
+                    "foreign-session",
+                    9,
+                );
+            } else {
+                db.conn()
+                    .execute(
+                        "INSERT INTO instances (name, session_id, tool, status, created_at)
+                         VALUES ('foreign-owner', 'foreign-session', 'hermes', 'active', ?1)",
+                        params![crate::shared::time::now_epoch_f64()],
+                    )
+                    .unwrap();
+                db.set_session_binding("foreign-session", "foreign-owner")
+                    .unwrap();
+            }
+
+            let before = db.iter_instances_full().unwrap();
+            let error =
+                start_rebind(&db, "native-target", &ctx, Some("foreign-owner")).unwrap_err();
+            assert!(error.to_string().contains("Refusing native Claude"));
+            assert_eq!(db.iter_instances_full().unwrap().len(), before.len());
+            assert!(db.get_instance_full("native-target").unwrap().is_none());
+        }
     }
 
     #[test]

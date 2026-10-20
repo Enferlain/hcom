@@ -2,3 +2,4 @@
 /bin/
 /.hcom/
 /node_modules/
+/.rebuild-artifacts/

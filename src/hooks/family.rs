@@ -24,7 +24,10 @@ pub fn extract_tool_detail(tool: &str, tool_name: &str, tool_input: &serde_json:
             .to_string();
     }
     let is_notebook_edit = tool_enum == Tool::Claude && tool_name == "NotebookEdit";
-    if detail.file.contains(&tool_name) || is_notebook_edit {
+    // Read approvals need the path for display and owner matching too. Keep
+    // Read out of the spec's write category used by collision filters.
+    let is_claude_read = tool_enum == Tool::Claude && tool_name == "Read";
+    if detail.file.contains(&tool_name) || is_notebook_edit || is_claude_read {
         return tool_input
             .get("file_path")
             .or_else(|| tool_input.get("filePath")) // opencode/kilo
