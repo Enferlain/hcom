@@ -189,42 +189,38 @@ pub enum ForkArgs {
 pub struct ResumeSpec {
     pub resume: ResumeArgs,
     pub fork: Option<ForkArgs>,
-    /// How the saved launch args combine with the resume args.
+    /// Where the resolved settings and session selector belong in the command.
     pub merge: ResumeMerge,
 }
 
-/// How `hcom r`/`hcom f` combines the saved launch args with the resume args
-/// (the session selector plus any extra args given to `hcom r`).
+/// Render the session selector and already-resolved arguments for `hcom r`/`hcom f`.
 #[derive(Debug, Clone, Copy)]
 pub enum ResumeMerge {
-    /// Saved args, then resume args. The tool resolves any conflict.
+    /// Resolved settings, then the session selector (before any `--` tail).
     Append,
-    /// Resume args, then the saved args that survive [`ResumeFlags`].
-    Flags(&'static ResumeFlags),
-    /// Tool-specific merger, for flags that only apply in a subcommand scope.
-    Custom(fn(&[String], &[String]) -> Vec<String>),
+    /// Session selector, then resolved settings.
+    Prepend,
 }
 
-/// Flag table for [`ResumeMerge::Flags`].
+/// Known option shapes for argument composition and saved-argument replay.
 ///
-/// Saved args lose every flag in `drop`, the launch prompt (when
-/// `positional_prompt`), and every non-repeatable flag the resume args also
-/// set, so a resume-time `--model` replaces the saved one. Arity comes from
-/// `value` and `multi_value`; any other flag is boolean, so a value flag
-/// missing from `value` would lose its value.
+/// Known non-repeatable options use the last occurrence across configured,
+/// saved, and explicit arguments. Unknown options and repeatable options stay
+/// in order for the tool to interpret. `drop` and `positional_prompt` apply only
+/// when inheriting an earlier launch, before explicit overrides are composed.
 #[derive(Debug)]
-pub struct ResumeFlags {
+pub struct ArgFlags {
     /// Flags that take one value: the next token, unless it is `--` or a flag
     /// in these tables (so `"- be terse"` is still a value).
     pub value: &'static [&'static str],
     /// Flags with an optional value or several values: they take the following
     /// tokens up to the next flag, even after `--flag=value`.
     pub multi_value: &'static [&'static str],
-    /// Flags that take no value. Only consulted with `extension_flags`.
+    /// Root subcommands that terminate optional or variadic option values.
+    /// Required single values can still equal a subcommand name.
+    pub subcommands: &'static [&'static str],
+    /// Flags that take no value.
     pub boolean: &'static [&'static str],
-    /// Extensions can register their own flags, so a flag in none of the
-    /// tables takes the next token as its value unless that token is a flag.
-    pub extension_flags: bool,
     /// Saved flags dropped with their values: session selectors, prompts, and
     /// cwd/worktree flags (hcom relaunches in the session's directory).
     pub drop: &'static [&'static str],
@@ -238,12 +234,12 @@ pub struct ResumeFlags {
     pub single_dash_long: bool,
 }
 
-impl ResumeFlags {
+impl ArgFlags {
     const EMPTY: Self = Self {
         value: &[],
         multi_value: &[],
+        subcommands: &[],
         boolean: &[],
-        extension_flags: false,
         drop: &[],
         repeatable: &[],
         aliases: &[],
@@ -313,6 +309,8 @@ pub struct IntegrationSpec {
     pub hooks: HooksSpec,
     pub gates: GatesSpec,
     pub launch: LaunchSpec,
+    /// Known argument shapes shared by launch composition and saved-argument replay.
+    pub args: &'static ArgFlags,
     pub resume: Option<ResumeSpec>,
     pub help: HelpSpec,
     pub status_detail: StatusDetailSpec,
@@ -568,8 +566,233 @@ const QODER_HELP_EXAMPLES: &[HelpEntry] = &[
 // Taken from each CLI's own option parser or `--help`. A value flag missing
 // here loses its value on resume, so keep `value` complete.
 
+/// These are composition hints, not validators: upstream flags not listed here
+/// still pass through. Config overrides remain ordered/repeatable.
+static CODEX_ARG_FLAGS: ArgFlags = ArgFlags {
+    value: &[
+        "--model",
+        "--sandbox",
+        "--profile",
+        "--ask-for-approval",
+        "--cd",
+        "--config",
+        "--image",
+        "--add-dir",
+        "--enable",
+        "--disable",
+        "--local-provider",
+        "--remote",
+        "--remote-auth-token-env",
+    ],
+    boolean: &[
+        "--oss",
+        "--search",
+        "--no-alt-screen",
+        "--no-daemon",
+        "--strict-config",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "--approve-for-me",
+        "--worktree",
+        "--help",
+        "--version",
+        "--last",
+        "--all",
+        "--include-non-interactive",
+    ],
+    repeatable: &["--config", "--image", "--add-dir", "--enable", "--disable"],
+    aliases: &[
+        ("-m", "--model"),
+        ("-s", "--sandbox"),
+        ("-p", "--profile"),
+        ("-a", "--ask-for-approval"),
+        ("-C", "--cd"),
+        ("-c", "--config"),
+        ("-i", "--image"),
+        ("-h", "--help"),
+        ("-V", "--version"),
+        ("--yolo", "--dangerously-bypass-approvals-and-sandbox"),
+        ("--not-so-yolo", "--approve-for-me"),
+    ],
+    drop: &[
+        "--cd",
+        "--image",
+        "--worktree",
+        "--last",
+        "--all",
+        "--include-non-interactive",
+    ],
+    positional_prompt: true,
+    ..ArgFlags::EMPTY
+};
+
+static CLAUDE_ARG_FLAGS: ArgFlags = ArgFlags {
+    value: &[
+        "--model",
+        "--fallback-model",
+        "--effort",
+        "--permission-mode",
+        "--system-prompt",
+        "--append-system-prompt",
+        "--system-prompt-file",
+        "--append-system-prompt-file",
+        "--settings",
+        "--setting-sources",
+        "--agent",
+        "--agents",
+        "--output-format",
+        "--input-format",
+        "--json-schema",
+        "--name",
+        "--session-id",
+        "--max-budget-usd",
+        "--plugin-dir",
+    ],
+    multi_value: &[
+        "--resume",
+        "--worktree",
+        "--debug",
+        "--add-dir",
+        "--allowed-tools",
+        "--disallowed-tools",
+        "--tools",
+        "--mcp-config",
+        "--betas",
+    ],
+    boolean: &[
+        "--continue",
+        "--fork-session",
+        "--print",
+        "--verbose",
+        "--dangerously-skip-permissions",
+        "--allow-dangerously-skip-permissions",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+        "--help",
+        "--version",
+    ],
+    repeatable: &["--add-dir", "--mcp-config", "--plugin-dir", "--betas"],
+    aliases: &[
+        ("-r", "--resume"),
+        ("-c", "--continue"),
+        ("-p", "--print"),
+        ("-n", "--name"),
+        ("-w", "--worktree"),
+        ("-d", "--debug"),
+        ("-h", "--help"),
+        ("-v", "--version"),
+        ("--allowedTools", "--allowed-tools"),
+        ("--disallowedTools", "--disallowed-tools"),
+    ],
+    drop: &[
+        "--resume",
+        "--continue",
+        "--fork-session",
+        "--session-id",
+        "--worktree",
+    ],
+    positional_prompt: true,
+    ..ArgFlags::EMPTY
+};
+
+static GEMINI_ARG_FLAGS: ArgFlags = ArgFlags {
+    value: &[
+        "--model",
+        "--prompt",
+        "--prompt-interactive",
+        "--approval-mode",
+        "--output-format",
+        "--resume",
+        "--session-id",
+        "--session-file",
+    ],
+    multi_value: &[
+        "--worktree",
+        "--include-directories",
+        "--extensions",
+        "--allowed-tools",
+        "--allowed-mcp-server-names",
+        "--policy",
+        "--admin-policy",
+    ],
+    boolean: &["--debug", "--sandbox", "--yolo", "--help", "--version"],
+    repeatable: &[
+        "--include-directories",
+        "--extensions",
+        "--allowed-tools",
+        "--allowed-mcp-server-names",
+        "--policy",
+        "--admin-policy",
+    ],
+    aliases: &[
+        ("-m", "--model"),
+        ("-p", "--prompt"),
+        ("-i", "--prompt-interactive"),
+        ("-r", "--resume"),
+        ("-e", "--extensions"),
+        ("-d", "--debug"),
+        ("-w", "--worktree"),
+        ("-o", "--output-format"),
+        ("-s", "--sandbox"),
+        ("-y", "--yolo"),
+        ("-h", "--help"),
+        ("-v", "--version"),
+    ],
+    drop: &[
+        "--resume",
+        "--prompt",
+        "--prompt-interactive",
+        "--worktree",
+        "--session-id",
+        "--session-file",
+    ],
+    positional_prompt: true,
+    ..ArgFlags::EMPTY
+};
+
+static HERMES_ARG_FLAGS: ArgFlags = ArgFlags {
+    value: &[
+        "--profile",
+        "--model",
+        "--provider",
+        "--toolsets",
+        "--skills",
+        "--resume",
+        "--in",
+        "--reasoning",
+        "--query",
+        "--query-file",
+        "--image",
+        "--format",
+        "--max-turns",
+        "--run-budget",
+        "--source",
+        "--usage-file",
+    ],
+    multi_value: &["--continue"],
+    subcommands: &["chat"],
+    boolean: &["--tui", "--yolo", "--help", "--version"],
+    aliases: &[
+        ("-p", "--profile"),
+        ("-m", "--model"),
+        ("-t", "--toolsets"),
+        ("-s", "--skills"),
+        ("-r", "--resume"),
+        ("-q", "--query"),
+        ("-c", "--continue"),
+    ],
+    drop: &[
+        "--resume",
+        "--continue",
+        "--query",
+        "--query-file",
+        "--image",
+    ],
+    ..ArgFlags::EMPTY
+};
+
 /// OpenCode and Kilo (yargs). The positional is the project dir, not a prompt.
-static OPENCODE_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+static OPENCODE_RESUME_FLAGS: ArgFlags = ArgFlags {
     value: &[
         "--log-level",
         "--port",
@@ -594,11 +817,11 @@ static OPENCODE_RESUME_FLAGS: ResumeFlags = ResumeFlags {
     ],
     repeatable: &["--cors"],
     aliases: &[("-m", "--model"), ("-s", "--session"), ("-c", "--continue")],
-    ..ResumeFlags::EMPTY
+    ..ArgFlags::EMPTY
 };
 
 /// Antigravity (Go `flag`).
-static ANTIGRAVITY_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+static ANTIGRAVITY_RESUME_FLAGS: ArgFlags = ArgFlags {
     value: &[
         "--add-dir",
         "--agent",
@@ -631,11 +854,11 @@ static ANTIGRAVITY_RESUME_FLAGS: ResumeFlags = ResumeFlags {
         ("-p", "--print"),
     ],
     single_dash_long: true,
-    ..ResumeFlags::EMPTY
+    ..ArgFlags::EMPTY
 };
 
 /// Cursor (commander). Print flags stay: the launcher rejects them loudly.
-static CURSOR_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+static CURSOR_RESUME_FLAGS: ArgFlags = ArgFlags {
     value: &[
         "--api-key",
         "--header",
@@ -667,11 +890,11 @@ static CURSOR_RESUME_FLAGS: ResumeFlags = ResumeFlags {
         ("-w", "--worktree"),
     ],
     positional_prompt: true,
-    ..ResumeFlags::EMPTY
+    ..ArgFlags::EMPTY
 };
 
 /// Kimi. `--agent`/`--agent-file` cannot be combined with `--session`.
-static KIMI_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+static KIMI_RESUME_FLAGS: ArgFlags = ArgFlags {
     value: &[
         "--model",
         "--prompt",
@@ -697,11 +920,11 @@ static KIMI_RESUME_FLAGS: ResumeFlags = ResumeFlags {
         ("-p", "--prompt"),
         ("-y", "--yolo"),
     ],
-    ..ResumeFlags::EMPTY
+    ..ArgFlags::EMPTY
 };
 
 /// Pi. The initial prompt is positional.
-static PI_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+static PI_RESUME_FLAGS: ArgFlags = ArgFlags {
     boolean: &[
         "--print",
         "--continue",
@@ -722,7 +945,6 @@ static PI_RESUME_FLAGS: ResumeFlags = ResumeFlags {
         "--help",
         "--version",
     ],
-    extension_flags: true,
     value: &[
         "--provider",
         "--model",
@@ -783,11 +1005,11 @@ static PI_RESUME_FLAGS: ResumeFlags = ResumeFlags {
         ("-na", "--no-approve"),
     ],
     positional_prompt: true,
-    ..ResumeFlags::EMPTY
+    ..ArgFlags::EMPTY
 };
 
 /// OMP (`cli/flag-tables.ts`). The initial prompt is positional.
-static OMP_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+static OMP_RESUME_FLAGS: ArgFlags = ArgFlags {
     boolean: &[
         "--help",
         "--version",
@@ -813,7 +1035,6 @@ static OMP_RESUME_FLAGS: ResumeFlags = ResumeFlags {
         "--auto-approve",
         "--yolo",
     ],
-    extension_flags: true,
     value: &[
         "--cwd",
         "--config",
@@ -881,11 +1102,11 @@ static OMP_RESUME_FLAGS: ResumeFlags = ResumeFlags {
         ("-p", "--print"),
     ],
     positional_prompt: true,
-    ..ResumeFlags::EMPTY
+    ..ArgFlags::EMPTY
 };
 
 /// Copilot (commander). Saved permission flags are dropped.
-static COPILOT_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+static COPILOT_RESUME_FLAGS: ArgFlags = ArgFlags {
     value: &[
         "--interactive",
         "--prompt",
@@ -967,11 +1188,11 @@ static COPILOT_RESUME_FLAGS: ResumeFlags = ResumeFlags {
         ("-s", "--silent"),
     ],
     positional_prompt: true,
-    ..ResumeFlags::EMPTY
+    ..ArgFlags::EMPTY
 };
 
 /// Qoder. `--tools` takes every value up to the next flag.
-static QODER_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+static QODER_RESUME_FLAGS: ArgFlags = ArgFlags {
     value: &[
         "--model",
         "--reasoning-effort",
@@ -1032,11 +1253,11 @@ static QODER_RESUME_FLAGS: ResumeFlags = ResumeFlags {
         ("-w", "--cwd"),
     ],
     positional_prompt: true,
-    ..ResumeFlags::EMPTY
+    ..ArgFlags::EMPTY
 };
 
 /// Grok (clap, which rejects a repeated singular flag). `--worktree` takes an optional value.
-static GROK_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+static GROK_RESUME_FLAGS: ArgFlags = ArgFlags {
     value: &[
         "--model",
         "--rules",
@@ -1090,7 +1311,7 @@ static GROK_RESUME_FLAGS: ResumeFlags = ResumeFlags {
         ("-c", "--continue"),
     ],
     positional_prompt: true,
-    ..ResumeFlags::EMPTY
+    ..ArgFlags::EMPTY
 };
 
 // ── Per-tool integration constants ──────────────────────────────────────
@@ -1153,6 +1374,7 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
         max_launch_count: 100,
         background: BackgroundMode::NativePrint,
     },
+    args: &CLAUDE_ARG_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         fork: Some(ForkArgs::AppendFlag("--fork-session")),
@@ -1214,6 +1436,7 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &GEMINI_ARG_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         fork: None,
@@ -1284,10 +1507,11 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &CODEX_ARG_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Subcommand("resume"),
         fork: Some(ForkArgs::Subcommand("fork")),
-        merge: ResumeMerge::Custom(crate::commands::resume::merge_codex_resume_args),
+        merge: ResumeMerge::Prepend,
     }),
     help: HelpSpec {
         unique_examples: CODEX_HELP_EXAMPLES,
@@ -1348,10 +1572,11 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &OPENCODE_RESUME_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--session"),
         fork: Some(ForkArgs::AppendFlag("--fork")),
-        merge: ResumeMerge::Flags(&OPENCODE_RESUME_FLAGS),
+        merge: ResumeMerge::Prepend,
     }),
     help: HelpSpec {
         unique_examples: OPENCODE_HELP_EXAMPLES,
@@ -1417,10 +1642,11 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &OPENCODE_RESUME_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--session"),
         fork: Some(ForkArgs::AppendFlag("--fork")),
-        merge: ResumeMerge::Flags(&OPENCODE_RESUME_FLAGS),
+        merge: ResumeMerge::Prepend,
     }),
     help: HelpSpec {
         unique_examples: KILO_HELP_EXAMPLES,
@@ -1479,10 +1705,11 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &ANTIGRAVITY_RESUME_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--conversation"),
         fork: None,
-        merge: ResumeMerge::Flags(&ANTIGRAVITY_RESUME_FLAGS),
+        merge: ResumeMerge::Prepend,
     }),
     help: HelpSpec {
         // Help lookup uses "agy" externally; the agy unique examples document
@@ -1550,6 +1777,7 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &CURSOR_RESUME_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         // O2: cursor-agent has no native fork/branch primitive (only `--resume`
@@ -1557,7 +1785,7 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
         // simulating fork via resume+create-chat is deferred (not needed for
         // parity).
         fork: None,
-        merge: ResumeMerge::Flags(&CURSOR_RESUME_FLAGS),
+        merge: ResumeMerge::Prepend,
     }),
     help: HelpSpec {
         unique_examples: CURSOR_HELP_EXAMPLES,
@@ -1624,6 +1852,7 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &KIMI_RESUME_FLAGS,
     resume: Some(ResumeSpec {
         // Use --session as it is the documented flag in kimi --help.
         resume: ResumeArgs::Flag("--session"),
@@ -1631,7 +1860,7 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
         // command only (`kimi --fork` errors "unknown option"). Like
         // gemini/cursor/agy, leave fork unsupported.
         fork: None,
-        merge: ResumeMerge::Flags(&KIMI_RESUME_FLAGS),
+        merge: ResumeMerge::Prepend,
     }),
     help: HelpSpec {
         unique_examples: KIMI_HELP_EXAMPLES,
@@ -1700,6 +1929,7 @@ pub static PI: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &PI_RESUME_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--session"),
         // Pi's `--fork <id>` takes the session id as its value and is mutually
@@ -1708,7 +1938,7 @@ pub static PI: IntegrationSpec = IntegrationSpec {
         // `["--fork", <id>]` (replacing `--session`), not `["--session", <id>,
         // "--fork"]` which pi rejects.
         fork: Some(ForkArgs::Subcommand("--fork")),
-        merge: ResumeMerge::Flags(&PI_RESUME_FLAGS),
+        merge: ResumeMerge::Prepend,
     }),
     help: HelpSpec {
         unique_examples: PI_HELP_EXAMPLES,
@@ -1781,6 +2011,7 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &OMP_RESUME_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         // Top-level `omp --help` omits `--fork`, but the flag is real: it has
@@ -1792,7 +2023,7 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
         // `["--fork", <id>]` (replacing `--resume`), not `["--resume", <id>,
         // "--fork"]`. Must not degrade `hcom f` into a plain `--resume`.
         fork: Some(ForkArgs::Subcommand("--fork")),
-        merge: ResumeMerge::Flags(&OMP_RESUME_FLAGS),
+        merge: ResumeMerge::Prepend,
     }),
     help: HelpSpec {
         unique_examples: OMP_HELP_EXAMPLES,
@@ -1860,11 +2091,12 @@ pub static HERMES: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &HERMES_ARG_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         // Hermes has no fork flag (only an interactive /branch).
         fork: None,
-        merge: ResumeMerge::Custom(crate::tools::hermes_preprocessing::merge_resume_args),
+        merge: ResumeMerge::Append,
     }),
     help: HelpSpec {
         unique_examples: HERMES_HELP_EXAMPLES,
@@ -1922,10 +2154,11 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &COPILOT_RESUME_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         fork: None,
-        merge: ResumeMerge::Flags(&COPILOT_RESUME_FLAGS),
+        merge: ResumeMerge::Prepend,
     }),
     help: HelpSpec {
         unique_examples: COPILOT_HELP_EXAMPLES,
@@ -1995,10 +2228,11 @@ pub static QODER: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &QODER_RESUME_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         fork: Some(ForkArgs::AppendFlag("--fork-session")),
-        merge: ResumeMerge::Flags(&QODER_RESUME_FLAGS),
+        merge: ResumeMerge::Prepend,
     }),
     help: HelpSpec {
         unique_examples: QODER_HELP_EXAMPLES,
@@ -2061,10 +2295,11 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
         max_launch_count: 10,
         background: BackgroundMode::HeadlessPty,
     },
+    args: &GROK_RESUME_FLAGS,
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         fork: Some(ForkArgs::AppendFlag("--fork-session")),
-        merge: ResumeMerge::Flags(&GROK_RESUME_FLAGS),
+        merge: ResumeMerge::Prepend,
     }),
     help: HelpSpec {
         unique_examples: GROK_HELP_EXAMPLES,
@@ -2119,6 +2354,7 @@ pub static ADHOC: IntegrationSpec = IntegrationSpec {
         max_launch_count: 0,
         background: BackgroundMode::Unsupported,
     },
+    args: &ArgFlags::EMPTY,
     resume: None,
     help: HelpSpec {
         unique_examples: &[],
@@ -2385,16 +2621,15 @@ mod tests {
                 .resume
                 .as_ref()
                 .unwrap_or_else(|| panic!("{}: missing resume spec", spec.name));
-            let ResumeMerge::Flags(flags) = resume.merge else {
-                continue;
-            };
+            let flags = spec.args;
             let selectors = [
                 match resume.resume {
                     ResumeArgs::Flag(flag) => Some(flag),
                     ResumeArgs::Subcommand(_) => None,
                 },
                 match resume.fork {
-                    Some(ForkArgs::AppendFlag(flag) | ForkArgs::Subcommand(flag)) => Some(flag),
+                    Some(ForkArgs::AppendFlag(flag)) => Some(flag),
+                    Some(ForkArgs::Subcommand(_)) => None,
                     None => None,
                 },
             ];

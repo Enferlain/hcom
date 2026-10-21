@@ -1213,7 +1213,7 @@ pub fn config_help(key: &str) -> Option<String> {
         .find(|s| s.launch.args_env == Some(key))
     {
         return Some(format!(
-            "{key} - Default args passed to {} on launch\n\nSet:   hcom config {}_args \"<args>\"\nClear: hcom config {}_args \"\"\n\nPrepended to launch-time cli args.",
+            "{key} - Default args passed to {} on launch\n\nSet:   hcom config {}_args \"<args>\"\nClear: hcom config {}_args \"\"\n\nExplicit CLI arguments replace known singleton defaults (including aliases). Other arguments pass through in order.",
             spec.cli_binary, spec.name, spec.name
         ));
     }

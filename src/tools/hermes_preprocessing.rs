@@ -97,41 +97,15 @@ pub fn with_chat_subcommand(mut args: Vec<String>) -> Vec<String> {
     args
 }
 
-/// Replay the original launch's args with `resume` (`--resume <id>`), minus
-/// the session selector and seed prompt they carried.
-pub fn merge_resume_args(original: &[String], resume: &[String]) -> Vec<String> {
-    let mut merged = Vec::new();
-    let mut args = original.iter().peekable();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-r" | "--resume" | "-q" | "--query" | "--query-file" => {
-                args.next();
-            }
-            // `-c [NAME]`: the name is optional.
-            "-c" | "--continue" => {
-                args.next_if(|next| !next.starts_with('-') && *next != "chat");
-            }
-            a if [
-                "--resume=",
-                "-r=",
-                "--query=",
-                "-q=",
-                "--query-file=",
-                "--continue=",
-                "-c=",
-            ]
-            .iter()
-            .any(|prefix| a.starts_with(prefix)) => {}
-            _ => merged.push(arg.clone()),
-        }
-    }
-    merged.extend_from_slice(resume);
-    merged
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn merge_resume_args(original: &[String], resume: &[String]) -> Vec<String> {
+        use crate::tools::argument_overrides::{override_args, saved_args};
+        let inherited = saved_args(crate::tool::Tool::Hermes, original);
+        override_args(crate::tool::Tool::Hermes, &inherited, resume)
+    }
 
     fn sv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()

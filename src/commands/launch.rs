@@ -435,7 +435,7 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
         }
         if !env_args.is_empty() && !preview.args.is_empty() {
             println!(
-                "  (config args are passed first, then CLI args; the tool resolves duplicates)"
+                "  (CLI overrides known singleton defaults; other args pass through in order)"
             );
         }
     }
@@ -562,9 +562,9 @@ fn parse_launch_argv(argv: &[String]) -> Result<(usize, String, HcomLaunchFlags,
     Ok((count, tool, flags, tool_args))
 }
 
-/// Merge env config args with CLI args via tool-specific parsers.
-fn append_config_args(config_args: &str, cli_args: &[String]) -> Vec<String> {
-    let mut tokens = if config_args.is_empty() {
+/// Split configured defaults before composing explicit arguments.
+fn config_arg_tokens(config_args: &str) -> Vec<String> {
+    if config_args.is_empty() {
         Vec::new()
     } else {
         // Don't silently drop hand-edited config args on a parse error (e.g. an
@@ -574,9 +574,7 @@ fn append_config_args(config_args: &str, cli_args: &[String]) -> Vec<String> {
             eprintln!("hcom: ignoring malformed configured args ({err}): {config_args}");
             Vec::new()
         })
-    };
-    tokens.extend(cli_args.iter().cloned());
-    tokens
+    }
 }
 
 pub(crate) fn merge_tool_args(
@@ -584,7 +582,11 @@ pub(crate) fn merge_tool_args(
     cli_args: &[String],
     config: &HcomConfig,
 ) -> Vec<String> {
-    append_config_args(config.tool_args(tool.tool()), cli_args)
+    crate::tools::argument_overrides::override_args(
+        tool.tool(),
+        &config_arg_tokens(config.tool_args(tool.tool())),
+        cli_args,
+    )
 }
 
 fn args_contain_any(args: &[String], needles: &[&str]) -> bool {
@@ -1042,6 +1044,36 @@ mod tests {
     #[test]
     fn test_parse_launch_argv_empty_fails() {
         assert!(parse_launch_argv(&[]).is_err());
+    }
+
+    #[test]
+    fn explicit_args_override_configured_singletons_and_preserve_config_overrides() {
+        let mut config = HcomConfig::default();
+        config
+            .set_field("codex_args", "-m old -s read-only -c key=1")
+            .unwrap();
+        assert_eq!(
+            merge_tool_args(
+                &lt("codex"),
+                &s(&[
+                    "--model=new",
+                    "--sandbox",
+                    "workspace-write",
+                    "--config",
+                    "key=2"
+                ]),
+                &config
+            ),
+            s(&[
+                "-c",
+                "key=1",
+                "--model=new",
+                "--sandbox",
+                "workspace-write",
+                "--config",
+                "key=2"
+            ])
+        );
     }
 
     #[test]

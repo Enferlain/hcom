@@ -500,17 +500,9 @@ fn prepare_resume_plan_from_source(
     } else {
         Vec::new()
     };
-    let mut persisted_args = original_args.clone();
-    persisted_args.extend(clean_extra.iter().cloned());
-
-    let mut cli_tool_args = build_resume_args(tool, &session_id, fork);
-    cli_tool_args.extend(clean_extra);
-
-    let merged_cli_args = if !original_args.is_empty() {
-        merge_resume_args(tool, &original_args, &cli_tool_args)
-    } else {
-        cli_tool_args
-    };
+    let session_args = build_resume_args(tool, &session_id, fork);
+    let (persisted_args, merged_cli_args) =
+        compose_resume_args(tool, &original_args, &session_args, &clean_extra);
 
     let mut merged_args = merged_cli_args.clone();
 
@@ -1102,162 +1094,29 @@ fn build_resume_args(tool: Tool, session_id: &str, fork: bool) -> Vec<String> {
     args
 }
 
-/// Merge original launch args with resume-specific args, per the tool's
-/// [`ResumeMerge`](crate::integration_spec::ResumeMerge).
-fn merge_resume_args(tool: Tool, original: &[String], resume: &[String]) -> Vec<String> {
-    use crate::integration_spec::ResumeMerge;
-    let merge = tool
-        .spec()
-        .resume
-        .as_ref()
-        .expect("resume tool must have a resume spec")
-        .merge;
-    match merge {
-        ResumeMerge::Append => [original, resume].concat(),
-        ResumeMerge::Flags(flags) => merge_with_flags(flags, original, resume),
-        ResumeMerge::Custom(merge) => merge(original, resume),
-    }
-}
-
-/// Resume args first, then the saved args minus dropped flags, the launch
-/// prompt, and singular flags the resume args set again.
-fn merge_with_flags(
-    flags: &crate::integration_spec::ResumeFlags,
+/// Resolve reusable settings once, then render the session operation from the
+/// same settings that will be persisted. Session controls never enter the saved
+/// argv, and explicit prompts/cwd flags survive for this invocation.
+fn compose_resume_args(
+    tool: Tool,
     original: &[String],
-    resume: &[String],
-) -> Vec<String> {
-    let is_flag = |t: &str| t.len() > 1 && t.starts_with('-');
-    // Canonical name (long form, no `=value`) and whether the value is inline.
-    let key = |token: &str| -> (String, bool) {
-        let (name, inline) = match token.split_once('=') {
-            Some((name, _)) => (name, true),
-            None => (token, false),
-        };
-        let name = match name.trim_start_matches('-') {
-            bare if flags.single_dash_long && bare.len() > 1 => format!("--{bare}"),
-            bare if flags.single_dash_long => format!("-{bare}"),
-            _ => name.to_string(),
-        };
-        let name = flags
-            .aliases
-            .iter()
-            .find(|(short, _)| *short == name)
-            .map_or(name, |(_, long)| long.to_string());
-        (name, inline)
+    session: &[String],
+    extra: &[String],
+) -> (Vec<String>, Vec<String>) {
+    use crate::integration_spec::ResumeMerge;
+    use crate::tools::argument_overrides::{override_args, saved_args};
+    let inherited = saved_args(tool, original);
+    let resolved = override_args(tool, &inherited, extra);
+    let merge = tool.spec().resume.as_ref().expect("resume spec").merge;
+    let command = match merge {
+        ResumeMerge::Append => {
+            let mut command = resolved.clone();
+            crate::hooks::runtime::insert_before_separator(&mut command, session.iter().cloned());
+            command
+        }
+        ResumeMerge::Prepend => [session, resolved.as_slice()].concat(),
     };
-    let is_known_flag = |token: &str| {
-        let name = key(token).0;
-        let tables = [
-            flags.value,
-            flags.multi_value,
-            flags.boolean,
-            flags.drop,
-            flags.repeatable,
-        ];
-        is_flag(token) && tables.iter().any(|t| t.contains(&name.as_str()))
-    };
-    // Index just past `args[i]` and its values.
-    let flag_end = |args: &[String], i: usize, name: &str, inline: bool| -> usize {
-        let takes = |end: usize| end < args.len() && !is_flag(&args[end]);
-        let mut end = i + 1;
-        if flags.multi_value.contains(&name) {
-            while takes(end) {
-                end += 1;
-            }
-        } else if !inline && flags.value.contains(&name) {
-            // A required value may start with `-` ("- be terse"); only `--`
-            // or a flag this table knows means the value is missing.
-            if end < args.len() && args[end] != "--" && !is_known_flag(&args[end]) {
-                end += 1;
-            }
-        } else if !inline
-            && flags.extension_flags
-            && !flags.boolean.contains(&name)
-            && !flags.drop.contains(&name)
-            && takes(end)
-        {
-            end += 1;
-        }
-        end
-    };
-
-    let mut resume_set = std::collections::HashSet::new();
-    let mut i = 0;
-    while i < resume.len() && resume[i] != "--" {
-        if is_flag(&resume[i]) {
-            let (name, inline) = key(&resume[i]);
-            let end = flag_end(resume, i, &name, inline);
-            if !flags.repeatable.contains(&name.as_str()) {
-                resume_set.insert(name);
-            }
-            i = end;
-        } else {
-            i += 1;
-        }
-    }
-
-    let mut merged = resume.to_vec();
-    let mut i = 0;
-    while i < original.len() {
-        let token = &original[i];
-        if token == "--" {
-            if !flags.positional_prompt {
-                merged.extend_from_slice(&original[i..]);
-            }
-            break;
-        }
-        if !is_flag(token) {
-            if !flags.positional_prompt {
-                merged.push(token.clone());
-            }
-            i += 1;
-            continue;
-        }
-        let (name, inline) = key(token);
-        let end = flag_end(original, i, &name, inline);
-        if !flags.drop.contains(&name.as_str()) && !resume_set.contains(&name) {
-            merged.extend_from_slice(&original[i..end]);
-        }
-        i = end;
-    }
-    merged
-}
-
-/// Keep ordinary flags at the root, but replay config overrides after the
-/// session selector. Extra resume overrides follow saved overrides so Codex
-/// resolves precedence itself. Moving all flags would put saved and new
-/// singular options (such as --model) in one clap scope, where they conflict.
-pub(crate) fn merge_codex_resume_args(original: &[String], resume: &[String]) -> Vec<String> {
-    let mut root = Vec::new();
-    let mut config = Vec::new();
-    let mut i = 0;
-    while i < original.len() {
-        let token = &original[i];
-        if token == "--" {
-            root.extend_from_slice(&original[i..]);
-            break;
-        }
-        if matches!(token.as_str(), "-c" | "--config") {
-            config.push(token.clone());
-            i += 1;
-            if let Some(value) = original.get(i) {
-                config.push(value.clone());
-                i += 1;
-            }
-        } else {
-            if (token.starts_with("-c") && token.len() > 2) || token.starts_with("--config=") {
-                config.push(token.clone());
-            } else {
-                root.push(token.clone());
-            }
-            i += 1;
-        }
-    }
-    // hcom constructs this pair with build_resume_args.
-    root.extend_from_slice(&resume[..2]);
-    root.extend(config);
-    root.extend_from_slice(&resume[2..]);
-    root
+    (resolved, command)
 }
 
 // ── Thread-name resolution ───────────────────────────────────────────────
@@ -2063,6 +1922,20 @@ fn build_adopt_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Existing fixtures supply the operation selector and overrides together.
+    fn merge_resume_args(tool: Tool, original: &[String], resume: &[String]) -> Vec<String> {
+        let end = if matches!(
+            resume.get(2).map(String::as_str),
+            Some("--fork-session" | "--fork")
+        ) {
+            3
+        } else {
+            2
+        };
+        compose_resume_args(tool, original, &resume[..end], &resume[end..]).1
+    }
+
     use crate::db::HcomDb;
 
     fn s(items: &[&str]) -> Vec<String> {
@@ -2257,6 +2130,87 @@ mod tests {
     }
 
     #[test]
+    fn resume_and_fork_reuse_the_resolved_settings_without_growth() {
+        let mut saved = s(&["-m", "old", "-s", "read-only", "--model", "stale"]);
+        for (fork, extra, expected_model) in [
+            (
+                false,
+                s(&["--model", "new", "--sandbox=workspace-write"]),
+                "new",
+            ),
+            (false, s(&["-m", "new", "-s", "workspace-write"]), "new"),
+            (true, vec![], "new"),
+            (false, vec![], "new"),
+        ] {
+            let session = build_resume_args(Tool::Codex, "session-id", fork);
+            let (persisted, command) = compose_resume_args(Tool::Codex, &saved, &session, &extra);
+            let model_at = persisted
+                .iter()
+                .position(|s| s == "-m" || s == "--model")
+                .unwrap();
+            assert_eq!(persisted[model_at + 1], expected_model);
+            assert!(
+                persisted.len() <= 4,
+                "singletons must not accumulate: {persisted:?}"
+            );
+            assert!(
+                !persisted
+                    .iter()
+                    .any(|s| s == "resume" || s == "fork" || s == "session-id")
+            );
+            let mut expected = session;
+            expected.extend(persisted.clone());
+            assert_eq!(
+                command, expected,
+                "execution and persistence must use the same settings"
+            );
+            saved = persisted;
+        }
+    }
+
+    #[test]
+    fn resume_plan_repairs_poisoned_snapshot_and_keeps_explicit_prompt() {
+        let db = test_db();
+        db.log_event(
+            "life",
+            "memo",
+            &json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": "codex", "session_id": "old-session",
+                    "launch_args": serde_json::to_string(&s(&[
+                        "-m", "old", "--model", "new", "--", "old prompt"
+                    ])).unwrap(),
+                }
+            }),
+        )
+        .unwrap();
+        let plan = prepare_resume_plan(
+            &db,
+            "memo",
+            false,
+            &s(&["--", "--", "new prompt"]),
+            &GlobalFlags::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.launch.persisted_args.unwrap(),
+            s(&["--model", "new", "--", "new prompt"])
+        );
+        assert_eq!(
+            plan.launch.args,
+            s(&[
+                "resume",
+                "old-session",
+                "--model",
+                "new",
+                "--",
+                "new prompt"
+            ])
+        );
+    }
+
+    #[test]
     fn test_build_resume_args_claude_fork() {
         let args = build_resume_args(Tool::Claude, "sess-123", true);
         assert_eq!(args, s(&["--resume", "sess-123", "--fork-session"]));
@@ -2322,13 +2276,11 @@ mod tests {
             assert_eq!(
                 merged,
                 s(&[
-                    "--model",
-                    "gpt-6-luna",
-                    "--yolo",
                     if fork { "fork" } else { "resume" },
                     "session-id",
                     "-c",
                     "model_reasoning_effort=\"low\"",
+                    "--yolo",
                     "--config=service_tier=\"fast\"",
                     "-c=features.foo=true",
                     "-cfeatures.bar=false",
@@ -2849,15 +2801,14 @@ mod tests {
             s(&[
                 "--resume",
                 "sid",
+                // Saved repeatables precede explicit repeatables.
+                "-H",
+                "X-Baked: 1",
+                "--force",
                 "--model",
                 "x",
                 "-H",
                 "X-Resume: 1",
-                // baked --model y dropped (resume wins); -H kept (repeatable);
-                // --force preserved.
-                "-H",
-                "X-Baked: 1",
-                "--force",
             ])
         );
     }
@@ -2882,7 +2833,6 @@ mod tests {
             s(&[
                 "--resume",
                 "sid",
-                "-p",
                 "--print",
                 "--stream-partial-output",
                 "--model",
@@ -3139,7 +3089,7 @@ mod tests {
         );
         assert_eq!(
             merged,
-            s(&["--session", "ses_1", "--model", "new/model", "proj"])
+            s(&["--session", "ses_1", "proj", "--model", "new/model"])
         );
         let merged = merge_resume_args(
             Tool::Kimi,
@@ -3151,12 +3101,12 @@ mod tests {
             s(&[
                 "--session",
                 "sid",
+                "--add-dir",
+                "a",
                 "-m",
                 "k3",
                 "--add-dir",
-                "b",
-                "--add-dir",
-                "a"
+                "b"
             ])
         );
     }
@@ -3178,10 +3128,10 @@ mod tests {
             s(&[
                 "--resume",
                 "sid",
-                "--append-system-prompt",
-                "New rules",
                 "--model",
-                "m"
+                "m",
+                "--append-system-prompt",
+                "New rules"
             ])
         );
     }
@@ -3233,7 +3183,7 @@ mod tests {
         );
         assert_eq!(
             merged,
-            s(&["--conversation", "c2", "--model", "new", "--sandbox"])
+            s(&["--conversation", "c2", "--sandbox", "--model", "new"])
         );
     }
 
@@ -4041,7 +3991,7 @@ mod tests {
             assert_eq!(
                 merge_resume_args(Tool::Qoder, &original, &resume),
                 s(&[
-                    "--resume", "sid", "--tools", "Bash", "Write", "--model", "m"
+                    "--resume", "sid", "--model", "m", "--tools", "Bash", "Write"
                 ])
             );
         }
@@ -4075,10 +4025,10 @@ mod tests {
             s(&[
                 "--resume",
                 "sess-abc",
-                "--cwd",
-                "elsewhere",
                 "--model",
-                "Qwen3.8-Flash"
+                "Qwen3.8-Flash",
+                "--cwd",
+                "elsewhere"
             ])
         );
     }

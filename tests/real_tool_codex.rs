@@ -366,3 +366,149 @@ fn real_codex_approval_gate_blocks_pending_message_then_clears_on_approval() {
         });
     }
 }
+
+/// Issue #173: overrides must survive several generations without accumulating
+/// singleton flags. A real CLI parses every generated argv, and the mock API
+/// observes the effective model/config rather than trusting hcom's token list.
+#[test]
+#[ignore = "requires the pinned real @openai/codex binary"]
+#[serial]
+fn real_codex_argument_overrides_survive_resume_resume_fork_resume() {
+    use support::codex_mock::{is_title_request, title_reply};
+
+    let h = Hcom::new();
+    require_pinned(&h, &CodexCase);
+    let mock = MockResponses::start(|body: &str| {
+        if is_title_request(body) {
+            return title_reply();
+        }
+        Reply::Sse(sse(&[
+            created("RESP_ARGS"),
+            message("ITEM_ARGS", "ARGUMENT_OVERRIDE_PROOF"),
+            completed("RESP_ARGS"),
+        ]))
+    })
+    .expect("start mock Responses server");
+    h.prepare_codex_config(&mock.base_url());
+    let (code, _, stderr) = h.run([
+        "config",
+        "codex_args",
+        "-m gpt-5.4 -s read-only -c model_reasoning_effort=\"high\"",
+    ]);
+    assert_eq!(code, 0, "configure defaults: {stderr}");
+
+    let mut parent = String::new();
+    let mut child = String::new();
+    for (stage, model) in [
+        (0, "gpt-5.5"),
+        (1, "gpt-5.5"),
+        (2, "gpt-5.4"),
+        (3, "gpt-5.4"),
+        (4, "gpt-5.4"),
+    ] {
+        let prompt = format!("issue173_stage_{stage}");
+        let mut argv = match stage {
+            0 => vec![
+                "codex".to_string(),
+                "--dir".to_string(),
+                h.workspace.to_str().unwrap().to_string(),
+            ],
+            3 => vec!["f".to_string(), parent.clone()],
+            4 => vec!["r".to_string(), child.clone()],
+            _ => vec!["r".to_string(), parent.clone()],
+        };
+        argv.extend([
+            "--headless".to_string(),
+            "--hcom-prompt".to_string(),
+            prompt.clone(),
+        ]);
+        if stage < 3 {
+            argv.extend([
+                if stage == 1 { "--model" } else { "-m" }.to_string(),
+                model.to_string(),
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "-c".to_string(),
+                "model_reasoning_effort=\"low\"".to_string(),
+            ]);
+        }
+        let (code, stdout, stderr) = h.run(&argv);
+        assert_eq!(
+            code,
+            0,
+            "stage {stage}: {stdout}\n{stderr}\n{}",
+            h.diagnostics()
+        );
+        let name = match stage {
+            0 => {
+                parent = parse_launch_names(&stdout)
+                    .into_iter()
+                    .next()
+                    .expect("parent name");
+                parent.clone()
+            }
+            3 => {
+                child = parse_launch_names(&stdout)
+                    .into_iter()
+                    .next()
+                    .expect("fork name");
+                child.clone()
+            }
+            4 => child.clone(),
+            _ => parent.clone(),
+        };
+        h.eventually(
+            &format!("argument override stage {stage}"),
+            Duration::from_secs(90),
+            || {
+                let reached = mock
+                    .requests()
+                    .iter()
+                    .any(|body| !is_title_request(body) && body.contains(&prompt));
+                let Some(instance) = h.instance_json(&name)? else {
+                    return Ok(None);
+                };
+                Ok((reached
+                    && instance["hooks_bound"] == true
+                    && instance["status"] == "listening")
+                    .then_some(()))
+            },
+        );
+        let request = mock
+            .requests()
+            .into_iter()
+            .rfind(|body| !is_title_request(body) && body.contains(&prompt))
+            .expect("stage reached model");
+        let request: Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["model"], model, "stage {stage}");
+        assert_eq!(request["reasoning"]["effort"], "low", "stage {stage}");
+
+        let conn = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT launch_args FROM instances WHERE name = ?1",
+                [&name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored: Vec<String> = serde_json::from_str(&stored).unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|arg| matches!(arg.as_str(), "-m" | "--model"))
+                .count(),
+            1,
+            "stage {stage}: {stored:?}"
+        );
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|arg| matches!(arg.as_str(), "-s" | "--sandbox"))
+                .count(),
+            1,
+            "stage {stage}: {stored:?}"
+        );
+        let (code, stdout, stderr) = h.run(["kill", &name]);
+        assert_eq!(code, 0, "kill stage {stage}: {stdout}\n{stderr}");
+    }
+}

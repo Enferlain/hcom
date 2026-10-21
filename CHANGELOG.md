@@ -14,6 +14,7 @@ UTC release dates from [PyPI](https://pypi.org/project/hcom/#history).
 
 ### Fixed
 
+- Fixed launch, resume, and fork argument overrides accumulating duplicate singleton options, which broke later Codex resumes and forks ([#173](https://github.com/aannoo/hcom/issues/173)).
 - Fixed `hcom r` dropping the agent's event subscriptions and thread memberships; a subscription that matched while the agent was stopped now notifies on resume.
 - Fixed Antigravity and OMP agents losing their event subscriptions at the end of a turn while still running.
 
