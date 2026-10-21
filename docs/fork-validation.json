@@ -282,5 +282,129 @@
     "committed": false,
     "pushed": false,
     "remote_dolt_synced": false
+  },
+  "upgrade_qualification_2026_10_21": {
+    "status": "final_source_validated_reviewed_release_ready_activation_pending",
+    "source_base": "5357794",
+    "scope": "Independent Antigravity idle-banner and feedback-survey safeguards; isolation remains excluded.",
+    "gates": [
+      {
+        "gate": "fmt",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--",
+          "--check"
+        ],
+        "exit_code": 0,
+        "seconds": 2.51,
+        "log": ".rebuild-artifacts/live-trial-2026-10-21/reviewfix-fmt.log"
+      },
+      {
+        "gate": "clippy",
+        "command": [
+          "cargo",
+          "clippy",
+          "--all-targets",
+          "--locked",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit_code": 0,
+        "seconds": 0.37,
+        "log": ".rebuild-artifacts/live-trial-2026-10-21/reviewfix-clippy.log"
+      },
+      {
+        "gate": "tests",
+        "command": [
+          "cargo",
+          "test",
+          "--workspace",
+          "--all-targets",
+          "--locked",
+          "--",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "seconds": 211.8,
+        "log": ".rebuild-artifacts/live-trial-2026-10-21/reviewfix-tests.log"
+      },
+      {
+        "gate": "release",
+        "command": [
+          "cargo",
+          "build",
+          "--release",
+          "--locked"
+        ],
+        "exit_code": 0,
+        "seconds": 236.06,
+        "log": ".rebuild-artifacts/live-trial-2026-10-21/reviewfix-release.log"
+      }
+    ],
+    "rust_passed": 2917,
+    "rust_ignored": 18,
+    "rust_failed": 0,
+    "review_report": "reviews/upgrade-trial-2026-10-21.md",
+    "limits": [
+      "No fresh live feedback survey observed",
+      "Native Windows execution unverified",
+      "Rust 1.88 execution unverified"
+    ],
+    "live_checks": {
+      "gemini": {
+        "provider": "gemini",
+        "cursor": 46197,
+        "thread": "live-rebuild-final-20261021-gemini",
+        "prefix": "/home/imi/.local/share/hcom/releases/rebuild-5357794-survey1",
+        "launch_exit": 2,
+        "name": "zani",
+        "sha256": "c6ed1475736bc79472a0f96dfdde7c3063e45e577e23c1895009313d1af6e586",
+        "nonce": "748e6cbcd718f052426c09cc23767e1f",
+        "workspace": "/home/imi/Projects/hcom-upstream-rebuild-f687a9c/.rebuild-artifacts/live-trial-2026-10-21/final-workspace",
+        "phase1_verified": true,
+        "phase2_nonce": "cb324218956bfaa5b20e3d05",
+        "phase2_cursor": 46285,
+        "launch_trust_prompt_resolved": true,
+        "phase2_verified": true,
+        "phase2_wait_exit": 0,
+        "phase2_event": 46292,
+        "manual_submit_after_followup": false
+      },
+      "glm": {
+        "provider": "glm",
+        "cursor": 46210,
+        "thread": "live-rebuild-final-20261021-glm",
+        "prefix": "/home/imi/.local/share/hcom/releases/rebuild-5357794-survey1",
+        "launch_exit": 0,
+        "name": "luva",
+        "sha256": "4db2af0b6c7a3441968b7b48bfba7c825028e74fb0b72342bf4a225ff50a97ca",
+        "nonce": "c6d45ae23998c4aec32943cda660f152",
+        "workspace": "/home/imi/Projects/hcom-upstream-rebuild-f687a9c/.rebuild-artifacts/live-trial-2026-10-21/final-workspace",
+        "phase1_verified": true,
+        "phase2_nonce": "ad6593ecdd9a2347b8802b10",
+        "phase2_cursor": 46239,
+        "phase2_verified": true,
+        "phase2_wait_exit": 0,
+        "phase2_event": 46251,
+        "manual_submit_after_followup": false
+      }
+    },
+    "review": {
+      "method": "review-mcp review_with_context",
+      "rounds": 2,
+      "result": "All three actionable survey findings resolved; no concrete introduced regression within followup scope",
+      "raw_reports": [
+        ".rebuild-artifacts/live-trial-2026-10-21/survey-review.json",
+        ".rebuild-artifacts/live-trial-2026-10-21/survey-followup-review.json"
+      ]
+    },
+    "live_checks_stage": "Previous release candidate before the three bounded status corrections; default-launch verification pending final release",
+    "final_release": {
+      "sha256": "7810b1618a3acd04032416a1ab6f63e0d0b71cc7384302012769a7afc4e6504e",
+      "version": "0.7.28"
+    }
   }
 }

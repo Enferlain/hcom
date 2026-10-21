@@ -331,6 +331,18 @@
       "status": "implemented; full gates and independent review passed; fresh live retest pending",
       "risk": "Medium; prompt-empty recognition participates in safe PTY injection.",
       "validation": "Restored omitted independent hcom-f6g.10 behavior. Focused PTY241 and banner8 filters passed; full serial Rust2887passed18ignored0failed, formatting, strict all-target Clippy and locked release passed. Scoped review accepted. Initial live reproduction and fresh retest recorded in docs/reviews/upgrade-trial-2026-10-21.md."
+    },
+    {
+      "id": "antigravity-feedback-survey",
+      "feature": "Safe Antigravity feedback-survey dismissal and typed fallback",
+      "contract": [
+        "Recognize a complete active non-task survey, reject quotes/partial frames/real prompts and approval dialogs; Skip uses only byte0, never Enter.",
+        "Bounded stable-frame retries, redraw grace and wall-clock escalation publish pty:survey after failed dismissal; publication and release preserve foreign blocker ownership.",
+        "Unix and Windows share the same controller; row and status event changes commit atomically before notifications."
+      ],
+      "status": "restored; independently reviewed and regression-tested; final release and default-launch qualification pending",
+      "risk": "High; safe keystroke selection and blocker ownership must not confuse UX survey with permission approval.",
+      "validation": "Final full Rust suite: 2917 passed, 18 ignored, zero failures; fmt and strict all-target Clippy clean. Two independent survey review rounds resolved active-clear/last_stop, vanished-row retry and atomic status_detail findings. Live survey itself and native Windows remain unrun."
     }
   ],
   "external_assets": [

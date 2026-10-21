@@ -475,6 +475,476 @@ pub(super) fn publish_approval_status(
     }
 }
 
+// ---- Antigravity feedback survey (hcom-f6g.9) ----
+
+/// Keystroke that dismisses the Antigravity feedback survey: `0` selects the
+/// `[0] Skip` option. Deliberately no Enter/newline — if detection ever raced
+/// a live prompt, a stray `0` is inert text while an Enter could submit the
+/// user's in-progress input. Skipping answers no permission question and
+/// changes no tool setting.
+pub(super) const ANTIGRAVITY_SURVEY_SKIP_KEY: &[u8] = b"0";
+
+/// Dismissal attempts before the typed non-task blocker is published.
+pub(super) const SURVEY_DISMISS_MAX_ATTEMPTS: u32 = 3;
+
+/// Cooldown between dismissal attempts: long enough for the TUI to consume
+/// the key and redraw the survey away (or prove it did not). Also the wait
+/// before the blocker may publish after the final attempt, and the retry
+/// cadence for a failed/deferred blocker publication.
+pub(super) const SURVEY_DISMISS_RETRY_COOLDOWN: Duration = Duration::from_millis(2500);
+
+/// How long the survey may vanish before the sighting is considered over.
+/// Redraw flicker hides the survey for at most a frame or two; within this
+/// window the sighting's age and attempt budget survive, so flicker cannot
+/// reset the budget and starve escalation (hcom-f6g.9 review fix).
+pub(super) const SURVEY_REAPPEAR_GRACE: Duration = Duration::from_millis(2000);
+
+/// Wall-clock ceiling on a continuous sighting. A survey whose output never
+/// settles (an animated/spinner variant) can never pass the stability gate,
+/// so after this duration the controller escalates straight to the actionable
+/// blocker. Skip injection stays stability-gated either way.
+pub(super) const SURVEY_SIGHTING_MAX: Duration = Duration::from_secs(30);
+
+/// While a sighting is active (or possibly mid-flicker), the Unix poll loop
+/// caps its timeout to this so stability windows, retries, and blocker
+/// publication fire on time instead of after the 10s idle poll.
+pub(super) const SURVEY_POLL_CAP_MS: u16 = 500;
+
+/// Minimum interval between repeated `pty.survey_block_deferred` warnings
+/// while blocker publication remains deferred (e.g. another blocker owns
+/// the instance row, or the instance is not bound yet).
+pub(super) const SURVEY_BLOCK_DEFERRED_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Minimum interval between repeated `pty.survey_unblock_failed` warnings.
+pub(super) const SURVEY_UNBLOCK_FAILED_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Per-sighting state for the Antigravity feedback-survey dismissal policy.
+#[derive(Default)]
+pub(super) struct SurveyDismissal {
+    attempts: u32,
+    next_attempt_at: Option<Instant>,
+    /// First tick of the current sighting; anchors the wall-clock ceiling.
+    first_seen_at: Option<Instant>,
+    /// Last tick that saw the survey; anchors the reappearance grace and the
+    /// poll-cap hint.
+    last_seen_at: Option<Instant>,
+    /// True once a blocker publication succeeded. Latched only by
+    /// `run_survey_dismissal` on a successful `publish_survey_status` —
+    /// never by the pure tick — so a failed or deferred publication retries.
+    blocker_published: bool,
+    /// Last instant a `pty.survey_block_deferred` warning was emitted; rate-limits
+    /// repeated warnings while publication remains deferred.
+    last_block_deferred_warn_at: Option<Instant>,
+    /// Last instant a failed blocker-clear warning was emitted.
+    last_unblock_failed_warn_at: Option<Instant>,
+}
+
+impl SurveyDismissal {
+    /// True while a sighting is active, possibly mid-flicker, or while a
+    /// published blocker is pending clear — the Unix poll loop caps its
+    /// timeout so dismissal timing and unblock retries stay tight.
+    pub(super) fn caps_poll(&self) -> bool {
+        self.caps_poll_at(Instant::now())
+    }
+
+    pub(super) fn caps_poll_at(&self, now: Instant) -> bool {
+        self.blocker_published
+            || self
+                .last_seen_at
+                .is_some_and(|last| now.saturating_duration_since(last) < SURVEY_REAPPEAR_GRACE)
+    }
+
+    /// Push the next blocker-publication retry out by one cooldown after a
+    /// failed/deferred publish, so retries do not hot-loop.
+    ///
+    /// Returns `true` if a `pty.survey_block_deferred` warning should be emitted
+    /// (the initial deferral and rate-limited repeats every [`SURVEY_BLOCK_DEFERRED_WARN_INTERVAL`]).
+    pub(super) fn defer_block_retry(&mut self, now: Instant) -> bool {
+        self.next_attempt_at = Some(now + SURVEY_DISMISS_RETRY_COOLDOWN);
+        let should_warn = self.last_block_deferred_warn_at.is_none_or(|last| {
+            now.saturating_duration_since(last) >= SURVEY_BLOCK_DEFERRED_WARN_INTERVAL
+        });
+        if should_warn {
+            self.last_block_deferred_warn_at = Some(now);
+        }
+        should_warn
+    }
+
+    /// Delay another blocker-clear attempt and rate-limit its warning.
+    fn defer_unblock_retry(&mut self, now: Instant) -> bool {
+        self.next_attempt_at = Some(now + SURVEY_DISMISS_RETRY_COOLDOWN);
+        let should_warn = self.last_unblock_failed_warn_at.is_none_or(|last| {
+            now.saturating_duration_since(last) >= SURVEY_UNBLOCK_FAILED_WARN_INTERVAL
+        });
+        if should_warn {
+            self.last_unblock_failed_warn_at = Some(now);
+        }
+        should_warn
+    }
+}
+
+/// Action for the PTY loop after a [`survey_dismissal_tick`].
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SurveyAction {
+    /// Inject [`ANTIGRAVITY_SURVEY_SKIP_KEY`] now.
+    Dismiss,
+    /// Publish the typed non-task blocker. Emitted on every qualifying tick
+    /// until the caller latches a successful publication — a deferred or
+    /// failed publish must retry.
+    Block,
+    /// The sighting ended with a published blocker: clear it. Re-emitted
+    /// until the caller observes a successful clear.
+    Unblock,
+    /// Nothing to do.
+    None,
+}
+
+/// Pure dismissal-policy decision for one PTY-loop tick.
+///
+/// Deterministic given (sighting history, visibility, output stability, now)
+/// so the Unix poll loop and the Windows reader thread behave identically.
+/// Blocker publication state is owned by the caller: the tick emits
+/// [`SurveyAction::Block`] / [`SurveyAction::Unblock`] and only the caller's
+/// successful `publish_survey_status` latches `blocker_published`, so a
+/// failed or deferred publication (e.g. another blocker owning the instance
+/// row) retries on later ticks.
+pub(super) fn survey_dismissal_tick(
+    state: &mut SurveyDismissal,
+    survey_visible: bool,
+    output_stable: bool,
+    now: Instant,
+) -> SurveyAction {
+    if survey_visible {
+        let first_seen = *state.first_seen_at.get_or_insert(now);
+        state.last_seen_at = Some(now);
+
+        // Bounded wall-clock escalation: an animated survey whose output
+        // never settles can never pass the stability gate below, but it must
+        // not stall unattended waits forever — at the sighting ceiling the
+        // actionable blocker fires even while output churns. Skip injection
+        // itself stays stability-gated.
+        if now.saturating_duration_since(first_seen) >= SURVEY_SIGHTING_MAX
+            && !state.blocker_published
+            && state.next_attempt_at.is_none_or(|at| now >= at)
+        {
+            return SurveyAction::Block;
+        }
+
+        // Only act on a settled frame: a partially drawn (or mid-redraw)
+        // screen must not receive the dismissal key.
+        if !output_stable {
+            return SurveyAction::None;
+        }
+
+        if state.attempts >= SURVEY_DISMISS_MAX_ATTEMPTS {
+            // The final Skip attempt gets its full cooldown before the
+            // blocker may publish — the tool may still be mid-redraw
+            // consuming the key (hcom-f6g.9 review fix).
+            if state.next_attempt_at.is_some_and(|at| now < at) {
+                return SurveyAction::None;
+            }
+            if !state.blocker_published {
+                return SurveyAction::Block;
+            }
+            return SurveyAction::None;
+        }
+
+        if state.next_attempt_at.is_some_and(|at| now < at) {
+            return SurveyAction::None;
+        }
+        state.attempts += 1;
+        state.next_attempt_at = Some(now + SURVEY_DISMISS_RETRY_COOLDOWN);
+        return SurveyAction::Dismiss;
+    }
+
+    // Not visible. A disappearance shorter than the reappearance grace is
+    // redraw flicker: the sighting (age, attempts, published blocker)
+    // survives it, so flicker cannot reset the budget and starve escalation.
+    // `next_attempt_at` also survives a reset sighting end, preventing an
+    // immediate second Skip key on the next sighting.
+    let sighting_over = state
+        .last_seen_at
+        .is_some_and(|last| now.saturating_duration_since(last) >= SURVEY_REAPPEAR_GRACE);
+    if !sighting_over {
+        return SurveyAction::None;
+    }
+    // Sighting over: reset the budget for the next survey. A published
+    // blocker is unlatched by the caller on a successful clear; until then
+    // keep re-emitting Unblock so a failed clear retries.
+    state.first_seen_at = None;
+    state.attempts = 0;
+    state.last_block_deferred_warn_at = None;
+    if state.blocker_published {
+        if state.next_attempt_at.is_some_and(|at| now < at) {
+            return SurveyAction::None;
+        }
+        return SurveyAction::Unblock;
+    }
+    SurveyAction::None
+}
+
+/// Drive the Antigravity feedback-survey policy for one PTY-loop tick.
+///
+/// Shared by the Unix poll loop and the Windows reader thread; only the
+/// keystroke write differs (`inject`). Non-Antigravity targets are a no-op.
+/// The survey is a non-task UX prompt, not a permission approval: dismissal
+/// sends only the Skip key, publishes nothing while it succeeds, and never
+/// touches the approval path. If dismissal repeatedly fails,
+/// [`publish_survey_status`] converts the silent stall into an actionable
+/// typed blocker.
+pub(super) fn run_survey_dismissal(
+    screen: &ScreenTracker,
+    survey: &mut SurveyDismissal,
+    target: &PtyTarget,
+    instance_name_cfg: Option<&str>,
+    current_status: &Arc<RwLock<String>>,
+    inject: impl FnOnce(&[u8]) -> Result<()>,
+) {
+    if !matches!(target.known_tool(), Some(Tool::Antigravity)) {
+        return;
+    }
+    let action = survey_dismissal_tick(
+        survey,
+        screen.is_antigravity_survey_visible(),
+        screen.is_output_stable(APPROVAL_SCRAPE_CLEAR_MS),
+        Instant::now(),
+    );
+    handle_survey_action(survey, instance_name_cfg, current_status, inject, action);
+}
+
+fn handle_survey_action(
+    survey: &mut SurveyDismissal,
+    instance_name_cfg: Option<&str>,
+    current_status: &Arc<RwLock<String>>,
+    inject: impl FnOnce(&[u8]) -> Result<()>,
+    action: SurveyAction,
+) {
+    match action {
+        SurveyAction::Dismiss => {
+            if let Err(error) = inject(ANTIGRAVITY_SURVEY_SKIP_KEY) {
+                // The failed write still consumed the attempt; retries and,
+                // finally, the blocker bound the damage. Never fail the
+                // session over the survey.
+                log_warn(
+                    "native",
+                    "pty.survey_dismiss_failed",
+                    &format!("Failed to inject Antigravity survey Skip key: {error}"),
+                );
+            } else {
+                log_info(
+                    "native",
+                    "pty.survey_dismiss",
+                    "Antigravity feedback survey detected; injected Skip (0)",
+                );
+            }
+        }
+        SurveyAction::Block => {
+            // Latch only on a successful publication. A deferred or failed
+            // publish (another blocker owns the row, DB hiccup, instance not
+            // yet bound) must retry on later ticks — including after the
+            // other blocker clears — so push the retry out by one cooldown.
+            if publish_survey_status(true, instance_name_cfg, current_status) {
+                survey.blocker_published = true;
+                survey.last_block_deferred_warn_at = None;
+                log_warn(
+                    "native",
+                    "pty.survey_block",
+                    "Antigravity feedback survey did not dismiss after repeated Skip \
+                     attempts; published pty:survey blocker",
+                );
+            } else if survey.defer_block_retry(Instant::now()) {
+                log_warn(
+                    "native",
+                    "pty.survey_block_deferred",
+                    "pty:survey blocker publication deferred (another blocker owns the \
+                     instance row, the instance is not bound yet, or the DB is \
+                     unavailable); will retry",
+                );
+            }
+        }
+        SurveyAction::Unblock => {
+            // A failed clear keeps the latch and the poll cap, but retries on
+            // the bounded dismissal cadence rather than every 500ms poll.
+            if publish_survey_status(false, instance_name_cfg, current_status) {
+                survey.blocker_published = false;
+                survey.next_attempt_at = None;
+                survey.last_unblock_failed_warn_at = None;
+            } else if survey.defer_unblock_retry(Instant::now()) {
+                log_warn(
+                    "native",
+                    "pty.survey_unblock_failed",
+                    "Failed to clear the pty:survey blocker; will retry",
+                );
+            }
+        }
+        SurveyAction::None => {}
+    }
+}
+
+enum SurveyOutcome {
+    NotFound,
+    Deferred,
+    AlreadyOurs,
+    NothingToClear,
+    Committed {
+        status: &'static str,
+        event_id: i64,
+        data: serde_json::Value,
+    },
+}
+
+/// Publish the Antigravity feedback-survey blocker edge (hcom-f6g.9).
+///
+/// Fires only when auto-dismissal failed repeatedly, converting a silent
+/// stall behind the survey into an actionable typed non-task blocker
+/// (`pty:survey`) that `hcom list` and result waits can surface. The survey
+/// is not a permission approval: this path never uses the `pty:approval`
+/// context and never overwrites a hook- or approval-owned block. Clearing
+/// releases only rows this path blocked.
+///
+/// Returns `true` when, after the call, this path owns the published state:
+/// the rising edge actually wrote `pty:survey` (or the row already carried
+/// it), or the falling edge actually cleared it (or there was nothing of
+/// ours to clear). Returns `false` when publication did not happen — DB
+/// failure, unknown instance, or another blocker owning the row — so the
+/// caller must retry rather than latch. A session with no instance name has
+/// no channel to publish on and can never succeed, so it counts as handled.
+pub(super) fn publish_survey_status(
+    blocked: bool,
+    instance_name_cfg: Option<&str>,
+    current_status: &Arc<RwLock<String>>,
+) -> bool {
+    let Ok(db) = HcomDb::open() else {
+        log_warn(
+            "native",
+            "pty.survey_status_open_failed",
+            "Failed to open database for PTY survey status",
+        );
+        return false;
+    };
+
+    let config = Config::get();
+    let instance_name = config
+        .process_id
+        .as_deref()
+        .and_then(|process_id| db.get_process_binding(process_id).ok().flatten())
+        .or_else(|| instance_name_cfg.map(str::to_string))
+        .or(config.instance_name);
+    let Some(instance_name) = instance_name.filter(|name| !name.is_empty()) else {
+        return true;
+    };
+
+    let outcome = db.with_write_scope(|| {
+        let current = match db.get_instance_full(&instance_name)? {
+            Some(row) => row,
+            None => {
+                return Ok(if blocked {
+                    SurveyOutcome::NotFound
+                } else {
+                    SurveyOutcome::NothingToClear
+                });
+            }
+        };
+        let survey_blocked = current.status == ST_BLOCKED && current.status_context == "pty:survey";
+
+        if blocked {
+            if survey_blocked {
+                // Already ours — idempotent success.
+                return Ok(SurveyOutcome::AlreadyOurs);
+            }
+            if current.status == ST_BLOCKED {
+                // Another blocker (hook approval, elicitation, …) owns the row
+                // and outranks the survey: defer, and let the caller retry once
+                // it clears.
+                return Ok(SurveyOutcome::Deferred);
+            }
+        } else if !survey_blocked {
+            // No survey block of ours to clear (e.g. already cleared or a newer approval owns it).
+            // Clear only survey-owned row, never a newer approval; no stale shared-title override after refused write.
+            return Ok(SurveyOutcome::NothingToClear);
+        }
+
+        let (status, context, detail) = if blocked {
+            (
+                ST_BLOCKED,
+                "pty:survey",
+                "Antigravity feedback survey did not dismiss after repeated Skip attempts; \
+                 answer it (0 = Skip) to resume the worker",
+            )
+        } else {
+            (ST_ACTIVE, "pty:survey_cleared", "")
+        };
+
+        db.set_status(&instance_name, status, context)?;
+        db.conn().execute(
+            "UPDATE instances SET status_detail = ? WHERE name = ?",
+            rusqlite::params![detail, &instance_name],
+        )?;
+
+        let mut data = serde_json::json!({
+            "status": status,
+            "context": context,
+            "position": current.last_event_id,
+        });
+        if !detail.is_empty() {
+            data["detail"] = serde_json::json!(detail);
+        }
+
+        let event_id = db.insert_event_row("status", &instance_name, &data, None)?;
+        Ok(SurveyOutcome::Committed {
+            status,
+            event_id,
+            data,
+        })
+    });
+
+    match outcome {
+        Ok(SurveyOutcome::Committed {
+            status,
+            event_id,
+            data,
+        }) => {
+            crate::notify::wake(&db, &instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+            db.after_event_logged(event_id, "status", &instance_name, &data);
+            if let Ok(mut shared_status) = current_status.write() {
+                *shared_status = status.to_string();
+            }
+            true
+        }
+        Ok(SurveyOutcome::AlreadyOurs) => {
+            // Already ours — idempotent success; keep the shared status consistent for `hcom list`.
+            if let Ok(mut shared_status) = current_status.write() {
+                *shared_status = ST_BLOCKED.to_string();
+            }
+            true
+        }
+        Ok(SurveyOutcome::NothingToClear) => {
+            // No survey block of ours to clear (or instance unbound on falling edge).
+            // Clear only survey-owned row, never a newer approval; no stale shared-title override.
+            true
+        }
+        Ok(SurveyOutcome::Deferred) => {
+            // Another blocker owns the row: defer so caller retries.
+            false
+        }
+        Ok(SurveyOutcome::NotFound) => {
+            // Instance not bound yet on rising edge (launch race); it may appear — retry.
+            false
+        }
+        Err(error) => {
+            log_warn(
+                "native",
+                "pty.survey_status_failed",
+                &format!(
+                    "Failed to publish survey blocked={} for {}: {}",
+                    blocked, instance_name, error
+                ),
+            );
+            false
+        }
+    }
+}
+
 /// Outcome of [`start_delivery_thread`].
 ///
 /// `Result::Err` (distinct from every variant here) is an up-front init failure:
@@ -2173,6 +2643,707 @@ No session found matching 'never-saved'"
             .unwrap();
         mirror_shared_status_after_refusal(&db, "hera", &shared_status);
         assert_eq!(*shared_status.read().unwrap(), ST_LISTENING);
+    }
+
+    // ---- Antigravity feedback survey (hcom-f6g.9) ----
+
+    #[test]
+    fn survey_tick_blocks_once_after_exhausted_attempts() {
+        let mut s = SurveyDismissal::default();
+        let t0 = Instant::now();
+        for i in 0..SURVEY_DISMISS_MAX_ATTEMPTS {
+            let t = t0 + SURVEY_DISMISS_RETRY_COOLDOWN * i;
+            assert_eq!(
+                survey_dismissal_tick(&mut s, true, true, t),
+                SurveyAction::Dismiss
+            );
+        }
+        let t_block = t0 + SURVEY_DISMISS_RETRY_COOLDOWN * SURVEY_DISMISS_MAX_ATTEMPTS;
+        assert_eq!(
+            survey_dismissal_tick(&mut s, true, true, t_block),
+            SurveyAction::Block
+        );
+        // The tick keeps emitting Block until the CALLER latches a
+        // successful publication (`run_survey_dismissal` does); simulate it.
+        s.blocker_published = true;
+        assert_eq!(
+            survey_dismissal_tick(&mut s, true, true, t_block),
+            SurveyAction::None
+        );
+    }
+
+    #[test]
+    fn survey_tick_animated_survey_escalates_after_bounded_age() {
+        // An animated survey whose output never settles can never pass the
+        // stability gate, so no Skip key is ever injected…
+        let mut s = SurveyDismissal::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            survey_dismissal_tick(&mut s, true, false, t0),
+            SurveyAction::None
+        );
+        assert_eq!(
+            survey_dismissal_tick(&mut s, true, false, t0 + Duration::from_secs(10)),
+            SurveyAction::None
+        );
+        // …but escalation cannot be starved forever: at the bounded sighting
+        // age the actionable blocker fires even while output churns.
+        assert_eq!(
+            survey_dismissal_tick(&mut s, true, false, t0 + SURVEY_SIGHTING_MAX),
+            SurveyAction::Block
+        );
+    }
+
+    #[test]
+    fn survey_tick_flicker_cannot_starve_escalation() {
+        // Half-second tick cadence (the Unix poll cap) with a one-tick
+        // disappearance inside every cooldown window. Each flicker is well
+        // inside the reappearance grace, so the sighting's age and attempt
+        // budget survive and escalation completes on schedule.
+        let mut s = SurveyDismissal::default();
+        let step = Duration::from_millis(500);
+        let t0 = Instant::now();
+        let mut dismissals = 0u32;
+        let mut blocked_at: Option<u32> = None;
+        for i in 0..16u32 {
+            let now = t0 + step * i;
+            let visible = i % 5 != 1; // one-tick flicker per window
+            match survey_dismissal_tick(&mut s, visible, true, now) {
+                SurveyAction::Dismiss => dismissals += 1,
+                SurveyAction::Block => blocked_at = Some(i),
+                SurveyAction::Unblock => panic!("no blocker was published"),
+                SurveyAction::None => {}
+            }
+        }
+        assert_eq!(dismissals, SURVEY_DISMISS_MAX_ATTEMPTS);
+        // Third attempt at 2×cooldown; the blocker follows only after the
+        // full final cooldown (i.e. at 3×cooldown = tick 15).
+        assert_eq!(blocked_at, Some(15));
+    }
+
+    #[test]
+    fn survey_tick_clears_blocker_and_rearms_when_survey_leaves() {
+        let mut s = SurveyDismissal::default();
+        let t0 = Instant::now();
+        for i in 0..SURVEY_DISMISS_MAX_ATTEMPTS {
+            let t = t0 + SURVEY_DISMISS_RETRY_COOLDOWN * i;
+            assert_eq!(
+                survey_dismissal_tick(&mut s, true, true, t),
+                SurveyAction::Dismiss
+            );
+        }
+        let t_block = t0 + SURVEY_DISMISS_RETRY_COOLDOWN * SURVEY_DISMISS_MAX_ATTEMPTS;
+        assert_eq!(
+            survey_dismissal_tick(&mut s, true, true, t_block),
+            SurveyAction::Block
+        );
+        s.blocker_published = true; // caller latched the publication
+        // Survey leaves: within the reappearance grace the sighting (and the
+        // published blocker) survives a flicker…
+        assert_eq!(
+            survey_dismissal_tick(&mut s, false, true, t_block + Duration::from_millis(500)),
+            SurveyAction::None
+        );
+        // …past the grace the sighting ends and the blocker clear fires.
+        assert_eq!(
+            survey_dismissal_tick(&mut s, false, true, t_block + SURVEY_REAPPEAR_GRACE),
+            SurveyAction::Unblock
+        );
+        // Caller observed the successful clear → re-armed: a fresh sighting
+        // gets a fresh attempt budget.
+        s.blocker_published = false;
+        let t2 = t_block + SURVEY_REAPPEAR_GRACE + Duration::from_secs(5);
+        assert_eq!(
+            survey_dismissal_tick(&mut s, true, true, t2),
+            SurveyAction::Dismiss
+        );
+        // Leaving again without a published blocker is silent.
+        let t3 = t2 + Duration::from_secs(10);
+        assert_eq!(
+            survey_dismissal_tick(&mut s, false, true, t3),
+            SurveyAction::None
+        );
+    }
+
+    #[test]
+    fn survey_tick_redraw_flicker_does_not_refire_immediately() {
+        // A mid-redraw frame that hides the survey for one tick must not
+        // re-arm an immediate second Skip key — the cooldown survives.
+        let mut s = SurveyDismissal::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            survey_dismissal_tick(&mut s, true, true, t0),
+            SurveyAction::Dismiss
+        );
+        assert_eq!(
+            survey_dismissal_tick(&mut s, false, true, t0 + Duration::from_millis(50)),
+            SurveyAction::None
+        );
+        assert_eq!(
+            survey_dismissal_tick(&mut s, true, true, t0 + Duration::from_millis(100)),
+            SurveyAction::None,
+            "back within the cooldown: no immediate second key"
+        );
+        assert_eq!(
+            survey_dismissal_tick(
+                &mut s,
+                true,
+                true,
+                t0 + SURVEY_DISMISS_RETRY_COOLDOWN + Duration::from_millis(100)
+            ),
+            SurveyAction::Dismiss
+        );
+    }
+
+    #[test]
+    fn survey_tick_idle_state_is_inert() {
+        let mut s = SurveyDismissal::default();
+        assert_eq!(
+            survey_dismissal_tick(&mut s, false, true, Instant::now()),
+            SurveyAction::None
+        );
+        assert!(!s.caps_poll());
+    }
+
+    #[test]
+    fn survey_caps_poll_active_while_unblock_pending() {
+        let mut s = SurveyDismissal::default();
+        let t0 = Instant::now();
+        assert!(!s.caps_poll_at(t0));
+
+        // Survey visible: poll cap is active.
+        assert_eq!(
+            survey_dismissal_tick(&mut s, true, true, t0),
+            SurveyAction::Dismiss
+        );
+        assert!(s.caps_poll_at(t0));
+
+        // Blocker is published after repeated attempts fail.
+        for i in 1..SURVEY_DISMISS_MAX_ATTEMPTS {
+            let t = t0 + SURVEY_DISMISS_RETRY_COOLDOWN * i;
+            assert_eq!(
+                survey_dismissal_tick(&mut s, true, true, t),
+                SurveyAction::Dismiss
+            );
+        }
+        let t_block = t0 + SURVEY_DISMISS_RETRY_COOLDOWN * SURVEY_DISMISS_MAX_ATTEMPTS;
+        assert_eq!(
+            survey_dismissal_tick(&mut s, true, true, t_block),
+            SurveyAction::Block
+        );
+        s.blocker_published = true;
+        assert!(s.caps_poll_at(t_block));
+
+        // Survey leaves: within reappearance grace poll cap remains active.
+        let t_leave = t_block + Duration::from_millis(500);
+        assert_eq!(
+            survey_dismissal_tick(&mut s, false, true, t_leave),
+            SurveyAction::None
+        );
+        assert!(s.caps_poll_at(t_leave));
+
+        // Past the grace, Unblock fires.
+        let t_unblock = t_block + SURVEY_REAPPEAR_GRACE;
+        assert_eq!(
+            survey_dismissal_tick(&mut s, false, true, t_unblock),
+            SurveyAction::Unblock
+        );
+        // Clear fails (caller does not clear blocker_published): poll cap must stay
+        // active well past the grace / 10s idle poll window so clearing retries on time.
+        let t_later = t_unblock + Duration::from_secs(10);
+        assert!(
+            s.caps_poll_at(t_later),
+            "poll cap must stay active while failed unblock is pending so clearing does not fall back to 10s idle cadence"
+        );
+        assert_eq!(
+            survey_dismissal_tick(&mut s, false, true, t_later),
+            SurveyAction::Unblock
+        );
+
+        // Caller succeeds in clearing blocker: poll cap releases.
+        s.blocker_published = false;
+        assert!(!s.caps_poll_at(t_later));
+    }
+
+    #[test]
+    fn survey_defer_block_retry_rate_limits_warnings() {
+        let mut s = SurveyDismissal::default();
+        let t0 = Instant::now();
+
+        // First deferral emits warning and schedules retry.
+        assert!(s.defer_block_retry(t0));
+        assert_eq!(s.next_attempt_at, Some(t0 + SURVEY_DISMISS_RETRY_COOLDOWN));
+
+        // Repeated deferrals within the rate-limit interval are suppressed.
+        assert!(!s.defer_block_retry(t0 + Duration::from_millis(500)));
+        assert!(!s.defer_block_retry(t0 + SURVEY_DISMISS_RETRY_COOLDOWN));
+        assert!(!s.defer_block_retry(t0 + Duration::from_secs(10)));
+        assert!(!s.defer_block_retry(
+            t0 + SURVEY_BLOCK_DEFERRED_WARN_INTERVAL - Duration::from_millis(1)
+        ));
+
+        // Once the rate-limit interval elapses, warning is emitted again.
+        assert!(s.defer_block_retry(t0 + SURVEY_BLOCK_DEFERRED_WARN_INTERVAL));
+        assert!(
+            !s.defer_block_retry(t0 + SURVEY_BLOCK_DEFERRED_WARN_INTERVAL + Duration::from_secs(1))
+        );
+
+        // Sighting ending past grace resets the rate-limiting state.
+        s.last_seen_at = Some(t0);
+        let t_end = t0 + SURVEY_REAPPEAR_GRACE + Duration::from_millis(100);
+        assert_eq!(
+            survey_dismissal_tick(&mut s, false, true, t_end),
+            SurveyAction::None
+        );
+        assert!(s.defer_block_retry(t_end));
+    }
+
+    #[test]
+    fn survey_failed_unblock_uses_cooldown_and_rate_limits_warnings() {
+        let t0 = Instant::now();
+        let mut s = SurveyDismissal {
+            last_seen_at: Some(t0),
+            blocker_published: true,
+            ..Default::default()
+        };
+
+        assert!(s.defer_unblock_retry(t0));
+        assert_eq!(s.next_attempt_at, Some(t0 + SURVEY_DISMISS_RETRY_COOLDOWN));
+        assert_eq!(
+            survey_dismissal_tick(&mut s, false, true, t0 + Duration::from_millis(500)),
+            SurveyAction::None,
+            "the 500ms poll cap must not cause another clear attempt before cooldown"
+        );
+        assert_eq!(
+            survey_dismissal_tick(&mut s, false, true, t0 + SURVEY_DISMISS_RETRY_COOLDOWN),
+            SurveyAction::Unblock
+        );
+        assert!(!s.defer_unblock_retry(t0 + SURVEY_DISMISS_RETRY_COOLDOWN));
+        assert!(s.defer_unblock_retry(t0 + SURVEY_UNBLOCK_FAILED_WARN_INTERVAL));
+    }
+
+    #[test]
+    #[serial]
+    fn run_survey_dismissal_rate_limits_deferred_block_warning() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let shared_status = Arc::new(RwLock::new(ST_BLOCKED.to_string()));
+
+        // Another blocker owns the row: survey blocker publication will be deferred.
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, status_time, created_at)
+                 VALUES ('mia', 'antigravity', 'blocked', 'approval', '', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        let mut survey = SurveyDismissal::default();
+
+        // First Block action: publish fails, warning logged.
+        handle_survey_action(
+            &mut survey,
+            Some("mia"),
+            &shared_status,
+            |_| Ok(()),
+            SurveyAction::Block,
+        );
+        assert!(!survey.blocker_published);
+
+        let count_deferred_logs = || {
+            crate::log::get_recent_logs(1.0, &["WARN"], 50)
+                .into_iter()
+                .filter(|e| {
+                    e.get("event").and_then(|v| v.as_str()) == Some("pty.survey_block_deferred")
+                })
+                .count()
+        };
+        assert_eq!(
+            count_deferred_logs(),
+            1,
+            "initial deferral must log warning"
+        );
+
+        // Subsequent retry tick while still deferred: warning must be rate-limited.
+        handle_survey_action(
+            &mut survey,
+            Some("mia"),
+            &shared_status,
+            |_| Ok(()),
+            SurveyAction::Block,
+        );
+        assert_eq!(
+            count_deferred_logs(),
+            1,
+            "repeated deferral warning must be rate-limited"
+        );
+
+        // When the other blocker clears, publication succeeds and logs pty.survey_block.
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening', status_context = 'idle'
+                 WHERE name = 'mia'",
+                [],
+            )
+            .unwrap();
+        handle_survey_action(
+            &mut survey,
+            Some("mia"),
+            &shared_status,
+            |_| Ok(()),
+            SurveyAction::Block,
+        );
+        assert!(survey.blocker_published);
+        let block_logs = crate::log::get_recent_logs(1.0, &["WARN"], 50)
+            .into_iter()
+            .filter(|e| e.get("event").and_then(|v| v.as_str()) == Some("pty.survey_block"))
+            .count();
+        assert_eq!(block_logs, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn run_survey_dismissal_rate_limits_failed_unblock_warning() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let shared_status = Arc::new(RwLock::new(ST_BLOCKED.to_string()));
+
+        // Seed instance as blocked:pty:survey
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, status_time, created_at)
+                 VALUES ('mia', 'antigravity', 'blocked', 'pty:survey', '', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        // Trigger DB failure on update to simulate a genuine failed unblock
+        db.conn()
+            .execute(
+                "CREATE TRIGGER abort_instances_update BEFORE UPDATE ON instances
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced unblock fail for test');
+                 END;",
+                [],
+            )
+            .unwrap();
+
+        let mut survey = SurveyDismissal {
+            blocker_published: true,
+            ..Default::default()
+        };
+        handle_survey_action(
+            &mut survey,
+            Some("mia"),
+            &shared_status,
+            |_| Ok(()),
+            SurveyAction::Unblock,
+        );
+        handle_survey_action(
+            &mut survey,
+            Some("mia"),
+            &shared_status,
+            |_| Ok(()),
+            SurveyAction::Unblock,
+        );
+
+        let warning_count = crate::log::get_recent_logs(1.0, &["WARN"], 50)
+            .into_iter()
+            .filter(|entry| {
+                entry.get("event").and_then(|value| value.as_str())
+                    == Some("pty.survey_unblock_failed")
+            })
+            .count();
+        assert_eq!(warning_count, 1);
+        assert!(survey.blocker_published);
+        assert!(survey.next_attempt_at.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn publish_survey_status_ownership_semantics() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let shared_status = Arc::new(RwLock::new(ST_LISTENING.to_string()));
+
+        // Unbound instance: publication deferred (it may bind later), so the
+        // caller must retry instead of latching.
+        assert!(!publish_survey_status(true, Some("mia"), &shared_status));
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, status_time, created_at)
+                 VALUES ('mia', 'antigravity', 'listening', 'idle', '', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        // Rising edge publishes and reports ownership.
+        assert!(publish_survey_status(true, Some("mia"), &shared_status));
+        let row = db.get_instance_full("mia").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "pty:survey");
+        assert_eq!(
+            row.status_detail,
+            "Antigravity feedback survey did not dismiss after repeated Skip attempts; \
+             answer it (0 = Skip) to resume the worker"
+        );
+        assert_eq!(*shared_status.read().unwrap(), ST_BLOCKED);
+
+        // Already ours: idempotent success.
+        assert!(publish_survey_status(true, Some("mia"), &shared_status));
+
+        let initial_last_stop = row.last_stop;
+
+        // Falling edge clears to ST_ACTIVE and reports success (last_stop untouched).
+        assert!(publish_survey_status(false, Some("mia"), &shared_status));
+        let row = db.get_instance_full("mia").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "pty:survey_cleared");
+        assert_eq!(row.status_detail, "");
+        assert_eq!(*shared_status.read().unwrap(), ST_ACTIVE);
+        assert_eq!(
+            row.last_stop, initial_last_stop,
+            "last_stop must remain unchanged on clear"
+        );
+
+        // Verify status event logged for clear is active
+        let events = db.get_events_since(0, Some("status"), Some("mia")).unwrap();
+        let clear_event = events
+            .iter()
+            .find(|e| {
+                e.get("data")
+                    .and_then(|d| d.get("context"))
+                    .and_then(|v| v.as_str())
+                    == Some("pty:survey_cleared")
+            })
+            .expect("clear event must be logged");
+        assert_eq!(
+            clear_event
+                .get("data")
+                .and_then(|d| d.get("status"))
+                .and_then(|v| v.as_str()),
+            Some("active")
+        );
+
+        // Another blocker owning the row defers the rising edge…
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'blocked', status_context = 'approval'
+                 WHERE name = 'mia'",
+                [],
+            )
+            .unwrap();
+        assert!(!publish_survey_status(true, Some("mia"), &shared_status));
+        let row = db.get_instance_full("mia").unwrap().unwrap();
+        assert_eq!(row.status_context, "approval", "other blocker untouched");
+        // …and once it clears, the retried publish succeeds.
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening', status_context = 'idle'
+                 WHERE name = 'mia'",
+                [],
+            )
+            .unwrap();
+        assert!(publish_survey_status(true, Some("mia"), &shared_status));
+
+        // Clearing while another blocker owns the row touches nothing and
+        // reports handled (there is no survey block of ours to clear).
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'blocked', status_context = 'elicitation'
+                 WHERE name = 'mia'",
+                [],
+            )
+            .unwrap();
+        assert!(publish_survey_status(false, Some("mia"), &shared_status));
+        let row = db.get_instance_full("mia").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "elicitation");
+    }
+
+    #[test]
+    #[serial]
+    fn publish_survey_status_not_found_semantics_and_latch_cleanup() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let _db = HcomDb::open().unwrap();
+        let shared_status = Arc::new(RwLock::new(ST_BLOCKED.to_string()));
+
+        // Rising edge on unbound instance returns false (retry)
+        assert!(!publish_survey_status(
+            true,
+            Some("nonexistent"),
+            &shared_status
+        ));
+        assert_eq!(
+            *shared_status.read().unwrap(),
+            ST_BLOCKED,
+            "no shared title mutation on rising not-found"
+        );
+
+        // Falling edge on unbound instance returns true (handled, no endless retry), no shared title mutation
+        assert!(publish_survey_status(
+            false,
+            Some("nonexistent"),
+            &shared_status
+        ));
+        assert_eq!(
+            *shared_status.read().unwrap(),
+            ST_BLOCKED,
+            "no shared title mutation on falling not-found"
+        );
+
+        // Controller latch cleanup: unblock clears published latch and poll cap releases
+        let t0 = Instant::now();
+        let mut survey = SurveyDismissal {
+            blocker_published: true,
+            last_seen_at: Some(t0 - SURVEY_REAPPEAR_GRACE - Duration::from_millis(100)),
+            ..Default::default()
+        };
+        assert!(survey.caps_poll_at(t0));
+        handle_survey_action(
+            &mut survey,
+            Some("nonexistent"),
+            &shared_status,
+            |_| Ok(()),
+            SurveyAction::Unblock,
+        );
+        assert!(
+            !survey.blocker_published,
+            "unblock clears published latch on unbound instance"
+        );
+        assert!(
+            !survey.caps_poll_at(t0),
+            "poll cap releases on unbound instance unblock once grace has passed"
+        );
+    }
+
+    #[test]
+    fn survey_skip_key_is_byte_zero_without_enter() {
+        assert_eq!(ANTIGRAVITY_SURVEY_SKIP_KEY, b"0");
+        assert!(!ANTIGRAVITY_SURVEY_SKIP_KEY.contains(&b'\n'));
+        assert!(!ANTIGRAVITY_SURVEY_SKIP_KEY.contains(&b'\r'));
+    }
+
+    #[test]
+    #[serial]
+    fn publish_survey_status_preserves_foreign_and_replacement_approval() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let shared_status = Arc::new(RwLock::new(ST_BLOCKED.to_string()));
+
+        // Seed instance as blocked:approval
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, status_time, created_at)
+                 VALUES ('zara', 'antigravity', 'blocked', 'approval', 'Run command permission', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        // 1. Survey publish cannot overwrite hook approval
+        assert!(!publish_survey_status(true, Some("zara"), &shared_status));
+        let row = db.get_instance_full("zara").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.status_detail, "Run command permission");
+
+        // 2. Unblock when row is approval (not survey) does not mutate row or clear approval
+        assert!(publish_survey_status(false, Some("zara"), &shared_status));
+        let row = db.get_instance_full("zara").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.status_detail, "Run command permission");
+        assert_eq!(*shared_status.read().unwrap(), ST_BLOCKED);
+    }
+
+    #[test]
+    #[serial]
+    fn publish_survey_status_event_insert_failure_rolls_back_status_mutation() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let shared_status = Arc::new(RwLock::new(ST_LISTENING.to_string()));
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, status_time, created_at)
+                 VALUES ('bora', 'antigravity', 'listening', 'idle', 'original_detail', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        // Create trigger to abort event insertion
+        db.conn()
+            .execute(
+                "CREATE TRIGGER abort_status_events BEFORE INSERT ON events
+                 WHEN NEW.event_type = 'status'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced trigger abort for test');
+                 END;",
+                [],
+            )
+            .unwrap();
+
+        // Attempt to publish survey blocker: event insert will fail inside write scope
+        assert!(!publish_survey_status(true, Some("bora"), &shared_status));
+
+        // Status and detail mutations rolled back: row remains listening:idle with original_detail
+        let row = db.get_instance_full("bora").unwrap().unwrap();
+        assert_eq!(row.status, ST_LISTENING);
+        assert_eq!(row.status_context, "idle");
+        assert_eq!(row.status_detail, "original_detail");
+        // Shared status was NOT updated to blocked
+        assert_eq!(*shared_status.read().unwrap(), ST_LISTENING);
+    }
+
+    #[test]
+    #[serial]
+    fn publish_survey_status_unblock_refuses_replacement_approval_and_preserves_shared_title() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let shared_status = Arc::new(RwLock::new(ST_LISTENING.to_string()));
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, status_time, created_at)
+                 VALUES ('kora', 'antigravity', 'listening', 'idle', '', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        // First, publish survey block
+        assert!(publish_survey_status(true, Some("kora"), &shared_status));
+        assert_eq!(*shared_status.read().unwrap(), ST_BLOCKED);
+        let row = db.get_instance_full("kora").unwrap().unwrap();
+        assert!(row.status_detail.contains("Antigravity feedback survey"));
+
+        // A newer approval arrives while survey was blocked (replacement approval)
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'blocked', status_context = 'approval',
+                 status_detail = 'Run this command?' WHERE name = 'kora'",
+                [],
+            )
+            .unwrap();
+
+        // Now survey dismisser attempts to unblock:
+        // Must refuse to clear the replacement approval!
+        assert!(publish_survey_status(false, Some("kora"), &shared_status));
+
+        // Verify the approval row was NOT overwritten or cleared, and detail is untouched
+        let row = db.get_instance_full("kora").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.status_detail, "Run this command?");
+
+        // Shared status must remain ST_BLOCKED (no stale shared-title override to listening/active!)
+        assert_eq!(*shared_status.read().unwrap(), ST_BLOCKED);
     }
 
     // ---- Antigravity mode-banner delivery wiring (hcom-f6g.10) ----
