@@ -11,16 +11,16 @@ use crate::commands::launch::{
     LaunchOutputContext, LaunchPreview, extract_launch_flags, is_background_from_args,
     load_hcom_config, print_launch_preview, report_launch, resolve_launcher_name,
 };
-use crate::commands::transcript::detect_agent_type;
 use crate::db::HcomDb;
 use crate::hooks::codex::derive_codex_transcript_path;
 use crate::hooks::gemini::derive_gemini_transcript_path;
 use crate::hooks::kimi::derive_kimi_transcript_path;
-use crate::launcher::{self, LaunchParams, LaunchResult};
+use crate::launcher::{self, LaunchParams, LaunchResult, LaunchTool};
 use crate::log::log_info;
 use crate::router::GlobalFlags;
 use crate::shared::ST_INACTIVE;
-use crate::transcript::{claude_projects_dir, qoder_projects_dir};
+use crate::tool::Tool;
+use crate::transcript::{claude_projects_dir, detect_tool_from_path, qoder_projects_dir};
 use rusqlite::OptionalExtension;
 
 /// Where to load the resume/fork plan from.
@@ -35,12 +35,13 @@ enum ResumeSource<'a> {
     /// Adopt a session from its on-disk transcript (first-time bring-in under hcom).
     Disk {
         session_id: String,
-        tool: String,
+        tool: Tool,
         cwd_hint: Option<String>,
     },
 }
 
 struct PreparedResume {
+    tool: Tool,
     output: ResumeOutputContext,
     launch: LaunchParams,
     session_id: String,
@@ -66,7 +67,7 @@ struct TrackedForkIdentity {
 }
 
 struct ResumePromptInput<'a> {
-    tool: &'a str,
+    tool: Tool,
     display_name: &'a str,
     fork: bool,
     is_adoption: bool,
@@ -434,7 +435,7 @@ fn prepare_resume_plan_from_source(
         } => {
             let display = session_id.clone();
             (
-                tool,
+                tool.as_str().to_string(),
                 session_id,
                 String::new(),
                 String::new(),
@@ -450,7 +451,8 @@ fn prepare_resume_plan_from_source(
         bail!(missing_session_error(db, &display_name, fork));
     }
 
-    validate_resume_operation(&tool, fork)?;
+    let launch_tool = validate_resume_operation(&tool, fork)?;
+    let tool = launch_tool.tool();
     let inherited_tag = if tag.is_empty() {
         None
     } else {
@@ -501,18 +503,17 @@ fn prepare_resume_plan_from_source(
     let mut persisted_args = original_args.clone();
     persisted_args.extend(clean_extra.iter().cloned());
 
-    let mut cli_tool_args = build_resume_args(&tool, &session_id, fork);
+    let mut cli_tool_args = build_resume_args(tool, &session_id, fork);
     cli_tool_args.extend(clean_extra);
 
     let merged_cli_args = if !original_args.is_empty() {
-        merge_resume_args(&tool, &original_args, &cli_tool_args)
+        merge_resume_args(tool, &original_args, &cli_tool_args)
     } else {
         cli_tool_args
     };
 
     let mut merged_args = merged_cli_args.clone();
 
-    let launch_tool = crate::launcher::LaunchTool::from_str(&tool)?;
     let is_headless =
         launch_flags.headless || is_background_from_args(&launch_tool, &merged_args) || background;
 
@@ -521,7 +522,7 @@ fn prepare_resume_plan_from_source(
     // mirrors `prepare_launch_execution` on the launch path so resume/fork and
     // launch share one execution-mode policy. `-p` is opt-in because, from
     // 2026-06-15, `claude -p` draws from a separate Agent SDK credit pool.
-    if tool == "claude"
+    if launch_tool == Tool::Claude.into()
         && is_headless
         && merged_args
             .iter()
@@ -550,7 +551,7 @@ fn prepare_resume_plan_from_source(
 
     let (effective_system_prompt, fork_initial_prompt, append_reply_handoff) =
         build_resume_prompts(ResumePromptInput {
-            tool: &tool,
+            tool,
             display_name: &display_name,
             fork,
             is_adoption,
@@ -585,9 +586,10 @@ fn prepare_resume_plan_from_source(
     };
 
     Ok(PreparedResume {
+        tool,
         output: ResumeOutputContext {
             action: if fork { "fork" } else { "resume" }.to_string(),
-            tool: tool.clone(),
+            tool: launch_tool.as_str().to_string(),
             tag: output_tag,
             terminal: launch_flags.terminal.clone(),
             background: is_headless,
@@ -596,7 +598,7 @@ fn prepare_resume_plan_from_source(
             json: launch_flags.json,
         },
         launch: LaunchParams {
-            tool: tool.clone(),
+            tool: launch_tool.as_str().to_string(),
             count: 1,
             args: merged_args,
             persisted_args: Some(persisted_args),
@@ -722,7 +724,7 @@ fn prepare_launch_for_execution(db: &HcomDb, plan: &PreparedResume) -> Result<La
     let reserved_child_name = crate::instance_names::reserve_generated_name(db)?;
     let (system_prompt, initial_prompt, append_reply_handoff) =
         build_resume_prompts(ResumePromptInput {
-            tool: &launch.tool,
+            tool: plan.tool,
             display_name: &identity.parent_name,
             fork: true,
             is_adoption: false,
@@ -855,29 +857,24 @@ fn resolve_adhoc_resume_tool(name: &str, tool: String, sid: &str, fork: bool) ->
         bail!("'{name}' joined ad-hoc with no native session, so there is nothing to {op}");
     }
     match find_session_on_disk(sid) {
-        Some((tool, _)) => Ok(tool),
+        Some((tool, _)) => Ok(tool.as_str().to_string()),
         None => bail!(
             "'{name}' joined ad-hoc from session {sid}, but no transcript for it was found, so hcom cannot tell which tool to {op}"
         ),
     }
 }
 
-fn validate_resume_operation(tool: &str, fork: bool) -> Result<()> {
-    let tool_lookup = if tool == "claude-pty" { "claude" } else { tool };
-    let parsed = tool_lookup
-        .parse::<crate::tool::Tool>()
+/// Parse the saved tool name (canonical, alias, or `claude-pty`) and check it
+/// supports the operation.
+fn validate_resume_operation(tool: &str, fork: bool) -> Result<LaunchTool> {
+    let launch_tool = LaunchTool::from_str(tool)
         .map_err(|_| anyhow::anyhow!("Unknown tool '{}' in saved session metadata", tool))?;
-
-    if !fork {
-        return Ok(());
-    }
     // Drive fork support from the spec so help text and validation can't drift.
-    // Accepts canonical names + aliases (e.g. `"agy"` → Antigravity).
-    let spec = parsed.spec();
-    if spec.resume.and_then(|r| r.fork).is_none() {
+    let spec = launch_tool.spec();
+    if fork && spec.resume.and_then(|r| r.fork).is_none() {
         bail!("{} does not support session forking (hcom f)", spec.label);
     }
-    Ok(())
+    Ok(launch_tool)
 }
 
 fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option<String>, bool) {
@@ -895,7 +892,7 @@ fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option
     // Codex and Qoder fork identity resets belong in the initial prompt.
     // Qoder must preserve its saved system prompt across resume/fork.
     // Adoption-fork has no prior hcom identity, so normal bootstrap handles it.
-    let initial_prompt = if fork && matches!(tool, "codex" | "qoder") && !is_adoption {
+    let initial_prompt = if fork && matches!(tool, Tool::Codex | Tool::Qoder) && !is_adoption {
         let child_name = child_name.expect("tracked fork child name should be available");
         let child_display = effective_tag
             .map(|tag| format!("{tag}-{child_name}"))
@@ -913,7 +910,7 @@ fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option
             }
             _ => identity_reset,
         })
-    } else if tool == "qoder" && !is_adoption {
+    } else if tool == Tool::Qoder && !is_adoption {
         let identity = resume_system_prompt(tool, display_name, false, None);
         Some(match custom_initial_prompt {
             Some(prompt) => format!("{identity}\n\n{prompt}"),
@@ -926,7 +923,7 @@ fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option
     // System prompt:
     // - Tracked-instance resume/fork: identity-carrying prompt (existing behavior).
     // - Adoption: None — SessionStart issues the normal fresh-launch bootstrap.
-    let base_system_prompt = if is_adoption || tool == "qoder" {
+    let base_system_prompt = if is_adoption || tool == Tool::Qoder {
         None
     } else {
         Some(resume_system_prompt(tool, display_name, fork, child_name))
@@ -942,13 +939,13 @@ fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option
 
     // Codex tracked-instance fork uses initial_prompt for an identity reset;
     // don't dilute it with a reply-handoff suffix. Adoption-fork has no reset.
-    let append_reply_handoff = !(fork && matches!(tool, "codex" | "qoder") && !is_adoption);
+    let append_reply_handoff = !(fork && matches!(tool, Tool::Codex | Tool::Qoder) && !is_adoption);
     (system_prompt, initial_prompt, append_reply_handoff)
 }
 
-fn resume_system_prompt(tool: &str, name: &str, fork: bool, child_name: Option<&str>) -> String {
+fn resume_system_prompt(tool: Tool, name: &str, fork: bool, child_name: Option<&str>) -> String {
     if fork {
-        if tool == "codex" {
+        if tool == Tool::Codex {
             format!(
                 "YOU ARE A FORK of agent '{}'. \
                  You have the same session history but are a NEW agent with an already-assigned hcom identity. \
@@ -1078,14 +1075,9 @@ fn parse_stopped_snapshot(data_str: &str) -> Option<SnapshotData> {
 }
 
 /// Build tool-specific resume/fork args from the integration spec.
-fn build_resume_args(tool: &str, session_id: &str, fork: bool) -> Vec<String> {
+fn build_resume_args(tool: Tool, session_id: &str, fork: bool) -> Vec<String> {
     use crate::integration_spec::{ForkArgs, ResumeArgs};
-    // claude-pty resolves to the Claude spec.
-    let tool_lookup = if tool == "claude-pty" { "claude" } else { tool };
-    let Ok(tool_enum) = tool_lookup.parse::<crate::tool::Tool>() else {
-        return Vec::new();
-    };
-    let Some(resume_spec) = tool_enum.spec().resume.as_ref() else {
+    let Some(resume_spec) = tool.spec().resume.as_ref() else {
         return Vec::new();
     };
 
@@ -1112,12 +1104,8 @@ fn build_resume_args(tool: &str, session_id: &str, fork: bool) -> Vec<String> {
 
 /// Merge original launch args with resume-specific args, per the tool's
 /// [`ResumeMerge`](crate::integration_spec::ResumeMerge).
-fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<String> {
+fn merge_resume_args(tool: Tool, original: &[String], resume: &[String]) -> Vec<String> {
     use crate::integration_spec::ResumeMerge;
-    let tool_lookup = if tool == "claude-pty" { "claude" } else { tool };
-    let tool = tool_lookup
-        .parse::<crate::tool::Tool>()
-        .expect("resume tool must be validated before argument merging");
     let merge = tool
         .spec()
         .resume
@@ -1508,8 +1496,8 @@ fn opencode_data_dir() -> Option<std::path::PathBuf> {
     crate::runtime_env::opencode_family_data_dir("opencode")
 }
 
-fn opencode_family_db_path(tool: &str) -> Option<std::path::PathBuf> {
-    crate::runtime_env::opencode_family_db_path(tool)
+fn opencode_family_db_path(tool: Tool) -> Option<std::path::PathBuf> {
+    crate::runtime_env::opencode_family_db_path(tool.as_str())
 }
 
 /// Query an OpenCode-family SQLite DB for a session's working directory.
@@ -1517,7 +1505,7 @@ fn opencode_family_db_path(tool: &str) -> Option<std::path::PathBuf> {
 /// OpenCode 1 and Kilo keep sessions in `session`; OpenCode 2 keeps them in
 /// `session_v2`. Either table may be absent, so a failed query (missing
 /// table or row) just falls through to the next.
-fn lookup_opencode_family_session(tool: &str, session_id: &str) -> Option<String> {
+fn lookup_opencode_family_session(tool: Tool, session_id: &str) -> Option<String> {
     let db_path = opencode_family_db_path(tool)?;
     if !db_path.exists() {
         return None;
@@ -1537,10 +1525,10 @@ fn lookup_opencode_family_session(tool: &str, session_id: &str) -> Option<String
     })
 }
 
-fn lookup_family_session(session_id: &str) -> Option<(String, String)> {
-    ["opencode", "kilo"].into_iter().find_map(|tool| {
-        lookup_opencode_family_session(tool, session_id).map(|cwd| (tool.to_string(), cwd))
-    })
+fn lookup_family_session(session_id: &str) -> Option<(Tool, String)> {
+    [Tool::OpenCode, Tool::Kilo]
+        .into_iter()
+        .find_map(|tool| lookup_opencode_family_session(tool, session_id).map(|cwd| (tool, cwd)))
 }
 
 /// Resolve a session ID to the owning tool and (optionally) a pre-recovered
@@ -1548,9 +1536,9 @@ fn lookup_family_session(session_id: &str) -> Option<(String, String)> {
 ///
 /// - Claude, Codex, Gemini: returns `(tool, Some(transcript_path))`.
 ///   Caller reads the transcript's first line to recover CWD.
-/// - Opencode: returns `(tool="opencode", None)` — opencode stores sessions
+/// - OpenCode family: returns `(tool, None)` — opencode stores sessions
 ///   in SQLite; CWD comes from a separate DB query, not a transcript file.
-fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
+fn find_session_on_disk(session_id: &str) -> Option<(Tool, Option<String>)> {
     // 1. OpenCode family: prefix-scoped, query the SQLite DBs directly.
     if is_opencode_session_id(session_id) {
         if let Some((tool, _)) = lookup_family_session(session_id) {
@@ -1569,51 +1557,57 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
                 let candidate = entry.path().join(format!("{}.jsonl", session_id));
                 if candidate.exists() {
                     let path_str = candidate.to_string_lossy().to_string();
-                    let tool = detect_agent_type(&path_str).to_string();
-                    return Some((tool, Some(path_str)));
+                    if let Some(tool) = detect_tool_from_path(&path_str) {
+                        return Some((tool, Some(path_str)));
+                    }
                 }
             }
         }
     }
 
     // 3. Codex
-    if let Some(path) = derive_codex_transcript_path(session_id) {
-        let tool = detect_agent_type(&path).to_string();
+    if let Some(path) = derive_codex_transcript_path(session_id)
+        && let Some(tool) = detect_tool_from_path(&path)
+    {
         return Some((tool, Some(path)));
     }
 
     // 4. Gemini
-    if let Some(path) = derive_gemini_transcript_path(session_id) {
-        let tool = detect_agent_type(&path).to_string();
+    if let Some(path) = derive_gemini_transcript_path(session_id)
+        && let Some(tool) = detect_tool_from_path(&path)
+    {
         return Some((tool, Some(path)));
     }
 
     // 5. Cursor
-    if let Some(path) = derive_cursor_transcript_path(session_id) {
-        let tool = detect_agent_type(&path).to_string();
+    if let Some(path) = derive_cursor_transcript_path(session_id)
+        && let Some(tool) = detect_tool_from_path(&path)
+    {
         return Some((tool, Some(path)));
     }
 
     // 6. Kimi
-    if let Some(path) = derive_kimi_transcript_path(session_id) {
-        let tool = detect_agent_type(&path).to_string();
+    if let Some(path) = derive_kimi_transcript_path(session_id)
+        && let Some(tool) = detect_tool_from_path(&path)
+    {
         return Some((tool, Some(path)));
     }
 
     // 6b. Qoder (Claude-format transcripts under its own config dir)
     if let Some(path) = derive_qoder_transcript_path(session_id) {
-        return Some(("qoder".to_string(), Some(path)));
+        return Some((Tool::Qoder, Some(path)));
     }
 
     // 7. Copilot
-    if let Some(path) = derive_copilot_transcript_path(session_id) {
-        let tool = detect_agent_type(&path).to_string();
+    if let Some(path) = derive_copilot_transcript_path(session_id)
+        && let Some(tool) = detect_tool_from_path(&path)
+    {
         return Some((tool, Some(path)));
     }
 
     // 8. Grok
     if let Some(path) = derive_grok_transcript_path(session_id) {
-        return Some(("grok".to_string(), Some(path)));
+        return Some((Tool::Grok, Some(path)));
     }
 
     // 9. Pi / OMP. Attribute by root PROVENANCE, not probe order:
@@ -1637,7 +1631,7 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
 }
 
 enum PiOmpMatch {
-    Found { tool: String, path: String },
+    Found { tool: Tool, path: String },
     Ambiguous { path: String },
     None,
 }
@@ -1655,19 +1649,19 @@ fn resolve_pi_omp_on_disk(session_id: &str) -> PiOmpMatch {
         let omp_active = omp_session_roots().contains(root);
         match (pi_active, omp_active) {
             (true, true) => Some(None),
-            (true, false) => Some(Some("pi")),
-            (false, true) => Some(Some("omp")),
+            (true, false) => Some(Some(Tool::Pi)),
+            (false, true) => Some(Some(Tool::Omp)),
             (false, false) => None,
         }
     });
 
     let roots = pi_exclusive_roots()
         .into_iter()
-        .map(|root| (root, Some("pi")))
+        .map(|root| (root, Some(Tool::Pi)))
         .chain(
             omp_exclusive_roots()
                 .into_iter()
-                .map(|root| (root, Some("omp"))),
+                .map(|root| (root, Some(Tool::Omp))),
         )
         .chain(shared.zip(shared_owner));
 
@@ -1676,10 +1670,7 @@ fn resolve_pi_omp_on_disk(session_id: &str) -> PiOmpMatch {
             && let Some(path) = find_pi_transcript_in_root(&root, session_id)
         {
             return match owner.or_else(|| pi_omp_path_owner(&path)) {
-                Some(tool) => PiOmpMatch::Found {
-                    tool: tool.to_string(),
-                    path,
-                },
+                Some(tool) => PiOmpMatch::Found { tool, path },
                 None => PiOmpMatch::Ambiguous { path },
             };
         }
@@ -1688,12 +1679,8 @@ fn resolve_pi_omp_on_disk(session_id: &str) -> PiOmpMatch {
 }
 
 /// Return the owner encoded in a shared path's `.pi` or `.omp` marker.
-fn pi_omp_path_owner(path: &str) -> Option<&'static str> {
-    match crate::transcript::detect_tool_from_path(path) {
-        Some(crate::tool::Tool::Pi) => Some("pi"),
-        Some(crate::tool::Tool::Omp) => Some("omp"),
-        _ => None,
-    }
+fn pi_omp_path_owner(path: &str) -> Option<Tool> {
+    detect_tool_from_path(path).filter(|tool| matches!(tool, Tool::Pi | Tool::Omp))
 }
 
 /// The path of a Pi/OMP session that was found but is genuinely ambiguous
@@ -1865,25 +1852,25 @@ fn recover_cursor_cwd(transcript_path: &str) -> Option<String> {
 ///   `~/.cursor/projects/<slug>/.workspace-trusted` marker (`workspacePath`).
 /// - **Copilot**: `session.start` entry carries `cwd` in the `data` object;
 ///   scan the first few lines for it.
-fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
+fn extract_cwd_from_transcript(path: &str, tool: Tool) -> Option<String> {
     match tool {
         // Qoder transcripts are Claude-format: `cwd` rides on the first user record.
-        "claude" | "qoder" => {
+        Tool::Claude | Tool::Qoder => {
             scan_lines_for_cwd(path, 20, |v| v.get("cwd").and_then(|c| c.as_str()))
         }
-        "codex" => scan_lines_for_cwd(path, 1, |v| {
+        Tool::Codex => scan_lines_for_cwd(path, 1, |v| {
             v.get("payload")
                 .and_then(|p| p.get("cwd"))
                 .and_then(|c| c.as_str())
         }),
         // Antigravity shares Gemini's session tree/format (GEMINI_CLI_HOME);
-        // an agy-pathed transcript that detect_agent_type labels "antigravity"
-        // still has the gemini `projectHash` field, so reuse the same recovery.
-        "gemini" | "antigravity" => recover_gemini_cwd(path),
-        "cursor" => recover_cursor_cwd(path),
-        "kimi" => None, // Kimi context.jsonl does not store cwd
-        "grok" => recover_grok_cwd(path),
-        "copilot" => scan_lines_for_cwd(path, 20, |v| {
+        // an agy-pathed transcript detected as Antigravity still has the
+        // gemini `projectHash` field, so reuse the same recovery.
+        Tool::Gemini | Tool::Antigravity => recover_gemini_cwd(path),
+        Tool::Cursor => recover_cursor_cwd(path),
+        Tool::Kimi => None, // Kimi context.jsonl does not store cwd
+        Tool::Grok => recover_grok_cwd(path),
+        Tool::Copilot => scan_lines_for_cwd(path, 20, |v| {
             v.get("event")
                 .or_else(|| v.get("type"))
                 .and_then(|event| event.as_str())
@@ -1892,7 +1879,7 @@ fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
                 .and_then(|data| data.get("cwd"))
                 .and_then(|cwd| cwd.as_str())
         }),
-        "omp" => scan_lines_for_cwd(path, 10, |v| {
+        Tool::Pi | Tool::Omp => scan_lines_for_cwd(path, 10, |v| {
             if v.get("type").and_then(|t| t.as_str()) == Some("session") {
                 v.get("cwd")
                     .or_else(|| v.get("session").and_then(|s| s.get("cwd")))
@@ -1901,16 +1888,8 @@ fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
                 None
             }
         }),
-        "pi" => scan_lines_for_cwd(path, 10, |v| {
-            if v.get("type").and_then(|t| t.as_str()) == Some("session") {
-                v.get("cwd")
-                    .or_else(|| v.get("session").and_then(|s| s.get("cwd")))
-                    .and_then(|c| c.as_str())
-            } else {
-                None
-            }
-        }),
-        _ => None,
+        // Found through their own session stores, not a transcript path.
+        Tool::OpenCode | Tool::Kilo | Tool::Hermes | Tool::Adhoc => None,
     }
 }
 
@@ -2005,7 +1984,7 @@ fn build_adopt_plan(
         let opencode_db = opencode_data_dir()
             .map(|d| d.join("opencode.db").display().to_string())
             .unwrap_or_else(|| "(no data dir)".to_string());
-        let kilo_db = opencode_family_db_path("kilo")
+        let kilo_db = opencode_family_db_path(Tool::Kilo)
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "(no data dir)".to_string());
         if is_opencode_session_id(session_id) {
@@ -2047,10 +2026,10 @@ fn build_adopt_plan(
     let cwd_hint = if fork {
         None
     } else {
-        let raw = if tool == "opencode" || tool == "kilo" {
-            lookup_opencode_family_session(&tool, session_id)
+        let raw = if matches!(tool, Tool::OpenCode | Tool::Kilo) {
+            lookup_opencode_family_session(tool, session_id)
         } else if let Some(ref path) = transcript_path {
-            extract_cwd_from_transcript(path, &tool)
+            extract_cwd_from_transcript(path, tool)
         } else {
             None
         };
@@ -2130,7 +2109,7 @@ mod tests {
                     &db,
                     ResumeSource::Disk {
                         session_id: "untracked-session".into(),
-                        tool: "codex".into(),
+                        tool: Tool::Codex,
                         cwd_hint: Some("/tmp".into()),
                     },
                     fork,
@@ -2273,13 +2252,13 @@ mod tests {
 
     #[test]
     fn test_build_resume_args_claude() {
-        let args = build_resume_args("claude", "sess-123", false);
+        let args = build_resume_args(Tool::Claude, "sess-123", false);
         assert_eq!(args, s(&["--resume", "sess-123"]));
     }
 
     #[test]
     fn test_build_resume_args_claude_fork() {
-        let args = build_resume_args("claude", "sess-123", true);
+        let args = build_resume_args(Tool::Claude, "sess-123", true);
         assert_eq!(args, s(&["--resume", "sess-123", "--fork-session"]));
     }
 
@@ -2309,13 +2288,13 @@ mod tests {
 
     #[test]
     fn test_build_resume_args_codex_resume() {
-        let args = build_resume_args("codex", "sess-456", false);
+        let args = build_resume_args(Tool::Codex, "sess-456", false);
         assert_eq!(args, s(&["resume", "sess-456"]));
     }
 
     #[test]
     fn test_build_resume_args_codex_fork() {
-        let args = build_resume_args("codex", "sess-456", true);
+        let args = build_resume_args(Tool::Codex, "sess-456", true);
         assert_eq!(args, s(&["fork", "sess-456"]));
     }
 
@@ -2332,14 +2311,14 @@ mod tests {
             "-cfeatures.bar=false",
         ]);
         for fork in [false, true] {
-            let mut resume = build_resume_args("codex", "session-id", fork);
+            let mut resume = build_resume_args(Tool::Codex, "session-id", fork);
             resume.extend(s(&[
                 "--model",
                 "gpt-6-astra",
                 "--config",
                 "model_reasoning_effort=\"high\"",
             ]));
-            let merged = merge_resume_args("codex", &original, &resume);
+            let merged = merge_resume_args(Tool::Codex, &original, &resume);
             assert_eq!(
                 merged,
                 s(&[
@@ -2364,13 +2343,13 @@ mod tests {
 
     #[test]
     fn test_build_resume_args_gemini() {
-        let args = build_resume_args("gemini", "sess-789", false);
+        let args = build_resume_args(Tool::Gemini, "sess-789", false);
         assert_eq!(args, s(&["--resume", "sess-789"]));
     }
 
     #[test]
     fn test_build_resume_args_omp_resume() {
-        let args = build_resume_args("omp", "sess-omp", false);
+        let args = build_resume_args(Tool::Omp, "sess-omp", false);
         assert_eq!(args, s(&["--resume", "sess-omp"]));
     }
 
@@ -2381,7 +2360,7 @@ mod tests {
         // SessionManager.forkFrom(...). Same shape as Pi — fork must emit
         // `["--fork", <id>]`, replacing `--resume`, not `["--resume", <id>,
         // "--fork"]`. hcom must not degrade `hcom f` into a plain `--resume`.
-        let args = build_resume_args("omp", "sess-omp", true);
+        let args = build_resume_args(Tool::Omp, "sess-omp", true);
         assert_eq!(args, s(&["--fork", "sess-omp"]));
     }
 
@@ -2392,11 +2371,11 @@ mod tests {
         // config flags.
         let fork = s(&["--fork", "new"]);
         assert_eq!(
-            merge_resume_args("omp", &s(&["--model", "opus", "--fork", "old"]), &fork),
+            merge_resume_args(Tool::Omp, &s(&["--model", "opus", "--fork", "old"]), &fork),
             s(&["--fork", "new", "--model", "opus"])
         );
         assert_eq!(
-            merge_resume_args("omp", &s(&["--fork=old", "-r", "prev"]), &fork),
+            merge_resume_args(Tool::Omp, &s(&["--fork=old", "-r", "prev"]), &fork),
             s(&["--fork", "new"])
         );
     }
@@ -2405,16 +2384,20 @@ mod tests {
     fn test_merge_omp_args_strips_resume_aliases_and_values() {
         let resume = s(&["--resume", "new"]);
         assert_eq!(
-            merge_resume_args("omp", &s(&["--model", "opus", "-r", "old"]), &resume),
+            merge_resume_args(Tool::Omp, &s(&["--model", "opus", "-r", "old"]), &resume),
             s(&["--resume", "new", "--model", "opus"])
         );
         assert_eq!(
-            merge_resume_args("omp", &s(&["--resume=old", "--thinking", "high"]), &resume),
+            merge_resume_args(
+                Tool::Omp,
+                &s(&["--resume=old", "--thinking", "high"]),
+                &resume
+            ),
             s(&["--resume", "new", "--thinking", "high"])
         );
         assert_eq!(
             merge_resume_args(
-                "omp",
+                Tool::Omp,
                 &s(&["--continue", "-c", "--session-dir", "/tmp/s"]),
                 &resume
             ),
@@ -2426,7 +2409,11 @@ mod tests {
     fn test_merge_omp_args_does_not_drop_following_flags() {
         let resume = s(&["--resume", "new"]);
         assert_eq!(
-            merge_resume_args("omp", &s(&["--session-dir", "--model", "opus"]), &resume),
+            merge_resume_args(
+                Tool::Omp,
+                &s(&["--session-dir", "--model", "opus"]),
+                &resume
+            ),
             s(&["--resume", "new", "--model", "opus"])
         );
     }
@@ -2485,7 +2472,7 @@ mod tests {
         std::fs::write(root.join("session-omp.jsonl"), "{}").unwrap();
 
         let found = find_session_on_disk("session-omp").unwrap();
-        assert_eq!(found.0, "omp");
+        assert_eq!(found.0, Tool::Omp);
     }
 
     #[test]
@@ -2505,7 +2492,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            lookup_opencode_family_session("opencode", "ses_v2only").as_deref(),
+            lookup_opencode_family_session(Tool::OpenCode, "ses_v2only").as_deref(),
             Some("/work/v2")
         );
         // Migrated DB: the v1 row wins.
@@ -2515,11 +2502,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            lookup_opencode_family_session("opencode", "ses_v2only").as_deref(),
+            lookup_opencode_family_session(Tool::OpenCode, "ses_v2only").as_deref(),
             Some("/work/v1")
         );
         assert_eq!(
-            lookup_opencode_family_session("opencode", "ses_missing"),
+            lookup_opencode_family_session(Tool::OpenCode, "ses_missing"),
             None
         );
     }
@@ -2545,7 +2532,7 @@ mod tests {
         // OMP must not find it at all.
         assert!(derive_omp_transcript_path("session-pi").is_none());
         let found = find_session_on_disk("session-pi").unwrap();
-        assert_eq!(found.0, "pi");
+        assert_eq!(found.0, Tool::Pi);
     }
 
     #[test]
@@ -2571,7 +2558,7 @@ mod tests {
         std::fs::create_dir_all(&pi_root).unwrap();
         std::fs::write(pi_root.join("mgpi.jsonl"), "{}").unwrap();
         unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &pi_dir) }
-        assert_eq!(find_session_on_disk("mgpi").unwrap().0, "pi");
+        assert_eq!(find_session_on_disk("mgpi").unwrap().0, Tool::Pi);
 
         // Managed OMP: PI_CODING_AGENT_DIR=<base>/.omp -> sessions/<file>.
         let omp_dir = base.path().join(".omp");
@@ -2579,7 +2566,7 @@ mod tests {
         std::fs::create_dir_all(&omp_root).unwrap();
         std::fs::write(omp_root.join("mgomp.jsonl"), "{}").unwrap();
         unsafe { std::env::set_var("PI_CODING_AGENT_DIR", &omp_dir) }
-        assert_eq!(find_session_on_disk("mgomp").unwrap().0, "omp");
+        assert_eq!(find_session_on_disk("mgomp").unwrap().0, Tool::Omp);
     }
 
     #[test]
@@ -2669,7 +2656,7 @@ mod tests {
 
     #[test]
     fn test_build_resume_args_antigravity_resume() {
-        let args = build_resume_args("antigravity", "conv-abc", false);
+        let args = build_resume_args(Tool::Antigravity, "conv-abc", false);
         assert_eq!(args, s(&["--conversation", "conv-abc"]));
     }
 
@@ -2707,7 +2694,7 @@ mod tests {
     fn test_merge_resume_args_antigravity_strips_session_and_prompt_flags() {
         // --conversation (value-consuming), --continue/-c (bare), --prompt-interactive (value), -p (bare)
         let merged = merge_resume_args(
-            "antigravity",
+            Tool::Antigravity,
             &s(&[
                 "--conversation",
                 "old-conv",
@@ -2725,7 +2712,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_antigravity_preserves_sandbox_and_add_dir() {
         let merged = merge_resume_args(
-            "antigravity",
+            Tool::Antigravity,
             &s(&["--sandbox", "--add-dir", "/some/path"]),
             &s(&["--conversation", "conv-xyz"]),
         );
@@ -2746,7 +2733,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_antigravity_strips_equals_form() {
         let merged = merge_resume_args(
-            "antigravity",
+            Tool::Antigravity,
             &s(&[
                 "--conversation=old-id",
                 "--sandbox",
@@ -2762,7 +2749,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_antigravity_strips_single_dash_long_form() {
         let merged = merge_resume_args(
-            "antigravity",
+            Tool::Antigravity,
             &s(&[
                 "-conversation",
                 "old-id",
@@ -2781,7 +2768,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_cursor_preserves_config_drops_prompt_and_session() {
         let merged = merge_resume_args(
-            "cursor",
+            Tool::Cursor,
             &s(&[
                 "--model",
                 "composer-2.5",
@@ -2810,7 +2797,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_cursor_strips_workspace_worktree_continue() {
         let merged = merge_resume_args(
-            "cursor",
+            Tool::Cursor,
             &s(&[
                 "--workspace",
                 "/old/path",
@@ -2831,7 +2818,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_cursor_equals_form_and_header() {
         let merged = merge_resume_args(
-            "cursor",
+            Tool::Cursor,
             &s(&[
                 "--model=sonnet-4",
                 "--resume=old",
@@ -2853,7 +2840,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_cursor_resume_value_beats_baked() {
         let merged = merge_resume_args(
-            "cursor",
+            Tool::Cursor,
             &s(&["--model", "y", "-H", "X-Baked: 1", "--force", "stale task"]),
             &s(&["--resume", "sid", "--model", "x", "-H", "X-Resume: 1"]),
         );
@@ -2880,7 +2867,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_cursor_preserves_print_flags_for_validation() {
         let merged = merge_resume_args(
-            "cursor",
+            Tool::Cursor,
             &s(&[
                 "-p",
                 "--print",
@@ -3035,7 +3022,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_opencode_preserves_non_session_flags() {
         let merged = merge_resume_args(
-            "opencode",
+            Tool::OpenCode,
             &s(&[
                 "--model",
                 "openai/gpt-5.4",
@@ -3065,7 +3052,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_opencode_strips_equals_form_session_and_prompt() {
         let merged = merge_resume_args(
-            "opencode",
+            Tool::OpenCode,
             &s(&[
                 "--session=old-sess",
                 "--prompt=old prompt",
@@ -3087,13 +3074,13 @@ mod tests {
 
     #[test]
     fn test_build_resume_args_opencode_fork() {
-        let args = build_resume_args("opencode", "sess-000", true);
+        let args = build_resume_args(Tool::OpenCode, "sess-000", true);
         assert_eq!(args, s(&["--session", "sess-000", "--fork"]));
     }
 
     #[test]
     fn test_build_resume_args_kilo_fork() {
-        let args = build_resume_args("kilo", "sess-000", true);
+        let args = build_resume_args(Tool::Kilo, "sess-000", true);
         assert_eq!(args, s(&["--session", "sess-000", "--fork"]));
     }
 
@@ -3103,14 +3090,14 @@ mod tests {
         // with `--session` (pi errors "--fork cannot be combined with
         // --session"), so fork must emit `["--fork", <id>]`, not
         // `["--session", <id>, "--fork"]`.
-        let args = build_resume_args("pi", "sess-000", true);
+        let args = build_resume_args(Tool::Pi, "sess-000", true);
         assert_eq!(args, s(&["--fork", "sess-000"]));
     }
 
     #[test]
     fn test_merge_resume_args_pi_strips_session_controls_and_positional_prompt() {
         let merged = merge_resume_args(
-            "pi",
+            Tool::Pi,
             &s(&[
                 "--model",
                 "claude-3-5-sonnet",
@@ -3132,7 +3119,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_pi_boolean_flag_does_not_replay_prompt() {
         let merged = merge_resume_args(
-            "pi",
+            Tool::Pi,
             &s(&["--verbose", "fix x", "-t", "read,bash"]),
             &s(&["--session", "new-sess"]),
         );
@@ -3146,7 +3133,7 @@ mod tests {
     fn test_merge_resume_args_resume_flag_replaces_saved_across_spellings() {
         // OpenCode keeps its positional project dir; `-m` and `--model` are one flag.
         let merged = merge_resume_args(
-            "opencode",
+            Tool::OpenCode,
             &s(&["-m", "old/model", "--prompt", "task", "proj"]),
             &s(&["--session", "ses_1", "--model", "new/model"]),
         );
@@ -3155,7 +3142,7 @@ mod tests {
             s(&["--session", "ses_1", "--model", "new/model", "proj"])
         );
         let merged = merge_resume_args(
-            "kimi",
+            Tool::Kimi,
             &s(&["--model", "k2", "--agent", "coder", "--add-dir", "a"]),
             &s(&["--session", "sid", "-m", "k3", "--add-dir", "b"]),
         );
@@ -3177,7 +3164,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_value_may_start_with_dash() {
         let merged = merge_resume_args(
-            "qoder",
+            Tool::Qoder,
             &s(&[
                 "--append-system-prompt",
                 "- Always run tests",
@@ -3202,7 +3189,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_pi_keeps_extension_flag_values() {
         let merged = merge_resume_args(
-            "pi",
+            Tool::Pi,
             &s(&["--extension", "preset.ts", "--preset", "review", "task"]),
             &s(&["--session", "new-sess"]),
         );
@@ -3222,7 +3209,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_antigravity_double_dash_short_aliases() {
         let merged = merge_resume_args(
-            "antigravity",
+            Tool::Antigravity,
             &s(&["--i", "old task", "--c", "-sandbox"]),
             &s(&["--conversation", "c2"]),
         );
@@ -3232,7 +3219,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_antigravity_single_dash_long_flags() {
         let merged = merge_resume_args(
-            "antigravity",
+            Tool::Antigravity,
             &s(&[
                 "-model",
                 "old",
@@ -3253,7 +3240,7 @@ mod tests {
     #[test]
     fn test_merge_resume_args_kilo_preserves_non_session_flags() {
         let merged = merge_resume_args(
-            "kilo",
+            Tool::Kilo,
             &s(&["--model", "kilo/kilo-auto/free", "--prompt", "old prompt"]),
             &s(&["--session", "new-sess"]),
         );
@@ -3498,14 +3485,14 @@ mod tests {
 
     #[test]
     fn test_resume_system_prompt_codex_fork_does_not_tell_agent_to_rebind() {
-        let prompt = resume_system_prompt("codex", "luna", true, None);
+        let prompt = resume_system_prompt(Tool::Codex, "luna", true, None);
         assert!(prompt.contains("already-assigned hcom identity"));
         assert!(!prompt.contains("Run hcom start"));
     }
 
     #[test]
     fn test_resume_system_prompt_non_codex_fork_states_new_identity() {
-        let prompt = resume_system_prompt("claude", "luna", true, Some("feri"));
+        let prompt = resume_system_prompt(Tool::Claude, "luna", true, Some("feri"));
         assert!(prompt.contains("feri"), "should name the new identity");
         assert!(
             prompt.contains("--name feri"),
@@ -3521,7 +3508,7 @@ mod tests {
         );
 
         // None path falls back to already-assigned wording (no child name available)
-        let prompt_none = resume_system_prompt("claude", "luna", true, None);
+        let prompt_none = resume_system_prompt(Tool::Claude, "luna", true, None);
         assert!(prompt_none.contains("already-assigned hcom identity"));
         assert!(!prompt_none.contains("Run hcom start"));
     }
@@ -3793,7 +3780,7 @@ mod tests {
 "#,
         )
         .unwrap();
-        let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
+        let result = extract_cwd_from_transcript(path.to_str().unwrap(), Tool::Claude);
         assert_eq!(result, Some("/start/dir".to_string()));
     }
 
@@ -3811,7 +3798,7 @@ mod tests {
 "#,
         )
         .unwrap();
-        let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
+        let result = extract_cwd_from_transcript(path.to_str().unwrap(), Tool::Claude);
         assert_eq!(result, Some("/real/cwd".to_string()));
     }
 
@@ -3829,7 +3816,7 @@ mod tests {
         content.push_str(r#"{"type":"user","cwd":"/late/cwd"}"#);
         content.push('\n');
         std::fs::write(&path, content).unwrap();
-        let result = extract_cwd_from_transcript(path.to_str().unwrap(), "claude");
+        let result = extract_cwd_from_transcript(path.to_str().unwrap(), Tool::Claude);
         assert_eq!(result, None);
     }
 
@@ -3845,7 +3832,7 @@ mod tests {
 "#,
         )
         .unwrap();
-        let result = extract_cwd_from_transcript(path.to_str().unwrap(), "codex");
+        let result = extract_cwd_from_transcript(path.to_str().unwrap(), Tool::Codex);
         assert_eq!(result, Some("/start/dir".to_string()));
     }
 
@@ -3884,21 +3871,21 @@ mod tests {
 
         // Stub GEMINI_CLI_HOME so recover_gemini_cwd reads from our fake tree.
         let _gemini_home = crate::hooks::test_helpers::EnvVarGuard::set("GEMINI_CLI_HOME", base);
-        let result = extract_cwd_from_transcript(session_path.to_str().unwrap(), "gemini");
+        let result = extract_cwd_from_transcript(session_path.to_str().unwrap(), Tool::Gemini);
 
         assert_eq!(result, Some(fake_cwd.to_string()));
     }
 
     #[test]
     fn test_build_resume_args_copilot() {
-        let args = build_resume_args("copilot", "sess-abc", false);
+        let args = build_resume_args(Tool::Copilot, "sess-abc", false);
         assert_eq!(args, s(&["--resume", "sess-abc"]));
     }
 
     #[test]
     fn test_build_resume_args_copilot_fork_rejected() {
         // copilot has fork: None, so build_resume_args returns resume-only args
-        let args = build_resume_args("copilot", "sess-abc", true);
+        let args = build_resume_args(Tool::Copilot, "sess-abc", true);
         assert_eq!(args, s(&["--resume", "sess-abc"]));
     }
 
@@ -3906,7 +3893,7 @@ mod tests {
     fn test_merge_grok_args_drops_worktree_and_keeps_rules() {
         let original = s(&["--worktree", "feat", "--rules", "BOOT", "--always-approve"]);
         let resume = s(&["--resume", "sess-1"]);
-        let merged = merge_resume_args("grok", &original, &resume);
+        let merged = merge_resume_args(Tool::Grok, &original, &resume);
         assert!(!merged.iter().any(|t| t == "--worktree" || t == "feat"));
         assert!(merged.contains(&"--rules".to_string()));
         assert!(merged.contains(&"BOOT".to_string()));
@@ -3916,7 +3903,7 @@ mod tests {
     #[test]
     fn test_merge_grok_args_drops_cwd() {
         let original = s(&["--cwd", "/old", "--model", "grok-build"]);
-        let merged = merge_resume_args("grok", &original, &s(&["--resume", "sess-1"]));
+        let merged = merge_resume_args(Tool::Grok, &original, &s(&["--resume", "sess-1"]));
         assert!(!merged.iter().any(|arg| arg == "--cwd" || arg == "/old"));
         assert!(merged.contains(&"grok-build".to_string()));
     }
@@ -3925,7 +3912,7 @@ mod tests {
     fn test_merge_grok_args_bare_worktree_does_not_eat_model() {
         let original = s(&["--worktree", "--model", "grok-build"]);
         let resume = s(&["--resume", "sess-1"]);
-        let merged = merge_resume_args("grok", &original, &resume);
+        let merged = merge_resume_args(Tool::Grok, &original, &resume);
         assert!(!merged.contains(&"--worktree".to_string()));
         assert!(merged.contains(&"--model".to_string()));
         assert!(merged.contains(&"grok-build".to_string()));
@@ -3935,7 +3922,7 @@ mod tests {
     fn test_merge_grok_args_short_worktree_drops_name() {
         let original = s(&["-w", "mytree", "--always-approve"]);
         let resume = s(&["--resume", "sess-1"]);
-        let merged = merge_resume_args("grok", &original, &resume);
+        let merged = merge_resume_args(Tool::Grok, &original, &resume);
         assert!(!merged.iter().any(|t| t == "-w" || t == "mytree"));
         assert!(merged.contains(&"--always-approve".to_string()));
     }
@@ -3944,18 +3931,18 @@ mod tests {
     fn test_merge_grok_args_drops_prompt_after_separator() {
         let original = s(&["--model", "grok-4", "--", "-x looks like a flag"]);
         let resume = s(&["--resume", "sess-1"]);
-        let merged = merge_resume_args("grok", &original, &resume);
+        let merged = merge_resume_args(Tool::Grok, &original, &resume);
         assert_eq!(merged, s(&["--resume", "sess-1", "--model", "grok-4"]));
     }
 
     #[test]
     fn test_build_resume_args_qoder_resume_and_fork() {
         assert_eq!(
-            build_resume_args("qoder", "sess-abc", false),
+            build_resume_args(Tool::Qoder, "sess-abc", false),
             s(&["--resume", "sess-abc"])
         );
         assert_eq!(
-            build_resume_args("qoder", "sess-abc", true),
+            build_resume_args(Tool::Qoder, "sess-abc", true),
             s(&["--resume", "sess-abc", "--fork-session"])
         );
     }
@@ -3975,7 +3962,7 @@ mod tests {
             "-x looks like a flag",
         ]);
         let resume = s(&["--resume", "sess-abc", "--fork-session"]);
-        let merged = merge_resume_args("qoder", &original, &resume);
+        let merged = merge_resume_args(Tool::Qoder, &original, &resume);
         assert_eq!(
             merged,
             s(&[
@@ -4000,7 +3987,7 @@ mod tests {
             "n1",
         ]);
         let resume = s(&["--resume", "sess-abc", "-m", "other", "--name", "n2"]);
-        let merged = merge_resume_args("qoder", &original, &resume);
+        let merged = merge_resume_args(Tool::Qoder, &original, &resume);
         // The resume `-m` replaces the original `--model`; the shared `--name`
         // keeps only the resume value and nothing is left orphaned.
         assert!(!merged.contains(&"--model".to_string()));
@@ -4016,7 +4003,7 @@ mod tests {
     fn qoder_resume_identity_does_not_replace_saved_system_prompt() {
         for fork in [false, true] {
             let (system, initial, _) = build_resume_prompts(ResumePromptInput {
-                tool: "qoder",
+                tool: Tool::Qoder,
                 display_name: "memo",
                 fork,
                 is_adoption: false,
@@ -4048,18 +4035,18 @@ mod tests {
                 "prompt",
             ]),
         ] {
-            let merged = merge_resume_args("qoder", &original, &s(&["--resume", "sid"]));
+            let merged = merge_resume_args(Tool::Qoder, &original, &s(&["--resume", "sid"]));
             assert_eq!(&merged[2..], &original[..original.len() - 2]);
             let resume = s(&["--resume", "sid", "--tools", "Bash", "Write"]);
             assert_eq!(
-                merge_resume_args("qoder", &original, &resume),
+                merge_resume_args(Tool::Qoder, &original, &resume),
                 s(&[
                     "--resume", "sid", "--tools", "Bash", "Write", "--model", "m"
                 ])
             );
         }
         assert_eq!(
-            merge_resume_args("qoder", &s(&["--tools", ""]), &s(&["--resume", "sid"])),
+            merge_resume_args(Tool::Qoder, &s(&["--tools", ""]), &s(&["--resume", "sid"])),
             s(&["--resume", "sid", "--tools", ""])
         );
     }
@@ -4078,13 +4065,13 @@ mod tests {
         ]);
         let resume = s(&["--resume", "sess-abc"]);
         assert_eq!(
-            merge_resume_args("qoder", &original, &resume),
+            merge_resume_args(Tool::Qoder, &original, &resume),
             s(&["--resume", "sess-abc", "--model", "Qwen3.8-Flash"])
         );
         // A directory chosen at resume time is the caller's and is kept.
         let resume = s(&["--resume", "sess-abc", "--cwd", "elsewhere"]);
         assert_eq!(
-            merge_resume_args("qoder", &original, &resume),
+            merge_resume_args(Tool::Qoder, &original, &resume),
             s(&[
                 "--resume",
                 "sess-abc",
@@ -4111,7 +4098,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let cwd = extract_cwd_from_transcript(file.path().to_str().unwrap(), "qoder");
+        let cwd = extract_cwd_from_transcript(file.path().to_str().unwrap(), Tool::Qoder);
         assert_eq!(cwd, Some("/home/user/proj".to_string()));
     }
 
@@ -4119,7 +4106,7 @@ mod tests {
     fn test_merge_copilot_args_preserves_model_drops_prompt() {
         let original = s(&["--model", "claude-haiku-4.5", "-i", "do a task"]);
         let resume = s(&["--resume", "sess-abc"]);
-        let merged = merge_resume_args("copilot", &original, &resume);
+        let merged = merge_resume_args(Tool::Copilot, &original, &resume);
         assert!(merged.contains(&"--resume".to_string()));
         assert!(merged.contains(&"sess-abc".to_string()));
         assert!(merged.contains(&"--model".to_string()));
@@ -4133,7 +4120,7 @@ mod tests {
     fn test_merge_copilot_args_resume_model_wins() {
         let original = s(&["--model", "claude-haiku-4.5", "-i", "task"]);
         let resume = s(&["--resume", "sess-abc", "--model", "claude-sonnet-4-5"]);
-        let merged = merge_resume_args("copilot", &original, &resume);
+        let merged = merge_resume_args(Tool::Copilot, &original, &resume);
         // Only one --model entry
         assert_eq!(merged.iter().filter(|t| t.as_str() == "--model").count(), 1);
         assert!(merged.contains(&"claude-sonnet-4-5".to_string()));
@@ -4153,7 +4140,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let cwd = extract_cwd_from_transcript(file.path().to_str().unwrap(), "copilot");
+        let cwd = extract_cwd_from_transcript(file.path().to_str().unwrap(), Tool::Copilot);
         assert_eq!(cwd, Some("/home/user/myproject".to_string()));
     }
 
@@ -4168,7 +4155,7 @@ mod tests {
         let path = gemini.join("test.json");
         std::fs::write(&path, r#"{"projectHash":"deadbeef"}"#).unwrap();
         let _gemini_home = crate::hooks::test_helpers::EnvVarGuard::set("GEMINI_CLI_HOME", base);
-        let result = extract_cwd_from_transcript(path.to_str().unwrap(), "gemini");
+        let result = extract_cwd_from_transcript(path.to_str().unwrap(), Tool::Gemini);
         assert_eq!(result, None);
     }
 }

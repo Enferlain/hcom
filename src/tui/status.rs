@@ -136,12 +136,12 @@ pub fn compute_status(agent: &Agent, now: f64) -> ComputedStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::model::Tool;
+    use crate::tool::Tool;
 
     fn test_agent(status: AgentStatus, ctx: &str) -> Agent {
         Agent {
             name: "test".into(),
-            tool: Tool::Claude,
+            tool: Tool::Claude.into(),
             status,
             status_context: ctx.into(),
             status_detail: String::new(),

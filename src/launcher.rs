@@ -22,6 +22,7 @@ use crate::paths;
 use crate::shared::constants::HCOM_IDENTITY_VARS;
 use crate::shared::tool_detection::tool_marker_vars;
 use crate::terminal;
+use crate::tool::Tool;
 use crate::tools::launch_arg_validation::{
     ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, KILO_REJECTED_ARGS, KIMI_REJECTED_ARGS,
     OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS, QODER_REJECTED_ARGS,
@@ -32,110 +33,70 @@ use crate::tools::{
     qoder_preprocessing,
 };
 
-/// Canonical tool types for launch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LaunchTool {
-    Claude,
-    ClaudePty,
-    Gemini,
-    Codex,
-    OpenCode,
-    Kilo,
-    Pi,
-    Antigravity,
-    Cursor,
-    Kimi,
-    Copilot,
-    Qoder,
-    Grok,
-    Omp,
-    Hermes,
+/// What `hcom <tool>` launches: a launchable [`Tool`](crate::tool::Tool), and
+/// for Claude whether it was asked for as `claude-pty` (always PTY-wrapped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchTool {
+    tool: crate::tool::Tool,
+    claude_pty: bool,
+}
+
+impl From<crate::tool::Tool> for LaunchTool {
+    fn from(tool: crate::tool::Tool) -> Self {
+        Self {
+            tool,
+            claude_pty: false,
+        }
+    }
 }
 
 impl LaunchTool {
+    pub const CLAUDE_PTY: Self = Self {
+        tool: crate::tool::Tool::Claude,
+        claude_pty: true,
+    };
+
+    /// Parse a spec name or alias, or `claude-pty`. Adhoc is not launchable.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "claude" => Ok(LaunchTool::Claude),
-            "claude-pty" => Ok(LaunchTool::ClaudePty),
-            "gemini" => Ok(LaunchTool::Gemini),
-            "codex" => Ok(LaunchTool::Codex),
-            "opencode" => Ok(LaunchTool::OpenCode),
-            "kilo" | "kilocode" => Ok(LaunchTool::Kilo),
-            "pi" | "pi-agent" => Ok(LaunchTool::Pi),
-            "omp" | "omp-agent" => Ok(LaunchTool::Omp),
-            "antigravity" | "agy" => Ok(LaunchTool::Antigravity),
-            "cursor" | "cursor-agent" => Ok(LaunchTool::Cursor),
-            "kimi" => Ok(LaunchTool::Kimi),
-            "copilot" => Ok(LaunchTool::Copilot),
-            "qoder" | "qodercli" => Ok(LaunchTool::Qoder),
-            "grok" | "grok-build" => Ok(LaunchTool::Grok),
-            "hermes" => Ok(LaunchTool::Hermes),
+        if s == Self::CLAUDE_PTY.as_str() {
+            return Ok(Self::CLAUDE_PTY);
+        }
+        match s.parse::<crate::tool::Tool>() {
+            Ok(tool) if tool != crate::tool::Tool::Adhoc => Ok(tool.into()),
             _ => bail!("Unknown tool: {}", s),
         }
     }
 
     pub fn as_str(&self) -> &'static str {
-        match self {
-            LaunchTool::Claude => "claude",
-            LaunchTool::ClaudePty => "claude-pty",
-            LaunchTool::Gemini => "gemini",
-            LaunchTool::Codex => "codex",
-            LaunchTool::OpenCode => "opencode",
-            LaunchTool::Kilo => "kilo",
-            LaunchTool::Pi => "pi",
-            LaunchTool::Omp => "omp",
-            LaunchTool::Antigravity => "antigravity",
-            LaunchTool::Cursor => "cursor",
-            LaunchTool::Kimi => "kimi",
-            LaunchTool::Copilot => "copilot",
-            LaunchTool::Qoder => "qoder",
-            LaunchTool::Grok => "grok",
-            LaunchTool::Hermes => "hermes",
+        if self.claude_pty {
+            "claude-pty"
+        } else {
+            self.tool.as_str()
         }
     }
 
-    /// Canonical [`Tool`] for this launch surface.
-    ///
-    /// `ClaudePty` is a launch-surface alias (PTY-wrapped Claude); it resolves
-    /// to `Tool::Claude` so all per-tool data flows through one spec.
     pub fn tool(&self) -> crate::tool::Tool {
-        match self {
-            LaunchTool::Claude | LaunchTool::ClaudePty => crate::tool::Tool::Claude,
-            LaunchTool::Gemini => crate::tool::Tool::Gemini,
-            LaunchTool::Codex => crate::tool::Tool::Codex,
-            LaunchTool::OpenCode => crate::tool::Tool::OpenCode,
-            LaunchTool::Kilo => crate::tool::Tool::Kilo,
-            LaunchTool::Pi => crate::tool::Tool::Pi,
-            LaunchTool::Omp => crate::tool::Tool::Omp,
-            LaunchTool::Antigravity => crate::tool::Tool::Antigravity,
-            LaunchTool::Cursor => crate::tool::Tool::Cursor,
-            LaunchTool::Kimi => crate::tool::Tool::Kimi,
-            LaunchTool::Copilot => crate::tool::Tool::Copilot,
-            LaunchTool::Qoder => crate::tool::Tool::Qoder,
-            LaunchTool::Grok => crate::tool::Tool::Grok,
-            LaunchTool::Hermes => crate::tool::Tool::Hermes,
-        }
+        self.tool
     }
 
-    /// Integration spec for this launch surface (shared with the base `Tool`).
+    /// True for `claude-pty`.
+    pub fn is_claude_pty(&self) -> bool {
+        self.claude_pty
+    }
+
     pub fn spec(&self) -> &'static crate::integration_spec::IntegrationSpec {
-        self.tool().spec()
+        self.tool.spec()
     }
 
-    /// Base tool name (without -pty suffix). Equivalent to `self.tool().as_str()`.
+    /// Base tool name (`claude` for `claude-pty`).
     pub fn base_tool(&self) -> &'static str {
-        self.tool().as_str()
+        self.tool.as_str()
     }
 
     /// Whether this tool uses the PTY wrapper.
     pub fn uses_pty(&self) -> bool {
-        // ClaudePty is a launch surface (alias), not a Tool variant — it always
-        // takes the PTY path. Everything else defers to the canonical spec.
-        if matches!(self, LaunchTool::ClaudePty) {
-            return true;
-        }
-        self.spec().launch.uses_pty_default
+        self.claude_pty || self.spec().launch.uses_pty_default
     }
 
     /// Executable name on PATH for this tool.
@@ -164,30 +125,19 @@ impl LaunchBackend {
     /// Resolve from the already-prepared (tool, background) pair.
     ///
     /// The PTY-vs-print decision for Claude is encoded in the [`LaunchTool`]
-    /// surface chosen by `launch()`: `Claude` is the `-p`/`--print` surface
-    /// (→ `NativePrint`), `ClaudePty` is the live PTY surface (→ `HeadlessPty`).
-    /// Background Claude defaults to `ClaudePty`; it only becomes
-    /// `Claude`/`NativePrint` when the caller passes `-p`/`--print`.
+    /// chosen by `launch()`: plain `claude` is the `-p`/`--print` surface
+    /// (→ `NativePrint`), `claude-pty` the live PTY surface (→ `HeadlessPty`).
+    /// Background Claude defaults to `claude-pty`; it only becomes
+    /// `NativePrint` when the caller passes `-p`/`--print`.
     pub fn resolve(tool: &LaunchTool, background: bool) -> Self {
+        use crate::integration_spec::BackgroundMode;
         if !background {
             return LaunchBackend::InteractiveVisible;
         }
-        match tool {
-            LaunchTool::Claude => LaunchBackend::NativePrint,
-            LaunchTool::ClaudePty => LaunchBackend::HeadlessPty,
-            LaunchTool::Gemini
-            | LaunchTool::Codex
-            | LaunchTool::OpenCode
-            | LaunchTool::Kilo
-            | LaunchTool::Pi
-            | LaunchTool::Omp
-            | LaunchTool::Antigravity
-            | LaunchTool::Cursor
-            | LaunchTool::Kimi
-            | LaunchTool::Copilot
-            | LaunchTool::Qoder
-            | LaunchTool::Grok
-            | LaunchTool::Hermes => LaunchBackend::HeadlessPty,
+        match tool.spec().launch.background {
+            BackgroundMode::NativePrint if !tool.is_claude_pty() => LaunchBackend::NativePrint,
+            BackgroundMode::NativePrint | BackgroundMode::HeadlessPty => LaunchBackend::HeadlessPty,
+            BackgroundMode::Unsupported => unreachable!("{} is not launchable", tool.as_str()),
         }
     }
 }
@@ -686,7 +636,7 @@ fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)])
 /// Uses verify-first pattern: read-only check first, only write if needed.
 /// Strict gate: refuses to launch if hooks can't be installed.
 fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Result<()> {
-    if *tool == LaunchTool::Gemini && !crate::hooks::gemini::is_gemini_version_supported() {
+    if tool.tool() == Tool::Gemini && !crate::hooks::gemini::is_gemini_version_supported() {
         if let Some(ver) = crate::hooks::gemini::get_gemini_version() {
             bail!(
                 "Gemini CLI version {}.{}.{} is too old. Update: npm i -g @google/gemini-cli@latest",
@@ -1647,12 +1597,12 @@ pub(crate) fn inject_workspace_trust_args(
     if !auto_trust {
         return;
     }
-    match tool {
-        LaunchTool::Gemini if !args.iter().any(|a| a == "--skip-trust") => {
+    match tool.tool() {
+        Tool::Gemini if !args.iter().any(|a| a == "--skip-trust") => {
             args.push("--skip-trust".to_string());
         }
-        LaunchTool::Gemini => {}
-        LaunchTool::Codex => {
+        Tool::Gemini => {}
+        Tool::Codex => {
             let already_set = args
                 .windows(2)
                 .any(|w| w[0] == "-c" && w[1].contains("trust_level"));
@@ -1811,7 +1761,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     }
 
     let normalized = if params.tool == "claude" && !claude_print {
-        LaunchTool::ClaudePty
+        LaunchTool::CLAUDE_PTY
     } else {
         LaunchTool::from_str(&params.tool)?
     };
@@ -1897,7 +1847,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
     // Codex preflight and hook setup must use the same effective CODEX_HOME as
     // the child, including overrides from ~/.hcom/env and caller-provided env.
-    let codex_home = if matches!(normalized, LaunchTool::Codex) {
+    let codex_home = if normalized.tool() == Tool::Codex {
         crate::tools::codex_preprocessing::resolve_codex_home_from_env(&base_env, &canonical_dir)
     } else {
         None
@@ -1912,7 +1862,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         crate::tools::codex_preprocessing::ensure_codex_home_writable_at(path, explicit_env)?;
     }
 
-    if matches!(normalized, LaunchTool::Qoder) {
+    if normalized.tool() == Tool::Qoder {
         qoder_preprocessing::apply_system_prompt(&mut params.args, params.system_prompt.as_deref());
         if let Some(args) = params.persisted_args.as_mut() {
             qoder_preprocessing::apply_system_prompt(args, params.system_prompt.as_deref());
@@ -1944,7 +1894,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             }
             Some(injection)
         }
-        None if normalized == LaunchTool::Hermes => {
+        None if normalized.tool() == Tool::Hermes => {
             // Installed per profile, so it needs the launch's args and env.
             crate::hooks::hermes::ensure_installed(&crate::hooks::runtime::LaunchCtx {
                 tool: normalized.tool(),
@@ -1988,7 +1938,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
     // System prompt file for Gemini/Codex
     if let Some(ref sp) = params.system_prompt
-        && normalized == LaunchTool::Gemini
+        && normalized.tool() == Tool::Gemini
     {
         let path = write_system_prompt_file(sp, "gemini");
         base_env.insert("GEMINI_SYSTEM_MD".to_string(), path);
@@ -2000,13 +1950,13 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // launch dir to smooth the process. Cursor's lever is a marker file (its
     // `--trust` flag is print-only, inert in our PTY), so it's seeded here;
     // gemini/codex use arg injection below.
-    if hcom_config.auto_trust_workspace && matches!(normalized, LaunchTool::Cursor) {
+    if hcom_config.auto_trust_workspace && normalized.tool() == Tool::Cursor {
         cursor_preprocessing::ensure_cursor_workspace_trusted(&canonical_dir)?;
     }
-    if hcom_config.auto_trust_workspace && matches!(normalized, LaunchTool::Copilot) {
+    if hcom_config.auto_trust_workspace && normalized.tool() == Tool::Copilot {
         copilot_preprocessing::ensure_copilot_workspace_trusted(&canonical_dir)?;
     }
-    if hcom_config.auto_trust_workspace && matches!(normalized, LaunchTool::Qoder) {
+    if hcom_config.auto_trust_workspace && normalized.tool() == Tool::Qoder {
         qoder_preprocessing::ensure_qoder_workspace_trusted(
             &canonical_dir,
             &params.args,
@@ -2046,7 +1996,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         }
     });
 
-    if normalized == LaunchTool::Hermes {
+    if normalized.tool() == Tool::Hermes {
         params.args = crate::tools::hermes_preprocessing::with_chat_subcommand(std::mem::take(
             &mut params.args,
         ));
@@ -2110,9 +2060,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         instance_env.insert("HCOM_PROCESS_ID".to_string(), process_id.clone());
 
         // Fork mode detection
-        if matches!(normalized, LaunchTool::Claude | LaunchTool::ClaudePty)
-            && params.args.iter().any(|a| a == "--fork-session")
-        {
+        if normalized.tool() == Tool::Claude && params.args.iter().any(|a| a == "--fork-session") {
             instance_env.insert("HCOM_IS_FORK".to_string(), "1".to_string());
         }
 
@@ -2175,11 +2123,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         // Claude's background daemon keeps settings but not launch env; see
         // `pin_launch_environment`.
         let mut params = params.clone();
-        if matches!(normalized, LaunchTool::Claude | LaunchTool::ClaudePty)
+        if normalized.tool() == Tool::Claude
             && let Err(error) = crate::hooks::claude::pin_launch_environment(
                 &mut params.args,
                 &instance_env,
-                matches!(normalized, LaunchTool::ClaudePty),
+                normalized.is_claude_pty(),
             )
         {
             errors.push(json!({"tool": base_tool, "error": error.to_string()}));
@@ -2206,8 +2154,8 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
         // Dispatch to tool-specific launcher
         let launch_result = (|| -> Result<bool> {
-            match normalized {
-                LaunchTool::Claude => {
+            match normalized.tool() {
+                Tool::Claude if !normalized.is_claude_pty() => {
                     let claude_cmd = build_claude_command(&params.args);
 
                     // Store launch_args
@@ -2220,9 +2168,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         )]),
                     );
 
-                    // LaunchTool::Claude only resolves to NativePrint (background,
+                    // Plain `claude` only resolves to NativePrint (background,
                     // direct spawn in print mode) or InteractiveVisible — the
-                    // PTY-backed variants live in LaunchTool::ClaudePty below.
+                    // PTY-backed `claude-pty` takes the shared arm below.
                     if matches!(backend, LaunchBackend::NativePrint) {
                         let log_filename = format!(
                             "background_{}_{}.log",
@@ -2311,8 +2259,8 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         "launch_args".to_string(),
                         json!(&stored_launch_args),
                     )]);
-                    match normalized {
-                        LaunchTool::Codex => {
+                    match normalized.tool() {
+                        Tool::Codex => {
                             // Preserve the announcement before rendering the launch bootstrap.
                             instances::update_instance_position(
                                 db,
@@ -2348,16 +2296,12 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                                 codex_home.as_ref().map(|(path, _)| path.as_path()),
                             );
                         }
-                        LaunchTool::OpenCode
-                        | LaunchTool::Kilo
-                        | LaunchTool::Pi
-                        | LaunchTool::Omp
-                        | LaunchTool::Hermes => {
+                        Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp | Tool::Hermes => {
                             opencode_preprocessing::preprocess_opencode_env(
                                 &mut instance_env,
                                 &instance_name,
                             );
-                            effective_args = if normalized == LaunchTool::OpenCode {
+                            effective_args = if normalized.tool() == Tool::OpenCode {
                                 opencode_preprocessing::preprocess_opencode_args(
                                     &params.args,
                                     &mut instance_env,
@@ -2367,11 +2311,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                                 params.args.clone()
                             };
                         }
-                        LaunchTool::Antigravity => {
+                        Tool::Antigravity => {
                             // Bootstrap arrives through SessionStart; leave name_announced unset.
                             instance_env.insert("ANTIGRAVITY_AGENT".to_string(), "1".to_string());
                         }
-                        LaunchTool::Grok => {
+                        Tool::Grok => {
                             // Grok hook output never reaches the model, so the bootstrap
                             // goes in at launch through `--rules` (appended to the
                             // system prompt).
@@ -2489,31 +2433,27 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
 /// Validate tool args (pure parsing, no mutation).
 pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<String> {
-    match tool {
-        LaunchTool::Claude | LaunchTool::ClaudePty | LaunchTool::Codex => Vec::new(),
-        LaunchTool::Gemini => {
-            validate_rejected_args("Gemini", "hcom gemini", args, GEMINI_REJECTED_ARGS)
-        }
-        LaunchTool::Cursor => crate::tools::cursor_preprocessing::validate_cursor_args(args),
-        LaunchTool::Kimi => validate_rejected_args("Kimi", "hcom kimi", args, KIMI_REJECTED_ARGS),
-        LaunchTool::OpenCode => {
+    match tool.tool() {
+        Tool::Claude | Tool::Codex | Tool::Adhoc => Vec::new(),
+        Tool::Gemini => validate_rejected_args("Gemini", "hcom gemini", args, GEMINI_REJECTED_ARGS),
+        Tool::Cursor => crate::tools::cursor_preprocessing::validate_cursor_args(args),
+        Tool::Kimi => validate_rejected_args("Kimi", "hcom kimi", args, KIMI_REJECTED_ARGS),
+        Tool::OpenCode => {
             validate_rejected_args("OpenCode", "hcom opencode", args, OPENCODE_REJECTED_ARGS)
         }
-        LaunchTool::Kilo => validate_rejected_args("Kilo", "hcom kilo", args, KILO_REJECTED_ARGS),
-        LaunchTool::Pi => validate_rejected_args("Pi", "hcom pi", args, PI_REJECTED_ARGS),
-        LaunchTool::Omp => validate_rejected_args("Oh My Pi", "hcom omp", args, OMP_REJECTED_ARGS),
-        LaunchTool::Hermes => crate::tools::hermes_preprocessing::validate_hermes_args(args),
-        LaunchTool::Antigravity => validate_rejected_args(
+        Tool::Kilo => validate_rejected_args("Kilo", "hcom kilo", args, KILO_REJECTED_ARGS),
+        Tool::Pi => validate_rejected_args("Pi", "hcom pi", args, PI_REJECTED_ARGS),
+        Tool::Omp => validate_rejected_args("Oh My Pi", "hcom omp", args, OMP_REJECTED_ARGS),
+        Tool::Hermes => crate::tools::hermes_preprocessing::validate_hermes_args(args),
+        Tool::Antigravity => validate_rejected_args(
             "Antigravity",
             "hcom antigravity",
             args,
             ANTIGRAVITY_REJECTED_ARGS,
         ),
-        LaunchTool::Copilot => crate::tools::copilot_preprocessing::validate_copilot_args(args),
-        LaunchTool::Qoder => {
-            validate_rejected_args("Qoder", "hcom qoder", args, QODER_REJECTED_ARGS)
-        }
-        LaunchTool::Grok => {
+        Tool::Copilot => crate::tools::copilot_preprocessing::validate_copilot_args(args),
+        Tool::Qoder => validate_rejected_args("Qoder", "hcom qoder", args, QODER_REJECTED_ARGS),
+        Tool::Grok => {
             let borrowed: Vec<_> = args.iter().map(String::as_str).collect();
             validate_grok_args(&borrowed)
         }
@@ -2552,69 +2492,103 @@ mod tests {
 
     #[test]
     fn test_launch_tool_from_str() {
-        assert_eq!(LaunchTool::from_str("claude").unwrap(), LaunchTool::Claude);
+        assert_eq!(
+            LaunchTool::from_str("claude").unwrap(),
+            LaunchTool::from(crate::tool::Tool::Claude)
+        );
         assert_eq!(
             LaunchTool::from_str("claude-pty").unwrap(),
-            LaunchTool::ClaudePty
+            LaunchTool::CLAUDE_PTY
         );
-        assert_eq!(LaunchTool::from_str("gemini").unwrap(), LaunchTool::Gemini);
-        assert_eq!(LaunchTool::from_str("codex").unwrap(), LaunchTool::Codex);
+        assert_eq!(
+            LaunchTool::from_str("gemini").unwrap(),
+            LaunchTool::from(crate::tool::Tool::Gemini)
+        );
+        assert_eq!(
+            LaunchTool::from_str("codex").unwrap(),
+            LaunchTool::from(crate::tool::Tool::Codex)
+        );
         assert_eq!(
             LaunchTool::from_str("opencode").unwrap(),
-            LaunchTool::OpenCode
+            LaunchTool::from(crate::tool::Tool::OpenCode)
         );
-        assert_eq!(LaunchTool::from_str("kilo").unwrap(), LaunchTool::Kilo);
-        assert_eq!(LaunchTool::from_str("kilocode").unwrap(), LaunchTool::Kilo);
+        assert_eq!(
+            LaunchTool::from_str("kilo").unwrap(),
+            LaunchTool::from(crate::tool::Tool::Kilo)
+        );
+        assert_eq!(
+            LaunchTool::from_str("kilocode").unwrap(),
+            LaunchTool::from(crate::tool::Tool::Kilo)
+        );
         assert_eq!(
             LaunchTool::from_str("antigravity").unwrap(),
-            LaunchTool::Antigravity
+            LaunchTool::from(crate::tool::Tool::Antigravity)
         );
         assert_eq!(
             LaunchTool::from_str("agy").unwrap(),
-            LaunchTool::Antigravity
+            LaunchTool::from(crate::tool::Tool::Antigravity)
         );
         assert_eq!(
             LaunchTool::from_str("copilot").unwrap(),
-            LaunchTool::Copilot
+            LaunchTool::from(crate::tool::Tool::Copilot)
         );
-        assert_eq!(LaunchTool::from_str("grok").unwrap(), LaunchTool::Grok);
+        assert_eq!(
+            LaunchTool::from_str("grok").unwrap(),
+            LaunchTool::from(crate::tool::Tool::Grok)
+        );
         assert_eq!(
             LaunchTool::from_str("grok-build").unwrap(),
-            LaunchTool::Grok
+            LaunchTool::from(crate::tool::Tool::Grok)
         );
         assert!(LaunchTool::from_str("unknown").is_err());
     }
 
     #[test]
     fn launch_count_uses_per_tool_spec_limit() {
-        assert!(validate_launch_count(&LaunchTool::Kimi, 10).is_ok());
-        let err = validate_launch_count(&LaunchTool::Kimi, 11).unwrap_err();
+        assert!(validate_launch_count(&LaunchTool::from(crate::tool::Tool::Kimi), 10).is_ok());
+        let err =
+            validate_launch_count(&LaunchTool::from(crate::tool::Tool::Kimi), 11).unwrap_err();
         assert!(err.to_string().contains("max 10"));
 
-        assert!(validate_launch_count(&LaunchTool::Claude, 100).is_ok());
-        let err = validate_launch_count(&LaunchTool::Claude, 101).unwrap_err();
+        assert!(validate_launch_count(&LaunchTool::from(crate::tool::Tool::Claude), 100).is_ok());
+        let err =
+            validate_launch_count(&LaunchTool::from(crate::tool::Tool::Claude), 101).unwrap_err();
         assert!(err.to_string().contains("max 100"));
     }
 
     #[test]
     fn unsupported_initial_prompt_is_spec_driven() {
         let mut args = Vec::new();
-        let err =
-            append_initial_prompt_args(&LaunchTool::Kimi, &mut args, "task".into()).unwrap_err();
+        let err = append_initial_prompt_args(
+            &LaunchTool::from(crate::tool::Tool::Kimi),
+            &mut args,
+            "task".into(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("kimi does not support an initial prompt")
         );
         assert!(args.is_empty());
 
-        append_initial_prompt_args(&LaunchTool::Gemini, &mut args, "task".into()).unwrap();
+        append_initial_prompt_args(
+            &LaunchTool::from(crate::tool::Tool::Gemini),
+            &mut args,
+            "task".into(),
+        )
+        .unwrap();
         assert_eq!(args, vec!["task"]);
     }
 
     #[test]
     fn initial_prompt_flag_shape_appends_after_native_prompt() {
         let mut args = vec!["--prompt".to_string(), "native prompt".to_string()];
-        append_initial_prompt_args(&LaunchTool::OpenCode, &mut args, "hcom prompt".into()).unwrap();
+        append_initial_prompt_args(
+            &LaunchTool::from(crate::tool::Tool::OpenCode),
+            &mut args,
+            "hcom prompt".into(),
+        )
+        .unwrap();
         assert_eq!(
             args,
             vec!["--prompt", "native prompt", "--prompt", "hcom prompt"]
@@ -2624,14 +2598,24 @@ mod tests {
     #[test]
     fn initial_prompt_positional_shape_appends_after_native_prompt() {
         let mut args = vec!["native prompt".to_string()];
-        append_initial_prompt_args(&LaunchTool::Gemini, &mut args, "hcom prompt".into()).unwrap();
+        append_initial_prompt_args(
+            &LaunchTool::from(crate::tool::Tool::Gemini),
+            &mut args,
+            "hcom prompt".into(),
+        )
+        .unwrap();
         assert_eq!(args, vec!["native prompt", "hcom prompt"]);
     }
 
     #[test]
     fn initial_prompt_dash_dash_shape_appends_after_native_prompt() {
         let mut args = vec!["--".to_string(), "native prompt".to_string()];
-        append_initial_prompt_args(&LaunchTool::Claude, &mut args, "hcom prompt".into()).unwrap();
+        append_initial_prompt_args(
+            &LaunchTool::from(crate::tool::Tool::Claude),
+            &mut args,
+            "hcom prompt".into(),
+        )
+        .unwrap();
         assert_eq!(args, vec!["--", "native prompt", "--", "hcom prompt"]);
     }
 
@@ -2639,12 +2623,15 @@ mod tests {
     fn hcom_prompt_alone_is_injected_for_every_shape() {
         for (tool, expected) in [
             (
-                LaunchTool::OpenCode,
+                LaunchTool::from(crate::tool::Tool::OpenCode),
                 vec!["--prompt".to_string(), "hcom".to_string()],
             ),
-            (LaunchTool::Gemini, vec!["hcom".to_string()]),
             (
-                LaunchTool::Claude,
+                LaunchTool::from(crate::tool::Tool::Gemini),
+                vec!["hcom".to_string()],
+            ),
+            (
+                LaunchTool::from(crate::tool::Tool::Claude),
                 vec!["--".to_string(), "hcom".to_string()],
             ),
         ] {
@@ -2657,20 +2644,36 @@ mod tests {
     #[test]
     fn positional_shape_does_not_treat_model_value_as_prompt() {
         let mut args = vec!["--model".to_string(), "safe-model".to_string()];
-        append_initial_prompt_args(&LaunchTool::Gemini, &mut args, "hcom".into()).unwrap();
+        append_initial_prompt_args(
+            &LaunchTool::from(crate::tool::Tool::Gemini),
+            &mut args,
+            "hcom".into(),
+        )
+        .unwrap();
         assert_eq!(args.last().map(String::as_str), Some("hcom"));
     }
 
     #[test]
     fn validate_grok_rejects_one_shot_and_ignored_flags() {
-        let errors = validate_tool_args(&LaunchTool::Grok, &["-p".to_string(), "task".to_string()]);
+        let errors = validate_tool_args(
+            &LaunchTool::from(crate::tool::Tool::Grok),
+            &["-p".to_string(), "task".to_string()],
+        );
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("-p") || errors[0].contains("single"));
         assert!(
-            validate_tool_args(&LaunchTool::Grok, &["--always-approve".to_string()]).is_empty()
+            validate_tool_args(
+                &LaunchTool::from(crate::tool::Tool::Grok),
+                &["--always-approve".to_string()]
+            )
+            .is_empty()
         );
         assert_eq!(
-            validate_tool_args(&LaunchTool::Grok, &["--no-leader".into()]).len(),
+            validate_tool_args(
+                &LaunchTool::from(crate::tool::Tool::Grok),
+                &["--no-leader".into()]
+            )
+            .len(),
             1
         );
         for flag in [
@@ -2687,68 +2690,133 @@ mod tests {
             "--memory-flush",
         ] {
             assert_eq!(
-                validate_tool_args(&LaunchTool::Grok, &[flag.to_string()]).len(),
+                validate_tool_args(
+                    &LaunchTool::from(crate::tool::Tool::Grok),
+                    &[flag.to_string()]
+                )
+                .len(),
                 1
             );
         }
         assert!(
-            validate_tool_args(&LaunchTool::Grok, &["--".into(), "--tools=Read".into()]).is_empty()
+            validate_tool_args(
+                &LaunchTool::from(crate::tool::Tool::Grok),
+                &["--".into(), "--tools=Read".into()]
+            )
+            .is_empty()
         );
-        assert!(validate_tool_args(&LaunchTool::Grok, &["--no-subagents".to_string()]).is_empty());
+        assert!(
+            validate_tool_args(
+                &LaunchTool::from(crate::tool::Tool::Grok),
+                &["--no-subagents".to_string()]
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn validate_cursor_print_mode_fails_fast() {
-        let errors = validate_tool_args(&LaunchTool::Cursor, &["--print".to_string()]);
+        let errors = validate_tool_args(
+            &LaunchTool::from(crate::tool::Tool::Cursor),
+            &["--print".to_string()],
+        );
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("not supported"));
     }
 
     #[test]
     fn validate_kimi_rejects_prompt_mode_but_allows_resume() {
-        let errors = validate_tool_args(&LaunchTool::Kimi, &["--prompt".to_string()]);
+        let errors = validate_tool_args(
+            &LaunchTool::from(crate::tool::Tool::Kimi),
+            &["--prompt".to_string()],
+        );
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("--prompt"));
-        assert!(validate_tool_args(&LaunchTool::Kimi, &["--session".to_string()]).is_empty());
+        assert!(
+            validate_tool_args(
+                &LaunchTool::from(crate::tool::Tool::Kimi),
+                &["--session".to_string()]
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn validate_opencode_rejects_run_but_allows_session() {
-        let errors = validate_tool_args(&LaunchTool::OpenCode, &["run".to_string()]);
+        let errors = validate_tool_args(
+            &LaunchTool::from(crate::tool::Tool::OpenCode),
+            &["run".to_string()],
+        );
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("run"));
-        assert!(validate_tool_args(&LaunchTool::OpenCode, &["--session".to_string()]).is_empty());
-        assert!(validate_tool_args(&LaunchTool::OpenCode, &["--prompt".to_string()]).is_empty());
+        assert!(
+            validate_tool_args(
+                &LaunchTool::from(crate::tool::Tool::OpenCode),
+                &["--session".to_string()]
+            )
+            .is_empty()
+        );
+        assert!(
+            validate_tool_args(
+                &LaunchTool::from(crate::tool::Tool::OpenCode),
+                &["--prompt".to_string()]
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn validate_kilo_rejects_serve_but_allows_continue() {
-        let errors = validate_tool_args(&LaunchTool::Kilo, &["serve".to_string()]);
+        let errors = validate_tool_args(
+            &LaunchTool::from(crate::tool::Tool::Kilo),
+            &["serve".to_string()],
+        );
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("serve"));
-        assert!(validate_tool_args(&LaunchTool::Kilo, &["--continue".to_string()]).is_empty());
+        assert!(
+            validate_tool_args(
+                &LaunchTool::from(crate::tool::Tool::Kilo),
+                &["--continue".to_string()]
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn validate_pi_rejects_print_but_allows_fork() {
-        let errors = validate_tool_args(&LaunchTool::Pi, &["--print".to_string()]);
+        let errors = validate_tool_args(
+            &LaunchTool::from(crate::tool::Tool::Pi),
+            &["--print".to_string()],
+        );
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("--print"));
-        assert!(validate_tool_args(&LaunchTool::Pi, &["--fork".to_string()]).is_empty());
+        assert!(
+            validate_tool_args(
+                &LaunchTool::from(crate::tool::Tool::Pi),
+                &["--fork".to_string()]
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn validate_antigravity_rejects_print_alias_but_allows_conversation() {
-        let errors = validate_tool_args(&LaunchTool::Antigravity, &["--prompt".to_string()]);
+        let errors = validate_tool_args(
+            &LaunchTool::from(crate::tool::Tool::Antigravity),
+            &["--prompt".to_string()],
+        );
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("--prompt"));
         assert!(
-            validate_tool_args(&LaunchTool::Antigravity, &["--conversation".to_string()])
-                .is_empty()
+            validate_tool_args(
+                &LaunchTool::from(crate::tool::Tool::Antigravity),
+                &["--conversation".to_string()]
+            )
+            .is_empty()
         );
         assert!(
             validate_tool_args(
-                &LaunchTool::Antigravity,
+                &LaunchTool::from(crate::tool::Tool::Antigravity),
                 &["--prompt-interactive".to_string()]
             )
             .is_empty()
@@ -2757,45 +2825,69 @@ mod tests {
 
     #[test]
     fn test_launch_tool_as_str() {
-        assert_eq!(LaunchTool::Claude.as_str(), "claude");
-        assert_eq!(LaunchTool::ClaudePty.as_str(), "claude-pty");
-        assert_eq!(LaunchTool::Gemini.as_str(), "gemini");
-        assert_eq!(LaunchTool::Antigravity.as_str(), "antigravity");
-        assert_eq!(LaunchTool::Copilot.as_str(), "copilot");
+        assert_eq!(
+            LaunchTool::from(crate::tool::Tool::Claude).as_str(),
+            "claude"
+        );
+        assert_eq!(LaunchTool::CLAUDE_PTY.as_str(), "claude-pty");
+        assert_eq!(
+            LaunchTool::from(crate::tool::Tool::Gemini).as_str(),
+            "gemini"
+        );
+        assert_eq!(
+            LaunchTool::from(crate::tool::Tool::Antigravity).as_str(),
+            "antigravity"
+        );
+        assert_eq!(
+            LaunchTool::from(crate::tool::Tool::Copilot).as_str(),
+            "copilot"
+        );
     }
 
     #[test]
     fn test_launch_tool_base_tool() {
-        assert_eq!(LaunchTool::Claude.base_tool(), "claude");
-        assert_eq!(LaunchTool::ClaudePty.base_tool(), "claude");
-        assert_eq!(LaunchTool::Codex.base_tool(), "codex");
-        assert_eq!(LaunchTool::Antigravity.base_tool(), "antigravity");
-        assert_eq!(LaunchTool::Copilot.base_tool(), "copilot");
+        assert_eq!(
+            LaunchTool::from(crate::tool::Tool::Claude).base_tool(),
+            "claude"
+        );
+        assert_eq!(LaunchTool::CLAUDE_PTY.base_tool(), "claude");
+        assert_eq!(
+            LaunchTool::from(crate::tool::Tool::Codex).base_tool(),
+            "codex"
+        );
+        assert_eq!(
+            LaunchTool::from(crate::tool::Tool::Antigravity).base_tool(),
+            "antigravity"
+        );
+        assert_eq!(
+            LaunchTool::from(crate::tool::Tool::Copilot).base_tool(),
+            "copilot"
+        );
     }
 
     #[test]
     fn test_launch_tool_uses_pty() {
-        assert!(!LaunchTool::Claude.uses_pty());
-        assert!(LaunchTool::ClaudePty.uses_pty());
-        assert!(LaunchTool::Gemini.uses_pty());
-        assert!(LaunchTool::Codex.uses_pty());
-        assert!(LaunchTool::OpenCode.uses_pty());
-        assert!(LaunchTool::Kilo.uses_pty());
-        assert!(LaunchTool::Copilot.uses_pty());
+        assert!(!LaunchTool::from(crate::tool::Tool::Claude).uses_pty());
+        assert!(LaunchTool::CLAUDE_PTY.uses_pty());
+        assert!(LaunchTool::from(crate::tool::Tool::Gemini).uses_pty());
+        assert!(LaunchTool::from(crate::tool::Tool::Codex).uses_pty());
+        assert!(LaunchTool::from(crate::tool::Tool::OpenCode).uses_pty());
+        assert!(LaunchTool::from(crate::tool::Tool::Kilo).uses_pty());
+        assert!(LaunchTool::from(crate::tool::Tool::Copilot).uses_pty());
     }
 
     #[test]
     fn test_launch_backend_resolve_interactive() {
         // Any tool, !background → InteractiveVisible (visible terminal).
         for tool in [
-            LaunchTool::Claude,
-            LaunchTool::ClaudePty,
-            LaunchTool::Gemini,
-            LaunchTool::Codex,
-            LaunchTool::OpenCode,
-            LaunchTool::Kilo,
-            LaunchTool::Antigravity,
-            LaunchTool::Copilot,
+            LaunchTool::from(crate::tool::Tool::Claude),
+            LaunchTool::CLAUDE_PTY,
+            LaunchTool::from(crate::tool::Tool::Gemini),
+            LaunchTool::from(crate::tool::Tool::Codex),
+            LaunchTool::from(crate::tool::Tool::OpenCode),
+            LaunchTool::from(crate::tool::Tool::Kilo),
+            LaunchTool::from(crate::tool::Tool::Antigravity),
+            LaunchTool::from(crate::tool::Tool::Copilot),
         ] {
             assert_eq!(
                 LaunchBackend::resolve(&tool, false),
@@ -2811,7 +2903,7 @@ mod tests {
         // claude `-p`/`--print` surface (`Claude`) + background → NativePrint
         // (detached -p stream-json). Only chosen when the caller passes -p.
         assert_eq!(
-            LaunchBackend::resolve(&LaunchTool::Claude, true),
+            LaunchBackend::resolve(&LaunchTool::from(crate::tool::Tool::Claude), true),
             LaunchBackend::NativePrint
         );
     }
@@ -2821,7 +2913,7 @@ mod tests {
         // claude --headless default surface (`ClaudePty`) → HeadlessPty
         // (PTY wrapper, live TUI).
         assert_eq!(
-            LaunchBackend::resolve(&LaunchTool::ClaudePty, true),
+            LaunchBackend::resolve(&LaunchTool::CLAUDE_PTY, true),
             LaunchBackend::HeadlessPty
         );
     }
@@ -2830,12 +2922,12 @@ mod tests {
     fn test_launch_backend_resolve_other_tools_headless() {
         // gemini/codex/opencode + --headless → HeadlessPty (unchanged from today).
         for tool in [
-            LaunchTool::Gemini,
-            LaunchTool::Codex,
-            LaunchTool::OpenCode,
-            LaunchTool::Kilo,
-            LaunchTool::Antigravity,
-            LaunchTool::Copilot,
+            LaunchTool::from(crate::tool::Tool::Gemini),
+            LaunchTool::from(crate::tool::Tool::Codex),
+            LaunchTool::from(crate::tool::Tool::OpenCode),
+            LaunchTool::from(crate::tool::Tool::Kilo),
+            LaunchTool::from(crate::tool::Tool::Antigravity),
+            LaunchTool::from(crate::tool::Tool::Copilot),
         ] {
             assert_eq!(
                 LaunchBackend::resolve(&tool, true),
@@ -3110,7 +3202,7 @@ mod tests {
         unsafe { std::env::set_var("CODEX_HOME", "/isolated/codex-home") };
         let mut env = HashMap::from([("HOME".to_string(), "/clean-shell-home".to_string())]);
 
-        ensure_tool_config_env(&LaunchTool::Codex, &mut env);
+        ensure_tool_config_env(&LaunchTool::from(crate::tool::Tool::Codex), &mut env);
 
         assert_eq!(
             env.get("CODEX_HOME").map(String::as_str),
@@ -3129,7 +3221,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("HCOM_DIR", dir.path().join(".hcom")) };
 
-        for tool in [LaunchTool::Claude, LaunchTool::Codex] {
+        for tool in [
+            LaunchTool::from(crate::tool::Tool::Claude),
+            LaunchTool::from(crate::tool::Tool::Codex),
+        ] {
             let mut env = HashMap::new();
             ensure_tool_config_env(&tool, &mut env);
             assert!(env.is_empty(), "{tool:?} got {env:?}");
@@ -3286,12 +3381,22 @@ mod tests {
     #[test]
     fn grok_prompt_that_looks_like_a_flag_stays_a_prompt() {
         let mut args = Vec::new();
-        append_initial_prompt_args(&LaunchTool::Grok, &mut args, "--rules=x".into()).unwrap();
+        append_initial_prompt_args(
+            &LaunchTool::from(crate::tool::Tool::Grok),
+            &mut args,
+            "--rules=x".into(),
+        )
+        .unwrap();
         assert_eq!(args, ["--", "--rules=x"]);
         inject_grok_rules(&mut args, "BOOT");
         assert_eq!(args, ["--rules", "BOOT", "--", "--rules=x"]);
         let mut args = Vec::new();
-        append_initial_prompt_args(&LaunchTool::Grok, &mut args, "--continue".into()).unwrap();
+        append_initial_prompt_args(
+            &LaunchTool::from(crate::tool::Tool::Grok),
+            &mut args,
+            "--continue".into(),
+        )
+        .unwrap();
         ensure_grok_session_id(&mut args);
         assert_eq!(args[0], "--session-id");
     }
@@ -4008,7 +4113,12 @@ mod tests {
     fn test_gemini_flag_on_injects_skip_trust() {
         let dir = std::path::Path::new("/some/workspace");
         let mut args = vec!["--model".to_string(), "gemini-2.5-flash".to_string()];
-        inject_workspace_trust_args(&LaunchTool::Gemini, dir, &mut args, true);
+        inject_workspace_trust_args(
+            &LaunchTool::from(crate::tool::Tool::Gemini),
+            dir,
+            &mut args,
+            true,
+        );
         assert!(args.contains(&"--skip-trust".to_string()));
     }
 
@@ -4016,7 +4126,12 @@ mod tests {
     fn test_gemini_flag_off_no_injection() {
         let dir = std::path::Path::new("/some/workspace");
         let mut args = vec!["--model".to_string(), "gemini-2.5-flash".to_string()];
-        inject_workspace_trust_args(&LaunchTool::Gemini, dir, &mut args, false);
+        inject_workspace_trust_args(
+            &LaunchTool::from(crate::tool::Tool::Gemini),
+            dir,
+            &mut args,
+            false,
+        );
         assert!(!args.contains(&"--skip-trust".to_string()));
     }
 
@@ -4028,7 +4143,12 @@ mod tests {
             "--model".to_string(),
             "x".to_string(),
         ];
-        inject_workspace_trust_args(&LaunchTool::Gemini, dir, &mut args, true);
+        inject_workspace_trust_args(
+            &LaunchTool::from(crate::tool::Tool::Gemini),
+            dir,
+            &mut args,
+            true,
+        );
         assert_eq!(
             args.iter().filter(|a| a.as_str() == "--skip-trust").count(),
             1
@@ -4039,7 +4159,12 @@ mod tests {
     fn test_codex_flag_on_injects_trust_level() {
         let dir = std::path::Path::new("/my/project");
         let mut args = vec!["--model".to_string(), "o4-mini".to_string()];
-        inject_workspace_trust_args(&LaunchTool::Codex, dir, &mut args, true);
+        inject_workspace_trust_args(
+            &LaunchTool::from(crate::tool::Tool::Codex),
+            dir,
+            &mut args,
+            true,
+        );
         let c_idx = args
             .iter()
             .position(|a| a == "-c")
@@ -4054,7 +4179,12 @@ mod tests {
     fn test_codex_flag_off_no_injection() {
         let dir = std::path::Path::new("/my/project");
         let mut args = vec!["--model".to_string(), "o4-mini".to_string()];
-        inject_workspace_trust_args(&LaunchTool::Codex, dir, &mut args, false);
+        inject_workspace_trust_args(
+            &LaunchTool::from(crate::tool::Tool::Codex),
+            dir,
+            &mut args,
+            false,
+        );
         assert!(!args.iter().any(|a| a == "-c"));
     }
 
@@ -4064,7 +4194,12 @@ mod tests {
         // Any -c value containing "trust_level" suppresses re-injection.
         let existing = r#"projects={ "/my/project" = { trust_level = "trusted" } }"#.to_string();
         let mut args = vec!["-c".to_string(), existing];
-        inject_workspace_trust_args(&LaunchTool::Codex, dir, &mut args, true);
+        inject_workspace_trust_args(
+            &LaunchTool::from(crate::tool::Tool::Codex),
+            dir,
+            &mut args,
+            true,
+        );
         assert_eq!(args.iter().filter(|a| a.as_str() == "-c").count(), 1);
     }
 
@@ -4074,7 +4209,12 @@ mod tests {
         // format keeps the whole path as one TOML quoted key — no dot-splitting.
         let dir = std::path::Path::new("/Users/x/proj.v2");
         let mut args: Vec<String> = vec![];
-        inject_workspace_trust_args(&LaunchTool::Codex, dir, &mut args, true);
+        inject_workspace_trust_args(
+            &LaunchTool::from(crate::tool::Tool::Codex),
+            dir,
+            &mut args,
+            true,
+        );
         let c_idx = args
             .iter()
             .position(|a| a == "-c")
@@ -4095,7 +4235,12 @@ mod tests {
         // backslashes must be TOML-escaped or codex rejects the inline table.
         let dir = std::path::Path::new(r"\\?\C:\Users\x\proj");
         let mut args: Vec<String> = vec![];
-        inject_workspace_trust_args(&LaunchTool::Codex, dir, &mut args, true);
+        inject_workspace_trust_args(
+            &LaunchTool::from(crate::tool::Tool::Codex),
+            dir,
+            &mut args,
+            true,
+        );
         let val = &args[1];
         assert!(
             val.contains(r#""C:\\Users\\x\\proj""#),
@@ -4111,7 +4256,12 @@ mod tests {
     fn test_codex_windows_verbatim_unc_path_keeps_server_form() {
         let dir = std::path::Path::new(r"\\?\UNC\server\share\dir");
         let mut args: Vec<String> = vec![];
-        inject_workspace_trust_args(&LaunchTool::Codex, dir, &mut args, true);
+        inject_workspace_trust_args(
+            &LaunchTool::from(crate::tool::Tool::Codex),
+            dir,
+            &mut args,
+            true,
+        );
         let val = &args[1];
         // \\?\UNC\server\... → \\server\... → TOML-escaped \\\\server\\...
         assert!(
@@ -4124,9 +4274,9 @@ mod tests {
     fn test_non_trust_tools_unaffected() {
         let dir = std::path::Path::new("/some/workspace");
         for tool in &[
-            LaunchTool::Claude,
-            LaunchTool::ClaudePty,
-            LaunchTool::OpenCode,
+            LaunchTool::from(crate::tool::Tool::Claude),
+            LaunchTool::CLAUDE_PTY,
+            LaunchTool::from(crate::tool::Tool::OpenCode),
         ] {
             let mut args = vec!["--model".to_string(), "x".to_string()];
             inject_workspace_trust_args(tool, dir, &mut args, true);

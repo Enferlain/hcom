@@ -1,6 +1,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
+use crate::tool::Tool;
 use crate::tui::app::App;
 use crate::tui::model::*;
 use crate::tui::theme::{Theme, palette};
@@ -13,7 +14,7 @@ pub fn render_launch_inline(frame: &mut Frame, area: Rect, app: &App) {
     let w = area.width;
     let mut lines: Vec<Line> = vec![
         separator_line(w, Some("launch")),
-        field_row("Tool", ls.tool.name(), LaunchField::Tool, ls, w),
+        field_row("Tool", ls.tool.as_str(), LaunchField::Tool, ls, w),
         field_row("Count", &ls.count.to_string(), LaunchField::Count, ls, w),
         field_row_text("Tag", &ls.tag, LaunchField::Tag, ls, w),
     ];

@@ -5,7 +5,7 @@
 
 use serde::Deserialize;
 
-use crate::tui::model::Tool;
+use crate::tool::Tool;
 
 // ── Response type ────────────────────────────────────────────────
 
@@ -77,7 +77,7 @@ pub fn build_launch_argv(
 ) -> Vec<String> {
     let mut argv: Vec<String> = vec![
         count.to_string(),
-        tool.name().into(),
+        tool.as_str().into(),
         "--no-run-here".into(),
         "--go".into(),
     ];
@@ -112,7 +112,7 @@ pub fn parse_command_argv(cmd: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::{Response, build_launch_argv, parse_command_argv};
-    use crate::tui::model::Tool;
+    use crate::tool::Tool;
 
     #[test]
     fn response_error_prefers_stderr() {
@@ -202,12 +202,12 @@ mod tests {
             Tool::Qoder,
             Tool::OpenCode,
         ] {
-            let argv = build_launch_argv(tool.clone(), 1, "", false, false, "kitty", "fix the bug");
+            let argv = build_launch_argv(tool, 1, "", false, false, "kitty", "fix the bug");
             assert_eq!(
                 argv,
                 vec![
                     "1".to_string(),
-                    tool.name().to_string(),
+                    tool.as_str().to_string(),
                     "--no-run-here".to_string(),
                     "--go".to_string(),
                     "--terminal".to_string(),

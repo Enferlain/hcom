@@ -83,14 +83,10 @@ fn agent_icon(agent: &Agent, tick: u64) -> &'static str {
 }
 
 /// Compact tool prefix for multi-tool display.
-fn tool_prefix_str(tool: &Tool) -> String {
+fn tool_prefix_str(tool: &AgentTool) -> String {
     match tool {
-        Tool::Unknown(raw) => raw.chars().take(4).collect(),
-        _ => tool
-            .spec()
-            .expect("known TUI tool must have an integration spec")
-            .tui_prefix
-            .to_string(),
+        AgentTool::Unknown(raw) => raw.chars().take(4).collect(),
+        AgentTool::Known(tool) => tool.spec().tui_prefix.to_string(),
     }
 }
 
@@ -1210,7 +1206,7 @@ mod usage_tests {
         crate::config::Config::init();
         let mut app = crate::tui::test_helpers::offline_app();
         let mut agent = crate::tui::test_helpers::make_test_agent("nahe", 3240.0);
-        agent.tool = crate::tui::model::Tool::Qoder;
+        agent.tool = crate::tool::Tool::Qoder.into();
         agent.status_time = agent.created_at;
         agent.transcript_path = Some("/test/session.jsonl".into());
         for context in ["100k/200k", "100k"] {

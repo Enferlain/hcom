@@ -386,12 +386,13 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::model::{Agent, AgentStatus, OrphanProcess, Tool};
+    use crate::tool::Tool;
+    use crate::tui::model::{Agent, AgentStatus, OrphanProcess};
 
     fn dummy_agent(name: &str) -> Agent {
         Agent {
             name: name.into(),
-            tool: Tool::Claude,
+            tool: Tool::Claude.into(),
             status: AgentStatus::Active,
             status_context: String::new(),
             status_detail: String::new(),
@@ -416,7 +417,7 @@ mod tests {
     fn dummy_orphan(pid: u32) -> OrphanProcess {
         OrphanProcess {
             pid,
-            tool: Tool::Claude,
+            tool: Tool::Claude.into(),
             names: vec![],
             launched_at: 0.0,
             directory: String::new(),

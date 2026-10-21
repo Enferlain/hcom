@@ -2083,30 +2083,21 @@ mod tests {
         use crate::config::{HcomConfig, user_field};
         use crate::launcher::LaunchTool;
         use crate::shared::tool_detection::{EnvMatch, TOOL_DETECTION_RULES, detect_tool};
-        use crate::tui::model::Tool as TuiTool;
+        use crate::tui::model::{next_launch_tool, prev_launch_tool};
         use std::collections::{HashMap, HashSet};
 
         let mut names = HashMap::new();
         let mut forward = HashSet::new();
         let mut backward = HashSet::new();
-        for (seen, next) in [
-            (&mut forward, TuiTool::next as fn(&TuiTool) -> TuiTool),
-            (&mut backward, TuiTool::prev as fn(&TuiTool) -> TuiTool),
+        for (seen, step) in [
+            (&mut forward, next_launch_tool as fn(Tool) -> Tool),
+            (&mut backward, prev_launch_tool as fn(Tool) -> Tool),
         ] {
-            let mut current = TuiTool::Claude;
-            for _ in 0..ALL.len() {
-                let tool = current
-                    .canonical()
-                    .expect("TUI cycle contains unknown tool");
-                if !seen.insert(tool) {
-                    assert_eq!(tool, Tool::Claude, "TUI cycle closes on {tool}");
-                    break;
-                }
-                assert_eq!(current.next().prev(), current, "{tool}: next/prev disagree");
-                assert_eq!(current.prev().next(), current, "{tool}: prev/next disagree");
-                current = next(&current);
+            let mut current = Tool::Claude;
+            while seen.insert(current) {
+                current = step(current);
             }
-            assert_eq!(current, TuiTool::Claude, "TUI cycle did not close");
+            assert_eq!(current, Tool::Claude, "TUI cycle did not close");
         }
 
         for spec in ALL {

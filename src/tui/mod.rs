@@ -309,9 +309,10 @@ mod tests {
 
 #[cfg(test)]
 pub mod test_helpers {
+    use crate::tool::Tool;
     use crate::tui::app::App;
     use crate::tui::data::DataSource;
-    use crate::tui::model::{Agent, AgentStatus, Tool, epoch_now};
+    use crate::tui::model::{Agent, AgentStatus, epoch_now};
     use crate::tui::state::DataState;
 
     struct NullSource;
@@ -335,7 +336,7 @@ pub mod test_helpers {
         let now = epoch_now();
         Agent {
             name: name.into(),
-            tool: Tool::Claude,
+            tool: Tool::Claude.into(),
             status: AgentStatus::Active,
             status_context: "working".into(),
             status_detail: String::new(),

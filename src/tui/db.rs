@@ -332,27 +332,6 @@ fn json_str<'a>(v: &'a serde_json::Value, key: &str, default: &'a str) -> &'a st
     v.get(key).and_then(|v| v.as_str()).unwrap_or(default)
 }
 
-fn parse_tool(s: &str) -> Tool {
-    match s.parse::<crate::tool::Tool>() {
-        Ok(crate::tool::Tool::Claude) => Tool::Claude,
-        Ok(crate::tool::Tool::Gemini) => Tool::Gemini,
-        Ok(crate::tool::Tool::Codex) => Tool::Codex,
-        Ok(crate::tool::Tool::OpenCode) => Tool::OpenCode,
-        Ok(crate::tool::Tool::Kilo) => Tool::Kilo,
-        Ok(crate::tool::Tool::Pi) => Tool::Pi,
-        Ok(crate::tool::Tool::Omp) => Tool::Omp,
-        Ok(crate::tool::Tool::Antigravity) => Tool::Antigravity,
-        Ok(crate::tool::Tool::Cursor) => Tool::Cursor,
-        Ok(crate::tool::Tool::Kimi) => Tool::Kimi,
-        Ok(crate::tool::Tool::Copilot) => Tool::Copilot,
-        Ok(crate::tool::Tool::Qoder) => Tool::Qoder,
-        Ok(crate::tool::Tool::Grok) => Tool::Grok,
-        Ok(crate::tool::Tool::Hermes) => Tool::Hermes,
-        Ok(crate::tool::Tool::Adhoc) => Tool::Adhoc,
-        Err(_) => Tool::Unknown(s.to_string()),
-    }
-}
-
 fn parse_status(s: &str) -> Option<AgentStatus> {
     match s {
         "active" => Some(AgentStatus::Active),
@@ -494,7 +473,7 @@ fn load_instances(conn: &Connection, device_uuid: &str, now: f64) -> (Vec<Agent>
         let parsed_status = parse_status(&status_s);
         let mut agent = Agent {
             name,
-            tool: parse_tool(&tool_s),
+            tool: AgentTool::parse(&tool_s),
             status: parsed_status.unwrap_or(AgentStatus::Inactive),
             status_context: ctx,
             status_detail: detail,
@@ -732,7 +711,7 @@ fn load_stopped(conn: &Connection, now: f64, max_age_secs: Option<f64>) -> Vec<A
 
         stopped.push(Agent {
             name: name.clone(),
-            tool: parse_tool(tool_s),
+            tool: AgentTool::parse(tool_s),
             status: AgentStatus::Inactive,
             status_context: action.to_string(),
             status_detail: String::new(),
@@ -851,7 +830,7 @@ fn read_tracked_ptys() -> Option<Vec<TrackedPty>> {
         tracked.push(TrackedPty {
             orphan: OrphanProcess {
                 pid,
-                tool: parse_tool(tool_s),
+                tool: AgentTool::parse(tool_s),
                 names,
                 launched_at,
                 directory,
@@ -1329,9 +1308,10 @@ pub fn get_available_presets() -> Vec<String> {
 mod tests {
     use super::{
         compute_unread_batch, count_gt, load_instances, load_recently_stopped, parse_message_row,
-        parse_status_or_life_row, parse_tool,
+        parse_status_or_life_row,
     };
-    use crate::tui::model::{ActivityKind, Agent, AgentStatus, EventKind, SenderKind, Tool};
+    use crate::tool::Tool;
+    use crate::tui::model::{ActivityKind, Agent, AgentStatus, AgentTool, EventKind, SenderKind};
     use rusqlite::Connection;
 
     // Blocker 1 regression: the no-arg TUI must route through the owner-only
@@ -1471,15 +1451,15 @@ mod tests {
     #[test]
     fn parse_tool_preserves_unknown_persisted_value() {
         assert_eq!(
-            parse_tool("future-tool"),
-            Tool::Unknown("future-tool".to_string())
+            AgentTool::parse("future-tool"),
+            AgentTool::Unknown("future-tool".to_string())
         );
     }
 
     fn make_agent(name: &str, last_event_id: u64) -> Agent {
         Agent {
             name: name.into(),
-            tool: Tool::Claude,
+            tool: Tool::Claude.into(),
             status: AgentStatus::Active,
             status_context: String::new(),
             status_detail: String::new(),

@@ -1,3 +1,4 @@
+use crate::tool::Tool;
 use crate::tui::theme::Theme;
 use ratatui::style::Style;
 use unicode_segmentation::UnicodeSegmentation;
@@ -75,115 +76,83 @@ impl AgentStatus {
     }
 }
 
+/// An agent's tool as stored: a known integration, or a name written by a
+/// newer or third-party integration.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Tool {
-    Claude,
-    Gemini,
-    Codex,
-    OpenCode,
-    Kilo,
-    Pi,
-    Omp,
-    Antigravity,
-    Cursor,
-    Kimi,
-    Copilot,
-    Qoder,
-    Grok,
-    Hermes,
-    Adhoc,
-    /// Persisted value written by a newer or third-party integration.
+pub enum AgentTool {
+    Known(Tool),
     Unknown(String),
 }
 
-impl Tool {
-    /// Convert to the canonical `crate::tool::Tool` for spec lookup.
-    pub fn canonical(&self) -> Option<crate::tool::Tool> {
+impl From<Tool> for AgentTool {
+    fn from(tool: Tool) -> Self {
+        Self::Known(tool)
+    }
+}
+
+impl PartialEq<Tool> for AgentTool {
+    fn eq(&self, other: &Tool) -> bool {
+        *self == Self::Known(*other)
+    }
+}
+
+impl AgentTool {
+    pub fn parse(s: &str) -> Self {
+        s.parse()
+            .map_or_else(|_| Self::Unknown(s.to_string()), Self::Known)
+    }
+
+    pub fn canonical(&self) -> Option<Tool> {
         match self {
-            Self::Claude => Some(crate::tool::Tool::Claude),
-            Self::Gemini => Some(crate::tool::Tool::Gemini),
-            Self::Codex => Some(crate::tool::Tool::Codex),
-            Self::OpenCode => Some(crate::tool::Tool::OpenCode),
-            Self::Kilo => Some(crate::tool::Tool::Kilo),
-            Self::Pi => Some(crate::tool::Tool::Pi),
-            Self::Omp => Some(crate::tool::Tool::Omp),
-            Self::Antigravity => Some(crate::tool::Tool::Antigravity),
-            Self::Cursor => Some(crate::tool::Tool::Cursor),
-            Self::Kimi => Some(crate::tool::Tool::Kimi),
-            Self::Copilot => Some(crate::tool::Tool::Copilot),
-            Self::Qoder => Some(crate::tool::Tool::Qoder),
-            Self::Grok => Some(crate::tool::Tool::Grok),
-            Self::Hermes => Some(crate::tool::Tool::Hermes),
-            Self::Adhoc => Some(crate::tool::Tool::Adhoc),
+            Self::Known(tool) => Some(*tool),
             Self::Unknown(_) => None,
         }
     }
 
-    /// Integration spec for known TUI tools.
     pub fn spec(&self) -> Option<&'static crate::integration_spec::IntegrationSpec> {
-        self.canonical().map(crate::tool::Tool::spec)
+        self.canonical().map(Tool::spec)
     }
 
     pub fn name(&self) -> &str {
         match self {
+            Self::Known(tool) => tool.as_str(),
             Self::Unknown(raw) => raw,
-            _ => {
-                self.spec()
-                    .expect("known TUI tool must have an integration spec")
-                    .name
-            }
         }
     }
+}
 
-    /// Cycle forward (for launch panel). Adhoc is not launchable.
-    pub fn next(&self) -> Self {
-        match self {
-            Self::Claude => Self::Gemini,
-            Self::Gemini => Self::Codex,
-            Self::Codex => Self::OpenCode,
-            Self::OpenCode => Self::Kilo,
-            Self::Kilo => Self::Pi,
-            Self::Pi => Self::Omp,
-            Self::Omp => Self::Antigravity,
-            Self::Antigravity => Self::Cursor,
-            Self::Cursor => Self::Kimi,
-            Self::Kimi => Self::Copilot,
-            Self::Copilot => Self::Qoder,
-            Self::Qoder => Self::Grok,
-            Self::Grok => Self::Hermes,
-            Self::Hermes => Self::Claude,
-            Self::Adhoc => Self::Adhoc,
-            Self::Unknown(raw) => Self::Unknown(raw.clone()),
-        }
-    }
+/// Tools the launch panel cycles through, in spec order.
+fn launchable_tools() -> impl DoubleEndedIterator<Item = Tool> + Clone {
+    crate::integration_spec::ALL
+        .iter()
+        .filter(|spec| spec.released && spec.tool != Tool::Adhoc)
+        .map(|spec| spec.tool)
+}
 
-    /// Cycle backward (for launch panel). Adhoc is not launchable.
-    pub fn prev(&self) -> Self {
-        match self {
-            Self::Claude => Self::Hermes,
-            Self::Hermes => Self::Grok,
-            Self::Gemini => Self::Claude,
-            Self::Codex => Self::Gemini,
-            Self::OpenCode => Self::Codex,
-            Self::Antigravity => Self::Omp,
-            Self::Omp => Self::Pi,
-            Self::Pi => Self::Kilo,
-            Self::Kilo => Self::OpenCode,
-            Self::Cursor => Self::Antigravity,
-            Self::Kimi => Self::Cursor,
-            Self::Copilot => Self::Kimi,
-            Self::Qoder => Self::Copilot,
-            Self::Grok => Self::Qoder,
-            Self::Adhoc => Self::Adhoc,
-            Self::Unknown(raw) => Self::Unknown(raw.clone()),
-        }
+/// Next launch-panel tool after `tool`, wrapping around.
+pub fn next_launch_tool(tool: Tool) -> Tool {
+    if !launchable_tools().any(|t| t == tool) {
+        return tool;
     }
+    let mut tools = launchable_tools().cycle();
+    tools.find(|t| *t == tool);
+    tools.next().unwrap_or(tool)
+}
+
+/// Previous launch-panel tool before `tool`, wrapping around.
+pub fn prev_launch_tool(tool: Tool) -> Tool {
+    if !launchable_tools().any(|t| t == tool) {
+        return tool;
+    }
+    let mut tools = launchable_tools().rev().cycle();
+    tools.find(|t| *t == tool);
+    tools.next().unwrap_or(tool)
 }
 
 #[derive(Clone)]
 pub struct Agent {
     pub name: String,
-    pub tool: Tool,
+    pub tool: AgentTool,
     pub status: AgentStatus,
     pub status_context: String,
     pub status_detail: String,
@@ -394,7 +363,7 @@ pub struct Event {
 #[derive(Clone)]
 pub struct OrphanProcess {
     pub pid: u32,
-    pub tool: Tool,
+    pub tool: AgentTool,
     pub names: Vec<String>,
     pub launched_at: f64,
     pub directory: String,
@@ -742,7 +711,7 @@ impl LaunchState {
     pub fn adjust_left(&mut self) {
         match self.options_cursor {
             Some(LaunchField::Tool) => {
-                self.tool = self.tool.prev();
+                self.tool = prev_launch_tool(self.tool);
                 if self.tool != Tool::Claude {
                     self.headless_pty = false;
                 }
@@ -764,7 +733,7 @@ impl LaunchState {
     pub fn adjust_right(&mut self) {
         match self.options_cursor {
             Some(LaunchField::Tool) => {
-                self.tool = self.tool.next();
+                self.tool = next_launch_tool(self.tool);
                 if self.tool != Tool::Claude {
                     self.headless_pty = false;
                 }
@@ -952,7 +921,7 @@ mod tests {
     fn test_agent(name: &str) -> Agent {
         Agent {
             name: name.into(),
-            tool: Tool::Claude,
+            tool: Tool::Claude.into(),
             status: AgentStatus::Active,
             status_context: String::new(),
             status_detail: String::new(),
@@ -1282,45 +1251,22 @@ mod tests {
     // ── Tool cycling ──────────────────────────────────────────────
 
     #[test]
-    fn tool_next_cycles_through_launchable() {
-        assert_eq!(Tool::Claude.next(), Tool::Gemini);
-        assert_eq!(Tool::Gemini.next(), Tool::Codex);
-        assert_eq!(Tool::Codex.next(), Tool::OpenCode);
-        assert_eq!(Tool::OpenCode.next(), Tool::Kilo);
-        assert_eq!(Tool::Kilo.next(), Tool::Pi);
-        assert_eq!(Tool::Pi.next(), Tool::Omp);
-        assert_eq!(Tool::Omp.next(), Tool::Antigravity);
-        assert_eq!(Tool::Antigravity.next(), Tool::Cursor);
-        assert_eq!(Tool::Cursor.next(), Tool::Kimi);
-        assert_eq!(Tool::Kimi.next(), Tool::Copilot);
-        assert_eq!(Tool::Copilot.next(), Tool::Qoder);
-        assert_eq!(Tool::Qoder.next(), Tool::Grok);
-        assert_eq!(Tool::Grok.next(), Tool::Hermes);
-        assert_eq!(Tool::Hermes.next(), Tool::Claude);
-    }
-
-    #[test]
-    fn tool_prev_cycles_backward() {
-        assert_eq!(Tool::Claude.prev(), Tool::Hermes);
-        assert_eq!(Tool::Hermes.prev(), Tool::Grok);
-        assert_eq!(Tool::Grok.prev(), Tool::Qoder);
-        assert_eq!(Tool::Qoder.prev(), Tool::Copilot);
-        assert_eq!(Tool::Copilot.prev(), Tool::Kimi);
-        assert_eq!(Tool::Kimi.prev(), Tool::Cursor);
-        assert_eq!(Tool::Cursor.prev(), Tool::Antigravity);
-        assert_eq!(Tool::Antigravity.prev(), Tool::Omp);
-        assert_eq!(Tool::Omp.prev(), Tool::Pi);
-        assert_eq!(Tool::Pi.prev(), Tool::Kilo);
-        assert_eq!(Tool::Kilo.prev(), Tool::OpenCode);
-        assert_eq!(Tool::OpenCode.prev(), Tool::Codex);
-        assert_eq!(Tool::Codex.prev(), Tool::Gemini);
-        assert_eq!(Tool::Gemini.prev(), Tool::Claude);
+    fn launch_tool_cycles_in_spec_order() {
+        assert_eq!(next_launch_tool(Tool::Claude), Tool::Gemini);
+        assert_eq!(prev_launch_tool(Tool::Claude), Tool::Grok);
+        assert_eq!(next_launch_tool(Tool::Grok), Tool::Claude);
+        let mut tool = Tool::Claude;
+        for _ in launchable_tools() {
+            assert_eq!(prev_launch_tool(next_launch_tool(tool)), tool);
+            tool = next_launch_tool(tool);
+        }
+        assert_eq!(tool, Tool::Claude);
     }
 
     #[test]
     fn tool_adhoc_does_not_cycle() {
-        assert_eq!(Tool::Adhoc.next(), Tool::Adhoc);
-        assert_eq!(Tool::Adhoc.prev(), Tool::Adhoc);
+        assert_eq!(next_launch_tool(Tool::Adhoc), Tool::Adhoc);
+        assert_eq!(prev_launch_tool(Tool::Adhoc), Tool::Adhoc);
     }
 
     // ── CommandPalette ────────────────────────────────────────────

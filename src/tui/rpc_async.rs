@@ -1,8 +1,8 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
+use crate::tool::Tool;
 use crate::tui::commands;
-use crate::tui::model::Tool;
 use crate::tui::rpc::{self, Response, build_launch_argv};
 
 pub enum RpcOp {
@@ -188,7 +188,7 @@ fn run_op(op: &RpcOp) -> Result<Response, String> {
             ..
         } => {
             let argv = build_launch_argv(
-                tool.clone(),
+                *tool,
                 *count,
                 tag,
                 *headless,

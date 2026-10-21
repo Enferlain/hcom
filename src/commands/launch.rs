@@ -235,7 +235,7 @@ pub(crate) fn prepare_launch_execution(
     // Print mode needs stream-json for the stop-hook loop. Keep this deliberately
     // grammar-free: hcom appends its required defaults and lets Claude resolve
     // duplicates or reject incompatible combinations.
-    if matches!(tool, LaunchTool::Claude | LaunchTool::ClaudePty)
+    if tool.tool() == crate::tool::Tool::Claude
         && background
         && args_contain_any(&merged_args, &["-p", "--print"])
     {
@@ -593,24 +593,10 @@ fn args_contain_any(args: &[String], needles: &[&str]) -> bool {
 
 /// Check if args indicate background/headless mode.
 pub(crate) fn is_background_from_args(tool: &LaunchTool, args: &[String]) -> bool {
-    match tool {
-        LaunchTool::Claude | LaunchTool::ClaudePty => args_contain_any(args, &["-p", "--print"]),
-        // These tools are always hosted in hcom's PTY. Their native
-        // non-interactive modes are rejected by validate_tool_args.
-        LaunchTool::Gemini
-        | LaunchTool::Codex
-        | LaunchTool::OpenCode
-        | LaunchTool::Kilo
-        | LaunchTool::Pi
-        | LaunchTool::Antigravity
-        | LaunchTool::Cursor
-        | LaunchTool::Kimi
-        | LaunchTool::Copilot
-        | LaunchTool::Qoder
-        | LaunchTool::Grok
-        | LaunchTool::Omp
-        | LaunchTool::Hermes => false,
-    }
+    // Other tools are always hosted in hcom's PTY. Their native
+    // non-interactive modes are rejected by validate_tool_args.
+    tool.spec().launch.background == crate::integration_spec::BackgroundMode::NativePrint
+        && args_contain_any(args, &["-p", "--print"])
 }
 
 pub(crate) fn load_hcom_config() -> HcomConfig {

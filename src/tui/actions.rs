@@ -201,7 +201,7 @@ impl App {
             } => match result.result {
                 Ok(resp) if resp.ok() => {
                     self.ui.flash = Some(Flash::new(
-                        format!("Launched {} {}", count, tool.name()),
+                        format!("Launched {} {}", count, tool.as_str()),
                         Theme::flash_ok(),
                     ));
                     self.reload_data_force();
@@ -473,7 +473,7 @@ mod tests {
         settings.tag = "retry".into();
         let failed = |settings: &LaunchState| RpcResult {
             op: RpcOp::Launch {
-                tool: settings.tool.clone(),
+                tool: settings.tool,
                 count: settings.count,
                 tag: settings.tag.clone(),
                 headless: settings.headless,

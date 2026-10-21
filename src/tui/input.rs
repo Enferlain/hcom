@@ -1081,10 +1081,10 @@ impl App {
             }
 
             KeyCode::Left if self.ui.input.is_empty() => {
-                self.ui.launch.tool = self.ui.launch.tool.prev();
+                self.ui.launch.tool = prev_launch_tool(self.ui.launch.tool);
             }
             KeyCode::Right if self.ui.input.is_empty() => {
-                self.ui.launch.tool = self.ui.launch.tool.next();
+                self.ui.launch.tool = next_launch_tool(self.ui.launch.tool);
             }
 
             KeyCode::Up => {
@@ -1102,14 +1102,14 @@ impl App {
             KeyCode::Right => cursor_right(&self.ui.input, &mut self.ui.input_cursor),
 
             KeyCode::Enter => {
-                let tool = self.ui.launch.tool.clone();
+                let tool = self.ui.launch.tool;
                 let count = self.ui.launch.count;
                 let tag = self.ui.launch.tag.clone();
                 let headless = self.ui.launch.headless;
                 let headless_pty = self.ui.launch.headless_pty;
                 let terminal = self.ui.launch.terminal_override().to_string();
                 let prompt = self.ui.input.clone();
-                let tool_name = tool.name().to_string();
+                let tool_name = tool.as_str().to_string();
 
                 let settings = Box::new(self.ui.launch.clone());
                 if let Err(e) = self.enqueue_rpc(RpcOp::Launch {
@@ -1548,7 +1548,7 @@ mod tests {
     #[test]
     fn fork_key_ignores_tools_without_fork_support() {
         let mut app = test_app();
-        app.data.agents[0].tool = Tool::Gemini;
+        app.data.agents[0].tool = crate::tool::Tool::Gemini.into();
 
         key(&mut app, KeyCode::Char('f'));
 

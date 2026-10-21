@@ -269,7 +269,7 @@ mod tests {
             let path = dir.path().join(format!("{name}.jsonl"));
             std::fs::write(&path, r#"{"type":"assistant","message":{"id":"a","content":[],"usage":{"input_tokens":1000,"output_tokens":1}}}"#).unwrap();
             let mut a = crate::tui::test_helpers::make_test_agent(name, 0.0);
-            a.tool = crate::tui::model::Tool::Claude;
+            a.tool = crate::tool::Tool::Claude.into();
             a.transcript_path = Some(path.to_string_lossy().into());
             a
         };
@@ -299,7 +299,7 @@ mod tests {
         let path = dir.path().join("s.jsonl");
         std::fs::write(&path, "").unwrap();
         let mut agent = crate::tui::test_helpers::make_test_agent("a", 0.0);
-        agent.tool = crate::tui::model::Tool::Claude;
+        agent.tool = crate::tool::Tool::Claude.into();
         agent.transcript_path = Some(path.to_string_lossy().into());
         agent.status = AgentStatus::Listening;
         let mut worker = UsageWorker::default();
