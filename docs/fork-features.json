@@ -340,9 +340,9 @@
         "Bounded stable-frame retries, redraw grace and wall-clock escalation publish pty:survey after failed dismissal; publication and release preserve foreign blocker ownership.",
         "Unix and Windows share the same controller; row and status event changes commit atomically before notifications."
       ],
-      "status": "restored; independently reviewed and regression-tested; final release and default-launch qualification pending",
+      "status": "restored, independently reviewed, regression-tested and installed in qualified default",
       "risk": "High; safe keystroke selection and blocker ownership must not confuse UX survey with permission approval.",
-      "validation": "Final full Rust suite: 2917 passed, 18 ignored, zero failures; fmt and strict all-target Clippy clean. Two independent survey review rounds resolved active-clear/last_stop, vanished-row retry and atomic status_detail findings. Live survey itself and native Windows remain unrun."
+      "validation": "Final full Rust suite: 2917 passed, 18 ignored, zero failures; fmt and strict all-target Clippy clean. Two independent survey review rounds resolved active-clear/last_stop, vanished-row retry and atomic status_detail findings. Live survey itself and native Windows remain unrun. Final locked release and ordinary installed-default Gemini/GLM hash+nonce delivery checks passed; approval blocker/re-arm path also exercised."
     }
   ],
   "external_assets": [

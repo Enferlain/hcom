@@ -284,7 +284,7 @@
     "remote_dolt_synced": false
   },
   "upgrade_qualification_2026_10_21": {
-    "status": "final_source_validated_reviewed_release_ready_activation_pending",
+    "status": "installed_default_validated_reviewed",
     "source_base": "5357794",
     "scope": "Independent Antigravity idle-banner and feedback-survey safeguards; isolation remains excluded.",
     "gates": [
@@ -356,39 +356,48 @@
     "live_checks": {
       "gemini": {
         "provider": "gemini",
-        "cursor": 46197,
+        "cursor": 46403,
         "thread": "live-rebuild-final-20261021-gemini",
-        "prefix": "/home/imi/.local/share/hcom/releases/rebuild-5357794-survey1",
-        "launch_exit": 2,
-        "name": "zani",
-        "sha256": "c6ed1475736bc79472a0f96dfdde7c3063e45e577e23c1895009313d1af6e586",
-        "nonce": "748e6cbcd718f052426c09cc23767e1f",
+        "prefix": "/home/imi/.local/share/hcom/releases/rebuild-f687a9c-20261021",
+        "runtime_selection": "default",
+        "launch_exit": 0,
+        "name": "movi",
+        "sha256": "2b26aab7ac59e837f0bd9319939082a98a2f54099dcd2c9d9311ad60d2a251bd",
+        "nonce": "307705c84799087d6d8f3b02d55f41de",
         "workspace": "/home/imi/Projects/hcom-upstream-rebuild-f687a9c/.rebuild-artifacts/live-trial-2026-10-21/final-workspace",
         "phase1_verified": true,
-        "phase2_nonce": "cb324218956bfaa5b20e3d05",
-        "phase2_cursor": 46285,
-        "launch_trust_prompt_resolved": true,
+        "phase2_nonce": "c774c411facc4ee2f25a4feb",
+        "phase2_cursor": 46477,
+        "phase2_file_verified": true,
+        "phase2_initial_wait_exit": 4,
+        "phase2_blocker": "pty:approval",
+        "phase2_blocker_event": 46486,
+        "phase2_approval_command": "od -c gemini-phase2.txt",
+        "manual_prompt_submission_after_followup": false,
+        "read_only_tool_approval_after_followup": true,
         "phase2_verified": true,
         "phase2_wait_exit": 0,
-        "phase2_event": 46292,
+        "phase2_event": 46492,
         "manual_submit_after_followup": false
       },
       "glm": {
         "provider": "glm",
-        "cursor": 46210,
+        "cursor": 46410,
         "thread": "live-rebuild-final-20261021-glm",
-        "prefix": "/home/imi/.local/share/hcom/releases/rebuild-5357794-survey1",
+        "prefix": "/home/imi/.local/share/hcom/releases/rebuild-f687a9c-20261021",
+        "runtime_selection": "default",
         "launch_exit": 0,
-        "name": "luva",
-        "sha256": "4db2af0b6c7a3441968b7b48bfba7c825028e74fb0b72342bf4a225ff50a97ca",
-        "nonce": "c6d45ae23998c4aec32943cda660f152",
+        "name": "dile",
+        "sha256": "58e179cd02b27e76e122ccbddb588df68325fbbbbbdb0613949e0f5f9c2b8763",
+        "nonce": "e57c786d5474080a37649d0ed7fb16b6",
         "workspace": "/home/imi/Projects/hcom-upstream-rebuild-f687a9c/.rebuild-artifacts/live-trial-2026-10-21/final-workspace",
         "phase1_verified": true,
-        "phase2_nonce": "ad6593ecdd9a2347b8802b10",
-        "phase2_cursor": 46239,
+        "phase2_nonce": "522bcad101cf83529870ac53",
+        "phase2_cursor": 46451,
+        "normal_auto_mode_verified": true,
         "phase2_verified": true,
         "phase2_wait_exit": 0,
-        "phase2_event": 46251,
+        "phase2_event": 46467,
         "manual_submit_after_followup": false
       }
     },
@@ -401,10 +410,27 @@
         ".rebuild-artifacts/live-trial-2026-10-21/survey-followup-review.json"
       ]
     },
-    "live_checks_stage": "Previous release candidate before the three bounded status corrections; default-launch verification pending final release",
+    "live_checks_stage": "Final release, ordinary installed-default launches with runtime/Claude-argument overrides removed",
     "final_release": {
       "sha256": "7810b1618a3acd04032416a1ab6f63e0d0b71cc7384302012769a7afc4e6504e",
       "version": "0.7.28"
+    },
+    "source_commit": "50ea6fe692d96ba31e98220a27e6f2c42954a12e",
+    "installation": {
+      "version": "0.7.28",
+      "release_sha256": "7810b1618a3acd04032416a1ab6f63e0d0b71cc7384302012769a7afc4e6504e",
+      "dev_root": "/home/imi/.local/share/hcom/releases/rebuild-f687a9c-20261021",
+      "previous_version": "0.7.25",
+      "claude_args": "--permission-mode auto",
+      "rollback": "/home/imi/.local/state/hcom/rollback/2026-10-21-rebuild/restore.sh",
+      "rollback_runtime_probe": "hcom 0.7.25 passed independently of source cache",
+      "version_after_source_cache_removal": "hcom 0.7.28"
+    },
+    "cleanup": {
+      "source_target_removed": true,
+      "trial_release_copies_removed": true,
+      "hcom_env_unchanged": true,
+      "claude_settings_unchanged_since_owned_hook_migration": true
     }
   }
 }
