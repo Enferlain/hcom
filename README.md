@@ -1,55 +1,40 @@
-<div align="center">
+# hcom
 
-# `hcom`
+[![CI](https://github.com/aannoo/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/aannoo/hcom/actions/workflows/ci.yml) [![Latest release](https://img.shields.io/github/v/release/aannoo/hcom)](https://github.com/aannoo/hcom/releases) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aannoo/hcom/blob/main/LICENSE)
 
-*Hook your coding agents together*
-
-[![CI](https://github.com/aannoo/hcom/actions/workflows/ci.yml/badge.svg)](https://github.com/aannoo/hcom/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/aannoo/hcom)](https://github.com/aannoo/hcom/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aannoo/hcom/blob/main/LICENSE)
-
-</div>
-
-**CLI tool that agents use to message, watch, and spawn each other across terminals.**
-
-Start an agent with `hcom` in front, then prompt normally.
+Connect independent coding agents across terminals and machines. They can message each other, monitor activity, react to events, and launch more agents. Start an agent  with `hcom` in front, then prompt normally.
 
 Use it to coordinate multi-agent pipelines, run different AI CLIs as each other's subagents, or just to avoid copy-pasting.
 
-Works with: `claude`, `codex`, `opencode`, `copilot`, `qoder`, `grok`, `hermes`, `pi`, `omp`, `agy`, `cursor`, `kimi`, `kilo`, `gemini`
+Works with `claude` `codex` `opencode` `grok` `hermes` `pi` `omp` `agy` `copilot` `qoder` `cursor` `kimi` `kilo` `gemini`
 
 https://github.com/user-attachments/assets/1ce23ed9-f529-4be0-8124-816aa4c2fd43
 
 ## Install
 
-**python -** macOS, Linux, Windows:
+macOS, Linux, Windows:
 
 ```bash
 uv tool install hcom
 ```
 
-**homebrew -** macOS, Linux:
-
-```bash
-brew install aannoo/hcom/hcom
-```
+or: `brew install aannoo/hcom/hcom`
 
 <details>
-<summary>Other install options</summary>
+<summary>or install script</summary>
+
+<br>
+
+macOS, Linux, Android:
 
 ```bash
-# macOS, Linux, Android
 curl -fsSL https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.sh | sh
 ```
 
-```powershell
-# Windows
-irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex
-```
+Windows:
 
-```bash
-# Update any existing install
-hcom update
+```powershell
+irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 | iex
 ```
 
 </details>
@@ -92,6 +77,8 @@ hcom codex
 
 - `when codex goes idle, send it the next task`
 
+- `find the agent that worked on that feature, resume it and ask it why it's bad`
+
 </details>
 
 **Open the TUI dashboard:**
@@ -102,13 +89,13 @@ hcom
 
 ## What agents can do
 
-- **Message** each other in real time: mid-turn or wake immediately when idle
+- **Message** each other in real time. Messages arrive mid-turn (after tool calls) or wake idle agents immediately.
 
-- **Observe** each other: status, transcripts, file edits, live terminal screens, command history.
+- **Observe** who's running and what they're doing: status, transcripts, tool results, file edits, commands, live terminal screens, context/token usage. Search past conversations.
 
-- **Subscribe** and notify on status changes, file edits, collisions, specific events. React automatically.
+- **Subscribe** to status changes, commands, file edits, collisions, and session events, then react automatically.
 
-- **Spawn**, **fork**, **resume**, **kill** in any terminal emulator or headless.
+- **Control**: spawn, fork, resume, kill agents in any terminal emulator or headless.
 
 ## How it works
 
@@ -123,22 +110,20 @@ Hooks activate only when an agent is launched with `hcom` in front. Normal usage
 <details>
 <summary>Any other AI tool without hooks can join by running <code>hcom start</code></summary>
 
+<br>
+
 In any CLI tool, prompt:
 
 ```text
-> run this command: `hcom start`
-```
-
-Keep it listening for messages:
-
-```text
-> stay connected to hcom
+> run: `hcom start --help` follow what it says and stay connected
 ```
 
 </details>
 
 <details>
 <summary>Any process can wake agents with <code>hcom send</code></summary>
+
+<br>
 
 Send messages from any process/script:
 
@@ -154,9 +139,9 @@ hcom events --idle luna --wait 600 && hcom send -b @nova -- "luna is done, revie
 
 </details>
 
-## Terminal
+## Terminals
 
-Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning. **kitty**, **wezterm**, **tmux**, **zellij**, **waveterm**, **cmux**, **herdr** also support closing panes from `hcom kill`.
+Every agent runs in a real terminal you can see, scroll, and interrupt. Any emulator works for spawning (hcom auto-detects). **kitty**, **wezterm**, **tmux**, **zellij**, **waveterm**, **cmux**, **herdr** also support closing panes from `hcom kill`.
 
 To configure a custom terminal open/close setup, tell an agent to run:
 
@@ -173,42 +158,15 @@ hcom relay new               # get token
 hcom relay connect <token>   # on each device
 ```
 
-```bash
-hcom relay status   # check connection
-hcom relay off|on   # toggle
-```
+Check with `hcom relay status`, toggle with `hcom relay off` / `on`.
 
 > Treat the token like an API/SSH key. See [SECURITY.md](SECURITY.md)
-
-## Troubleshoot
-
-```bash
-hcom status   # diagnostics
-```
-
-```bash
-hcom reset all   # clear and archive: database + hooks + config
-```
-
-## Uninstall
-
-Safely remove all hcom hooks:
-
-```bash
-hcom hooks remove
-```
-
-Then remove binary:
-
-```bash
-brew uninstall hcom
-# or: uv tool uninstall hcom
-# or: rm "$(which hcom)"
-```
 
 ---
 
 ## Reference
+
+Full reference: `hcom run docs`
 
 <details>
 <summary><strong>Tools</strong></summary>
@@ -391,6 +349,37 @@ Tell agent to run them:
 - **`hcom run onidle`** — waits for an agent to go idle, then types text into another agent (`hcom run onidle luna nova 'luna is done, review it'`) or launches a new one with it as the prompt (`hcom run onidle luna codex 'review what luna just did'`).
 
 Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovered, override bundled scripts of the same name. Ask an agent to author one; `hcom run docs --scripts` is the authoring guide.
+
+</details>
+
+<details>
+<summary><strong>Troubleshoot and Uninstall</strong></summary>
+
+### Troubleshoot
+
+```bash
+hcom status   # diagnostics
+```
+
+```bash
+hcom reset all   # clear and archive: database + hooks + config
+```
+
+### Uninstall
+
+Safely remove all hcom hooks:
+
+```bash
+hcom hooks remove
+```
+
+Then remove binary:
+
+```bash
+brew uninstall hcom
+# or: uv tool uninstall hcom
+# or: rm "$(which hcom)"
+```
 
 </details>
 

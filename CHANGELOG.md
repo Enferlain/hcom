@@ -2,21 +2,58 @@
 
 UTC release dates from [PyPI](https://pypi.org/project/hcom/#history).
 
-## Unreleased
+## 0.7.31 — 2026-10-21
 
 ### Breaking changes
 
 - Dropped ephemeral `uvx hcom` support. Run `uv tool install hcom` and restart affected sessions; hooks and agents need a persistent `hcom` on PATH. Legacy hooks can still be removed with `uvx hcom hooks remove`.
 
+### Added
+
+- Added `hcom events --follow` to stream matching events as JSON Lines, with `--last N` to replay recent matches first and `--after-id ID` to resume from a saved cursor.
+- Added `--json` output to launch, `hcom r`, `hcom f`, and `hcom kill`, so scripts no longer have to parse names out of the text output.
+- Added `bootstrap_exclude` to leave parts of the agent bootstrap out (`identity`, `messages`, `capabilities`, `rules`, `handoff`, or `all`), for projects with their own orchestration rules. Inspect with `hcom config bootstrap show` / `render` [#167](https://github.com/aannoo/hcom/issues/167).
+- Added longer agent names (6 letters, then more) once every 4-letter name has been used, instead of failing to launch. Names are still never reused [#166](https://github.com/aannoo/hcom/issues/166).
+
 ### Changed
 
-- Made native delivery the default for idle Claude and Copilot agents. Configure in config: `claude_delivery` / `copilot_delivery`.
+- Made native delivery the default for idle Claude and Copilot agents: hcom hands messages to the agent directly through the Claude mod or Copilot extension instead of typing into the terminal. Switch back with `hcom config claude_delivery inject` / `copilot_delivery inject`.
+- Showed the command's help page after a syntax error, with did-you-mean suggestions for subcommands.
+- Showed how to unsubscribe when creating an `hcom events sub` subscription.
+- Made a flag passed to `hcom r` / `hcom f` replace its saved copy for every tool, and dropped saved flags that conflict with resuming a session (Kimi `--agent`, Pi/OMP `--no-session`, OMP `--cwd`/`--goal`, Qoder remote-session flags, Kilo `--worktree`/`--cloud-fork`).
+- Made `hcom term --json` report `prompt_empty: null` when hcom can't read the tool's input box, instead of `false` [#162](https://github.com/aannoo/hcom/issues/162).
+- Showed session token usage in the TUI when context usage is unavailable.
+- Asked for confirmation before `reset` in the TUI command palette; hid relay join tokens in the TUI.
+- Made `hcom events --remote-fetch` return answers up to the relay's current size limit (about 1 MiB between up-to-date devices) instead of 96 KiB, and end a cut answer with a `truncated` line saying what was left out and how to narrow the query.
+- Made remote agents' status details previews in `hcom list` and the TUI; `hcom list -v` shows the `hcom events --remote-fetch … --full` command for the full text. Relayed status events still carry the whole detail.
+- Stopped writing `old_*`, `new_*` and `writer` fields into every status event; they stored each long command or prompt three times in the database and the relay.
 
 ### Fixed
 
-- Fixed launch, resume, and fork argument overrides accumulating duplicate singleton options, which broke later Codex resumes and forks ([#173](https://github.com/aannoo/hcom/issues/173)).
+- Fixed TUI command-palette launches, resumes, and forks blocking the TUI when they tried to run in its subprocess.
+- Fixed launch, resume, and fork argument overrides accumulating duplicate singleton options, which broke later Codex resumes and forks [#173](https://github.com/aannoo/hcom/issues/173).
+- Fixed Pi and OMP resumes replaying the original prompt after a boolean flag (`hcom pi --verbose "fix x"`).
+- Fixed `hcom r <session-id>` resuming the agent's newest conversation instead of the one asked for, and `hcom r` not finding an agent named `resume`.
 - Fixed `hcom r` dropping the agent's event subscriptions and thread memberships; a subscription that matched while the agent was stopped now notifies on resume.
 - Fixed Antigravity and OMP agents losing their event subscriptions at the end of a turn while still running.
+- Fixed a hook from the previous launch taking a resumed agent's messages.
+- Fixed `hcom kill` closing an unrelated tmux pane on another tmux server, and `tmux-split` launches on systems without `/bin/bash` (Termux, NixOS) [#168](https://github.com/aannoo/hcom/issues/168), [#171](https://github.com/aannoo/hcom/pull/171) — @sean0407.
+- Fixed Grok delivering a message twice when it was steered into a running turn [#169](https://github.com/aannoo/hcom/pull/169) — @zane668.
+- Fixed Grok mail stuck or duplicated after Grok's leader restarted (e.g. auto-update) or the bridge dropped [#163](https://github.com/aannoo/hcom/pull/163) — @signet-bot-claude.
+- Fixed hcom undoing a model or reasoning effort switch made in Grok's TUI.
+- Fixed Claude delivery stalling after a wake-up found no pending messages [#165](https://github.com/aannoo/hcom/pull/165) — @signet-bot-claude.
+- Fixed Codex and Cursor messages waiting forever behind an already answered approval while the screen kept redrawing (e.g. Codex `/voice`) [#164](https://github.com/aannoo/hcom/pull/164) — @signet-bot-claude.
+- Fixed a race that could overwrite an agent's `blocked` approval status.
+- Fixed concurrent `hcom config` changes overwriting each other; `hcom config -i` now errors on an ambiguous name prefix, and a broken config.toml is reported instead of silently showing defaults.
+- Fixed deleted events still appearing in search.
+- Fixed relay agents disappearing from other devices after a local `hcom reset`.
+- Fixed Kimi agents not showing as active while running tools.
+- Fixed `hcom term debug on` not applying to agents whose output never stops (e.g. Codex `/voice`).
+- Fixed TUI messages without recipients going to an agent named `all` instead of everyone.
+- Fixed TUI issues: multiline messages collapsed into one line, Ctrl+K opening the kill prompt, stopped agents always showing "just now", agent list overflow and a crash on non-ASCII session IDs, a local and remote agent with the same name selected together, a hung command freezing the TUI, the scrolled view jumping on new messages, and the last frame left on screen after quitting.
+- Fixed the TUI launch wizard dropping pasted text and the prompt on failure, and overriding the configured terminal.
+- Fixed a device dropping off the relay, with all its agents, once its agent list outgrew the relay size limit. Rows of Claude workflow agents stopped mid-run are now removed when the parent turn ends, long details are shortened, and devices raise the limit from 112 KiB to about 1 MiB once every peer on the relay runs this version [#172](https://github.com/aannoo/hcom/issues/172).
+- Fixed a Claude subagent with no hcom record running `hcom` commands as its parent.
 
 ## 0.7.30 — 2026-10-15
 
