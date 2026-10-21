@@ -320,6 +320,17 @@
       "status": "implemented; combined gates and independent review passed",
       "risk": "Medium; shared bootstrap/ack timing.",
       "validation": "Parent concurrent four-connection CAS and event-failure rollback/retry tests passed (2 cases); direct source checks confirm manual start and hook use the same transactional claim."
+    },
+    {
+      "id": "antigravity-idle-mode-banner",
+      "feature": "Antigravity idle mode banners do not block queued delivery",
+      "contract": [
+        "Known accept-edits, plan and best-of-N composer mode banners, including narrow-pane wraps, represent an empty prompt even when not dim-styled.",
+        "Real typed input remains protected; delivery follows existing inject/verify/submit gates and submit-edge tracking."
+      ],
+      "status": "implemented; full gates and independent review passed; fresh live retest pending",
+      "risk": "Medium; prompt-empty recognition participates in safe PTY injection.",
+      "validation": "Restored omitted independent hcom-f6g.10 behavior. Focused PTY241 and banner8 filters passed; full serial Rust2887passed18ignored0failed, formatting, strict all-target Clippy and locked release passed. Scoped review accepted. Initial live reproduction and fresh retest recorded in docs/reviews/upgrade-trial-2026-10-21.md."
     }
   ],
   "external_assets": [

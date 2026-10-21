@@ -181,6 +181,41 @@ fn is_block_border(line: &str) -> bool {
     trimmed.chars().count() >= 20 && trimmed.chars().all(|c| c == '▀' || c == '▄')
 }
 
+/// Mode banners the agy TUI renders on the `>` prompt row while the input is
+/// empty and a non-default agent mode is active (shift+tab cycles `default` →
+/// `accept-edits` → `plan`; Best-of-N is an experiment mode). Captured
+/// verbatim from the agy CLI.
+const ANTIGRAVITY_MODE_BANNERS: &[&str] = &[
+    "Accept-edits mode: file edits auto-approved (shift+tab to cycle)",
+    "Plan mode: research & plan only (shift+tab to cycle)",
+    "Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)",
+];
+
+/// Does this `>`-row text stand in for an empty prompt as an agy mode banner?
+///
+/// The banner replaces the dim `Type your message` placeholder and renders at
+/// least partly non-dim, so intensity cannot distinguish it from typed input —
+/// treating it as text left a ready, empty accept-edits prompt permanently
+/// blocked on `tui:prompt-has-text` and no delivery Enter was ever sent
+/// (hcom-f6g.10). Compare against the known banner text instead. A pane
+/// narrower than the banner wraps it, so a proper prefix longer than the
+/// `… mode:` head (the shortest unambiguous anchor) also matches. A collision
+/// with genuinely typed text fails safe: delivery then sees a mixed prompt
+/// and refuses to submit it.
+fn is_antigravity_mode_banner(text: &str) -> bool {
+    ANTIGRAVITY_MODE_BANNERS.iter().any(|banner| {
+        if *banner == text {
+            return true;
+        }
+        // Everything through "mode:" must be present for a prefix to count.
+        let Some(head_start) = banner.find("mode:") else {
+            return false;
+        };
+        let head_end = banner[..head_start + "mode:".len()].chars().count();
+        banner.starts_with(text) && text.chars().count() > head_end
+    })
+}
+
 /// Screen tracker with vt100 emulation
 pub struct ScreenTracker {
     parser: vt100::Parser,
@@ -1080,7 +1115,7 @@ impl ScreenTracker {
             let after = trimmed.strip_prefix('>')?.trim_start();
             Some((row_idx, trim_with_nbsp(after)))
         }) {
-            if text.is_empty() {
+            if text.is_empty() || is_antigravity_mode_banner(text) {
                 return Some(String::new());
             }
 
@@ -2488,6 +2523,93 @@ mod tests {
         t.process("> <hcom>old message</hcom>\r\n".as_bytes());
         t.process("some agent output\r\n".as_bytes());
         t.process("> \r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_accept_edits_banner_is_not_input_text() {
+        // hcom-f6g.10: rendered plain (non-dim) on the `>` row of a ready,
+        // empty prompt, the accept-edits mode banner was scraped as typed
+        // input and blocked delivery on prompt_has_text forever. It must be
+        // recognized by text, not intensity.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n".as_bytes(),
+        );
+        t.process("? for shortcuts\r\n".as_bytes());
+        assert!(t.is_ready());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+        assert_eq!(t.get_input_box_text("antigravity"), Some(String::new()));
+        assert!(t.is_prompt_empty("antigravity"));
+    }
+
+    #[test]
+    fn antigravity_accept_edits_banner_without_ready_footer_is_not_input_text() {
+        // Same banner with the ready footer off-screen: the banner check
+        // itself (not the is_ready() fallback) must classify it as empty.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n".as_bytes(),
+        );
+        assert!(!t.is_ready());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_plan_and_best_of_n_banners_are_not_input_text() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("> Plan mode: research & plan only (shift+tab to cycle)\r\n".as_bytes());
+        t.process("? for shortcuts\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(
+            "> Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)\r\n"
+                .as_bytes(),
+        );
+        t.process("? for shortcuts\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_wrapped_mode_banner_prefix_is_not_input_text() {
+        // A pane narrower than the banner wraps it; only a prefix of the
+        // banner lands on the `>` row (80-col full text does not fit 40).
+        let mut t = make_tracker(24, 40, "? for shortcuts");
+        t.process("> Accept-edits mode: file edits auto-approved\r\n".as_bytes());
+        t.process("  (shift+tab to cycle)\r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn antigravity_mode_head_typed_text_is_still_input_text() {
+        // Text reaching only the `… mode:` head is too short to prove a
+        // wrapped banner, so it stays typed input (a genuine collision with
+        // injected delivery fails safe via the mixed-prompt refusal).
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("> Plan mode:\r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("Plan mode:".to_string())
+        );
+        assert!(!t.is_prompt_empty("antigravity"));
+    }
+
+    #[test]
+    fn antigravity_banner_after_submit_keeps_prompt_empty() {
+        // After Enter the cleared prompt shows the banner again; reading it
+        // as text would stall phase-2 clear verification and re-inject.
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("> <hcom>test</hcom>\r\n? for shortcuts\r\n".as_bytes());
+        assert_eq!(
+            t.get_antigravity_input_text(),
+            Some("<hcom>test</hcom>".to_string())
+        );
+        t.process("\x1b[1;1H\x1b[2J".as_bytes());
+        t.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n".as_bytes(),
+        );
+        t.process("? for shortcuts\r\n".as_bytes());
         assert_eq!(t.get_antigravity_input_text(), Some(String::new()));
     }
 
