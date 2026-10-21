@@ -367,9 +367,11 @@ fn events_sub_filter(
     match outcome {
         SubCreateOutcome::AlreadyExists { id } => {
             println!("Subscription {id} already exists");
+            println!("  stop: hcom events unsub {id}");
         }
         SubCreateOutcome::Created { id, final_sql } => {
             println!("Subscription {id} created");
+            println!("  stop: hcom events unsub {id}");
 
             if let Ok(count) = db.conn().query_row(
                 &format!("SELECT COUNT(*) FROM events_v WHERE ({final_sql})"),
@@ -407,6 +409,7 @@ fn events_sub_sql(
     let (sub_id, sql) = match outcome {
         SubCreateOutcome::AlreadyExists { id } => {
             println!("Subscription {id} already exists");
+            println!("  stop: hcom events unsub {id}");
             return 0;
         }
         SubCreateOutcome::Created { id, final_sql } => (id, final_sql),
@@ -416,6 +419,7 @@ fn events_sub_sql(
     println!("{sub_id}");
     println!("  for: {caller}");
     println!("  filter: {sql}");
+    println!("  stop: hcom events unsub {sub_id}");
 
     // Historical matches
     if let Ok(count) = db.conn().query_row(
@@ -659,6 +663,7 @@ fn cmd_events_sub_remote_create(db: &HcomDb, args: &EventsSubArgs, device: &str)
             } else {
                 println!("Subscription {id} created on {device} for {resolved_caller}");
             }
+            println!("  stop: hcom events unsub {id} --device {device}");
             0
         }
         Err(e) => {
