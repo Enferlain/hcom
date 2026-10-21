@@ -1110,47 +1110,136 @@ fn build_resume_args(tool: &str, session_id: &str, fork: bool) -> Vec<String> {
     args
 }
 
-/// Merge original launch args with resume-specific args.
+/// Merge original launch args with resume-specific args, per the tool's
+/// [`ResumeMerge`](crate::integration_spec::ResumeMerge).
 fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<String> {
-    // Preserve user/config args where the tool accepts them. Codex config
-    // overrides must reach the resume/fork scope to take effect.
+    use crate::integration_spec::ResumeMerge;
     let tool_lookup = if tool == "claude-pty" { "claude" } else { tool };
     let tool = tool_lookup
         .parse::<crate::tool::Tool>()
         .expect("resume tool must be validated before argument merging");
+    let merge = tool
+        .spec()
+        .resume
+        .as_ref()
+        .expect("resume tool must have a resume spec")
+        .merge;
+    match merge {
+        ResumeMerge::Append => [original, resume].concat(),
+        ResumeMerge::Flags(flags) => merge_with_flags(flags, original, resume),
+        ResumeMerge::Custom(merge) => merge(original, resume),
+    }
+}
 
-    match tool {
-        crate::tool::Tool::Claude | crate::tool::Tool::Gemini => {
-            let mut merged = original.to_vec();
-            merged.extend_from_slice(resume);
-            merged
+/// Resume args first, then the saved args minus dropped flags, the launch
+/// prompt, and singular flags the resume args set again.
+fn merge_with_flags(
+    flags: &crate::integration_spec::ResumeFlags,
+    original: &[String],
+    resume: &[String],
+) -> Vec<String> {
+    let is_flag = |t: &str| t.len() > 1 && t.starts_with('-');
+    // Canonical name (long form, no `=value`) and whether the value is inline.
+    let key = |token: &str| -> (String, bool) {
+        let (name, inline) = match token.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (token, false),
+        };
+        let name = match name.trim_start_matches('-') {
+            bare if flags.single_dash_long && bare.len() > 1 => format!("--{bare}"),
+            bare if flags.single_dash_long => format!("-{bare}"),
+            _ => name.to_string(),
+        };
+        let name = flags
+            .aliases
+            .iter()
+            .find(|(short, _)| *short == name)
+            .map_or(name, |(_, long)| long.to_string());
+        (name, inline)
+    };
+    let is_known_flag = |token: &str| {
+        let name = key(token).0;
+        let tables = [
+            flags.value,
+            flags.multi_value,
+            flags.boolean,
+            flags.drop,
+            flags.repeatable,
+        ];
+        is_flag(token) && tables.iter().any(|t| t.contains(&name.as_str()))
+    };
+    // Index just past `args[i]` and its values.
+    let flag_end = |args: &[String], i: usize, name: &str, inline: bool| -> usize {
+        let takes = |end: usize| end < args.len() && !is_flag(&args[end]);
+        let mut end = i + 1;
+        if flags.multi_value.contains(&name) {
+            while takes(end) {
+                end += 1;
+            }
+        } else if !inline && flags.value.contains(&name) {
+            // A required value may start with `-` ("- be terse"); only `--`
+            // or a flag this table knows means the value is missing.
+            if end < args.len() && args[end] != "--" && !is_known_flag(&args[end]) {
+                end += 1;
+            }
+        } else if !inline
+            && flags.extension_flags
+            && !flags.boolean.contains(&name)
+            && !flags.drop.contains(&name)
+            && takes(end)
+        {
+            end += 1;
         }
-        crate::tool::Tool::Codex => merge_codex_resume_args(original, resume),
-        crate::tool::Tool::OpenCode | crate::tool::Tool::Kilo => {
-            merge_opencode_args(original, resume)
-        }
-        crate::tool::Tool::Antigravity => merge_antigravity_args(original, resume),
-        crate::tool::Tool::Cursor => merge_cursor_args(original, resume),
-        crate::tool::Tool::Kimi => merge_kimi_args(original, resume),
-        crate::tool::Tool::Copilot => merge_copilot_args(original, resume),
-        crate::tool::Tool::Qoder => merge_qoder_args(original, resume),
-        crate::tool::Tool::Grok => merge_grok_args(original, resume),
-        crate::tool::Tool::Pi => merge_pi_args(original, resume),
-        crate::tool::Tool::Omp => merge_omp_args(original, resume),
-        crate::tool::Tool::Hermes => {
-            crate::tools::hermes_preprocessing::merge_resume_args(original, resume)
-        }
-        crate::tool::Tool::Adhoc => {
-            unreachable!("Adhoc sessions do not support resume argument merging")
+        end
+    };
+
+    let mut resume_set = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < resume.len() && resume[i] != "--" {
+        if is_flag(&resume[i]) {
+            let (name, inline) = key(&resume[i]);
+            let end = flag_end(resume, i, &name, inline);
+            if !flags.repeatable.contains(&name.as_str()) {
+                resume_set.insert(name);
+            }
+            i = end;
+        } else {
+            i += 1;
         }
     }
+
+    let mut merged = resume.to_vec();
+    let mut i = 0;
+    while i < original.len() {
+        let token = &original[i];
+        if token == "--" {
+            if !flags.positional_prompt {
+                merged.extend_from_slice(&original[i..]);
+            }
+            break;
+        }
+        if !is_flag(token) {
+            if !flags.positional_prompt {
+                merged.push(token.clone());
+            }
+            i += 1;
+            continue;
+        }
+        let (name, inline) = key(token);
+        let end = flag_end(original, i, &name, inline);
+        if !flags.drop.contains(&name.as_str()) && !resume_set.contains(&name) {
+            merged.extend_from_slice(&original[i..end]);
+        }
+        i = end;
+    }
+    merged
 }
 
 /// Keep ordinary flags at the root, but replay config overrides after the
 /// session selector. Extra resume overrides follow saved overrides so Codex
 /// resolves precedence itself. Moving all flags would put saved and new
 /// singular options (such as --model) in one clap scope, where they conflict.
-fn merge_codex_resume_args(original: &[String], resume: &[String]) -> Vec<String> {
+pub(crate) fn merge_codex_resume_args(original: &[String], resume: &[String]) -> Vec<String> {
     let mut root = Vec::new();
     let mut config = Vec::new();
     let mut i = 0;
@@ -1181,640 +1270,6 @@ fn merge_codex_resume_args(original: &[String], resume: &[String]) -> Vec<String
     root.extend(config);
     root.extend_from_slice(&resume[2..]);
     root
-}
-
-/// Merge grok original launch args with resume args.
-///
-/// Drop session selectors, one-shot flags, and worktree flags (the session
-/// already lives in that tree). `-w`/`--worktree` take an optional value.
-fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
-    const VALUE_FLAGS: &[&str] = &[
-        "--model",
-        "-m",
-        "--rules",
-        "--agent",
-        "--permission-mode",
-        "--reasoning-effort",
-        "--effort",
-        "--max-turns",
-        "--output-format",
-        "--disallowed-tools",
-        "--tools",
-        "--sandbox",
-        "--debug-file",
-        "--system-prompt-override",
-        "--system-prompt",
-        "--agents",
-        "--json-schema",
-    ];
-    // `--cwd`: hcom already starts a resume/fork in the right directory.
-    const DROP_WITH_VALUE: &[&str] = &[
-        "--cwd",
-        "--resume",
-        "-r",
-        "--session-id",
-        "-s",
-        "--single",
-        "-p",
-        "--prompt-file",
-        "--prompt-json",
-        "--worktree",
-        "-w",
-        "--worktree-ref",
-        "--ref",
-    ];
-    const DROP_BOOLEAN: &[&str] = &["--continue", "-c", "--fork-session", "--restore-code"];
-
-    let is_flag = |t: &str| t.starts_with('-');
-
-    let mut resume_flags: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut skip_next = false;
-    for token in resume {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if is_flag(token) {
-            let lower = token.to_lowercase();
-            let bare = lower.split('=').next().unwrap_or(&lower).to_string();
-            if VALUE_FLAGS.contains(&bare.as_str()) {
-                skip_next = !token.contains('=');
-            }
-            if !DROP_WITH_VALUE.contains(&bare.as_str()) && !DROP_BOOLEAN.contains(&bare.as_str()) {
-                resume_flags.insert(bare);
-            }
-        }
-    }
-
-    let mut filtered_original: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < original.len() {
-        let token = &original[i];
-        // The launch prompt follows `--`, whatever it looks like: drop it all.
-        if token == "--" {
-            break;
-        }
-        if is_flag(token) {
-            let lower = token.to_lowercase();
-            let (bare, has_eq_value) = if let Some(pos) = lower.find('=') {
-                (lower[..pos].to_string(), true)
-            } else {
-                (lower.clone(), false)
-            };
-            if DROP_WITH_VALUE.contains(&bare.as_str()) {
-                i += 1;
-                if !has_eq_value && i < original.len() && !is_flag(&original[i]) {
-                    i += 1;
-                }
-                continue;
-            }
-            if DROP_BOOLEAN.contains(&bare.as_str()) {
-                i += 1;
-                continue;
-            }
-            if resume_flags.contains(&bare) {
-                i += 1;
-                if !has_eq_value && VALUE_FLAGS.contains(&bare.as_str()) && i < original.len() {
-                    i += 1;
-                }
-                continue;
-            }
-            filtered_original.push(token.clone());
-            i += 1;
-            if !has_eq_value && VALUE_FLAGS.contains(&bare.as_str()) && i < original.len() {
-                filtered_original.push(original[i].clone());
-                i += 1;
-            }
-        } else {
-            // Drop bare positional task prompt from original launch.
-            i += 1;
-        }
-    }
-
-    let mut result = resume.to_vec();
-    result.extend(filtered_original);
-    result
-}
-
-/// Merge qoder original launch args with resume args.
-///
-/// qoder launch_args bake in `HCOM_QODER_ARGS` (e.g. `--model Qwen3.8-Flash`)
-/// plus the `--prompt-interactive <initial-prompt>` from the launcher. On
-/// resume: drop the session selectors (`--resume`, `--session-id`,
-/// `--continue`, `--fork-session`), `-i`/`--prompt-interactive` and its value,
-/// and any positional prompt (bare or after `--`). Also drop `--cwd`/`-w` and
-/// `--worktree [name]`: hcom relaunches in the directory the session ended up
-/// in, so replaying them would move it again or start another worktree. Keep
-/// the rest. A value flag also given in the resume args takes the resume value,
-/// whichever of its short and long spellings each side used.
-fn merge_qoder_args(original: &[String], resume: &[String]) -> Vec<String> {
-    // Single-value flags; --tools consumes all values up to the next flag.
-    // Values must never be mistaken for positional prompt text.
-    const VALUE_FLAGS: &[&str] = &[
-        "--model",
-        "-m",
-        "--reasoning-effort",
-        "--thinking",
-        "--thinking-budget",
-        "--context-window",
-        "--config-dir",
-        "--permission-mode",
-        "--allowed-mcp-server-names",
-        "--tools",
-        "--allowed-tools",
-        "--disallowed-tools",
-        "--attachment",
-        "--plugin-dir",
-        "--name",
-        "-n",
-        "--add-dir",
-        "--agent",
-        "--agents",
-        "--append-system-prompt",
-        "--system-prompt",
-        "--output-style",
-        "--mcp-config",
-        "--settings",
-        "--setting-sources",
-        "--max-model-request-retries",
-        "--max-turns",
-        "--max-output-tokens",
-        "--output-format",
-        "-o",
-        "--input-format",
-    ];
-    // `--worktree` takes an optional name; the others always take a value.
-    const DROP_WITH_VALUE: &[&str] = &[
-        "--resume",
-        "-r",
-        "--session-id",
-        "-i",
-        "--prompt-interactive",
-        "--cwd",
-        "-w",
-        "--worktree",
-    ];
-    const DROP_BOOLEAN: &[&str] = &["--continue", "-c", "--fork-session"];
-
-    let is_flag = |t: &str| t.starts_with('-');
-    let bare_of = |token: &str| match token.find('=') {
-        Some(pos) => (token[..pos].to_string(), true),
-        None => (token.to_string(), false),
-    };
-    // Short and long spellings of one flag must override each other.
-    let canonical = |bare: &str| {
-        match bare {
-            "-m" => "--model",
-            "-n" => "--name",
-            "-o" => "--output-format",
-            other => other,
-        }
-        .to_string()
-    };
-
-    let mut resume_flags: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut skip_next = false;
-    for token in resume {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if token == "--" {
-            break;
-        }
-        if is_flag(token) {
-            let (bare, has_eq_value) = bare_of(token);
-            if VALUE_FLAGS.contains(&bare.as_str()) {
-                skip_next = !has_eq_value;
-            }
-            if !DROP_WITH_VALUE.contains(&bare.as_str()) && !DROP_BOOLEAN.contains(&bare.as_str()) {
-                resume_flags.insert(canonical(&bare));
-            }
-        }
-    }
-
-    let mut filtered_original: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < original.len() {
-        let token = &original[i];
-        // The launch prompt follows `--`, whatever it looks like: drop it all.
-        if token == "--" {
-            break;
-        }
-        if is_flag(token) {
-            let (bare, has_eq_value) = bare_of(token);
-            if DROP_WITH_VALUE.contains(&bare.as_str()) {
-                i += 1;
-                if !has_eq_value && i < original.len() && !is_flag(&original[i]) {
-                    i += 1;
-                }
-                continue;
-            }
-            if DROP_BOOLEAN.contains(&bare.as_str()) {
-                i += 1;
-                continue;
-            }
-            let takes_value = VALUE_FLAGS.contains(&bare.as_str()) && !has_eq_value;
-            let mut end = i + 1;
-            if bare == "--tools" {
-                while end < original.len() && !is_flag(&original[end]) {
-                    end += 1;
-                }
-            } else if takes_value && end < original.len() {
-                end += 1;
-            }
-            // --add-dir repeats; singular flags are replaced as a whole.
-            if !resume_flags.contains(&canonical(&bare)) || bare == "--add-dir" {
-                filtered_original.extend_from_slice(&original[i..end]);
-            }
-            i = end;
-        } else {
-            // A bare positional is the launch prompt: drop it.
-            i += 1;
-        }
-    }
-
-    let mut result = resume.to_vec();
-    result.extend(filtered_original);
-    result
-}
-
-/// Merge copilot original launch args with resume args.
-///
-/// copilot launch_args bake in `HCOM_COPILOT_ARGS` (e.g. `--model
-/// claude-haiku-4.5`) plus the `-i <initial-prompt>` from the launcher.
-/// On resume: drop `-i`/`--interactive` and its value, drop `--resume`
-/// and its value; keep everything else (model flags, `--allow-*`, etc.).
-/// Resume args take precedence for overlapping singular flags.
-fn merge_copilot_args(original: &[String], resume: &[String]) -> Vec<String> {
-    const VALUE_FLAGS: &[&str] = &["--model", "--name", "--add-dir", "--agent"];
-    const DROP_WITH_VALUE: &[&str] = &["--resume", "-i", "--interactive"];
-    const DROP_BOOLEAN: &[&str] = &["--allow-all-tools", "--allow-all", "--yolo"];
-
-    let is_flag = |t: &str| t.starts_with('-');
-
-    // Singular flags already present in resume args — original copies are dropped.
-    let mut resume_flags: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut skip_next = false;
-    for token in resume {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if is_flag(token) {
-            let lower = token.to_lowercase();
-            let bare = lower.split('=').next().unwrap_or(&lower).to_string();
-            if VALUE_FLAGS.contains(&bare.as_str()) {
-                skip_next = true;
-            }
-            if !DROP_WITH_VALUE.contains(&bare.as_str()) {
-                resume_flags.insert(bare);
-            }
-        }
-    }
-
-    // Filter the original args.
-    let mut filtered_original: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < original.len() {
-        let token = &original[i];
-        if is_flag(token) {
-            let lower = token.to_lowercase();
-            let (bare, has_eq_value) = if let Some(pos) = lower.find('=') {
-                (lower[..pos].to_string(), true)
-            } else {
-                (lower.clone(), false)
-            };
-            if DROP_WITH_VALUE.contains(&bare.as_str()) {
-                i += 1;
-                if !has_eq_value && i < original.len() && !is_flag(&original[i]) {
-                    i += 1;
-                }
-                continue;
-            }
-            if DROP_BOOLEAN.contains(&bare.as_str()) {
-                i += 1;
-                continue;
-            }
-            if resume_flags.contains(&bare) {
-                i += 1;
-                if !has_eq_value && VALUE_FLAGS.contains(&bare.as_str()) && i < original.len() {
-                    i += 1;
-                }
-                continue;
-            }
-            filtered_original.push(token.clone());
-            i += 1;
-            if !has_eq_value && VALUE_FLAGS.contains(&bare.as_str()) && i < original.len() {
-                filtered_original.push(original[i].clone());
-                i += 1;
-            }
-        } else {
-            // Skip bare positional values (e.g. the `-i` prompt that was split off).
-            i += 1;
-        }
-    }
-
-    let mut result = resume.to_vec();
-    result.extend(filtered_original);
-    result
-}
-
-/// Merge cursor-agent original launch args with resume args.
-///
-/// cursor's launch_args bake in `HCOM_CURSOR_ARGS` (e.g. `--model composer-2.5
-/// --force`) plus the trailing positional task prompt that the launcher appends
-/// (`launcher.rs` Positional shape). On resume we must:
-///   - preserve user config flags (`--model`, `--force`/`--yolo`, `--sandbox`,
-///     `--mode`/`--plan`, `--output-format`, `--api-key`, `-H`/`--header`,
-///     `--plugin-dir`, …) so the resumed agent keeps its model/permissions;
-///   - drop the stale positional prompt — re-submitting the original task on a
-///     resume would re-run it;
-///   - strip flags hcom owns at relaunch: prior session selectors
-///     (`--resume`/`--continue`) and cwd/worktree selectors
-///     (`--workspace`, `-w`/`--worktree`, `--worktree-base`,
-///     `--skip-worktree-setup`) — the launcher sets the working directory
-///     itself (snapshot dir or `--dir`), so a stale `--workspace` would fight
-///     the recovered cwd and `--worktree` would spawn a *new* worktree.
-///
-/// Resume args (`--resume <session_id>` + any user-supplied extra args) come
-/// first; preserved original flags follow. For **singular** flags that the
-/// resume args already specify (e.g. a resume-time `--model x`), the baked
-/// original copy is dropped so the resume value wins under commander.js
-/// last-wins — matching claude/codex/gemini precedence. **Repeatable** flags
-/// (`-H`/`--header`, `--plugin-dir`) are always kept and concatenate.
-fn merge_cursor_args(original: &[String], resume: &[String]) -> Vec<String> {
-    // Flags whose following token is a value (so it isn't mistaken for the
-    // positional prompt). `--resume`/`--worktree` also accept a value but are
-    // stripped, so they're handled by DROP_WITH_VALUE below. The repeatable
-    // header short flag `-H` is handled separately (case-sensitive) because
-    // lowercasing collides with the `-h` help flag.
-    const VALUE_FLAGS: &[&str] = &[
-        "--api-key",
-        "--header",
-        "--output-format",
-        "--mode",
-        "--model",
-        "--sandbox",
-        "--plugin-dir",
-    ];
-    // Strip these flags (and their value/optional-value token when split form).
-    const DROP_WITH_VALUE: &[&str] = &[
-        "--resume",
-        "--workspace",
-        "--worktree",
-        "-w",
-        "--worktree-base",
-    ];
-    const DROP_BOOLEAN: &[&str] = &["--continue", "--skip-worktree-setup"];
-    // Repeatable flags concatenate across resume + original, so they're never
-    // deduped (long names lowercased; `-H` matched case-sensitively below).
-    const REPEATABLE: &[&str] = &["--header", "--plugin-dir"];
-
-    let is_flag = |t: &str| t.starts_with('-');
-    let header_flags = ["-H"]; // cursor's repeatable header short flag takes a value
-    let is_repeatable = |token: &str, bare: &str| REPEATABLE.contains(&bare) || token == "-H";
-
-    // Singular flag base-names already present in the resume args — the baked
-    // original copy of any of these is dropped so resume wins (consistency with
-    // the other tools' resume-precedence). Repeatables are excluded.
-    let mut resume_singular_flags = std::collections::HashSet::new();
-    for token in resume {
-        if !is_flag(token) {
-            continue;
-        }
-        let lower = token.to_lowercase();
-        let bare = lower.split('=').next().unwrap_or(&lower).to_string();
-        if is_repeatable(token, &bare) {
-            continue;
-        }
-        resume_singular_flags.insert(bare);
-    }
-
-    let mut preserved = Vec::new();
-    let mut i = 0;
-    while i < original.len() {
-        let token = &original[i];
-        let lower = token.to_lowercase();
-        let bare = lower.split('=').next().unwrap_or(&lower);
-
-        if DROP_BOOLEAN.contains(&bare) {
-            i += 1;
-            continue;
-        }
-        if DROP_WITH_VALUE.contains(&bare) {
-            // `--flag=value`: single token. Bare `--flag`: consume an optional
-            // following value only when it isn't itself a flag.
-            if !token.contains('=') && i + 1 < original.len() && !is_flag(&original[i + 1]) {
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        // Resume already specifies this singular flag → drop the baked dup
-        // (and its value token, when split form) so resume wins.
-        let deduped = !is_repeatable(token, bare) && resume_singular_flags.contains(bare);
-        let takes_value = VALUE_FLAGS.contains(&bare) || header_flags.contains(&token.as_str());
-        if takes_value {
-            if !deduped {
-                preserved.push(token.clone());
-            }
-            if !token.contains('=') && i + 1 < original.len() {
-                if !deduped {
-                    preserved.push(original[i + 1].clone());
-                }
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        if is_flag(token) {
-            // Unknown/boolean config flag (e.g. --force, --yolo, --plan,
-            // --approve-mcps, --trust): preserve unless resume overrides it.
-            if !deduped {
-                preserved.push(token.clone());
-            }
-            i += 1;
-            continue;
-        }
-        // Bare positional = the stale task prompt. Drop it.
-        i += 1;
-    }
-
-    let mut merged = resume.to_vec();
-    merged.extend(preserved);
-    // The unified launcher rejects cursor print flags with a clear error. Keep
-    // them visible here so a stale baked flag cannot silently change meaning.
-    merged
-}
-
-/// Merge agy original args with resume args.
-///
-/// Strips prior session/prompt flags (--conversation, --continue/-c,
-/// --prompt/--prompt-interactive/-p/-i, --print) from the original to prevent
-/// conflicting session IDs or prompts from the last launch bleeding into the resume.
-/// Non-session flags (--sandbox, --add-dir, etc.) are preserved.
-///
-/// agy uses Go's `flag` package, which accepts `--flag value`, `--flag=value`,
-/// `-flag value`, and `-flag=value`. All four forms are stripped.
-fn merge_antigravity_args(original: &[String], resume: &[String]) -> Vec<String> {
-    // Flag names without leading dashes — match against any leading-dash form.
-    let session_flag_names: &[&str] = &[
-        "conversation",
-        "continue",
-        "c",
-        "prompt",
-        "prompt-interactive",
-        "i",
-        "print",
-        "p",
-    ];
-    // Flag names that consume the next token as their value when used in split form.
-    let value_flag_names: &[&str] = &["conversation", "prompt", "prompt-interactive"];
-
-    // Returns the bare flag name (e.g. "conversation") if `token` matches `--name`,
-    // `-name`, `--name=value`, or `-name=value` for some name in `names`.
-    fn match_flag(token: &str, names: &[&str]) -> Option<String> {
-        let trimmed = token
-            .strip_prefix("--")
-            .or_else(|| token.strip_prefix('-'))?;
-        let name = trimmed.split('=').next().unwrap_or(trimmed);
-        if names.contains(&name) {
-            Some(name.to_string())
-        } else {
-            None
-        }
-    }
-
-    let mut preserved = Vec::new();
-    let mut i = 0;
-    while i < original.len() {
-        let token = &original[i];
-        if let Some(name) = match_flag(token, session_flag_names) {
-            // `--flag=value` or `-flag=value`: one token, no following value.
-            if token.contains('=') {
-                i += 1;
-                continue;
-            }
-            // Bare flag: consume the next token only if this flag takes a value.
-            if value_flag_names.contains(&name.as_str()) && i + 1 < original.len() {
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        preserved.push(token.clone());
-        i += 1;
-    }
-
-    let mut merged = resume.to_vec();
-    merged.extend(preserved);
-    merged
-}
-
-fn merge_opencode_args(original: &[String], resume: &[String]) -> Vec<String> {
-    let mut preserved = Vec::new();
-    let mut i = 0;
-
-    while i < original.len() {
-        let token = &original[i];
-
-        if token == "--session" || token == "--prompt" {
-            i += 2;
-            continue;
-        }
-        if token == "--fork" || token.starts_with("--session=") || token.starts_with("--prompt=") {
-            i += 1;
-            continue;
-        }
-
-        preserved.push(token.clone());
-        i += 1;
-    }
-
-    let mut merged = resume.to_vec();
-    merged.extend(preserved);
-    merged
-}
-
-fn merge_kimi_args(original: &[String], resume: &[String]) -> Vec<String> {
-    let mut preserved = Vec::new();
-    let mut i = 0;
-
-    while i < original.len() {
-        let token = &original[i];
-
-        if token == "--resume" || token == "--fork" {
-            i += 1;
-            continue;
-        }
-        if token.starts_with("--resume=") || token.starts_with("--fork=") {
-            i += 1;
-            continue;
-        }
-
-        preserved.push(token.clone());
-        i += 1;
-    }
-
-    let mut merged = resume.to_vec();
-    merged.extend(preserved);
-    merged
-}
-
-/// Merge pi original launch args with resume args.
-///
-/// Strips session-control flags (`--session`/`--session-id`/`--session-dir`/
-/// `--fork`/`--continue`/`--resume`) and the positional initial prompt from the
-/// original launch args; preserves the rest (model flags, etc.). Resume args
-/// take precedence (prepended).
-fn merge_pi_args(original: &[String], resume: &[String]) -> Vec<String> {
-    let mut preserved = Vec::new();
-    let mut i = 0;
-
-    while i < original.len() {
-        let token = &original[i];
-        let token_str = token.as_str();
-
-        if matches!(
-            token_str,
-            "--session" | "--session-id" | "--session-dir" | "--fork"
-        ) {
-            i += 2;
-            continue;
-        }
-        if matches!(token_str, "--continue" | "--resume")
-            || token_str.starts_with("--session=")
-            || token_str.starts_with("--session-id=")
-            || token_str.starts_with("--session-dir=")
-            || token_str.starts_with("--fork=")
-        {
-            i += 1;
-            continue;
-        }
-
-        if !token_str.starts_with('-') {
-            // Pi initial prompts are positional; do not replay an old prompt
-            // when resuming or forking a session.
-            i += 1;
-            continue;
-        }
-
-        preserved.push(token.clone());
-        if i + 1 < original.len() && !original[i + 1].starts_with('-') {
-            preserved.push(original[i + 1].clone());
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-
-    let mut merged = resume.to_vec();
-    merged.extend(preserved);
-    merged
 }
 
 // ── Thread-name resolution ───────────────────────────────────────────────
@@ -2249,57 +1704,6 @@ fn ambiguous_pi_omp_session(session_id: &str) -> Option<String> {
         PiOmpMatch::Ambiguous { path } => Some(path),
         _ => None,
     }
-}
-
-/// Merge `omp` transcript arguments for a resumed or forked session.
-///
-/// Omp uses `--resume <id>` and `--fork <id>`, and lacks `--session`.
-fn merge_omp_args(original: &[String], resume: &[String]) -> Vec<String> {
-    let mut preserved = Vec::new();
-    let mut i = 0;
-
-    while i < original.len() {
-        let token = &original[i];
-        let token_str = token.as_str();
-
-        if matches!(
-            token_str,
-            "-r" | "--resume" | "--session" | "--session-id" | "--session-dir" | "--fork"
-        ) {
-            i += 1;
-            if i < original.len() && !original[i].starts_with('-') {
-                i += 1;
-            }
-            continue;
-        }
-        if matches!(token_str, "-c" | "--continue")
-            || token_str.starts_with("--resume=")
-            || token_str.starts_with("--session=")
-            || token_str.starts_with("--session-id=")
-            || token_str.starts_with("--session-dir=")
-            || token_str.starts_with("--fork=")
-        {
-            i += 1;
-            continue;
-        }
-
-        if !token_str.starts_with('-') {
-            i += 1;
-            continue;
-        }
-
-        preserved.push(token.clone());
-        if i + 1 < original.len() && !original[i + 1].starts_with('-') {
-            preserved.push(original[i + 1].clone());
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-
-    let mut final_args = resume.to_vec();
-    final_args.extend(preserved);
-    final_args
 }
 
 /// Locate an OMP transcript by session id under OMP's currently active session
@@ -2988,11 +2392,11 @@ mod tests {
         // config flags.
         let fork = s(&["--fork", "new"]);
         assert_eq!(
-            merge_omp_args(&s(&["--model", "opus", "--fork", "old"]), &fork),
+            merge_resume_args("omp", &s(&["--model", "opus", "--fork", "old"]), &fork),
             s(&["--fork", "new", "--model", "opus"])
         );
         assert_eq!(
-            merge_omp_args(&s(&["--fork=old", "-r", "prev"]), &fork),
+            merge_resume_args("omp", &s(&["--fork=old", "-r", "prev"]), &fork),
             s(&["--fork", "new"])
         );
     }
@@ -3001,15 +2405,16 @@ mod tests {
     fn test_merge_omp_args_strips_resume_aliases_and_values() {
         let resume = s(&["--resume", "new"]);
         assert_eq!(
-            merge_omp_args(&s(&["--model", "opus", "-r", "old"]), &resume),
+            merge_resume_args("omp", &s(&["--model", "opus", "-r", "old"]), &resume),
             s(&["--resume", "new", "--model", "opus"])
         );
         assert_eq!(
-            merge_omp_args(&s(&["--resume=old", "--thinking", "high"]), &resume),
+            merge_resume_args("omp", &s(&["--resume=old", "--thinking", "high"]), &resume),
             s(&["--resume", "new", "--thinking", "high"])
         );
         assert_eq!(
-            merge_omp_args(
+            merge_resume_args(
+                "omp",
                 &s(&["--continue", "-c", "--session-dir", "/tmp/s"]),
                 &resume
             ),
@@ -3021,7 +2426,7 @@ mod tests {
     fn test_merge_omp_args_does_not_drop_following_flags() {
         let resume = s(&["--resume", "new"]);
         assert_eq!(
-            merge_omp_args(&s(&["--session-dir", "--model", "opus"]), &resume),
+            merge_resume_args("omp", &s(&["--session-dir", "--model", "opus"]), &resume),
             s(&["--resume", "new", "--model", "opus"])
         );
     }
@@ -3721,6 +3126,127 @@ mod tests {
         assert_eq!(
             merged,
             s(&["--session", "new-sess", "--model", "claude-3-5-sonnet"])
+        );
+    }
+
+    #[test]
+    fn test_merge_resume_args_pi_boolean_flag_does_not_replay_prompt() {
+        let merged = merge_resume_args(
+            "pi",
+            &s(&["--verbose", "fix x", "-t", "read,bash"]),
+            &s(&["--session", "new-sess"]),
+        );
+        assert_eq!(
+            merged,
+            s(&["--session", "new-sess", "--verbose", "-t", "read,bash"])
+        );
+    }
+
+    #[test]
+    fn test_merge_resume_args_resume_flag_replaces_saved_across_spellings() {
+        // OpenCode keeps its positional project dir; `-m` and `--model` are one flag.
+        let merged = merge_resume_args(
+            "opencode",
+            &s(&["-m", "old/model", "--prompt", "task", "proj"]),
+            &s(&["--session", "ses_1", "--model", "new/model"]),
+        );
+        assert_eq!(
+            merged,
+            s(&["--session", "ses_1", "--model", "new/model", "proj"])
+        );
+        let merged = merge_resume_args(
+            "kimi",
+            &s(&["--model", "k2", "--agent", "coder", "--add-dir", "a"]),
+            &s(&["--session", "sid", "-m", "k3", "--add-dir", "b"]),
+        );
+        assert_eq!(
+            merged,
+            s(&[
+                "--session",
+                "sid",
+                "-m",
+                "k3",
+                "--add-dir",
+                "b",
+                "--add-dir",
+                "a"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_merge_resume_args_value_may_start_with_dash() {
+        let merged = merge_resume_args(
+            "qoder",
+            &s(&[
+                "--append-system-prompt",
+                "- Always run tests",
+                "--model",
+                "m",
+            ]),
+            &s(&["--resume", "sid", "--append-system-prompt", "New rules"]),
+        );
+        assert_eq!(
+            merged,
+            s(&[
+                "--resume",
+                "sid",
+                "--append-system-prompt",
+                "New rules",
+                "--model",
+                "m"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_merge_resume_args_pi_keeps_extension_flag_values() {
+        let merged = merge_resume_args(
+            "pi",
+            &s(&["--extension", "preset.ts", "--preset", "review", "task"]),
+            &s(&["--session", "new-sess"]),
+        );
+        assert_eq!(
+            merged,
+            s(&[
+                "--session",
+                "new-sess",
+                "--extension",
+                "preset.ts",
+                "--preset",
+                "review"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_merge_resume_args_antigravity_double_dash_short_aliases() {
+        let merged = merge_resume_args(
+            "antigravity",
+            &s(&["--i", "old task", "--c", "-sandbox"]),
+            &s(&["--conversation", "c2"]),
+        );
+        assert_eq!(merged, s(&["--conversation", "c2", "-sandbox"]));
+    }
+
+    #[test]
+    fn test_merge_resume_args_antigravity_single_dash_long_flags() {
+        let merged = merge_resume_args(
+            "antigravity",
+            &s(&[
+                "-model",
+                "old",
+                "-conversation",
+                "c1",
+                "-i",
+                "task",
+                "--sandbox",
+            ]),
+            &s(&["--conversation", "c2", "--model", "new"]),
+        );
+        assert_eq!(
+            merged,
+            s(&["--conversation", "c2", "--model", "new", "--sandbox"])
         );
     }
 
@@ -4522,18 +4048,18 @@ mod tests {
                 "prompt",
             ]),
         ] {
-            let merged = merge_qoder_args(&original, &s(&["--resume", "sid"]));
+            let merged = merge_resume_args("qoder", &original, &s(&["--resume", "sid"]));
             assert_eq!(&merged[2..], &original[..original.len() - 2]);
             let resume = s(&["--resume", "sid", "--tools", "Bash", "Write"]);
             assert_eq!(
-                merge_qoder_args(&original, &resume),
+                merge_resume_args("qoder", &original, &resume),
                 s(&[
                     "--resume", "sid", "--tools", "Bash", "Write", "--model", "m"
                 ])
             );
         }
         assert_eq!(
-            merge_qoder_args(&s(&["--tools", ""]), &s(&["--resume", "sid"])),
+            merge_resume_args("qoder", &s(&["--tools", ""]), &s(&["--resume", "sid"])),
             s(&["--resume", "sid", "--tools", ""])
         );
     }

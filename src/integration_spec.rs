@@ -169,6 +169,67 @@ pub enum ForkArgs {
 pub struct ResumeSpec {
     pub resume: ResumeArgs,
     pub fork: Option<ForkArgs>,
+    /// How the saved launch args combine with the resume args.
+    pub merge: ResumeMerge,
+}
+
+/// How `hcom r`/`hcom f` combines the saved launch args with the resume args
+/// (the session selector plus any extra args given to `hcom r`).
+#[derive(Debug, Clone, Copy)]
+pub enum ResumeMerge {
+    /// Saved args, then resume args. The tool resolves any conflict.
+    Append,
+    /// Resume args, then the saved args that survive [`ResumeFlags`].
+    Flags(&'static ResumeFlags),
+    /// Tool-specific merger, for flags that only apply in a subcommand scope.
+    Custom(fn(&[String], &[String]) -> Vec<String>),
+}
+
+/// Flag table for [`ResumeMerge::Flags`].
+///
+/// Saved args lose every flag in `drop`, the launch prompt (when
+/// `positional_prompt`), and every non-repeatable flag the resume args also
+/// set, so a resume-time `--model` replaces the saved one. Arity comes from
+/// `value` and `multi_value`; any other flag is boolean, so a value flag
+/// missing from `value` would lose its value.
+#[derive(Debug)]
+pub struct ResumeFlags {
+    /// Flags that take one value: the next token, unless it is `--` or a flag
+    /// in these tables (so `"- be terse"` is still a value).
+    pub value: &'static [&'static str],
+    /// Flags with an optional value or several values: they take the following
+    /// tokens up to the next flag, even after `--flag=value`.
+    pub multi_value: &'static [&'static str],
+    /// Flags that take no value. Only consulted with `extension_flags`.
+    pub boolean: &'static [&'static str],
+    /// Extensions can register their own flags, so a flag in none of the
+    /// tables takes the next token as its value unless that token is a flag.
+    pub extension_flags: bool,
+    /// Saved flags dropped with their values: session selectors, prompts, and
+    /// cwd/worktree flags (hcom relaunches in the session's directory).
+    pub drop: &'static [&'static str],
+    /// Flags that accumulate, so a resume copy adds to the saved ones.
+    pub repeatable: &'static [&'static str],
+    /// `(short, long)` spellings of one flag. Tables above use the long form.
+    pub aliases: &'static [(&'static str, &'static str)],
+    /// Bare positionals, and everything after `--`, are the launch prompt.
+    pub positional_prompt: bool,
+    /// Go `flag` parsing: `-name` and `--name` are the same flag.
+    pub single_dash_long: bool,
+}
+
+impl ResumeFlags {
+    const EMPTY: Self = Self {
+        value: &[],
+        multi_value: &[],
+        boolean: &[],
+        extension_flags: false,
+        drop: &[],
+        repeatable: &[],
+        aliases: &[],
+        positional_prompt: false,
+        single_dash_long: false,
+    };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -481,6 +542,536 @@ const QODER_HELP_EXAMPLES: &[HelpEntry] = &[
     ),
 ];
 
+// ── Resume flag tables ──────────────────────────────────────────────────
+//
+// Taken from each CLI's own option parser or `--help`. A value flag missing
+// here loses its value on resume, so keep `value` complete.
+
+/// OpenCode and Kilo (yargs). The positional is the project dir, not a prompt.
+static OPENCODE_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+    value: &[
+        "--log-level",
+        "--port",
+        "--hostname",
+        "--mdns-domain",
+        "--model",
+        "--session",
+        "--prompt",
+        "--agent",
+        "--replay-limit",
+        // Kilo only.
+        "--worktree",
+    ],
+    multi_value: &["--cors"],
+    drop: &[
+        "--session",
+        "--continue",
+        "--fork",
+        "--prompt",
+        "--worktree",
+        "--cloud-fork",
+    ],
+    repeatable: &["--cors"],
+    aliases: &[("-m", "--model"), ("-s", "--session"), ("-c", "--continue")],
+    ..ResumeFlags::EMPTY
+};
+
+/// Antigravity (Go `flag`).
+static ANTIGRAVITY_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+    value: &[
+        "--add-dir",
+        "--agent",
+        "--conversation",
+        "--effort",
+        "--input-format",
+        "--json-schema",
+        "--log-file",
+        "--mode",
+        "--model",
+        "--output-format",
+        "--print-timeout",
+        "--project",
+        "--prompt-interactive",
+    ],
+    // `-p "text"`: drop the prompt whichever way agy parses it.
+    multi_value: &["--print", "--prompt"],
+    drop: &[
+        "--conversation",
+        "--continue",
+        "--prompt-interactive",
+        "--print",
+        "--prompt",
+        "--new-project",
+    ],
+    repeatable: &["--add-dir"],
+    aliases: &[
+        ("-c", "--continue"),
+        ("-i", "--prompt-interactive"),
+        ("-p", "--print"),
+    ],
+    single_dash_long: true,
+    ..ResumeFlags::EMPTY
+};
+
+/// Cursor (commander). Print flags stay: the launcher rejects them loudly.
+static CURSOR_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+    value: &[
+        "--api-key",
+        "--header",
+        "--endpoint",
+        "--output-format",
+        "--mode",
+        "--model",
+        "--sandbox",
+        "--workspace",
+        "--add-dir",
+        "--plugin-dir",
+        "--worktree-base",
+    ],
+    multi_value: &["--resume", "--worktree"],
+    drop: &[
+        "--resume",
+        "--continue",
+        "--workspace",
+        "--worktree",
+        "--worktree-base",
+        "--skip-worktree-setup",
+    ],
+    repeatable: &["--header", "--add-dir", "--plugin-dir"],
+    aliases: &[
+        ("-H", "--header"),
+        ("-e", "--endpoint"),
+        ("-p", "--print"),
+        ("-f", "--force"),
+        ("-w", "--worktree"),
+    ],
+    positional_prompt: true,
+    ..ResumeFlags::EMPTY
+};
+
+/// Kimi. `--agent`/`--agent-file` cannot be combined with `--session`.
+static KIMI_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+    value: &[
+        "--model",
+        "--prompt",
+        "--output-format",
+        "--skills-dir",
+        "--agent",
+        "--agent-file",
+        "--add-dir",
+    ],
+    multi_value: &["--session"],
+    drop: &[
+        "--session",
+        "--continue",
+        "--prompt",
+        "--agent",
+        "--agent-file",
+    ],
+    repeatable: &["--skills-dir", "--add-dir"],
+    aliases: &[
+        ("-S", "--session"),
+        ("-c", "--continue"),
+        ("-m", "--model"),
+        ("-p", "--prompt"),
+        ("-y", "--yolo"),
+    ],
+    ..ResumeFlags::EMPTY
+};
+
+/// Pi. The initial prompt is positional.
+static PI_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+    boolean: &[
+        "--print",
+        "--continue",
+        "--resume",
+        "--no-session",
+        "--no-tools",
+        "--no-builtin-tools",
+        "--no-extensions",
+        "--no-mcp",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--no-context-files",
+        "--verbose",
+        "--approve",
+        "--no-approve",
+        "--offline",
+        "--help",
+        "--version",
+    ],
+    extension_flags: true,
+    value: &[
+        "--provider",
+        "--model",
+        "--api-key",
+        "--system-prompt",
+        "--append-system-prompt",
+        "--mode",
+        "--session",
+        "--session-id",
+        "--fork",
+        "--session-dir",
+        "--name",
+        "--models",
+        "--tools",
+        "--exclude-tools",
+        "--thinking",
+        "--extension",
+        "--skill",
+        "--prompt-template",
+        "--theme",
+        "--use-theme",
+        "--export",
+        "--tui-mode",
+    ],
+    multi_value: &["--list-models"],
+    drop: &[
+        "--session",
+        "--session-id",
+        "--session-dir",
+        "--fork",
+        "--continue",
+        "--resume",
+        "--no-session",
+        "--print",
+    ],
+    repeatable: &[
+        "--append-system-prompt",
+        "--extension",
+        "--skill",
+        "--prompt-template",
+        "--theme",
+    ],
+    aliases: &[
+        ("-p", "--print"),
+        ("-c", "--continue"),
+        ("-r", "--resume"),
+        ("-n", "--name"),
+        ("-t", "--tools"),
+        ("-xt", "--exclude-tools"),
+        ("-e", "--extension"),
+        ("-nt", "--no-tools"),
+        ("-nbt", "--no-builtin-tools"),
+        ("-ne", "--no-extensions"),
+        ("-ns", "--no-skills"),
+        ("-np", "--no-prompt-templates"),
+        ("-nc", "--no-context-files"),
+        ("-a", "--approve"),
+        ("-na", "--no-approve"),
+    ],
+    positional_prompt: true,
+    ..ResumeFlags::EMPTY
+};
+
+/// OMP (`cli/flag-tables.ts`). The initial prompt is positional.
+static OMP_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+    boolean: &[
+        "--help",
+        "--version",
+        "--allow-home",
+        "--continue",
+        "--no-session",
+        "--no-tools",
+        "--no-lsp",
+        "--no-pty",
+        "--hide-thinking",
+        "--advisor",
+        "--external-thinking",
+        "--prewalk",
+        "--no-prewalk",
+        "--plan-yolo",
+        "--print",
+        "--print-thoughts",
+        "--no-extensions",
+        "--no-skills",
+        "--no-rules",
+        "--no-title",
+        "--no-ui",
+        "--auto-approve",
+        "--yolo",
+    ],
+    extension_flags: true,
+    value: &[
+        "--cwd",
+        "--config",
+        "--add-dir",
+        "--mode",
+        "--fork",
+        "--provider",
+        "--model",
+        "--smol",
+        "--slow",
+        "--goal",
+        "--plan",
+        "--prewalk-into",
+        "--plan-yolo-into",
+        "--max-time",
+        "--service-tier",
+        "--api-key",
+        "--system-prompt",
+        "--system-prompt-template",
+        "--append-system-prompt",
+        "--provider-session-id",
+        "--prompt-cache-key",
+        "--session-dir",
+        "--session-id",
+        "--models",
+        "--tools",
+        "--thinking",
+        "--export",
+        "--hook",
+        "--extension",
+        "--trusted-extension",
+        "--plugin-dir",
+        "--skills",
+        "--approval-mode",
+        "--profile",
+        "--alias",
+    ],
+    multi_value: &["--resume", "--session", "--from-claude", "--from-codex"],
+    drop: &[
+        "--resume",
+        "--session",
+        "--session-id",
+        "--session-dir",
+        "--fork",
+        "--continue",
+        "--from-claude",
+        "--from-codex",
+        "--goal",
+        "--no-session",
+        "--print",
+        "--cwd",
+    ],
+    repeatable: &[
+        "--config",
+        "--add-dir",
+        "--hook",
+        "--extension",
+        "--trusted-extension",
+        "--plugin-dir",
+    ],
+    aliases: &[
+        ("-r", "--resume"),
+        ("-c", "--continue"),
+        ("-e", "--extension"),
+        ("-p", "--print"),
+    ],
+    positional_prompt: true,
+    ..ResumeFlags::EMPTY
+};
+
+/// Copilot (commander). Saved permission flags are dropped.
+static COPILOT_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+    value: &[
+        "--interactive",
+        "--prompt",
+        "--model",
+        "--reasoning-effort",
+        "--context",
+        "--auto-tier",
+        "--agent",
+        "--name",
+        "--session-id",
+        "-C",
+        "--log-dir",
+        "--extension-sdk-path",
+        "--log-level",
+        "--stream",
+        "--output-format",
+        "--add-dir",
+        "--attachment",
+        "--disable-mcp-server",
+        "--enable-mcp-server",
+        "--add-github-mcp-toolset",
+        "--add-github-mcp-tool",
+        "--plugin-dir",
+        "--additional-mcp-config",
+        "--mcp-github-auth",
+        "--max-autopilot-continues",
+        "--mode",
+        "--environment-host",
+        "--environment-compute-id",
+        "--dynamic-retrieval",
+        "--max-ai-credits",
+        "--usage-output-file",
+    ],
+    multi_value: &[
+        "--resume",
+        "--connect",
+        "--share",
+        "--allow-tool",
+        "--deny-tool",
+        "--available-tools",
+        "--excluded-tools",
+        "--secret-env-vars",
+        "--allow-url",
+        "--deny-url",
+        "--bash-env",
+        "--mouse",
+    ],
+    drop: &[
+        "--resume",
+        "--continue",
+        "--connect",
+        "--session-id",
+        "--interactive",
+        "--prompt",
+        "-C",
+        "--allow-all-tools",
+        "--allow-all",
+        "--yolo",
+    ],
+    repeatable: &[
+        "--add-dir",
+        "--attachment",
+        "--plugin-dir",
+        "--disable-mcp-server",
+        "--enable-mcp-server",
+        "--add-github-mcp-toolset",
+        "--add-github-mcp-tool",
+        "--allow-tool",
+        "--deny-tool",
+        "--allow-url",
+        "--deny-url",
+        "--secret-env-vars",
+    ],
+    aliases: &[
+        ("-i", "--interactive"),
+        ("-p", "--prompt"),
+        ("-r", "--resume"),
+        ("-n", "--name"),
+        ("-s", "--silent"),
+    ],
+    positional_prompt: true,
+    ..ResumeFlags::EMPTY
+};
+
+/// Qoder. `--tools` takes every value up to the next flag.
+static QODER_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+    value: &[
+        "--model",
+        "--reasoning-effort",
+        "--thinking",
+        "--thinking-budget",
+        "--context-window",
+        "--config-dir",
+        "--permission-mode",
+        "--allowed-mcp-server-names",
+        "--allowed-tools",
+        "--disallowed-tools",
+        "--attachment",
+        "--plugin-dir",
+        "--name",
+        "--add-dir",
+        "--agent",
+        "--agents",
+        "--append-system-prompt",
+        "--system-prompt",
+        "--output-style",
+        "--mcp-config",
+        "--settings",
+        "--setting-sources",
+        "--max-model-request-retries",
+        "--max-turns",
+        "--max-output-tokens",
+        "--output-format",
+        "--input-format",
+        "--session-id",
+        "--prompt-interactive",
+        "--cwd",
+        "--remote-session",
+        "--teleport",
+        "--remote-control",
+    ],
+    multi_value: &["--tools", "--resume", "--worktree", "--remote"],
+    drop: &[
+        "--resume",
+        "--session-id",
+        "--continue",
+        "--fork-session",
+        "--prompt-interactive",
+        "--cwd",
+        "--worktree",
+        "--remote",
+        "--remote-session",
+        "--teleport",
+        "--remote-control",
+    ],
+    repeatable: &["--add-dir"],
+    aliases: &[
+        ("-m", "--model"),
+        ("-n", "--name"),
+        ("-o", "--output-format"),
+        ("-r", "--resume"),
+        ("-c", "--continue"),
+        ("-i", "--prompt-interactive"),
+        ("-w", "--cwd"),
+    ],
+    positional_prompt: true,
+    ..ResumeFlags::EMPTY
+};
+
+/// Grok (clap, which rejects a repeated singular flag). `--worktree` takes an optional value.
+static GROK_RESUME_FLAGS: ResumeFlags = ResumeFlags {
+    value: &[
+        "--model",
+        "--rules",
+        "--agent",
+        "--permission-mode",
+        "--reasoning-effort",
+        "--effort",
+        "--max-turns",
+        "--output-format",
+        "--disallowed-tools",
+        "--tools",
+        "--sandbox",
+        "--debug-file",
+        "--system-prompt-override",
+        "--system-prompt",
+        "--agents",
+        "--json-schema",
+        "--cwd",
+        "--session-id",
+        "--single",
+        "--prompt-file",
+        "--prompt-json",
+        "--worktree-ref",
+        "--ref",
+        "--allow",
+        "--deny",
+        "--leader-socket",
+    ],
+    multi_value: &["--resume", "--worktree"],
+    drop: &[
+        "--cwd",
+        "--resume",
+        "--session-id",
+        "--single",
+        "--prompt-file",
+        "--prompt-json",
+        "--worktree",
+        "--worktree-ref",
+        "--ref",
+        "--continue",
+        "--fork-session",
+        "--restore-code",
+    ],
+    repeatable: &["--allow", "--deny"],
+    aliases: &[
+        ("-m", "--model"),
+        ("-r", "--resume"),
+        ("-s", "--session-id"),
+        ("-p", "--single"),
+        ("-w", "--worktree"),
+        ("-c", "--continue"),
+    ],
+    positional_prompt: true,
+    ..ResumeFlags::EMPTY
+};
+
 // ── Per-tool integration constants ──────────────────────────────────────
 
 pub static CLAUDE: IntegrationSpec = IntegrationSpec {
@@ -536,6 +1127,7 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         fork: Some(ForkArgs::AppendFlag("--fork-session")),
+        merge: ResumeMerge::Append,
     }),
     help: HelpSpec {
         unique_examples: CLAUDE_HELP_EXAMPLES,
@@ -591,6 +1183,7 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         fork: None,
+        merge: ResumeMerge::Append,
     }),
     help: HelpSpec {
         unique_examples: GEMINI_HELP_EXAMPLES,
@@ -648,6 +1241,7 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Subcommand("resume"),
         fork: Some(ForkArgs::Subcommand("fork")),
+        merge: ResumeMerge::Custom(crate::commands::resume::merge_codex_resume_args),
     }),
     help: HelpSpec {
         unique_examples: CODEX_HELP_EXAMPLES,
@@ -706,6 +1300,7 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--session"),
         fork: Some(ForkArgs::AppendFlag("--fork")),
+        merge: ResumeMerge::Flags(&OPENCODE_RESUME_FLAGS),
     }),
     help: HelpSpec {
         unique_examples: OPENCODE_HELP_EXAMPLES,
@@ -769,6 +1364,7 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--session"),
         fork: Some(ForkArgs::AppendFlag("--fork")),
+        merge: ResumeMerge::Flags(&OPENCODE_RESUME_FLAGS),
     }),
     help: HelpSpec {
         unique_examples: KILO_HELP_EXAMPLES,
@@ -825,6 +1421,7 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--conversation"),
         fork: None,
+        merge: ResumeMerge::Flags(&ANTIGRAVITY_RESUME_FLAGS),
     }),
     help: HelpSpec {
         // Help lookup uses "agy" externally; the agy unique examples document
@@ -891,6 +1488,7 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
         // simulating fork via resume+create-chat is deferred (not needed for
         // parity).
         fork: None,
+        merge: ResumeMerge::Flags(&CURSOR_RESUME_FLAGS),
     }),
     help: HelpSpec {
         unique_examples: CURSOR_HELP_EXAMPLES,
@@ -956,6 +1554,7 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
         // command only (`kimi --fork` errors "unknown option"). Like
         // gemini/cursor/agy, leave fork unsupported.
         fork: None,
+        merge: ResumeMerge::Flags(&KIMI_RESUME_FLAGS),
     }),
     help: HelpSpec {
         unique_examples: KIMI_HELP_EXAMPLES,
@@ -1027,6 +1626,7 @@ pub static PI: IntegrationSpec = IntegrationSpec {
         // `["--fork", <id>]` (replacing `--session`), not `["--session", <id>,
         // "--fork"]` which pi rejects.
         fork: Some(ForkArgs::Subcommand("--fork")),
+        merge: ResumeMerge::Flags(&PI_RESUME_FLAGS),
     }),
     help: HelpSpec {
         unique_examples: PI_HELP_EXAMPLES,
@@ -1105,6 +1705,7 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
         // `["--fork", <id>]` (replacing `--resume`), not `["--resume", <id>,
         // "--fork"]`. Must not degrade `hcom f` into a plain `--resume`.
         fork: Some(ForkArgs::Subcommand("--fork")),
+        merge: ResumeMerge::Flags(&OMP_RESUME_FLAGS),
     }),
     help: HelpSpec {
         unique_examples: OMP_HELP_EXAMPLES,
@@ -1165,6 +1766,7 @@ pub static HERMES: IntegrationSpec = IntegrationSpec {
         resume: ResumeArgs::Flag("--resume"),
         // Hermes has no fork flag (only an interactive /branch).
         fork: None,
+        merge: ResumeMerge::Custom(crate::tools::hermes_preprocessing::merge_resume_args),
     }),
     help: HelpSpec {
         unique_examples: HERMES_HELP_EXAMPLES,
@@ -1223,6 +1825,7 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         fork: None,
+        merge: ResumeMerge::Flags(&COPILOT_RESUME_FLAGS),
     }),
     help: HelpSpec {
         unique_examples: COPILOT_HELP_EXAMPLES,
@@ -1286,6 +1889,7 @@ pub static QODER: IntegrationSpec = IntegrationSpec {
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         fork: Some(ForkArgs::AppendFlag("--fork-session")),
+        merge: ResumeMerge::Flags(&QODER_RESUME_FLAGS),
     }),
     help: HelpSpec {
         unique_examples: QODER_HELP_EXAMPLES,
@@ -1343,6 +1947,7 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--resume"),
         fork: Some(ForkArgs::AppendFlag("--fork-session")),
+        merge: ResumeMerge::Flags(&GROK_RESUME_FLAGS),
     }),
     help: HelpSpec {
         unique_examples: GROK_HELP_EXAMPLES,
@@ -1669,6 +2274,57 @@ mod tests {
                 "{}: must have exactly one runtime adapter or persistent verify/setup registration",
                 spec.name
             );
+        }
+    }
+
+    #[test]
+    fn resume_flag_tables_are_canonical() {
+        for spec in ALL.iter().filter(|s| s.tool != Tool::Adhoc) {
+            let resume = spec
+                .resume
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: missing resume spec", spec.name));
+            let ResumeMerge::Flags(flags) = resume.merge else {
+                continue;
+            };
+            let selectors = [
+                match resume.resume {
+                    ResumeArgs::Flag(flag) => Some(flag),
+                    ResumeArgs::Subcommand(_) => None,
+                },
+                match resume.fork {
+                    Some(ForkArgs::AppendFlag(flag) | ForkArgs::Subcommand(flag)) => Some(flag),
+                    None => None,
+                },
+            ];
+            for selector in selectors.into_iter().flatten() {
+                assert!(
+                    flags.drop.contains(&selector),
+                    "{}: resume flags must drop a saved {selector}",
+                    spec.name
+                );
+            }
+            let tables = [
+                flags.value,
+                flags.multi_value,
+                flags.boolean,
+                flags.drop,
+                flags.repeatable,
+            ];
+            for name in tables.iter().flat_map(|t| t.iter()) {
+                assert!(
+                    !flags.aliases.iter().any(|(short, _)| short == name),
+                    "{}: resume flag table lists alias {name}; use the long form",
+                    spec.name
+                );
+            }
+            for name in flags.repeatable {
+                assert!(
+                    flags.value.contains(name) || flags.multi_value.contains(name),
+                    "{}: repeatable {name} has no value arity",
+                    spec.name
+                );
+            }
         }
     }
 
