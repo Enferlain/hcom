@@ -634,7 +634,6 @@ pub fn get_status_description(status: &str, context: &str) -> String {
 
 /// Set instance status with timestamp and log the status-change event.
 /// Best-effort: a failed write is logged, not returned.
-#[track_caller]
 pub fn set_status(
     db: &HcomDb,
     instance_name: &str,
@@ -652,7 +651,6 @@ pub fn set_status(
 }
 
 /// [`set_status`] for callers that must report whether the status was stored.
-#[track_caller]
 pub fn try_set_status(
     db: &HcomDb,
     instance_name: &str,
@@ -666,7 +664,6 @@ pub fn try_set_status(
         tool_name,
         tool_use_id,
     } = upd;
-    let writer = std::panic::Location::caller();
 
     // Row update and status event commit together: one write lock and sync
     // per hook instead of two. Wake and subscriptions run after commit so
@@ -701,17 +698,6 @@ pub fn try_set_status(
         if !msg_ts.is_empty() {
             data["msg_ts"] = serde_json::json!(msg_ts);
         }
-        // old_* differs from the prior status event when set_gate_status() touched
-        // the row without logging (tui:* gate context churns silently).
-        data["old_status"] = serde_json::json!(old_status);
-        data["old_context"] =
-            serde_json::json!(current_data.as_ref().map(|d| d.status_context.as_str()));
-        data["old_detail"] =
-            serde_json::json!(current_data.as_ref().map(|d| d.status_detail.as_str()));
-        data["new_status"] = serde_json::json!(status);
-        data["new_context"] = serde_json::json!(context);
-        data["new_detail"] = serde_json::json!(detail);
-        data["writer"] = serde_json::json!(format!("{}:{}", writer.file(), writer.line()));
         if let Some(session_id) = current_data.as_ref().and_then(|d| d.session_id.as_deref()) {
             data["session"] = serde_json::json!(session_id);
         }

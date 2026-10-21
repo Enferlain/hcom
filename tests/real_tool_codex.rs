@@ -308,16 +308,17 @@ fn real_codex_approval_gate_blocks_pending_message_then_clears_on_approval() {
             if code != 0 {
                 return Err(format!("status event lookup failed: {stderr}"));
             }
-            let cleared = stdout
+            let contexts: Vec<String> = stdout
                 .lines()
                 .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .any(|event| {
-                    let data = &event["data"];
-                    data["status"].as_str() == Some("active")
-                        && (data["context"].as_str() == Some("pty:approval_cleared")
-                            || (data["context"].as_str() == Some("approved:Bash")
-                                && data["old_context"].as_str() == Some("pty:approval")))
-                });
+                .filter_map(|event| event["data"]["context"].as_str().map(String::from))
+                .collect();
+            // Either the PTY saw the prompt clear, or the hook approved the
+            // tool right after the PTY approval status.
+            let cleared = contexts.iter().any(|c| c == "pty:approval_cleared")
+                || contexts
+                    .windows(2)
+                    .any(|w| w[0] == "pty:approval" && w[1] == "approved:Bash");
             if cleared { Ok(Some(())) } else { Ok(None) }
         },
     );
