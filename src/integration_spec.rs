@@ -12,16 +12,33 @@
 //! Not included on purpose:
 //! - `HOOK_REGISTRY` (Claude-only; lives in `hooks/utils.rs` as its own
 //!   registry — already a single source of truth, no drift across tools).
-//! - Tool environment detection (owned by `shared::tool_detection`, including
-//!   precedence and child-env clearing).
 //! - Transcript parser implementations (owned by `transcript::TranscriptBackend`; canonical identity stays `Tool`).
 //! - System-prompt env var keys (typed fields on `HcomConfig`; lookup goes
 //!   through `config.rs::FIELD_TO_ENV`).
 
+use crate::shared::tool_detection::EnvPredicate;
 use crate::tool::Tool;
 
 /// Help entry: `(usage, description)`. Mirrors `commands/help.rs::HelpEntry`.
 pub type HelpEntry = (&'static str, &'static str);
+
+/// How hcom recognises the tool from inside its processes. Precedence between
+/// tools lives in [`NATIVE_PRECEDENCE`](crate::shared::tool_detection::NATIVE_PRECEDENCE); every tool also
+/// matches `HCOM_TOOL=<name>` as a fallback.
+#[derive(Debug, Clone, Copy)]
+pub struct DetectionSpec {
+    /// Env set by the tool itself; any one identifies it.
+    pub markers: &'static [EnvPredicate],
+    /// Further tool env cleared for hcom-launched children (markers always are).
+    pub clear_for_child: &'static [&'static str],
+}
+
+impl DetectionSpec {
+    pub const NONE: Self = Self {
+        markers: &[],
+        clear_for_child: &[],
+    };
+}
 
 /// How the external tool invokes hcom hook commands.
 ///
@@ -116,6 +133,9 @@ pub struct PtySpec {
     /// How the tool reads its console on Windows; the PTY relay reads the
     /// real console the same way, so keys reach it as they would directly.
     pub console_input: ConsoleInput,
+    /// Pause between typing a message and pressing Enter, for TUIs that drop
+    /// an Enter arriving while they still process the paste. 0 for none.
+    pub pre_enter_settle_ms: u64,
 }
 
 /// How a Windows TUI reads keyboard input.
@@ -289,6 +309,7 @@ pub struct IntegrationSpec {
     /// today). Recoverable by adding the var when discovered.
     pub instance_state_env: &'static [&'static str],
 
+    pub detection: DetectionSpec,
     pub hooks: HooksSpec,
     pub gates: GatesSpec,
     pub launch: LaunchSpec,
@@ -1091,6 +1112,7 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     // Set in Claude's Bash tool for the parent session. CHILD_SESSION turns
     // off transcript saving, which would break resume, fork and lineage.
@@ -1099,6 +1121,13 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
         "CLAUDE_CODE_MESSAGING_SOCKET",
         "CLAUDE_CODE_MESSAGING_TOKEN",
     ],
+    detection: DetectionSpec {
+        markers: &[
+            EnvPredicate::equals("CLAUDECODE", "1"),
+            EnvPredicate::non_empty("CLAUDE_ENV_FILE"),
+        ],
+        ..DetectionSpec::NONE
+    },
     hooks: HooksSpec {
         names: CLAUDE_HOOKS,
         shared_hooks_with: None,
@@ -1154,8 +1183,13 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     instance_state_env: &["GEMINI_PTY_INFO"],
+    detection: DetectionSpec {
+        markers: &[EnvPredicate::equals("GEMINI_CLI", "1")],
+        clear_for_child: &["GEMINI_SYSTEM_MD", "GEMINI_CLI_NO_RELAUNCH"],
+    },
     hooks: HooksSpec {
         names: GEMINI_HOOKS,
         shared_hooks_with: None,
@@ -1211,8 +1245,20 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
         console_input: ConsoleInput::Records,
+        pre_enter_settle_ms: 0,
     },
     instance_state_env: &["CODEX_EXEC_SERVER_URL"],
+    detection: DetectionSpec {
+        markers: &[
+            EnvPredicate::set("CODEX_SANDBOX"),
+            EnvPredicate::set("CODEX_SANDBOX_NETWORK_DISABLED"),
+            EnvPredicate::set("CODEX_MANAGED_BY_NPM"),
+            EnvPredicate::set("CODEX_MANAGED_BY_BUN"),
+            EnvPredicate::set("CODEX_THREAD_ID"),
+            EnvPredicate::set("CODEX_SESSION_ID"),
+        ],
+        ..DetectionSpec::NONE
+    },
     hooks: HooksSpec {
         names: CODEX_HOOKS,
         shared_hooks_with: None,
@@ -1269,8 +1315,13 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     instance_state_env: &["OPENCODE_RUN_ID", "OPENCODE_PROCESS_ROLE"],
+    detection: DetectionSpec {
+        markers: &[EnvPredicate::equals("OPENCODE", "1")],
+        clear_for_child: &["OPENCODE_PID"],
+    },
     hooks: HooksSpec {
         names: OPENCODE_HOOKS,
         shared_hooks_with: None,
@@ -1335,8 +1386,13 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     instance_state_env: &["KILO_DB", "KILO_RUN_ID", "KILO_PROCESS_ROLE"],
+    detection: DetectionSpec {
+        markers: &[EnvPredicate::equals("KILO", "1")],
+        ..DetectionSpec::NONE
+    },
     hooks: HooksSpec {
         names: OPENCODE_HOOKS,
         shared_hooks_with: Some(Tool::OpenCode),
@@ -1391,8 +1447,13 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     instance_state_env: &["ANTIGRAVITY_EXECUTABLE_DATA_DIR", "GEMINI_PTY_INFO"],
+    detection: DetectionSpec {
+        markers: &[EnvPredicate::set("ANTIGRAVITY_AGENT")],
+        ..DetectionSpec::NONE
+    },
     hooks: HooksSpec {
         names: GEMINI_HOOKS,
         // Antigravity reuses Gemini hook names; routing resolves those names
@@ -1457,8 +1518,16 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     instance_state_env: &[],
+    detection: DetectionSpec {
+        markers: &[
+            EnvPredicate::set("CURSOR_AGENT"),
+            EnvPredicate::set("CURSOR_PROJECT_DIR"),
+        ],
+        ..DetectionSpec::NONE
+    },
     hooks: HooksSpec {
         names: CURSOR_HOOKS,
         shared_hooks_with: None,
@@ -1519,8 +1588,16 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     instance_state_env: &[],
+    detection: DetectionSpec {
+        markers: &[
+            EnvPredicate::equals("KIMI_CODE_CLI", "1"),
+            EnvPredicate::set("KIMI_SESSION_ID"),
+        ],
+        ..DetectionSpec::NONE
+    },
     hooks: HooksSpec {
         names: KIMI_HOOKS,
         shared_hooks_with: None,
@@ -1593,8 +1670,13 @@ pub static PI: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     instance_state_env: &[],
+    detection: DetectionSpec {
+        markers: &[EnvPredicate::equals("HCOM_PI", "1")],
+        clear_for_child: &["PI_CODING_AGENT", "PI_CODING_AGENT_SESSION_DIR"],
+    },
     hooks: HooksSpec {
         names: PI_HOOKS,
         shared_hooks_with: None,
@@ -1665,8 +1747,13 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     instance_state_env: &[],
+    detection: DetectionSpec {
+        markers: &[EnvPredicate::equals("HCOM_OMP", "1")],
+        clear_for_child: &["PI_CODING_AGENT", "PI_CODING_AGENT_SESSION_DIR"],
+    },
     hooks: HooksSpec {
         names: OMP_HOOKS,
         shared_hooks_with: None,
@@ -1736,8 +1823,19 @@ pub static HERMES: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     instance_state_env: &[],
+    detection: DetectionSpec {
+        // Hermes sets these in its own env, so its terminal children and the
+        // plugin's RPCs carry them. Gateway terminals export HERMES_SESSION_ID
+        // empty; HERMES_AGENT still identifies them.
+        markers: &[
+            EnvPredicate::non_empty("HERMES_SESSION_ID"),
+            EnvPredicate::non_empty("HERMES_AGENT"),
+        ],
+        ..DetectionSpec::NONE
+    },
     hooks: HooksSpec {
         names: HERMES_HOOKS,
         shared_hooks_with: None,
@@ -1797,9 +1895,11 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     // hcom's per-launch delivery mode; a nested `hcom copilot` decides its own.
     instance_state_env: &["HCOM_COPILOT_EXT_DELIVERY"],
+    detection: DetectionSpec::NONE,
     hooks: HooksSpec {
         names: COPILOT_HOOKS,
         shared_hooks_with: None,
@@ -1855,6 +1955,9 @@ pub static QODER: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
         console_input: ConsoleInput::Vt,
+        // Qoder 1.1.65 submits the text twice when Enter follows it within a
+        // few tens of ms as a separate write; 100ms measured, plus margin.
+        pre_enter_settle_ms: 250,
     },
     // Qoder's own session env vars are read as input on a fresh start and are
     // instance-specific. `QODER_CONFIG_DIR` is deliberately not here: it is a
@@ -1864,6 +1967,12 @@ pub static QODER: IntegrationSpec = IntegrationSpec {
         "QODER_SESSION_NAME",
         "QODER_WORKING_DIR",
     ],
+    detection: DetectionSpec {
+        // Set in its Bash tool. Its hook processes also get CLAUDE_PROJECT_DIR,
+        // which is deliberately not a Claude marker.
+        markers: &[EnvPredicate::set("QODER_CLI")],
+        clear_for_child: &["QODER_PID"],
+    },
     hooks: HooksSpec {
         names: QODER_HOOKS,
         shared_hooks_with: None,
@@ -1918,9 +2027,17 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 10,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     // Session id is instance-specific and would corrupt a same-tool child launch.
     instance_state_env: &["GROK_SESSION_ID"],
+    detection: DetectionSpec {
+        markers: &[
+            EnvPredicate::set("GROK_SESSION_ID"),
+            EnvPredicate::set("GROK_HOOK_EVENT"),
+        ],
+        clear_for_child: &["GROK_HOOK_NAME", "GROK_AGENT", "GROK_LEADER_SOCKET"],
+    },
     hooks: HooksSpec {
         names: GROK_HOOKS,
         shared_hooks_with: None,
@@ -1974,8 +2091,10 @@ pub static ADHOC: IntegrationSpec = IntegrationSpec {
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
         console_input: ConsoleInput::Vt,
+        pre_enter_settle_ms: 0,
     },
     instance_state_env: &[],
+    detection: DetectionSpec::NONE,
     hooks: HooksSpec {
         names: &[],
         shared_hooks_with: None,
@@ -2082,7 +2201,7 @@ mod tests {
     fn integrations_conform_across_registries() {
         use crate::config::{HcomConfig, user_field};
         use crate::launcher::LaunchTool;
-        use crate::shared::tool_detection::{EnvMatch, TOOL_DETECTION_RULES, detect_tool};
+        use crate::shared::tool_detection::detect_tool;
         use crate::tui::model::{next_launch_tool, prev_launch_tool};
         use std::collections::{HashMap, HashSet};
 
@@ -2218,15 +2337,6 @@ mod tests {
             assert!(
                 backward.contains(&spec.tool),
                 "{}: missing from prev TUI cycle",
-                spec.name
-            );
-            assert!(
-                TOOL_DETECTION_RULES
-                    .iter()
-                    .any(|rule| rule.tool == spec.tool
-                        && rule.predicates.iter().any(|p| p.var == "HCOM_TOOL"
-                            && matches!(p.condition, EnvMatch::Equals(name) if name == spec.name))),
-                "{}: missing HCOM_TOOL detection predicate",
                 spec.name
             );
             assert_eq!(

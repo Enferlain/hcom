@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use crate::shared::tool_detection::TOOL_DETECTION_RULES;
+use crate::shared::tool_detection::{HCOM_TOOL, tool_env_vars};
 use crate::tool::Tool;
 
 /// Vars a tool sets only for its shell commands, never for its own process or
@@ -99,13 +99,8 @@ fn inherited_identity_vars(nested: NestedAgent) -> Vec<&'static str> {
         // The parent's shell-only markers carry the parent's session.
         vars.extend(shell_only_markers(nested.parent));
     } else {
-        for rule in TOOL_DETECTION_RULES
-            .iter()
-            .filter(|r| r.tool == nested.parent)
-        {
-            vars.extend(rule.predicates.iter().map(|p| p.var));
-            vars.extend(rule.clear_for_child.iter().copied());
-        }
+        vars.extend(tool_env_vars(nested.parent));
+        vars.push(HCOM_TOOL);
     }
     vars.extend(nested.parent.spec().instance_state_env);
     vars

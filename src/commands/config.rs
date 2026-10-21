@@ -1402,8 +1402,8 @@ Only needed if your broker requires authentication.",
 HCOM_AUTO_APPROVE - Auto-approve safe hcom commands
 
 Purpose:
-  When enabled, Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot/Qoder/Grok auto-approve \"safe\" hcom commands
-  without requiring user confirmation.
+  When enabled, hcom agents auto-approve \"safe\" hcom commands without
+  requiring user confirmation.
 
 Usage:
   hcom config auto_approve 1    # Enable auto-approve
@@ -2105,9 +2105,7 @@ fn update_auto_approve_permissions() -> bool {
     let failures = super::hooks::refresh_installed_hook_permissions(enabled);
 
     if enabled {
-        println!(
-            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Kilo/Pi/OMP/Antigravity/Cursor/Kimi/Copilot/Qoder/Grok"
-        );
+        println!("Auto-approve enabled for safe hcom commands");
     } else {
         println!("Auto-approve disabled - safe hcom commands will require approval");
     }

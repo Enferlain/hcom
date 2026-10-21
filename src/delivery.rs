@@ -929,13 +929,16 @@ impl Default for ScreenState {
 /// about 1s; round up for headroom.
 pub(crate) const SUBMIT_SETTLE_COOLDOWN_MS: u64 = 1500;
 
-/// Pause between seeing the injected text in the composer and pressing Enter.
-///
-/// Qoder (1.1.65) submits the text twice (`<hcom><hcom>`) when Enter follows it
-/// within a few tens of milliseconds as a separate write. A 100ms gap is enough
-/// (measured); this leaves a margin. Other tools take Enter at once.
+/// Pause between seeing the injected text in the composer and pressing Enter
+/// (`PtySpec::pre_enter_settle_ms`).
 pub(crate) fn pre_enter_settle(tool: &str) -> Option<Duration> {
-    (tool == "qoder").then(|| Duration::from_millis(250))
+    let ms = tool
+        .parse::<crate::tool::Tool>()
+        .ok()?
+        .spec()
+        .pty
+        .pre_enter_settle_ms;
+    (ms > 0).then(|| Duration::from_millis(ms))
 }
 
 /// How long a negative approval scrape must hold before it clears the latched

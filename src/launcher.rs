@@ -3113,10 +3113,15 @@ mod tests {
         let _guard = clean_detection_env();
         assert!(!contaminated_parent());
 
-        for rule in crate::shared::tool_detection::TOOL_DETECTION_RULES {
-            for predicate in rule.predicates {
+        use crate::shared::tool_detection::{EnvMatch, EnvPredicate, HCOM_TOOL};
+        for spec in crate::integration_spec::ALL
+            .iter()
+            .filter(|s| s.tool != crate::tool::Tool::Adhoc)
+        {
+            let fallback = [EnvPredicate::equals(HCOM_TOOL, spec.name)];
+            for predicate in spec.detection.markers.iter().chain(&fallback) {
                 let value = match predicate.condition {
-                    crate::shared::tool_detection::EnvMatch::Equals(value) => value,
+                    EnvMatch::Equals(value) => value,
                     _ => "1",
                 };
                 unsafe { std::env::set_var(predicate.var, value) };

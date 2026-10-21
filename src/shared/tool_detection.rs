@@ -18,300 +18,51 @@ pub struct EnvPredicate {
     pub condition: EnvMatch,
 }
 
-#[derive(Debug)]
-pub struct ToolDetectionRule {
-    pub tool: Tool,
-    pub predicates: &'static [EnvPredicate],
-    pub clear_for_child: &'static [&'static str],
+impl EnvPredicate {
+    pub const fn set(var: &'static str) -> Self {
+        Self {
+            var,
+            condition: EnvMatch::Set,
+        }
+    }
+
+    pub const fn non_empty(var: &'static str) -> Self {
+        Self {
+            var,
+            condition: EnvMatch::NonEmpty,
+        }
+    }
+
+    pub const fn equals(var: &'static str, value: &'static str) -> Self {
+        Self {
+            var,
+            condition: EnvMatch::Equals(value),
+        }
+    }
 }
 
-const CLAUDE_NATIVE: &[EnvPredicate] = &[
-    EnvPredicate {
-        var: "CLAUDECODE",
-        condition: EnvMatch::Equals("1"),
-    },
-    EnvPredicate {
-        var: "CLAUDE_ENV_FILE",
-        condition: EnvMatch::NonEmpty,
-    },
-];
-const ANTIGRAVITY_NATIVE: &[EnvPredicate] = &[EnvPredicate {
-    var: "ANTIGRAVITY_AGENT",
-    condition: EnvMatch::Set,
-}];
-const GEMINI_NATIVE: &[EnvPredicate] = &[EnvPredicate {
-    var: "GEMINI_CLI",
-    condition: EnvMatch::Equals("1"),
-}];
-const CODEX_NATIVE: &[EnvPredicate] = &[
-    EnvPredicate {
-        var: "CODEX_SANDBOX",
-        condition: EnvMatch::Set,
-    },
-    EnvPredicate {
-        var: "CODEX_SANDBOX_NETWORK_DISABLED",
-        condition: EnvMatch::Set,
-    },
-    EnvPredicate {
-        var: "CODEX_MANAGED_BY_NPM",
-        condition: EnvMatch::Set,
-    },
-    EnvPredicate {
-        var: "CODEX_MANAGED_BY_BUN",
-        condition: EnvMatch::Set,
-    },
-    EnvPredicate {
-        var: "CODEX_THREAD_ID",
-        condition: EnvMatch::Set,
-    },
-    EnvPredicate {
-        var: "CODEX_SESSION_ID",
-        condition: EnvMatch::Set,
-    },
-];
-const OPENCODE_NATIVE: &[EnvPredicate] = &[EnvPredicate {
-    var: "OPENCODE",
-    condition: EnvMatch::Equals("1"),
-}];
-const KILO_NATIVE: &[EnvPredicate] = &[EnvPredicate {
-    var: "KILO",
-    condition: EnvMatch::Equals("1"),
-}];
-const CURSOR_NATIVE: &[EnvPredicate] = &[
-    EnvPredicate {
-        var: "CURSOR_AGENT",
-        condition: EnvMatch::Set,
-    },
-    EnvPredicate {
-        var: "CURSOR_PROJECT_DIR",
-        condition: EnvMatch::Set,
-    },
-];
-const KIMI_NATIVE: &[EnvPredicate] = &[
-    EnvPredicate {
-        var: "KIMI_CODE_CLI",
-        condition: EnvMatch::Equals("1"),
-    },
-    EnvPredicate {
-        var: "KIMI_SESSION_ID",
-        condition: EnvMatch::Set,
-    },
-];
-// Qoder CLI sets QODER_CLI in its Bash tool. Its hook processes also receive
-// CLAUDE_PROJECT_DIR, which is deliberately not a Claude marker here.
-const QODER_NATIVE: &[EnvPredicate] = &[EnvPredicate {
-    var: "QODER_CLI",
-    condition: EnvMatch::Set,
-}];
-const GROK_NATIVE: &[EnvPredicate] = &[
-    EnvPredicate {
-        var: "GROK_SESSION_ID",
-        condition: EnvMatch::Set,
-    },
-    EnvPredicate {
-        var: "GROK_HOOK_EVENT",
-        condition: EnvMatch::Set,
-    },
-];
-const PI_NATIVE: &[EnvPredicate] = &[EnvPredicate {
-    var: "HCOM_PI",
-    condition: EnvMatch::Equals("1"),
-}];
-const OMP_NATIVE: &[EnvPredicate] = &[EnvPredicate {
-    var: "HCOM_OMP",
-    condition: EnvMatch::Equals("1"),
-}];
-// Hermes sets these in its own process env, so its terminal children and the
-// hcom plugin's RPCs both carry them. Ranked after every other native marker:
-// an agent started from a Hermes terminal inherits them under its own.
-// Gateway terminals export HERMES_SESSION_ID empty, so HERMES_AGENT (set by
-// every Hermes terminal tool) is the marker that still identifies them.
-const HERMES_NATIVE: &[EnvPredicate] = &[
-    EnvPredicate {
-        var: "HERMES_SESSION_ID",
-        condition: EnvMatch::NonEmpty,
-    },
-    EnvPredicate {
-        var: "HERMES_AGENT",
-        condition: EnvMatch::NonEmpty,
-    },
+/// Order native markers are checked in. A tool started from another tool's
+/// shell inherits that tool's markers, so the more specific one goes first:
+/// Antigravity sets Gemini's markers too, and Hermes terminals pass theirs to
+/// every agent started in them. Each tool's markers live in its spec.
+pub static NATIVE_PRECEDENCE: &[Tool] = &[
+    Tool::Claude,
+    Tool::Antigravity,
+    Tool::Gemini,
+    Tool::Codex,
+    Tool::OpenCode,
+    Tool::Kilo,
+    Tool::Cursor,
+    Tool::Kimi,
+    Tool::Qoder,
+    Tool::Grok,
+    Tool::Pi,
+    Tool::Omp,
+    Tool::Hermes,
 ];
 
-macro_rules! hcom_tool_predicate {
-    ($name:literal, $ident:ident) => {
-        const $ident: &[EnvPredicate] = &[EnvPredicate {
-            var: "HCOM_TOOL",
-            condition: EnvMatch::Equals($name),
-        }];
-    };
-}
-
-hcom_tool_predicate!("claude", HCOM_TOOL_CLAUDE);
-hcom_tool_predicate!("antigravity", HCOM_TOOL_ANTIGRAVITY);
-hcom_tool_predicate!("gemini", HCOM_TOOL_GEMINI);
-hcom_tool_predicate!("codex", HCOM_TOOL_CODEX);
-hcom_tool_predicate!("opencode", HCOM_TOOL_OPENCODE);
-hcom_tool_predicate!("kilo", HCOM_TOOL_KILO);
-hcom_tool_predicate!("cursor", HCOM_TOOL_CURSOR);
-hcom_tool_predicate!("kimi", HCOM_TOOL_KIMI);
-hcom_tool_predicate!("copilot", HCOM_TOOL_COPILOT);
-hcom_tool_predicate!("qoder", HCOM_TOOL_QODER);
-hcom_tool_predicate!("grok", HCOM_TOOL_GROK);
-hcom_tool_predicate!("pi", HCOM_TOOL_PI);
-hcom_tool_predicate!("omp", HCOM_TOOL_OMP);
-hcom_tool_predicate!("hermes", HCOM_TOOL_HERMES);
-
-/// Detection precedence: native markers first, then hcom's explicit fallback.
-pub static TOOL_DETECTION_RULES: &[ToolDetectionRule] = &[
-    ToolDetectionRule {
-        tool: Tool::Claude,
-        predicates: CLAUDE_NATIVE,
-        clear_for_child: &["CLAUDECODE", "CLAUDE_ENV_FILE"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Antigravity,
-        predicates: ANTIGRAVITY_NATIVE,
-        clear_for_child: &["ANTIGRAVITY_AGENT"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Gemini,
-        predicates: GEMINI_NATIVE,
-        clear_for_child: &["GEMINI_CLI", "GEMINI_SYSTEM_MD", "GEMINI_CLI_NO_RELAUNCH"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Codex,
-        predicates: CODEX_NATIVE,
-        clear_for_child: &[
-            "CODEX_SANDBOX",
-            "CODEX_SANDBOX_NETWORK_DISABLED",
-            "CODEX_MANAGED_BY_NPM",
-            "CODEX_MANAGED_BY_BUN",
-            "CODEX_THREAD_ID",
-            "CODEX_SESSION_ID",
-        ],
-    },
-    ToolDetectionRule {
-        tool: Tool::OpenCode,
-        predicates: OPENCODE_NATIVE,
-        clear_for_child: &["OPENCODE", "OPENCODE_PID"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Kilo,
-        predicates: KILO_NATIVE,
-        clear_for_child: &["KILO"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Cursor,
-        predicates: CURSOR_NATIVE,
-        clear_for_child: &["CURSOR_AGENT", "CURSOR_PROJECT_DIR"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Kimi,
-        predicates: KIMI_NATIVE,
-        clear_for_child: &["KIMI_CODE_CLI", "KIMI_SESSION_ID"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Qoder,
-        predicates: QODER_NATIVE,
-        clear_for_child: &["QODER_CLI", "QODER_PID"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Grok,
-        predicates: GROK_NATIVE,
-        clear_for_child: &[
-            "GROK_SESSION_ID",
-            "GROK_HOOK_EVENT",
-            "GROK_HOOK_NAME",
-            "GROK_AGENT",
-            "GROK_LEADER_SOCKET",
-        ],
-    },
-    ToolDetectionRule {
-        tool: Tool::Pi,
-        predicates: PI_NATIVE,
-        clear_for_child: &["HCOM_PI", "PI_CODING_AGENT", "PI_CODING_AGENT_SESSION_DIR"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Omp,
-        predicates: OMP_NATIVE,
-        clear_for_child: &["HCOM_OMP", "PI_CODING_AGENT", "PI_CODING_AGENT_SESSION_DIR"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Hermes,
-        predicates: HERMES_NATIVE,
-        clear_for_child: &["HERMES_SESSION_ID", "HERMES_AGENT"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Claude,
-        predicates: HCOM_TOOL_CLAUDE,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Antigravity,
-        predicates: HCOM_TOOL_ANTIGRAVITY,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Gemini,
-        predicates: HCOM_TOOL_GEMINI,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Codex,
-        predicates: HCOM_TOOL_CODEX,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::OpenCode,
-        predicates: HCOM_TOOL_OPENCODE,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Kilo,
-        predicates: HCOM_TOOL_KILO,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Cursor,
-        predicates: HCOM_TOOL_CURSOR,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Kimi,
-        predicates: HCOM_TOOL_KIMI,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Copilot,
-        predicates: HCOM_TOOL_COPILOT,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Qoder,
-        predicates: HCOM_TOOL_QODER,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Grok,
-        predicates: HCOM_TOOL_GROK,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Pi,
-        predicates: HCOM_TOOL_PI,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Omp,
-        predicates: HCOM_TOOL_OMP,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-    ToolDetectionRule {
-        tool: Tool::Hermes,
-        predicates: HCOM_TOOL_HERMES,
-        clear_for_child: &["HCOM_TOOL"],
-    },
-];
+/// hcom's own fallback marker, `HCOM_TOOL=<spec name>`.
+pub const HCOM_TOOL: &str = "HCOM_TOOL";
 
 fn predicate_matches(env: &HashMap<String, String>, predicate: &EnvPredicate) -> bool {
     match predicate.condition {
@@ -326,34 +77,45 @@ fn predicate_matches(env: &HashMap<String, String>, predicate: &EnvPredicate) ->
 }
 
 pub fn detect_tool(env: &HashMap<String, String>) -> Tool {
-    TOOL_DETECTION_RULES
+    NATIVE_PRECEDENCE
         .iter()
-        .find(|rule| {
-            rule.predicates
+        .copied()
+        .find(|tool| {
+            tool.spec()
+                .detection
+                .markers
                 .iter()
                 .any(|predicate| predicate_matches(env, predicate))
         })
-        .map(|rule| rule.tool)
+        .or_else(|| {
+            let name = env.get(HCOM_TOOL)?;
+            crate::integration_spec::ALL
+                .iter()
+                .find(|spec| spec.tool != Tool::Adhoc && spec.name == name)
+                .map(|spec| spec.tool)
+        })
         .unwrap_or(Tool::Adhoc)
+}
+
+/// A tool's marker and child-clear vars, without `HCOM_TOOL`.
+pub fn tool_env_vars(tool: Tool) -> impl Iterator<Item = &'static str> {
+    let detection = tool.spec().detection;
+    detection
+        .markers
+        .iter()
+        .map(|predicate| predicate.var)
+        .chain(detection.clear_for_child.iter().copied())
 }
 
 pub fn tool_marker_vars() -> &'static [&'static str] {
     static VARS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         let mut seen = HashSet::new();
-        let mut vars = Vec::new();
-        for rule in TOOL_DETECTION_RULES {
-            for var in rule
-                .predicates
-                .iter()
-                .map(|predicate| predicate.var)
-                .chain(rule.clear_for_child.iter().copied())
-            {
-                if seen.insert(var) {
-                    vars.push(var);
-                }
-            }
-        }
-        vars
+        crate::integration_spec::ALL
+            .iter()
+            .flat_map(|spec| tool_env_vars(spec.tool))
+            .chain([HCOM_TOOL])
+            .filter(|var| seen.insert(*var))
+            .collect()
     });
     VARS.as_slice()
 }
@@ -430,16 +192,18 @@ mod tests {
     }
 
     #[test]
-    fn every_detection_var_is_cleared_for_children() {
-        let clear: HashSet<&str> = tool_marker_vars().iter().copied().collect();
-        for rule in TOOL_DETECTION_RULES {
-            for predicate in rule.predicates {
-                assert!(
-                    clear.contains(predicate.var),
-                    "{} detection marker must be cleared for child processes",
-                    predicate.var
-                );
-            }
+    fn precedence_lists_every_tool_with_markers_once() {
+        for spec in crate::integration_spec::ALL {
+            let listed = NATIVE_PRECEDENCE
+                .iter()
+                .filter(|tool| **tool == spec.tool)
+                .count();
+            let expected = usize::from(!spec.detection.markers.is_empty());
+            assert_eq!(
+                listed, expected,
+                "{}: NATIVE_PRECEDENCE must list each tool with markers once",
+                spec.name
+            );
         }
     }
 

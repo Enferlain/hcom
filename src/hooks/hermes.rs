@@ -36,19 +36,13 @@ const CONFIG_STAMP: &str = ".hcom-config-stamp";
 /// detection and child-clear vars, plus session ids those agents leave behind.
 /// Not hcom's own vars: the launch identity must reach terminal children.
 pub fn scrub_vars() -> Vec<&'static str> {
-    use crate::shared::tool_detection::TOOL_DETECTION_RULES;
     let mut vars = vec!["CLAUDE_CODE_SESSION_ID"];
-    for rule in TOOL_DETECTION_RULES
+    for spec in crate::integration_spec::ALL
         .iter()
-        .filter(|r| r.tool != Tool::Hermes)
+        .filter(|s| s.tool != Tool::Hermes)
     {
-        for var in rule
-            .predicates
-            .iter()
-            .map(|p| p.var)
-            .chain(rule.clear_for_child.iter().copied())
-        {
-            if var != "HCOM_TOOL" && !vars.contains(&var) {
+        for var in crate::shared::tool_detection::tool_env_vars(spec.tool) {
+            if !vars.contains(&var) {
                 vars.push(var);
             }
         }
