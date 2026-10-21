@@ -737,6 +737,27 @@ mod tests {
     }
 
     #[test]
+    fn state_includes_quiet_children() {
+        // A stale child may still be alive; peers need its row to reach it.
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO instances (name, session_id, tool, status, status_time, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 1, 0);
+                 INSERT INTO instances (name, parent_session_id, parent_name, agent_id, tool,
+                                        status, status_context, status_time, created_at)
+                 VALUES ('nova_task_1', 'sess-1', 'nova', 'a1', 'claude', 'inactive',
+                         'subagent:stale', 1, 0);",
+            )
+            .unwrap();
+        let state = build_state(&db, "device-test");
+        let instances = state["instances"].as_object().unwrap();
+        assert!(instances.contains_key("nova"));
+        assert!(instances.contains_key("nova_task_1"));
+    }
+
+    #[test]
     fn push_fails_fast_on_a_full_queue_instead_of_blocking_the_worker() {
         let dir = tempfile::tempdir().unwrap();
         let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();

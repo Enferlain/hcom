@@ -523,7 +523,10 @@ fn route_claude_hook(
             let (code, stdout) = handle_stop_failure(db, payload, instance_name);
             (code, stdout, None)
         }
-        HOOK_POLL => handle_poll(db, ctx, instance_name, &instance_data),
+        HOOK_POLL => {
+            reap_finished_subagents(db, &session_id, &payload.raw);
+            handle_poll(db, ctx, instance_name, &instance_data)
+        }
         HOOK_NOTIFY => {
             let (code, stdout) = handle_notify(db, payload, instance_name, &updates);
             (code, stdout, None)
@@ -583,6 +586,19 @@ fn route_subagent_actor_hook(
     // not proof that the hook belongs to the root, so fail closed.
     let Ok(Some(subagent_instance)) = db.get_instance_by_agent_id(agent_id) else {
         timing.result = Some("unknown_subagent_actor");
+        // Without a capability the CLI would fall back to the shared process
+        // binding and act as the root.
+        if hook_type == HOOK_PRE && child_visibly_invokes_hcom(payload) {
+            let output = serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason":
+                        "This Claude subagent has no hcom identity, so hcom commands are blocked. Continue without hcom.",
+                }
+            });
+            return (0, output.to_string(), None);
+        }
         return (0, String::new(), None);
     };
     refresh_subagent_last_seen(db, &subagent_instance);
@@ -2133,6 +2149,73 @@ fn mark_stale_subagents(db: &HcomDb, session_id: &str) {
            AND last_seen > 0 AND last_seen < ?
            AND status_context != 'subagent:stale'",
         rusqlite::params![ST_INACTIVE, session_id, cutoff],
+    );
+}
+
+/// Background task types that never host a subagent. Any other type, including
+/// ones Claude Code adds later, may still be running children.
+const AGENT_FREE_TASK_TYPES: &[&str] = &["shell", "monitor", "MCP task"];
+
+/// True when a root Stop proves no child of this session can still be running.
+///
+/// A foreground child holds the root's tool call open, so the root cannot
+/// reach Stop while one runs; background children and workflow agents are
+/// listed in `background_tasks`. A missing array means Claude could not read
+/// its task registry, which proves nothing.
+fn no_children_can_run(stop_raw: &Value) -> bool {
+    let Some(tasks) = stop_raw.get("background_tasks").and_then(Value::as_array) else {
+        return false;
+    };
+    tasks.iter().all(|task| {
+        task.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| AGENT_FREE_TASK_TYPES.contains(&t))
+    })
+}
+
+/// Root Stop: delete child rows whose SubagentStop never came. When a workflow
+/// run is stopped, Claude can skip SubagentStop for its agents (or send it after
+/// the run is gone, which then finds no row), so without this their rows live
+/// until the root session ends.
+fn reap_finished_subagents(db: &HcomDb, session_id: &str, stop_raw: &Value) {
+    if !no_children_can_run(stop_raw) {
+        return;
+    }
+    let names: Vec<String> = match db
+        .conn()
+        .prepare("SELECT name FROM instances WHERE parent_session_id = ?")
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![session_id], |row| row.get(0))?
+                .collect()
+        }) {
+        Ok(names) => names,
+        Err(e) => {
+            log::log_warn(
+                "hooks",
+                "subagent.reap_query_failed",
+                &format!("session_id={session_id} err={e}"),
+            );
+            return;
+        }
+    };
+    if names.is_empty() {
+        return;
+    }
+    for name in &names {
+        if let common::StopOutcome::RetryableError(error) =
+            common::stop_instance(db, name, "subagent", "orphaned")
+        {
+            log::log_warn(
+                "hooks",
+                "subagent.reap_failed",
+                &format!("name={name} err={error}"),
+            );
+        }
+    }
+    log::log_info(
+        "hooks",
+        "subagent.reaped",
+        &format!("session_id={session_id} count={}", names.len()),
     );
 }
 
@@ -5914,6 +5997,92 @@ mod tests {
         assert_eq!(exit_code, 0);
         assert!(stdout.is_empty());
         assert!(ack.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_unknown_child_hcom_is_denied_instead_of_acting_as_root() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_time, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-1", "nova");
+
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "agent_id": "never-started",
+            "tool_name": "Bash",
+            "tool_use_id": "tool-hcom",
+            "tool_input": {"command": "hcom send @luna -- hi"},
+        });
+        let mut payload = HookPayload::from_claude(raw);
+        let (_, stdout, _, _) = route_claude_hook(&db, &make_ctx(), HOOK_PRE, &mut payload);
+        let output: Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+    }
+
+    #[test]
+    fn test_only_agent_free_background_tasks_prove_children_finished() {
+        let stop = |tasks: Value| serde_json::json!({"background_tasks": tasks});
+        assert!(no_children_can_run(&stop(serde_json::json!([]))));
+        assert!(no_children_can_run(&stop(
+            serde_json::json!([{"type": "shell"}, {"type": "monitor"}])
+        )));
+        assert!(!no_children_can_run(&stop(
+            serde_json::json!([{"type": "workflow"}])
+        )));
+        assert!(!no_children_can_run(&stop(
+            serde_json::json!([{"type": "subagent"}])
+        )));
+        assert!(!no_children_can_run(&stop(
+            serde_json::json!([{"type": "something new"}])
+        )));
+        // No registry snapshot proves nothing.
+        assert!(!no_children_can_run(&serde_json::json!({})));
+    }
+
+    #[test]
+    #[serial]
+    fn test_root_stop_reaps_children_only_when_none_can_run() {
+        crate::config::Config::init();
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO instances (name, session_id, tool, status, status_time, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', 0, 0);
+                 INSERT INTO instances (name, parent_session_id, parent_name, agent_id, tool,
+                                        status, status_context, status_time, created_at)
+                 VALUES ('nova_task_1', 'sess-1', 'nova', 'a1', 'claude', 'inactive',
+                         'subagent:stale', 0, 0),
+                        ('nova_task_2', 'sess-1', 'nova', 'a2', 'claude', 'active',
+                         'tool:Bash', 0, 0);",
+            )
+            .unwrap();
+        let children = |db: &HcomDb| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM instances WHERE parent_session_id = 'sess-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        reap_finished_subagents(
+            &db,
+            "sess-1",
+            &serde_json::json!({"background_tasks": [{"type": "workflow"}]}),
+        );
+        assert_eq!(children(&db), 2, "a running workflow may own these rows");
+
+        reap_finished_subagents(&db, "sess-1", &serde_json::json!({"background_tasks": []}));
+        assert_eq!(children(&db), 0);
+        assert!(db.get_instance_full("nova").unwrap().is_some());
     }
 
     /// Property: a SubagentStart with no `prompt_id` field at all (Claude
