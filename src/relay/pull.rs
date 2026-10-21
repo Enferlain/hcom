@@ -118,6 +118,11 @@ pub fn handle_device_gone(db: &HcomDb, device_id: &str) {
     safe_kv_set(db, &format!("relay_sync_time_{}", device_id), None);
     safe_kv_set(db, &format!("relay_caps_{}", device_id), None);
     safe_kv_set(db, &format!("relay_ctrl_{}", device_id), None);
+    safe_kv_set(
+        db,
+        &format!("{}{}", super::PEER_MAX_PACKET_PREFIX, device_id),
+        None,
+    );
     if let Some(ref short) = short_id {
         safe_kv_set(db, &format!("relay_short_{}", short), None);
     }
@@ -327,6 +332,17 @@ pub fn handle_state_message(
     } else {
         safe_kv_set(db, &format!("relay_caps_{}", device_id), Some("null"));
     }
+    // A peer without the field runs an hcom that accepts LEGACY_MAX_PACKET_BYTES;
+    // the push budget treats a missing key that way.
+    let max_packet = state
+        .get("max_packet")
+        .and_then(Value::as_u64)
+        .map(|n| n.to_string());
+    safe_kv_set(
+        db,
+        &format!("{}{}", super::PEER_MAX_PACKET_PREFIX, device_id),
+        max_packet.as_deref(),
+    );
 
     // Check for device reset — clean old data before importing
     if reset_ts > cached_reset {
@@ -1221,6 +1237,7 @@ mod tests {
                 "short_id": "ABCD",
                 "reset_ts": 0.0,
                 "capabilities": ["launch", "resume"],
+                "max_packet": 1048576,
                 "instances": {}
             },
             "events": []
@@ -1246,6 +1263,10 @@ mod tests {
         assert_eq!(
             safe_kv_get(&db, "relay_caps_device-1234").as_deref(),
             Some(r#"["launch","resume"]"#)
+        );
+        assert_eq!(
+            safe_kv_get(&db, "relay_max_packet_device-1234").as_deref(),
+            Some("1048576")
         );
     }
 
@@ -1290,6 +1311,11 @@ mod tests {
             safe_kv_get(&db, "relay_caps_device-1234").as_deref(),
             Some("null"),
             "legacy peer (no capabilities field) must be cached as the \"null\" sentinel"
+        );
+        assert_eq!(
+            safe_kv_get(&db, "relay_max_packet_device-1234"),
+            None,
+            "no announced limit: the push budget falls back to 128 KiB"
         );
     }
 

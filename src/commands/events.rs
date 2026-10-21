@@ -179,6 +179,43 @@ pub fn streamline_event(event: &Value, filters: &HashMap<String, Vec<String>>) -
     })
 }
 
+/// Trailing JSON lines that say what a remote answer left out or cut, so a
+/// reader never mistakes a capped answer for the whole result.
+fn remote_truncation_notes(result: &Value, events: &[Value]) -> Vec<Value> {
+    let mut notes = Vec::new();
+    if let Some(marker) = result.get("_relay_truncated") {
+        notes.push(json!({
+            "truncated": true,
+            "original_bytes": marker["original_bytes"],
+            "note": "The relay cut this answer to fit a publish, so long fields end with a truncation marker. Ask for less with --last, --agent, --type or --sql.",
+        }));
+    }
+    if result.get("truncated").and_then(Value::as_bool) == Some(true) {
+        let mut note = json!({
+            "truncated": true,
+            "returned": events.len(),
+            "note": "The answer hit the peer's relay size limit, so older matching events were left out. Narrow it with --last, --agent, --type or --sql.",
+        });
+        // Older peers send only `truncated`.
+        for key in ["omitted", "max_bytes"] {
+            if let Some(value) = result.get(key) {
+                note[key] = value.clone();
+            }
+        }
+        notes.push(note);
+    }
+    for event in events {
+        if let Some(marker) = event["data"].get("_relay_truncated") {
+            notes.push(json!({
+                "truncated_event": event["id"],
+                "original_bytes": marker["original_bytes"],
+                "note": "This event is larger than anything the relay can carry, so its fields were cut. Read it on its own device.",
+            }));
+        }
+    }
+    notes
+}
+
 // ── Query events from DB ─────────────────────────────────────────────────
 
 /// Query events from events_v view. Returns parsed event objects.
@@ -1274,15 +1311,8 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
                     };
                     println!("{}", serde_json::to_string(&output).unwrap_or_default());
                 }
-                if result
-                    .get("truncated")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    println!(
-                        "{}",
-                        json!({"truncated": true, "note": "response size capped"})
-                    );
+                for note in remote_truncation_notes(&result, events_arr) {
+                    println!("{note}");
                 }
                 return 0;
             }
@@ -1445,6 +1475,34 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_truncation_is_reported_with_counts_and_cut_events() {
+        let events = vec![
+            json!({"id": 9, "data": {"text": "ok"}}),
+            json!({"id": 8, "data": {"_relay_truncated": {"level": 1, "original_bytes": 900000}}}),
+        ];
+        let result = json!({"truncated": true, "omitted": 3, "max_bytes": 1000});
+        let notes = remote_truncation_notes(&result, &events);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0]["returned"], 2);
+        assert_eq!(notes[0]["omitted"], 3);
+        assert!(notes[0]["note"].as_str().unwrap().contains("--last"));
+        assert_eq!(notes[1]["truncated_event"], 8);
+        assert_eq!(notes[1]["original_bytes"], 900000);
+
+        // An older peer sends only the flag; a whole answer gets no notes.
+        let old = remote_truncation_notes(&json!({"truncated": true}), &events[..1]);
+        assert_eq!(old.len(), 1);
+        assert!(old[0].get("omitted").is_none());
+        assert!(remote_truncation_notes(&json!({}), &events[..1]).is_empty());
+
+        // The relay cut the whole answer after the peer built it.
+        let cut = json!({"_relay_truncated": {"level": 1, "original_bytes": 150000}});
+        let notes = remote_truncation_notes(&cut, &events[..1]);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["original_bytes"], 150000);
+    }
 
     #[test]
     fn test_streamline_event_message() {

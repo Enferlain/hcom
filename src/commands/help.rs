@@ -70,7 +70,19 @@ const EVENTS_QUERY: &[HelpEntry] = &[
     ("  --sql EXPR", "Raw SQL WHERE (ANDed with flags)"),
     (
         "  --remote-fetch --device ID",
-        "One-shot fetch from remote device",
+        "One-shot fetch from remote device (with --full: whole status details)",
+    ),
+    (
+        "",
+        "Remote agents' details in list and TUI are previews. Full text:",
+    ),
+    (
+        "",
+        "  events --remote-fetch --device ID --agent NAME --type status --last 1 --full",
+    ),
+    (
+        "",
+        "A trailing {\"truncated\": true} line means the answer hit the relay size limit",
     ),
 ];
 

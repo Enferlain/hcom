@@ -380,7 +380,16 @@ pub fn dispatch_remote(
 ) -> Result<Value, String> {
     let response = dispatch_remote_raw(db, device_short_id, target_name, action, params, timeout)?;
     let response = require_successful_rpc_result(response)?;
-    Ok(response.get("result").cloned().unwrap_or(Value::Null))
+    let mut result = response.get("result").cloned().unwrap_or(Value::Null);
+    // The relay cut this answer to fit a publish after the peer built it. Keep
+    // its marker on the result so callers can say so instead of passing cut
+    // fields along as whole.
+    if let Some(marker) = response.get(super::push::SHRINK_MARKER)
+        && let Some(obj) = result.as_object_mut()
+    {
+        obj.insert(super::push::SHRINK_MARKER.into(), marker.clone());
+    }
+    Ok(result)
 }
 
 /// Dispatch a remote RPC and print the result field to stdout.
@@ -1045,9 +1054,24 @@ fn handle_remote_transcript(
 }
 
 const REMOTE_EVENTS_HARD_CAP: usize = 2000;
-// Cap RPC response below the rumqttc client's 128 KiB accept limit
-// (src/relay/client.rs), leaving room for envelope + AEAD overhead.
-const REMOTE_EVENTS_BYTE_CAP: usize = 98_304;
+/// Room for the rpc_result event wrapped around an answer.
+const RPC_RESULT_OVERHEAD_BYTES: usize = 2 * 1024;
+const REMOTE_EVENTS_MIN_BYTES: usize = 1024;
+
+/// Largest events answer this device can publish right now. The answer rides
+/// in this device's next push next to its state snapshot, so it gets the push
+/// budget (sized for every live receiver) minus that snapshot and the wrapper.
+fn remote_events_byte_cap(db: &HcomDb) -> usize {
+    let state_bytes = super::existing_device_uuid()
+        .map(|uuid| super::push::build_state(db, &uuid))
+        .and_then(|state| serde_json::to_vec(&state).ok())
+        .map_or(0, |v| v.len());
+    super::push::sealed_payload_budget(db)
+        .saturating_sub(state_bytes)
+        .saturating_sub(super::crypto::HEADER_LEN + super::crypto::TAG_LEN)
+        .saturating_sub(RPC_RESULT_OVERHEAD_BYTES)
+        .max(REMOTE_EVENTS_MIN_BYTES)
+}
 
 fn handle_remote_events(
     db: &HcomDb,
@@ -1063,9 +1087,9 @@ fn handle_remote_events(
     };
     let sql = optional_param(params, "sql").map(|s| s.to_string());
     // Callers whose answer must share a snapshot with other data (catch-up
-    // backfill) ask for a smaller byte budget; the hard cap still applies.
-    let byte_cap = usize_param(params, "max_bytes", REMOTE_EVENTS_BYTE_CAP)
-        .clamp(1024, REMOTE_EVENTS_BYTE_CAP);
+    // backfill) ask for a smaller byte budget; the widest is what fits a publish.
+    let widest = remote_events_byte_cap(db);
+    let byte_cap = usize_param(params, "max_bytes", widest).clamp(REMOTE_EVENTS_MIN_BYTES, widest);
     let mut last_n = usize_param(params, "last", 20);
     if last_n == 0 {
         last_n = 20;
@@ -1126,18 +1150,21 @@ fn handle_remote_events(
     }
 
     let mut truncated = false;
-    let build_envelope = |events: &Vec<Value>, truncated: bool| -> Value {
+    let mut omitted = 0usize;
+    let build_envelope = |events: &Vec<Value>, truncated: bool, omitted: usize| -> Value {
         let mut out = json!({"events": events, "count": events.len()});
         if truncated {
             out["truncated"] = json!(true);
+            out["omitted"] = json!(omitted);
+            out["max_bytes"] = json!(byte_cap);
         }
         out
     };
-    let mut out = build_envelope(&events, truncated);
+    let mut out = build_envelope(&events, truncated, omitted);
     let mut serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
     while serialized_len > byte_cap && !events.is_empty() {
         if events.len() == 1
-            && byte_cap >= REMOTE_EVENTS_BYTE_CAP
+            && byte_cap >= widest
             && super::push::shrink_level(&events[0]) < super::push::SHRINK_LAST_LEVEL
         {
             // The newest event alone is larger than the WIDEST budget, so no request can
@@ -1148,10 +1175,21 @@ fn handle_remote_events(
             super::push::shrink_event(&mut events[0]);
         } else {
             events.pop();
+            omitted += 1;
         }
         truncated = true;
-        out = build_envelope(&events, truncated);
+        out = build_envelope(&events, truncated, omitted);
         serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
+    }
+    if truncated {
+        log::log_info(
+            "relay",
+            "relay.rpc_events_truncated",
+            &format!(
+                "returned={} omitted={omitted} max_bytes={byte_cap} widest={widest}",
+                events.len()
+            ),
+        );
     }
     Ok(out)
 }
@@ -1410,6 +1448,15 @@ mod tests {
     use super::*;
     use crate::hooks::test_helpers::isolated_test_env;
     use serde_json::json;
+
+    /// A live peer on an older hcom holds the publish budget at 112 KiB.
+    fn with_legacy_peer(db: &HcomDb) {
+        crate::relay::safe_kv_set(
+            db,
+            "relay_sync_time_legacy-peer",
+            Some(&crate::shared::time::now_epoch_f64().to_string()),
+        );
+    }
 
     fn test_db() -> HcomDb {
         let dir = tempfile::tempdir().unwrap();
@@ -2052,7 +2099,8 @@ mod tests {
     #[test]
     fn test_handle_remote_events_truncates_when_envelope_exceeds_cap() {
         let db = test_db();
-        // Big payload per event so a few rows blow past the 96 KiB cap.
+        with_legacy_peer(&db);
+        // Big payload per event so a few rows blow past the answer budget.
         let big = "x".repeat(8_000);
         for _ in 0..20 {
             db.log_event("message", "luna", &json!({"blob": big}))
@@ -2074,7 +2122,7 @@ mod tests {
         );
         let envelope_len = serde_json::to_string(&out).unwrap().len();
         assert!(
-            envelope_len <= REMOTE_EVENTS_BYTE_CAP,
+            envelope_len <= remote_events_byte_cap(&db),
             "envelope {envelope_len} bytes exceeds cap"
         );
     }
@@ -2082,6 +2130,7 @@ mod tests {
     #[test]
     fn test_handle_remote_events_honours_a_smaller_byte_budget() {
         let db = test_db();
+        with_legacy_peer(&db);
         let big = "x".repeat(8_000);
         for _ in 0..20 {
             db.log_event("message", "luna", &json!({"blob": big}))
@@ -2106,7 +2155,7 @@ mod tests {
             .collect();
         assert!(ids.windows(2).all(|w| w[0] > w[1]), "{ids:?}");
 
-        // A budget above the hard cap is clamped to it.
+        // A budget above what fits a publish is clamped to it.
         let out = handle_remote_events(
             &db,
             &json!({"last": 20, "max_bytes": 10_000_000}),
@@ -2114,22 +2163,23 @@ mod tests {
             &HcomConfig::default(),
         )
         .unwrap();
-        assert!(serde_json::to_string(&out).unwrap().len() <= REMOTE_EVENTS_BYTE_CAP);
+        assert!(serde_json::to_string(&out).unwrap().len() <= remote_events_byte_cap(&db));
     }
 
     #[test]
     fn test_handle_remote_events_sends_a_cut_copy_of_one_event_larger_than_the_budget() {
-        // ~100 KiB: inside the 112 KiB publish budget, over every backfill answer budget.
+        // ~150 KB: over the widest answer a 112 KiB publish leaves room for.
         let db = test_db();
+        with_legacy_peer(&db);
         db.log_event(
             "message",
             "luna",
-            &json!({"from": "luna", "text": "x".repeat(100_000)}),
+            &json!({"from": "luna", "text": "x".repeat(150_000)}),
         )
         .unwrap();
         let out = handle_remote_events(
             &db,
-            &json!({"last": 1, "max_bytes": REMOTE_EVENTS_BYTE_CAP}),
+            &json!({"last": 1, "max_bytes": remote_events_byte_cap(&db)}),
             "initiator",
             &HcomConfig::default(),
         )
@@ -2139,7 +2189,7 @@ mod tests {
         assert_eq!(out["truncated"].as_bool(), Some(true));
         assert_eq!(events[0]["data"]["from"], "luna");
         assert_eq!(events[0]["data"]["_relay_truncated"]["level"], 1);
-        assert!(serde_json::to_string(&out).unwrap().len() <= REMOTE_EVENTS_BYTE_CAP);
+        assert!(serde_json::to_string(&out).unwrap().len() <= remote_events_byte_cap(&db));
     }
 
     #[test]
@@ -2148,6 +2198,7 @@ mod tests {
         // copy here would be imported and the intact event never fetched; the empty,
         // truncated answer is what sends backfill to the wide request.
         let db = test_db();
+        with_legacy_peer(&db);
         db.log_event(
             "message",
             "luna",
@@ -2165,7 +2216,7 @@ mod tests {
         assert_eq!(narrow["truncated"].as_bool(), Some(true));
         let wide = handle_remote_events(
             &db,
-            &json!({"last": 1, "max_bytes": REMOTE_EVENTS_BYTE_CAP}),
+            &json!({"last": 1, "max_bytes": remote_events_byte_cap(&db)}),
             "initiator",
             &HcomConfig::default(),
         )

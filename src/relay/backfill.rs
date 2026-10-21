@@ -32,8 +32,9 @@ pub(crate) const BACKFILL_BATCH: usize = 100;
 /// `max_bytes` parameter apply their own 96 KiB cap.
 pub(crate) const BACKFILL_MAX_BYTES: usize = 32 * 1024;
 /// Budget for the one-event request used when a single event is larger than
-/// `BACKFILL_MAX_BYTES`.
-pub(crate) const BACKFILL_WIDE_MAX_BYTES: usize = 96 * 1024;
+/// `BACKFILL_MAX_BYTES`. Deliberately above any real answer: the peer clamps it
+/// to the most it can publish (older peers to a fixed 96 KiB).
+pub(crate) const BACKFILL_WIDE_MAX_BYTES: usize = super::MQTT_MAX_PACKET_BYTES;
 /// Floor for the normal byte budget once answers have come back cut to fit the peer's publish.
 pub(crate) const BACKFILL_MIN_BYTES: usize = 4 * 1024;
 /// Seconds to wait for an answer before asking again.

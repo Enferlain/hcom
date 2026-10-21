@@ -671,6 +671,9 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     data.status_detail.clone()
                 };
                 println!("    detail:       {detail}");
+                if let Some(cmd) = crate::relay::preview_fetch_command(&data.status_detail) {
+                    println!("    full detail:  {cmd}");
+                }
             }
             println!();
         }

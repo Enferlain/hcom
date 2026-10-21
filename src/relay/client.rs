@@ -152,7 +152,7 @@ impl MqttRelay {
         let mut mqttoptions = MqttOptions::new(&client_id, (&host, port));
         mqttoptions.set_keep_alive(30);
         mqttoptions.set_clean_start(true);
-        mqttoptions.set_max_packet_size(Some(128 * 1024));
+        mqttoptions.set_max_packet_size(Some(super::MQTT_MAX_PACKET_BYTES as u32));
 
         // TLS
         if use_tls {
@@ -516,11 +516,22 @@ impl MqttRelay {
     fn handle_event(&self, event: Event, connected: &mut bool) -> bool {
         match event {
             Event::Incoming(incoming) => match incoming {
-                Packet::ConnAck(_connack) => {
+                Packet::ConnAck(connack) => {
                     *connected = true;
                     log::log_info("relay", "relay.connected", "MQTT connected");
                     if let Ok(db) = HcomDb::open() {
                         set_relay_status(&db, "ok", None, true);
+                        // The broker refuses anything over its own limit, so a
+                        // publish must fit it as well as every peer's.
+                        let broker_max = connack
+                            .properties
+                            .and_then(|p| p.max_packet_size)
+                            .map(|n| n.to_string());
+                        super::safe_kv_set(
+                            &db,
+                            super::BROKER_MAX_PACKET_KEY,
+                            broker_max.as_deref(),
+                        );
                     }
                     // Re-subscribe after reconnect
                     if let Err(e) = self.subscribe() {
@@ -682,6 +693,7 @@ impl MqttRelay {
                 true,
             ) {
                 Ok((true, has_more)) => {
+                    log_push_recovery();
                     if has_more && Instant::now() < deadline {
                         continue; // More events to drain
                     }
@@ -689,7 +701,7 @@ impl MqttRelay {
                 }
                 Ok((false, _)) => break,
                 Err(e) => {
-                    log::log_warn("relay", "relay.push_err", &e);
+                    log_push_failure(&e);
                     if let Ok(db) = HcomDb::open() {
                         set_relay_status(&db, "error", Some(&e), true);
                     }
@@ -1012,6 +1024,40 @@ pub fn clear_retained_state(config: &HcomConfig) -> bool {
 
     client.disconnect();
     result
+}
+
+/// Consecutive failed pushes and when the streak was last logged. A failure
+/// repeats on every push interval, so it is logged when it starts and then at
+/// most once a minute, and recovery reports how long it lasted.
+static PUSH_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PUSH_FAILURE_LOGGED_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const PUSH_FAILURE_LOG_INTERVAL_SECS: u64 = 60;
+
+fn log_push_failure(error: &str) {
+    use std::sync::atomic::Ordering;
+    let failures = PUSH_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = crate::shared::time::now_epoch_i64().max(0) as u64;
+    let logged_at = PUSH_FAILURE_LOGGED_AT.load(Ordering::Relaxed);
+    if failures == 1 || now.saturating_sub(logged_at) >= PUSH_FAILURE_LOG_INTERVAL_SECS {
+        PUSH_FAILURE_LOGGED_AT.store(now, Ordering::Relaxed);
+        log::log_warn(
+            "relay",
+            "relay.push_err",
+            &format!("{error} (consecutive_failures={failures})"),
+        );
+    }
+}
+
+fn log_push_recovery() {
+    use std::sync::atomic::Ordering;
+    let failures = PUSH_FAILURES.swap(0, Ordering::Relaxed);
+    if failures > 0 {
+        log::log_info(
+            "relay",
+            "relay.push_recovered",
+            &format!("after {failures} failed pushes"),
+        );
+    }
 }
 
 #[cfg(test)]

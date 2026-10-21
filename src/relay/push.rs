@@ -14,12 +14,42 @@ use super::crypto;
 use super::{device_short_id_for_db, safe_kv_get, safe_kv_set, set_relay_status, state_topic};
 
 const RETAINED_EVENT_TAIL: i64 = 50;
+/// Bytes of retained tail resent with every push.
+const RETAINED_TAIL_MAX_BYTES: usize = 96 * 1024;
 
-// MQTT clients advertise a 128 KiB maximum packet. Keep the encrypted application payload
-// comfortably below that so the topic and MQTT framing cannot push a QoS1 publish over the
-// broker limit and permanently occupy the in-flight window.
-const MAX_SEALED_PAYLOAD_BYTES: usize = 112 * 1024;
+// Room kept below a packet limit for the topic and MQTT framing, so a QoS1 publish never goes
+// over the limit and permanently occupies the in-flight window. A 128 KiB peer leaves 112 KiB.
+const PACKET_OVERHEAD_BYTES: usize = 16 * 1024;
 
+/// Largest sealed payload every current receiver accepts: the smallest of this
+/// device's own limit, the broker's and each live peer's. A broker drops a
+/// packet over a subscriber's limit without telling the sender, so one older
+/// peer keeps everyone at its size. A peer counts while its state is fresh;
+/// when it leaves, the budget grows back once it goes stale.
+pub(crate) fn sealed_payload_budget(db: &HcomDb) -> usize {
+    let mut limit = super::MQTT_MAX_PACKET_BYTES;
+    if let Some(broker) = safe_kv_get(db, super::BROKER_MAX_PACKET_KEY).and_then(|v| v.parse().ok())
+    {
+        limit = limit.min(broker);
+    }
+    let now = crate::shared::time::now_epoch_f64();
+    for (key, synced) in db.kv_prefix("relay_sync_time_").unwrap_or_default() {
+        let fresh = synced
+            .parse::<f64>()
+            .is_ok_and(|t| now - t < super::DEVICE_STALE_SECS);
+        if !fresh {
+            continue;
+        }
+        let device_id = key.trim_start_matches("relay_sync_time_");
+        let peer = safe_kv_get(db, &format!("{}{device_id}", super::PEER_MAX_PACKET_PREFIX))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(super::LEGACY_MAX_PACKET_BYTES);
+        limit = limit.min(peer);
+    }
+    limit.saturating_sub(PACKET_OVERHEAD_BYTES)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn seal_bounded_payload(
     state: &Value,
     events: &mut Vec<Value>,
@@ -28,7 +58,24 @@ fn seal_bounded_payload(
     relay_id: &str,
     topic: &str,
     now_secs: u64,
+    max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
+    // The retained tail goes out again on every push, idle or not. Cap it on
+    // its own, near what a 128 KiB publish carried, so a bigger budget speeds
+    // up new events instead of resending hundreds of KiB every few seconds.
+    // The state is not counted here: a large state must not strip the tail
+    // that peers use to catch up and to detect gaps. The loop below still
+    // enforces the combined limit.
+    let event_bytes = |event: &Value| serde_json::to_vec(event).map_or(0, |v| v.len());
+    let is_tail = |event: &Value| event["id"].as_i64().is_some_and(|id| id <= last_push_id);
+    let mut tail_bytes: usize = events.iter().filter(|e| is_tail(e)).map(event_bytes).sum();
+    while tail_bytes > RETAINED_TAIL_MAX_BYTES
+        && let Some(index) = events.iter().position(is_tail)
+    {
+        tail_bytes -= event_bytes(&events[index]);
+        events.remove(index);
+    }
+
     loop {
         let payload = json!({
             "state": state,
@@ -37,7 +84,7 @@ fn seal_bounded_payload(
         let payload_bytes = serde_json::to_vec(&payload).map_err(|e| format!("json: {e}"))?;
         // Sealing adds a fixed header and tag, so size the plaintext and seal
         // once it fits instead of encrypting every candidate batch.
-        if crypto::HEADER_LEN + payload_bytes.len() + crypto::TAG_LEN <= MAX_SEALED_PAYLOAD_BYTES {
+        if crypto::HEADER_LEN + payload_bytes.len() + crypto::TAG_LEN <= max_bytes {
             return crypto::seal(psk, relay_id, topic, &payload_bytes, now_secs)
                 .map_err(|e| format!("seal: {e}"));
         }
@@ -64,18 +111,36 @@ fn seal_bounded_payload(
             // the cursor moves past it; the local row keeps the full event.
             shrink_event(only);
         } else {
-            return Err(format!(
-                "relay state exceeds safe MQTT payload budget of {MAX_SEALED_PAYLOAD_BYTES} bytes"
-            ));
+            return Err(oversized_state_error(state, max_bytes));
         }
     }
+}
+
+/// Say what made the state too big: its size, how many agents it lists and
+/// which row is largest, so a log reader can tell many rows from one huge one.
+fn oversized_state_error(state: &Value, max_bytes: usize) -> String {
+    let state_bytes = serde_json::to_vec(state).map_or(0, |v| v.len());
+    let rows = state["instances"].as_object();
+    let count = rows.map_or(0, |r| r.len());
+    let largest = rows.and_then(|r| {
+        r.iter()
+            .map(|(name, row)| (name, serde_json::to_vec(row).map_or(0, |v| v.len())))
+            .max_by_key(|(_, bytes)| *bytes)
+    });
+    let largest = largest
+        .map(|(name, bytes)| format!(", largest {name} at {bytes} bytes"))
+        .unwrap_or_default();
+    format!(
+        "relay state exceeds safe MQTT payload budget of {max_bytes} bytes: \
+         state is {state_bytes} bytes for {count} agents{largest}"
+    )
 }
 
 /// Longest string kept by the first shrink level.
 const SHRINK_STRING_CHARS: usize = 4096;
 /// Top-level data fields at or under this size survive the second level.
 const SHRINK_KEEP_FIELD_BYTES: usize = 512;
-const SHRINK_MARKER: &str = "_relay_truncated";
+pub(crate) const SHRINK_MARKER: &str = "_relay_truncated";
 /// Fields the last level keeps: enough for a waiter to match and fail an RPC.
 const SHRINK_ALWAYS_KEEP: [&str; 4] = ["request_id", "action", "ok", "error"];
 pub(crate) const SHRINK_LAST_LEVEL: u64 = 3;
@@ -253,15 +318,16 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default();
 
-            let mut map = serde_json::Map::new();
+            let mut entries = Vec::new();
             for row in rows {
                 let name = &row.0;
                 // Skip internal instances
                 if name.starts_with('_') || name.starts_with("sys_") {
                     continue;
                 }
-                map.insert(
+                entries.push((
                     name.clone(),
+                    row.3.clone().unwrap_or_default(),
                     json!({
                         "enabled": true,
                         "status": row.1.as_deref().unwrap_or("unknown"),
@@ -276,11 +342,10 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
                         "tag": row.11,
                         "tool": row.12.as_deref().unwrap_or("claude"),
                         "background": row.13.unwrap_or(false),
-                        "detail": row.3.as_deref().unwrap_or(""),
                     }),
-                );
+                ));
             }
-            Value::Object(map)
+            Value::Object(with_detail_previews(db, &short_id, entries))
         }
         Err(_) => json!({}),
     };
@@ -308,7 +373,65 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
         "short_id": short_id,
         "reset_ts": reset_ts,
         "capabilities": capabilities,
+        "max_packet": super::MQTT_MAX_PACKET_BYTES,
     })
+}
+
+/// Fill in each snapshot row's status detail: whole when short, otherwise a
+/// marked preview naming the command that fetches the rest. Previews start at
+/// the longest level and get shorter while the snapshot would take more than
+/// three quarters of a publish, so many long details cannot crowd events out or
+/// fail the push. Rows are never dropped. Only the display-only snapshot is
+/// cut; relayed status events keep the full text so subscriptions and filters
+/// on remote events still match all of it.
+fn with_detail_previews(
+    db: &HcomDb,
+    short_id: &str,
+    entries: Vec<(String, String, Value)>,
+) -> serde_json::Map<String, Value> {
+    // Leave a quarter of the publish for events.
+    let target = sealed_payload_budget(db) / 4 * 3;
+    let mut map = serde_json::Map::new();
+    let mut used = super::DETAIL_PREVIEW_LEVELS[0];
+    for &max_chars in &super::DETAIL_PREVIEW_LEVELS {
+        used = max_chars;
+        map = entries
+            .iter()
+            .map(|(name, detail, row)| {
+                let mut row = row.clone();
+                let preview = (detail.chars().count() > max_chars)
+                    .then(|| {
+                        let cmd = format!(
+                            "hcom events --remote-fetch --device {short_id} --agent {name} --type status --last 1 --full"
+                        );
+                        super::preview_detail(detail, max_chars, &cmd)
+                    })
+                    .flatten();
+                row["detail"] = json!(preview.unwrap_or_else(|| detail.clone()));
+                (name.clone(), row)
+            })
+            .collect();
+        if serde_json::to_vec(&map).map_or(0, |v| v.len()) <= target {
+            break;
+        }
+    }
+    log_preview_level(used);
+    map
+}
+
+/// Log when previews get shorter or recover, not on every push.
+fn log_preview_level(max_chars: usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static LAST: AtomicUsize = AtomicUsize::new(super::DETAIL_PREVIEW_LEVELS[0]);
+    if LAST.swap(max_chars, Ordering::Relaxed) != max_chars {
+        log::log_warn(
+            "relay",
+            "relay.state_previews_resized",
+            &format!(
+                "status detail previews now {max_chars} chars to keep the snapshot within the publish budget"
+            ),
+        );
+    }
 }
 
 /// Build push payload: state + events, returning (state, events, max_event_id, has_more).
@@ -420,6 +543,7 @@ pub fn push(
         relay_id,
         &topic,
         now_secs,
+        sealed_payload_budget(db),
     )?;
     let payload_len = sealed.len();
     let max_id = events
@@ -472,6 +596,9 @@ mod tests {
     use super::*;
     use crate::db::HcomDb;
     use serde_json::json;
+
+    /// The budget toward a peer on an older hcom.
+    const MAX_SEALED_PAYLOAD_BYTES: usize = 112 * 1024;
 
     #[test]
     fn test_parse_iso_timestamp_to_epoch() {
@@ -533,6 +660,7 @@ mod tests {
             "relay-test",
             "relay-test/device-test",
             1_700_000_000,
+            MAX_SEALED_PAYLOAD_BYTES,
         )
         .unwrap();
 
@@ -568,6 +696,7 @@ mod tests {
             "relay-test",
             "relay-test/device-test",
             1_700_000_000,
+            MAX_SEALED_PAYLOAD_BYTES,
         )
         .unwrap();
 
@@ -607,6 +736,7 @@ mod tests {
             "relay-test",
             "relay-test/device-test",
             1_700_000_000,
+            MAX_SEALED_PAYLOAD_BYTES,
         )
         .unwrap();
 
@@ -650,6 +780,7 @@ mod tests {
             "relay-test",
             "relay-test/device-test",
             1_700_000_000,
+            MAX_SEALED_PAYLOAD_BYTES,
         )
         .unwrap();
 
@@ -730,10 +861,191 @@ mod tests {
             "relay-test",
             "relay-test/device-test",
             1_700_000_000,
+            MAX_SEALED_PAYLOAD_BYTES,
         )
         .unwrap_err();
 
         assert!(error.contains("exceeds safe MQTT payload budget"));
+        assert!(
+            error.contains("for 1 agents, largest oversized at"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_large_budget_does_not_resend_a_large_retained_tail() {
+        let state = json!({"instances": {}});
+        let big = |id: i64| json!({"id": id, "data": {"text": "x".repeat(30_000)}});
+        // Ten 30 KB events at or below the cursor (tail) and two new ones.
+        let mut events: Vec<Value> = (1..=12).map(big).collect();
+        seal_bounded_payload(
+            &state,
+            &mut events,
+            10,
+            &[0x42; 32],
+            "relay-test",
+            "relay-test/device-test",
+            1_700_000_000,
+            crate::relay::MQTT_MAX_PACKET_BYTES - PACKET_OVERHEAD_BYTES,
+        )
+        .unwrap();
+        let tail = events.iter().filter(|e| e["id"].as_i64().unwrap() <= 10);
+        let tail_bytes: usize = tail.map(|e| serde_json::to_vec(e).unwrap().len()).sum();
+        assert!(tail_bytes <= MAX_SEALED_PAYLOAD_BYTES, "{tail_bytes}");
+        // New events still use the full budget.
+        assert!(events.iter().any(|e| e["id"] == 11));
+        assert!(events.iter().any(|e| e["id"] == 12));
+    }
+
+    #[test]
+    fn budget_fits_the_smallest_live_receiver() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let now = crate::shared::time::now_epoch_f64();
+        let full = crate::relay::MQTT_MAX_PACKET_BYTES - PACKET_OVERHEAD_BYTES;
+        let set = |key: &str, value: Option<&str>| safe_kv_set(&db, key, value);
+
+        // Nobody else on the relay: only our own limit applies.
+        assert_eq!(sealed_payload_budget(&db), full);
+
+        // A live peer that announces 1 MiB keeps the full budget.
+        set("relay_sync_time_new", Some(&now.to_string()));
+        set("relay_max_packet_new", Some("1048576"));
+        assert_eq!(sealed_payload_budget(&db), full);
+
+        // A live peer that announces nothing is an older hcom: 128 KiB.
+        set("relay_sync_time_old", Some(&now.to_string()));
+        assert_eq!(sealed_payload_budget(&db), MAX_SEALED_PAYLOAD_BYTES);
+
+        // Once it goes stale it no longer holds the budget down.
+        set("relay_sync_time_old", Some(&(now - 600.0).to_string()));
+        assert_eq!(sealed_payload_budget(&db), full);
+
+        // The broker's own limit caps everyone.
+        set(crate::relay::BROKER_MAX_PACKET_KEY, Some("262144"));
+        assert_eq!(
+            sealed_payload_budget(&db),
+            256 * 1024 - PACKET_OVERHEAD_BYTES
+        );
+    }
+
+    #[test]
+    fn snapshot_details_are_previews_but_relayed_status_events_are_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let long = "x".repeat(5000);
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_detail,
+                                        status_time, created_at)
+                 VALUES ('nova', 'sess-1', 'claude', 'active', ?, 1, 0)",
+                [&long],
+            )
+            .unwrap();
+        let event_id = db
+            .log_event(
+                "status",
+                "nova",
+                &json!({"status": "active", "detail": long}),
+            )
+            .unwrap();
+
+        let state = build_state(&db, "device-test");
+        let row_detail = state["instances"]["nova"]["detail"].as_str().unwrap();
+        let cmd = crate::relay::preview_fetch_command(row_detail).unwrap();
+        assert!(
+            cmd.contains("--agent nova --type status --last 1 --full"),
+            "{cmd}"
+        );
+        assert!(row_detail.len() < 1000);
+
+        // Relayed status events keep the whole text for subscriptions and filters.
+        let (_, events, _, _) = build_push_payload(&db, "device-test");
+        let event = events.iter().find(|e| e["id"] == event_id).unwrap();
+        assert_eq!(event["data"]["detail"].as_str().unwrap().len(), 5000);
+
+        // The local row keeps the whole text.
+        let local: String = db
+            .conn()
+            .query_row(
+                "SELECT status_detail FROM instances WHERE name = 'nova'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(local.len(), 5000);
+    }
+
+    #[test]
+    fn many_long_details_shorten_every_preview_instead_of_failing_the_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        // An older peer holds the budget at 112 KiB.
+        safe_kv_set(
+            &db,
+            "relay_sync_time_old",
+            Some(&crate::shared::time::now_epoch_f64().to_string()),
+        );
+        let long = "é".repeat(2000);
+        for i in 0..150 {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, session_id, tool, status, status_detail,
+                                            status_time, created_at)
+                     VALUES (?, ?, 'claude', 'active', ?, 1, 0)",
+                    rusqlite::params![format!("a{i}"), format!("s{i}"), long],
+                )
+                .unwrap();
+        }
+        let state = build_state(&db, "device-test");
+        let rows = state["instances"].as_object().unwrap();
+        assert_eq!(rows.len(), 150, "no row is dropped");
+        assert!(
+            serde_json::to_vec(&state["instances"]).unwrap().len()
+                <= MAX_SEALED_PAYLOAD_BYTES / 4 * 3
+        );
+        let detail = rows["a0"]["detail"].as_str().unwrap();
+        assert!(
+            !detail.starts_with(&"é".repeat(400)),
+            "shorter than the first level"
+        );
+        assert!(crate::relay::preview_fetch_command(detail).is_some());
+    }
+
+    #[test]
+    fn a_large_state_keeps_the_retained_tail() {
+        let state = json!({"instances": {"big": "s".repeat(150_000)}});
+        let mut events = vec![
+            json!({"id": 1, "data": {"text": "tail"}}),
+            json!({"id": 2, "data": {"text": "new"}}),
+        ];
+        seal_bounded_payload(
+            &state,
+            &mut events,
+            1,
+            &[0x42; 32],
+            "relay-test",
+            "relay-test/device-test",
+            1_700_000_000,
+            crate::relay::MQTT_MAX_PACKET_BYTES - PACKET_OVERHEAD_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "room is left, so the tail stays for gap detection"
+        );
+    }
+
+    #[test]
+    fn state_announces_this_devices_packet_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let state = build_state(&db, "device-test");
+        assert_eq!(
+            state["max_packet"].as_u64(),
+            Some(crate::relay::MQTT_MAX_PACKET_BYTES as u64)
+        );
     }
 
     #[test]

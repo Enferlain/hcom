@@ -86,7 +86,7 @@ pub fn ping_mqtt_broker(
         MqttOptions::new(format!("hcom-probe-{}", uuid::Uuid::new_v4()), (host, port));
     options.set_keep_alive(30);
     options.set_clean_start(true);
-    options.set_max_packet_size(Some(128 * 1024));
+    options.set_max_packet_size(Some(super::MQTT_MAX_PACKET_BYTES as u32));
     if use_tls {
         options.set_transport(rumqttc::Transport::tls_with_config(
             super::client::relay_tls_config(),

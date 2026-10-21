@@ -32,6 +32,47 @@ pub const DEFAULT_BROKERS: &[(&str, u16)] = &[
     ("test.mosquitto.org", 8886),
 ];
 
+/// Largest MQTT packet this device accepts. Announced to peers as `max_packet`
+/// in the state snapshot so senders can size publishes for every receiver.
+pub const MQTT_MAX_PACKET_BYTES: usize = 1024 * 1024;
+
+/// What a peer that announces no `max_packet` accepts: every hcom before the
+/// field advertised 128 KiB, and the broker silently drops larger packets for it.
+pub const LEGACY_MAX_PACKET_BYTES: usize = 128 * 1024;
+
+/// KV keys for the packet limits a publish must respect.
+pub const BROKER_MAX_PACKET_KEY: &str = "relay_broker_max_packet";
+pub const PEER_MAX_PACKET_PREFIX: &str = "relay_max_packet_";
+
+/// Characters of a status detail (a whole Bash command or Agent prompt) sent to
+/// peers in the snapshot, longest first. Shorter levels apply only when the
+/// previews together would crowd events out of a publish; at 0 a long detail
+/// is just the marker. The owning device keeps the full text and serves it on
+/// request.
+pub const DETAIL_PREVIEW_LEVELS: [usize; 3] = [400, 100, 0];
+const DETAIL_PREVIEW_MARKER: &str = " … [relay preview of ";
+const DETAIL_PREVIEW_FETCH: &str = " chars; full text: ";
+
+/// A copy of `detail` cut to `max_chars`, or `None` when it already fits. The
+/// cut copy ends with a marker naming `fetch_cmd`, the command that returns the
+/// full text from the owning device.
+pub fn preview_detail(detail: &str, max_chars: usize, fetch_cmd: &str) -> Option<String> {
+    let total = detail.chars().count();
+    if total <= max_chars {
+        return None;
+    }
+    let head: String = detail.chars().take(max_chars).collect();
+    Some(format!(
+        "{head}{DETAIL_PREVIEW_MARKER}{total}{DETAIL_PREVIEW_FETCH}{fetch_cmd}]"
+    ))
+}
+
+/// The full-text command named by a relayed preview, if `detail` is one.
+pub fn preview_fetch_command(detail: &str) -> Option<&str> {
+    let (_, tail) = detail.rsplit_once(DETAIL_PREVIEW_MARKER)?;
+    tail.split_once(DETAIL_PREVIEW_FETCH)?.1.strip_suffix(']')
+}
+
 /// Threshold (seconds) after which a device with no state updates is considered offline.
 /// Used for reconnect detection, stale-device cleanup, and status display.
 pub const DEVICE_STALE_SECS: f64 = 90.0;
@@ -154,8 +195,16 @@ pub fn get_broker_from_config(config: &HcomConfig) -> Option<(String, u16, bool)
 /// is treated as missing and refilled under lock — recovers from prior aborted
 /// writes that left a 0-byte file.
 pub fn read_device_uuid() -> Option<String> {
-    let path = crate::paths::hcom_dir().join(".tmp").join("device_id");
-    read_or_create_device_uuid_at(&path)
+    read_or_create_device_uuid_at(&device_uuid_path())
+}
+
+/// This device's UUID if one was ever created; never creates it.
+pub fn existing_device_uuid() -> Option<String> {
+    read_nonempty(&device_uuid_path())
+}
+
+fn device_uuid_path() -> std::path::PathBuf {
+    crate::paths::hcom_dir().join(".tmp").join("device_id")
 }
 
 /// Path-parameterized core of `read_device_uuid`. Split out so tests can drive
@@ -318,6 +367,7 @@ pub fn clear_relay_device_state(db: &HcomDb) {
         "relay_sync_time_",
         "relay_state_ts_",
         "relay_ctrl_",
+        PEER_MAX_PACKET_PREFIX,
     ];
     for prefix in &prefixes {
         if let Ok(entries) = db.kv_prefix(prefix) {
@@ -784,6 +834,23 @@ pub fn set_relay_status(db: &HcomDb, status: &str, error: Option<&str>, is_worke
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_detail_becomes_a_marked_preview_naming_its_fetch_command() {
+        let cmd = "hcom events --remote-fetch --device ABCD --sql 'id=7' --full";
+        assert_eq!(preview_detail("short", 400, cmd), None);
+        assert_eq!(preview_fetch_command("short"), None);
+
+        let long = "é".repeat(450);
+        let preview = preview_detail(&long, 400, cmd).unwrap();
+        assert!(preview.starts_with(&"é".repeat(400)));
+        assert!(preview.contains("450 chars"));
+        assert_eq!(preview_fetch_command(&preview), Some(cmd));
+        // Level 0 keeps only the marker, which still names the command.
+        let bare = preview_detail(&long, 0, cmd).unwrap();
+        assert!(!bare.contains('é'));
+        assert_eq!(preview_fetch_command(&bare), Some(cmd));
+    }
 
     #[cfg(unix)]
     #[test]
