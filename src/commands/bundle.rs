@@ -945,10 +945,10 @@ fn cmd_bundle_create(db: &HcomDb, args: &BundleCreateArgs, ctx: Option<&CommandC
     let title = match args.title_flag.as_ref().or(args.title_positional.as_ref()) {
         Some(t) => t.clone(),
         None => {
-            eprintln!(
-                "Usage: hcom bundle create TITLE --description DESC [--events LIST] [--files LIST] [--transcript RANGES]"
+            return crate::commands::help::usage_error(
+                "bundle create",
+                "hcom bundle create needs a title",
             );
-            return 1;
         }
     };
 
@@ -1079,12 +1079,8 @@ pub fn cmd_bundle(db: &HcomDb, args: &BundleArgs, ctx: Option<&CommandContext>) 
 
     /// Try parsing a clap Args struct from sub-argv. Returns exit code on error.
     fn try_parse<T: clap::Parser>(name: &str, argv: &[String]) -> Result<T, i32> {
-        T::try_parse_from(std::iter::once(name.to_string()).chain(argv.iter().cloned())).map_err(
-            |e| {
-                e.print().ok();
-                if e.use_stderr() { 1 } else { 0 }
-            },
-        )
+        T::try_parse_from(std::iter::once(name.to_string()).chain(argv.iter().cloned()))
+            .map_err(|e| crate::commands::help::clap_usage_error(name, &e))
     }
 
     match subcmd {

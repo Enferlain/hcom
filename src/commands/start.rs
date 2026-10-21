@@ -63,10 +63,7 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     use clap::Parser;
     let start_args = match StartArgs::try_parse_from(&filtered) {
         Ok(a) => a,
-        Err(e) => {
-            e.print().ok();
-            return Ok(if e.use_stderr() { 1 } else { 0 });
-        }
+        Err(e) => return Ok(crate::commands::help::clap_usage_error("start", &e)),
     };
 
     let orphan_target = start_args.orphan;

@@ -363,18 +363,15 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     use clap::Parser;
     let kill_args = match KillArgs::try_parse_from(&filtered) {
         Ok(a) => a,
-        Err(e) => {
-            e.print().ok();
-            return Ok(if e.use_stderr() { 1 } else { 0 });
-        }
+        Err(e) => return Ok(crate::commands::help::clap_usage_error("kill", &e)),
     };
 
     let targets = kill_args.targets;
     if targets.is_empty() {
-        eprintln!(
-            "Error: no target specified\n\nUsage: kill <TARGET>...\n\nFor more information, try '--help'."
-        );
-        return Ok(1);
+        return Ok(crate::commands::help::usage_error(
+            "kill",
+            "hcom kill needs a target: <name>, tag:<tag>, or all",
+        ));
     }
     let explicit_name = flags.name.clone();
 

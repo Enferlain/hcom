@@ -691,19 +691,30 @@ fn config_bootstrap(db: &HcomDb, args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("show") => {
             if args.len() > 2 {
-                eprintln!("Usage: hcom config bootstrap show [part]");
-                return 1;
+                return crate::commands::help::usage_error(
+                    "config bootstrap",
+                    &format!(
+                        "Unexpected argument for hcom config bootstrap show: '{}'",
+                        args[2]
+                    ),
+                );
             }
             note_bootstrap_exclusion_source();
             if let Some(part) = args.get(1) {
                 match crate::bootstrap::part_source(part) {
                     Some(source) => println!("{source}"),
                     None => {
-                        eprintln!(
-                            "Unknown bootstrap part '{part}'. Valid parts: {}",
-                            crate::bootstrap::EXCLUDE_PARTS.join(", ")
+                        let hint = crate::shared::suggest::did_you_mean(
+                            part,
+                            crate::bootstrap::EXCLUDE_PARTS.iter().copied(),
                         );
-                        return 1;
+                        return crate::commands::help::usage_error(
+                            "config bootstrap",
+                            &format!(
+                                "Unknown bootstrap part '{part}'{hint}\nParts: {}",
+                                crate::bootstrap::EXCLUDE_PARTS.join(", ")
+                            ),
+                        );
                     }
                 }
             } else {
@@ -726,12 +737,16 @@ fn config_bootstrap(db: &HcomDb, args: &[String]) -> i32 {
         }
         Some("render") => {
             if !(3..=4).contains(&args.len()) || (args.len() == 4 && args[3] != "launched") {
-                eprintln!("Usage: hcom config bootstrap render <name> <tool> [launched]");
-                return 1;
+                return crate::commands::help::usage_error(
+                    "config bootstrap",
+                    "hcom config bootstrap render needs <name> <tool> [launched]",
+                );
             }
             if args[2].parse::<crate::tool::Tool>().is_err() {
-                eprintln!("Unknown tool '{}'", args[2]);
-                return 1;
+                return crate::commands::help::usage_error(
+                    "config bootstrap",
+                    &format!("Unknown tool '{}'", args[2]),
+                );
             }
             note_bootstrap_exclusion_source();
             let mut hcom_ctx = crate::shared::HcomContext::from_os();
@@ -742,12 +757,15 @@ fn config_bootstrap(db: &HcomDb, args: &[String]) -> i32 {
             );
             0
         }
-        _ => {
-            eprintln!(
-                "Usage: hcom config bootstrap show [part]\n       hcom config bootstrap render <name> <tool> [launched]"
-            );
-            1
-        }
+        None => crate::commands::help::usage_error(
+            "config bootstrap",
+            "hcom config bootstrap needs show or render",
+        ),
+        Some(other) => crate::commands::help::unknown_subcommand(
+            "config bootstrap",
+            other,
+            &["show", "render"],
+        ),
     }
 }
 

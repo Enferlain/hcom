@@ -402,8 +402,10 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
             .map(|s| s.as_str())
             .collect();
         if args.is_empty() {
-            println!("Usage: hcom term inject <name> [text] [--enter]");
-            return 1;
+            return crate::commands::help::usage_error(
+                "term inject",
+                "hcom term inject needs an agent name",
+            );
         }
         let name = resolve_display_name(db, args[0]).unwrap_or_else(|| args[0].to_string());
         let text = if args.len() > 1 {

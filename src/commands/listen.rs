@@ -24,6 +24,7 @@ use crate::shared::{CommandContext, ST_INACTIVE, ST_LISTENING};
 #[command(name = "listen", about = "Wait for events matching filters")]
 pub struct ListenArgs {
     /// Timeout in seconds (positional shorthand)
+    #[arg(value_name = "timeout")]
     pub timeout_positional: Option<u64>,
     /// Timeout in seconds (default: 86400 = 24h)
     #[arg(long)]
@@ -182,8 +183,9 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
             if explicit_name.is_some() {
                 eprintln!("Error: {e}");
             } else {
-                eprintln!("Error: --name required (no identity context)");
-                eprintln!("Usage: hcom listen --name <name> [--timeout N]");
+                eprintln!(
+                    "Error: no hcom identity. Run 'hcom start' first, then 'hcom listen --name <name>'"
+                );
             }
             return 1;
         }

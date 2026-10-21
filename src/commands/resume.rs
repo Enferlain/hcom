@@ -78,7 +78,10 @@ struct ResumePromptInput<'a> {
 
 /// Run the resume command. `argv` is the full argv[1..].
 pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
-    let (name, extra_args) = parse_resume_argv(argv, "r")?;
+    let (name, extra_args) = match parse_resume_argv(argv, "r") {
+        Ok(parsed) => parsed,
+        Err(e) => return Ok(crate::commands::help::usage_error("resume", &e.to_string())),
+    };
 
     do_resume(&name, false, &extra_args, flags)
 }
@@ -107,7 +110,7 @@ pub fn parse_resume_argv(argv: &[String], cmd: &str) -> Result<(String, Vec<Stri
     }
 
     if i >= argv.len() {
-        bail!("Usage: hcom {} <name> [tool-args...]", cmd);
+        bail!("hcom {cmd} needs an agent name");
     }
 
     let name = argv[i].clone();

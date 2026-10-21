@@ -91,10 +91,10 @@ pub fn cmd_daemon(argv: &[String]) -> i32 {
             thread::sleep(Duration::from_millis(500));
             daemon_start()
         }
-        other => {
-            eprintln!("Unknown daemon subcommand: {other}");
-            eprintln!("Usage: hcom relay daemon [status|start|stop|restart]");
-            1
-        }
+        other => crate::commands::help::unknown_subcommand(
+            "relay daemon",
+            other,
+            &["status", "start", "stop", "restart"],
+        ),
     }
 }

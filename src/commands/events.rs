@@ -535,37 +535,7 @@ fn cmd_events_sub(db: &HcomDb, args: &EventsSubArgs, caller_name: Option<&str>) 
 
     // No filters and no SQL: show help
     if sql_parts.is_empty() {
-        println!(
-            "Event subscriptions: get notified via hcom message when a future event matches.\n\n\
-             Usage:\n\
-             \x20 events sub [filters] [--once]     Subscribe using filter flags\n\
-             \x20 events sub \"SQL WHERE\" [--once]   Subscribe using raw SQL\n\
-             \x20 events sub list                   List active subscriptions\n\
-             \x20 events unsub <id>                 Remove a subscription\n\
-             \x20   --once                          Auto-remove after first match\n\
-             \x20   --for <name>                    Subscribe on behalf of another agent\n\
-             \x20   --on-hit <TEXT>                 Attach message (sent from caller) when sub fires\n\n\
-             Filters (same flag repeated = OR, different flags = AND):\n\
-             \x20 --agent NAME                      Agent name\n\
-             \x20 --type TYPE                       message | status | life\n\
-             \x20 --status VAL                      listening | active | blocked\n\
-             \x20 --context PATTERN                 tool:Bash | deliver:X (supports * wildcard)\n\
-             \x20 --action VAL                      created | started | ready | stopped | batch_launched | launch_failed | launch_blocked\n\
-             \x20 --cmd PATTERN                     Shell command (contains, ^prefix, =exact)\n\
-             \x20 --file PATH                       File write (*.py for glob, file.py for contains)\n\
-             \x20 --collision                        Two agents edit same file within 30s\n\
-             \x20 --from NAME                       Sender\n\
-             \x20 --mention NAME                    @mention target\n\
-             \x20 --intent VAL                      request | inform | ack\n\
-             \x20 --thread NAME                     Thread name\n\
-             \x20 --after TIME                      After timestamp (ISO-8601)\n\
-             \x20 --before TIME                     Before timestamp (ISO-8601)\n\
-             \x20 Shortcuts: --idle NAME, --blocked NAME\n\n\
-             Examples:\n\
-             \x20 events sub --idle peso            Notified when peso goes idle\n\
-             \x20 events sub --file '*.py' --once   One-shot: next .py file write\n\
-             \x20 events sub --collision            File edit conflict detection"
-        );
+        crate::commands::help::print_command_help("events sub");
         return 0;
     }
 

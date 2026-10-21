@@ -50,6 +50,7 @@ pub struct TranscriptArgs {
     /// Target instance name (with or without @)
     pub name: Option<String>,
     /// Exchange range (e.g., "5" or "5-10")
+    #[arg(value_name = "range")]
     pub range_positional: Option<String>,
 
     /// JSON output
@@ -1188,8 +1189,10 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         ctx.and_then(|c| c.identity.as_ref())
             .map(|id| id.name.clone())
     }) else {
-        eprintln!("Usage: hcom transcript @instance [N | N-M] [--full] [--json]");
-        return 1;
+        return crate::commands::help::usage_error(
+            "transcript",
+            "hcom transcript needs an agent name",
+        );
     };
 
     let opts = TranscriptRenderOpts {

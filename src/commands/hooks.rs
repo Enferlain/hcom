@@ -415,9 +415,7 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
         "add" | "install" => cmd_hooks_add(&sub_argv),
         "remove" | "uninstall" => cmd_hooks_remove(&sub_argv),
         _ => {
-            eprintln!("Error: Unknown hooks subcommand: {first}");
-            eprintln!("Usage: hcom hooks [status|add|remove] [tool]");
-            1
+            crate::commands::help::unknown_subcommand("hooks", first, &["status", "add", "remove"])
         }
     }
 }

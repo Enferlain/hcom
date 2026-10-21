@@ -60,6 +60,8 @@ fn released_tool_names() -> Vec<&'static str> {
 /// Error for an unrecognized first token, with typo suggestions.
 ///
 /// `hcom 2 claud` is reported as an unknown tool (not "unknown command '2'").
+/// With no close match, the main help follows so the caller can find the
+/// right command without another round trip.
 fn unknown_command_message(cmd: &str, args: &[String]) -> String {
     use crate::shared::suggest::did_you_mean;
     let tools = released_tool_names();
@@ -79,10 +81,15 @@ fn unknown_command_message(cmd: &str, args: &[String]) -> String {
         };
     }
     let candidates = COMMANDS.iter().chain(tools.iter()).copied();
-    format!(
-        "Unknown command '{cmd}'{}\nRun 'hcom --help' for usage.",
-        did_you_mean(cmd, candidates)
-    )
+    let suggestion = did_you_mean(cmd, candidates);
+    if suggestion.is_empty() {
+        format!(
+            "Unknown command '{cmd}'\n\n{}",
+            crate::commands::help::get_help_text()
+        )
+    } else {
+        format!("Unknown command '{cmd}'{suggestion}")
+    }
 }
 
 fn maybe_external_send_name_hint(
@@ -982,6 +989,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
 
     // Dispatch to command handler
     let has_json = cmd_argv.iter().any(|a| a == "--json");
+    let help_topic = crate::commands::help::help_topic(cmd, &cmd_argv);
     /// Parse a clap Args struct from command argv, handling help/error output.
     /// Returns exit code on parse error (1 for errors, 0 for help/version).
     macro_rules! clap_parse {
@@ -995,10 +1003,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         ($type:ty, $name:expr, $argv:expr, $handler:expr) => {{
             match clap_parse!($type, $name, $argv) {
                 Ok(args) => $handler(args),
-                Err(e) => {
-                    e.print().ok();
-                    if e.use_stderr() { 1 } else { 0 }
-                }
+                Err(e) => crate::commands::help::clap_usage_error(&help_topic, &e),
             }
         }};
     }
@@ -1010,10 +1015,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
                 args.had_separator = cmd_argv.iter().any(|a| a == "--");
                 crate::commands::send::cmd_send(&db, &args, Some(&ctx))
             }
-            Err(e) => {
-                e.print().ok();
-                if e.use_stderr() { 1 } else { 0 }
-            }
+            Err(e) => crate::commands::help::clap_usage_error(&help_topic, &e),
         },
         "list" => clap_dispatch!(crate::commands::list::ListArgs, cmd, &cmd_argv, |args| {
             crate::commands::list::cmd_list(&db, &args, Some(&ctx))
@@ -1076,8 +1078,7 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
                 }
             }
             Err(e) => {
-                e.print().ok();
-                let code = if e.use_stderr() { 1 } else { 0 };
+                let code = crate::commands::help::clap_usage_error(&help_topic, &e);
                 if let Err(e) =
                     crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json)
                 {
@@ -1132,6 +1133,20 @@ mod tests {
 
     fn sv(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unknown_command_shows_main_help_only_without_a_suggestion() {
+        let close = unknown_command_message("evnets", &sv(&["evnets"]));
+        assert!(close.contains("Did you mean: events?"), "{close}");
+        assert!(!close.contains("multi-agent communication"), "{close}");
+
+        let far = unknown_command_message("florp", &sv(&["florp"]));
+        assert!(far.contains("multi-agent communication"), "{far}");
+
+        let tool = unknown_command_message("5", &sv(&["5", "claud"]));
+        assert!(tool.contains("Did you mean: claude?"), "{tool}");
+        assert!(!tool.contains("multi-agent communication"), "{tool}");
     }
 
     #[test]

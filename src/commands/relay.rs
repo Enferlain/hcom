@@ -516,9 +516,11 @@ fn relay_notify_off_all(db: &HcomDb, config: &crate::config::HcomConfig) {
 
 fn relay_off(db: &HcomDb, argv: &[String]) -> i32 {
     let all = argv.iter().any(|a| a == "--all");
-    if argv.iter().any(|a| a != "--all") {
-        eprintln!("Usage: hcom relay off [--all]");
-        return 1;
+    if let Some(extra) = argv.iter().find(|a| *a != "--all") {
+        return crate::commands::help::usage_error(
+            "relay",
+            &format!("Unexpected argument for hcom relay off: '{extra}'"),
+        );
     }
 
     let config = config::load_config_snapshot().core;
@@ -901,11 +903,11 @@ pub fn cmd_relay(db: &HcomDb, args: &RelayArgs, _ctx: Option<&CommandContext>) -
             if argv[0].len() > 20 && !argv[0].starts_with('-') {
                 relay_connect(db, argv)
             } else {
-                eprintln!("Error: Unknown subcommand: {first}");
-                eprintln!(
-                    "Usage: hcom relay [new|token|connect|on|off|daemon] (see hcom relay --help)"
-                );
-                1
+                crate::commands::help::unknown_subcommand(
+                    "relay",
+                    first,
+                    &["new", "token", "connect", "on", "off", "daemon"],
+                )
             }
         }
     }

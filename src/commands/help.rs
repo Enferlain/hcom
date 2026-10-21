@@ -202,6 +202,7 @@ const EVENTS_PAGE: &[&[HelpEntry]] = &[
 
 const EVENTS_SUB_PAGE: &[&[HelpEntry]] = &[
     EVENTS_SUB,
+    EVENTS_UNSUB,
     FILTERS_HEADER,
     FILTER_HELP,
     EVENTS_SHORTCUTS,
@@ -274,13 +275,13 @@ const LIST_HELP: &[HelpEntry] = &[
 ];
 
 const SEND_HELP: &[HelpEntry] = &[
-    ("  send @name -- message text", "Direct message"),
-    ("  send @name1 @name2 -- message", "Multiple targets"),
-    ("  send -- message text", "Broadcast to all"),
-    ("  send @name", "Message from stdin (pipe or heredoc)"),
-    ("  send @name --file <path>", "Message from file"),
+    ("send @name -- message text", "Direct message"),
+    ("send @name1 @name2 -- message", "Multiple targets"),
+    ("send -- message text", "Broadcast to all"),
+    ("send @name", "Message from stdin (pipe or heredoc)"),
+    ("send @name --file <path>", "Message from file"),
     (
-        "  send @name --base64 <encoded>",
+        "send @name --base64 <encoded>",
         "Message from base64 string",
     ),
     ("", ""),
@@ -594,6 +595,21 @@ const CONFIG_HELP: &[HelpEntry] = &[
     ),
 ];
 
+/// Static head of `hcom config --help`; key list and file paths follow.
+const CONFIG_PAGE: &[&[HelpEntry]] = &[CONFIG_HELP, BLANK, CONFIG_BOOTSTRAP];
+
+const CONFIG_BOOTSTRAP: &[HelpEntry] = &[
+    ("Bootstrap (the hcom context agents get):", ""),
+    (
+        "config bootstrap show [part]",
+        "Print each part, or one part",
+    ),
+    (
+        "config bootstrap render <name> <tool> [launched]",
+        "Print the full bootstrap an agent would get",
+    ),
+];
+
 /// Keys a user sets by hand. Every config field must appear here or in
 /// CONFIG_KEYS_NOT_IN_HELP (enforced by `config_help_covers_registry_keys`).
 const CONFIG_KEYS_HELP: &[HelpEntry] = &[
@@ -879,6 +895,7 @@ const SUBCOMMAND_HELP: &[(&str, &[&[HelpEntry]])] = &[
     ("events sub", EVENTS_SUB_PAGE),
     ("events unsub", &[EVENTS_UNSUB]),
     ("events launch", &[EVENTS_LAUNCH]),
+    ("config bootstrap", &[CONFIG_BOOTSTRAP]),
     ("bundle list", &[BUNDLE_LIST]),
     ("bundle show", &[BUNDLE_SHOW]),
     ("bundle cat", &[BUNDLE_CAT]),
@@ -1384,7 +1401,7 @@ fn command_help_raw(name: &str) -> String {
 
     // Config is special: has dynamic config files hint
     if name == "config" {
-        lines.extend(format_entries(CONFIG_HELP));
+        lines.extend(format_page(CONFIG_PAGE));
         lines.extend(format_entries(CONFIG_KEYS_HELP));
         lines.push(String::new());
         lines.push(format_entry("", "hcom config <key> --info for details"));
@@ -1417,6 +1434,62 @@ fn command_help_raw(name: &str) -> String {
 /// Print help for a command to stdout.
 pub fn print_command_help(name: &str) {
     println!("{}", get_command_help(name));
+}
+
+/// Report a CLI syntax mistake: the error first, then the help page for
+/// `topic` (to stderr). The page saves the caller a follow-up `--help`.
+/// Returns the exit code (1).
+pub fn usage_error(topic: &str, msg: &str) -> i32 {
+    eprintln!("Error: {msg}\n\n{}", get_command_help(topic));
+    1
+}
+
+/// `usage_error` for an unrecognized subcommand, with a typo suggestion.
+pub fn unknown_subcommand(topic: &str, got: &str, valid: &[&str]) -> i32 {
+    let hint = crate::shared::suggest::did_you_mean(got, valid.iter().copied());
+    usage_error(
+        topic,
+        &format!("Unknown hcom {topic} subcommand '{got}'{hint}"),
+    )
+}
+
+/// Report a clap parse failure via `usage_error`, keeping clap's message and
+/// tips (e.g. "a similar argument exists") but not its generated usage line.
+pub fn clap_usage_error(topic: &str, err: &clap::Error) -> i32 {
+    if !err.use_stderr() {
+        print_command_help(topic);
+        return 0;
+    }
+    usage_error(topic, &clap_error_message(err))
+}
+
+fn clap_error_message(err: &clap::Error) -> String {
+    let rendered = err.render().to_string();
+    let body: Vec<&str> = rendered
+        .lines()
+        .take_while(|line| !line.starts_with("Usage:"))
+        // The help page follows, so drop clap's pointer to it.
+        .filter(|line| !line.starts_with("For more information"))
+        .collect();
+    // clap names missing positionals by field (`<ID>`); help pages say `<id>`.
+    if err.kind() == clap::error::ErrorKind::MissingRequiredArgument {
+        let names: Vec<String> = body
+            .iter()
+            .filter_map(|line| line.trim().strip_prefix('<'))
+            .map(|name| format!("<{}", name.to_lowercase()))
+            .collect();
+        if !names.is_empty() {
+            return format!("Missing required argument: {}", names.join(" "));
+        }
+    }
+    let body = body.join("\n");
+    let body = body.trim();
+    let body = body.strip_prefix("error: ").unwrap_or(body);
+    let mut chars = body.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 pub fn print_help() {
@@ -1592,10 +1665,50 @@ mod tests {
     }
 
     #[test]
+    fn clap_error_message_drops_generated_usage() {
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct Args {
+            #[arg(long)]
+            idle: Option<String>,
+        }
+        let err = Args::try_parse_from(["events", "--idel", "x"]).unwrap_err();
+        let msg = clap_error_message(&err);
+        assert!(msg.starts_with("Unexpected argument '--idel'"), "{msg}");
+        assert!(
+            msg.contains("'--idle'"),
+            "keeps the did-you-mean tip: {msg}"
+        );
+        assert!(!msg.contains("Usage:"), "{msg}");
+        assert!(!msg.contains("--help"), "{msg}");
+
+        #[derive(Parser, Debug)]
+        struct Listen {
+            #[arg(value_name = "timeout")]
+            timeout: Option<u64>,
+        }
+        let err = Listen::try_parse_from(["listen", "x"]).unwrap_err();
+        let msg = clap_error_message(&err);
+        assert!(
+            msg.starts_with("Invalid value 'x' for '[timeout]'"),
+            "{msg}"
+        );
+        assert!(!msg.contains("--help"), "{msg}");
+
+        #[derive(Parser, Debug)]
+        struct Unsub {
+            id: String,
+        }
+        let err = Unsub::try_parse_from(["unsub"]).unwrap_err();
+        assert_eq!(clap_error_message(&err), "Missing required argument: <id>");
+    }
+
+    #[test]
     fn nested_help_pages_are_specific() {
         let events_sub = get_command_help("events sub");
         assert!(events_sub.contains("--on-hit <text>"));
         assert!(events_sub.contains("--as <name>"));
+        assert!(events_sub.contains("events unsub <id>"));
         assert!(!events_sub.contains("Wait for a launch batch:"));
 
         let events_launch = get_command_help("events launch");
@@ -1622,6 +1735,7 @@ mod tests {
                 "relay" => RELAY_PAGE,
                 "hooks" => HOOKS_PAGE,
                 "term" => TERM_PAGE,
+                "config" => CONFIG_PAGE,
                 other => panic!("no parent page for {other}"),
             };
             for section in *sections {
