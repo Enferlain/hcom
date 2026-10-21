@@ -361,22 +361,12 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
         .ok()
         .and_then(|t| t.spec().launch.args_env);
     let env_args = if preview.show_config_args {
-        match preview.tool {
-            "claude" => preview.config.claude_args.as_str(),
-            "gemini" => preview.config.gemini_args.as_str(),
-            "codex" => preview.config.codex_args.as_str(),
-            "opencode" => preview.config.opencode_args.as_str(),
-            "kilo" | "kilocode" => preview.config.kilo_args.as_str(),
-            "pi" | "pi-agent" => preview.config.pi_args.as_str(),
-            "omp" | "omp-agent" => preview.config.omp_args.as_str(),
-            "cursor" | "cursor-agent" => preview.config.cursor_args.as_str(),
-            "copilot" => preview.config.copilot_args.as_str(),
-            "kimi" => preview.config.kimi_args.as_str(),
-            "qoder" | "qodercli" => preview.config.qoder_args.as_str(),
-            "grok" | "grok-build" => preview.config.grok_args.as_str(),
-            "hermes" => preview.config.hermes_args.as_str(),
-            _ => "",
-        }
+        preview
+            .tool
+            .parse::<crate::tool::Tool>()
+            .ok()
+            .map(|tool| preview.config.tool_args(tool))
+            .unwrap_or("")
     } else {
         ""
     };
@@ -594,33 +584,7 @@ pub(crate) fn merge_tool_args(
     cli_args: &[String],
     config: &HcomConfig,
 ) -> Vec<String> {
-    match tool {
-        LaunchTool::Claude | LaunchTool::ClaudePty => {
-            append_config_args(&config.claude_args, cli_args)
-        }
-        LaunchTool::Gemini => append_config_args(&config.gemini_args, cli_args),
-        LaunchTool::Codex => append_config_args(&config.codex_args, cli_args),
-        LaunchTool::Cursor => {
-            // env config args first, explicit CLI args last (CLI wins under
-            // commander.js last-wins). Print-mode conflicts are rejected by the
-            // unified launcher so their meaning is never silently changed.
-            append_config_args(&config.cursor_args, cli_args)
-        }
-        LaunchTool::Copilot => append_config_args(&config.copilot_args, cli_args),
-        LaunchTool::Grok => append_config_args(&config.grok_args, cli_args),
-        LaunchTool::Pi => append_config_args(&config.pi_args, cli_args),
-        LaunchTool::Omp => append_config_args(&config.omp_args, cli_args),
-        LaunchTool::Hermes => append_config_args(&config.hermes_args, cli_args),
-        LaunchTool::OpenCode => append_config_args(&config.opencode_args, cli_args),
-        LaunchTool::Kilo => append_config_args(&config.kilo_args, cli_args),
-        LaunchTool::Kimi => append_config_args(&config.kimi_args, cli_args),
-        LaunchTool::Qoder => append_config_args(&config.qoder_args, cli_args),
-        LaunchTool::Antigravity => {
-            // IntegrationSpec.launch.args_env is explicitly None: Antigravity
-            // has no persisted *_args config to merge.
-            cli_args.to_vec()
-        }
-    }
+    append_config_args(config.tool_args(tool.tool()), cli_args)
 }
 
 fn args_contain_any(args: &[String], needles: &[&str]) -> bool {

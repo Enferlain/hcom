@@ -12,7 +12,7 @@ use std::sync::{LazyLock, Mutex};
 static RE_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9-]+$").unwrap());
 static RE_PRESET_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_]+$").unwrap());
 
-use crate::paths;
+use crate::{paths, tool::Tool};
 
 /// Global configuration instance, lazily initialized and resettable for tests.
 static CONFIG: Mutex<Option<Config>> = Mutex::new(None);
@@ -151,6 +151,8 @@ pub(crate) struct ConfigField {
     /// Dotted path in config.toml.
     pub toml: &'static str,
     pub kind: FieldKind,
+    /// Set only for generated launch args settings.
+    pub tool: Option<Tool>,
     pub desc: &'static str,
 }
 
@@ -173,15 +175,41 @@ const fn f(
         env,
         toml,
         kind,
+        tool: None,
         desc,
     }
 }
 
 use FieldKind::{Bool, Int, Str};
 
+/// Metadata owned once; `FIELDS` borrows it for the same static field interface.
+struct ToolArgsField {
+    tool: Tool,
+    name: String,
+    env: &'static str,
+    toml: String,
+    desc: String,
+}
+
+static TOOL_ARGS_FIELDS: LazyLock<Vec<ToolArgsField>> = LazyLock::new(|| {
+    crate::integration_spec::ALL
+        .iter()
+        .filter_map(|spec| {
+            Some(ToolArgsField {
+                tool: spec.tool,
+                name: format!("{}_args", spec.name),
+                env: spec.launch.args_env?,
+                toml: format!("launch.{}.args", spec.name),
+                desc: format!("Default args for {} on launch", spec.cli_binary),
+            })
+        })
+        .collect()
+});
+
 /// All config fields, in display order.
 #[rustfmt::skip]
-pub(crate) const FIELDS: &[ConfigField] = &[
+pub(crate) static FIELDS: LazyLock<Vec<ConfigField>> = LazyLock::new(|| {
+    let mut fields = vec![
     f("terminal", "HCOM_TERMINAL", "terminal.active", Str, "Terminal preset for spawning agent panes"),
     f("title_mode", "HCOM_TITLE_MODE", "terminal.title_mode", Str, "Terminal title mode (combined | label | off)"),
     f("tag", "HCOM_TAG", "launch.tag", Str, "Group tag for launched instances"),
@@ -191,23 +219,22 @@ pub(crate) const FIELDS: &[ConfigField] = &[
     f("subagent_timeout", "HCOM_SUBAGENT_TIMEOUT", "launch.subagent_timeout", Int, "Timeout for Claude subagents in seconds (default: 30)"),
     f("auto_subscribe", "HCOM_AUTO_SUBSCRIBE", "launch.auto_subscribe", Str, "Auto-subscribe event presets (comma-separated)"),
     f("auto_trust_workspace", "HCOM_AUTO_TRUST_WORKSPACE", "launch.auto_trust_workspace", Bool, "Auto-approve workspace trust at launch; may persist in tool config"),
-    f("claude_args", "HCOM_CLAUDE_ARGS", "launch.claude.args", Str, "Default args for claude on launch"),
+    ];
+    for field in TOOL_ARGS_FIELDS.iter() {
+        fields.push(ConfigField {
+            name: &field.name,
+            env: field.env,
+            toml: &field.toml,
+            kind: Str,
+            tool: Some(field.tool),
+            desc: &field.desc,
+        });
+    }
+    fields.extend([
     f("claude_delivery", "HCOM_CLAUDE_DELIVERY", "launch.claude.idle_delivery", Str, "Idle Claude delivery for new launches (native | inject)"),
-    f("copilot_args", "HCOM_COPILOT_ARGS", "launch.copilot.args", Str, "Default args for copilot on launch"),
     f("copilot_delivery", "HCOM_COPILOT_DELIVERY", "launch.copilot.idle_delivery", Str, "Idle Copilot delivery for new launches (native | inject)"),
-    f("gemini_args", "HCOM_GEMINI_ARGS", "launch.gemini.args", Str, "Default args for gemini on launch"),
     f("gemini_system_prompt", "HCOM_GEMINI_SYSTEM_PROMPT", "launch.gemini.system_prompt", Str, "System prompt for gemini on launch"),
-    f("codex_args", "HCOM_CODEX_ARGS", "launch.codex.args", Str, "Default args for codex on launch"),
     f("codex_system_prompt", "HCOM_CODEX_SYSTEM_PROMPT", "launch.codex.system_prompt", Str, "System prompt for codex on launch"),
-    f("opencode_args", "HCOM_OPENCODE_ARGS", "launch.opencode.args", Str, "Default args for opencode on launch"),
-    f("kilo_args", "HCOM_KILO_ARGS", "launch.kilo.args", Str, "Default args for kilo on launch"),
-    f("pi_args", "HCOM_PI_ARGS", "launch.pi.args", Str, "Default args for pi on launch"),
-    f("omp_args", "HCOM_OMP_ARGS", "launch.omp.args", Str, "Default args for omp on launch"),
-    f("cursor_args", "HCOM_CURSOR_ARGS", "launch.cursor.args", Str, "Default args for cursor-agent on launch"),
-    f("kimi_args", "HCOM_KIMI_ARGS", "launch.kimi.args", Str, "Default args for kimi on launch"),
-    f("qoder_args", "HCOM_QODER_ARGS", "launch.qoder.args", Str, "Default args for qodercli on launch"),
-    f("grok_args", "HCOM_GROK_ARGS", "launch.grok.args", Str, "Default args for grok on launch"),
-    f("hermes_args", "HCOM_HERMES_ARGS", "launch.hermes.args", Str, "Default args for hermes chat on launch"),
     f("timeout", "HCOM_TIMEOUT", "preferences.timeout", Int, "Idle timeout in seconds (default: 86400)"),
     f("auto_approve", "HCOM_AUTO_APPROVE", "preferences.auto_approve", Bool, "Auto-approve safe hcom commands"),
     f("name_export", "HCOM_NAME_EXPORT", "preferences.name_export", Str, "Export instance name to custom env var"),
@@ -218,7 +245,9 @@ pub(crate) const FIELDS: &[ConfigField] = &[
     // Forge/decrypt authority for the whole relay group: never shown by
     // `hcom config`, never settable through it, never exported to env.
     f("relay_psk", "HCOM_RELAY_PSK", "relay.psk", Str, "Relay pre-shared key"),
-];
+    ]);
+    fields
+});
 
 /// Fields `hcom config` shows and accepts (everything but the relay PSK).
 pub(crate) fn user_fields() -> impl Iterator<Item = &'static ConfigField> {
@@ -275,24 +304,11 @@ pub struct HcomConfig {
     pub notes: String,
     pub bootstrap_exclude: String,
     pub tag: String,
-    pub claude_args: String,
+    pub(crate) tool_args: HashMap<Tool, String>,
     /// How idle Claude agents are woken: `"native"` (default) through hcom's
     /// bundled Claude mod, `"inject"` by typing into the PTY. Fixed per launch.
     /// See [`DELIVERY_MODES`].
     pub claude_delivery: String,
-    pub gemini_args: String,
-    pub codex_args: String,
-    pub opencode_args: String,
-    pub kilo_args: String,
-    pub pi_args: String,
-    /// Oh My Pi specific launch arguments
-    pub omp_args: String,
-    pub cursor_args: String,
-    pub kimi_args: String,
-    pub copilot_args: String,
-    pub qoder_args: String,
-    pub grok_args: String,
-    pub hermes_args: String,
     pub gemini_system_prompt: String,
     pub codex_system_prompt: String,
     pub relay: String,
@@ -325,20 +341,8 @@ impl Default for HcomConfig {
             notes: String::new(),
             bootstrap_exclude: "none".to_string(),
             tag: String::new(),
-            claude_args: String::new(),
+            tool_args: HashMap::new(),
             claude_delivery: DEFAULT_DELIVERY.to_string(),
-            gemini_args: String::new(),
-            codex_args: String::new(),
-            opencode_args: String::new(),
-            kilo_args: String::new(),
-            pi_args: String::new(),
-            omp_args: String::new(),
-            cursor_args: String::new(),
-            kimi_args: String::new(),
-            copilot_args: String::new(),
-            qoder_args: String::new(),
-            grok_args: String::new(),
-            hermes_args: String::new(),
             gemini_system_prompt: String::new(),
             codex_system_prompt: String::new(),
             relay: String::new(),
@@ -463,26 +467,17 @@ impl HcomConfig {
         }
 
         // Validate shell-quoted args fields
-        for (field, value) in [
-            ("claude_args", &self.claude_args),
-            ("gemini_args", &self.gemini_args),
-            ("codex_args", &self.codex_args),
-            ("opencode_args", &self.opencode_args),
-            ("kilo_args", &self.kilo_args),
-            ("pi_args", &self.pi_args),
-            ("omp_args", &self.omp_args),
-            ("cursor_args", &self.cursor_args),
-            ("kimi_args", &self.kimi_args),
-            ("copilot_args", &self.copilot_args),
-            ("qoder_args", &self.qoder_args),
-            ("grok_args", &self.grok_args),
-            ("hermes_args", &self.hermes_args),
-        ] {
+        for spec in crate::integration_spec::ALL
+            .iter()
+            .filter(|s| s.launch.args_env.is_some())
+        {
+            let field = format!("{}_args", spec.name);
+            let value = self.tool_args(spec.tool);
             if !value.is_empty()
                 && let Err(e) = shell_words::split(value)
             {
                 errors.insert(
-                    field.into(),
+                    field.clone(),
                     format!("{field} contains invalid shell quoting: {e}"),
                 );
             }
@@ -509,8 +504,16 @@ impl HcomConfig {
         errors
     }
 
+    /// Default launch args; empty for tools without an args setting.
+    pub fn tool_args(&self, tool: Tool) -> &str {
+        self.tool_args.get(&tool).map(String::as_str).unwrap_or("")
+    }
+
     /// Get a field value by name (returns string representation).
     pub fn get_field(&self, field: &str) -> Option<String> {
+        if let Some(tool) = user_field(field).and_then(|f| f.tool) {
+            return Some(self.tool_args(tool).to_string());
+        }
         match field {
             "timeout" => Some(self.timeout.to_string()),
             "subagent_timeout" => Some(self.subagent_timeout.to_string()),
@@ -519,20 +522,7 @@ impl HcomConfig {
             "notes" => Some(self.notes.clone()),
             "bootstrap_exclude" => Some(self.bootstrap_exclude.clone()),
             "tag" => Some(self.tag.clone()),
-            "claude_args" => Some(self.claude_args.clone()),
             "claude_delivery" => Some(self.claude_delivery.clone()),
-            "gemini_args" => Some(self.gemini_args.clone()),
-            "codex_args" => Some(self.codex_args.clone()),
-            "opencode_args" => Some(self.opencode_args.clone()),
-            "kilo_args" => Some(self.kilo_args.clone()),
-            "pi_args" => Some(self.pi_args.clone()),
-            "omp_args" => Some(self.omp_args.clone()),
-            "cursor_args" => Some(self.cursor_args.clone()),
-            "kimi_args" => Some(self.kimi_args.clone()),
-            "copilot_args" => Some(self.copilot_args.clone()),
-            "qoder_args" => Some(self.qoder_args.clone()),
-            "grok_args" => Some(self.grok_args.clone()),
-            "hermes_args" => Some(self.hermes_args.clone()),
             "gemini_system_prompt" => Some(self.gemini_system_prompt.clone()),
             "codex_system_prompt" => Some(self.codex_system_prompt.clone()),
             "relay" => Some(self.relay.clone()),
@@ -554,6 +544,14 @@ impl HcomConfig {
 
     /// Set a field value by name. Returns Err if field unknown or value invalid type.
     pub fn set_field(&mut self, field: &str, value: &str) -> Result<(), String> {
+        if let Some(tool) = user_field(field).and_then(|f| f.tool) {
+            if value.is_empty() {
+                self.tool_args.remove(&tool);
+            } else {
+                self.tool_args.insert(tool, value.to_string());
+            }
+            return Ok(());
+        }
         match field {
             "timeout" => {
                 self.timeout = value
@@ -570,20 +568,7 @@ impl HcomConfig {
             "notes" => self.notes = value.to_string(),
             "bootstrap_exclude" => self.bootstrap_exclude = value.to_string(),
             "tag" => self.tag = value.to_string(),
-            "claude_args" => self.claude_args = value.to_string(),
             "claude_delivery" => self.claude_delivery = value.to_string(),
-            "gemini_args" => self.gemini_args = value.to_string(),
-            "codex_args" => self.codex_args = value.to_string(),
-            "opencode_args" => self.opencode_args = value.to_string(),
-            "kilo_args" => self.kilo_args = value.to_string(),
-            "pi_args" => self.pi_args = value.to_string(),
-            "omp_args" => self.omp_args = value.to_string(),
-            "cursor_args" => self.cursor_args = value.to_string(),
-            "kimi_args" => self.kimi_args = value.to_string(),
-            "copilot_args" => self.copilot_args = value.to_string(),
-            "qoder_args" => self.qoder_args = value.to_string(),
-            "grok_args" => self.grok_args = value.to_string(),
-            "hermes_args" => self.hermes_args = value.to_string(),
             "gemini_system_prompt" => self.gemini_system_prompt = value.to_string(),
             "codex_system_prompt" => self.codex_system_prompt = value.to_string(),
             "relay" => self.relay = value.to_string(),
@@ -647,7 +632,7 @@ impl HcomConfig {
         let mut errors = ConfigErrors::new();
         let mut sources: HashMap<&str, String> = HashMap::new();
 
-        for field in FIELDS {
+        for field in FIELDS.iter() {
             let (val, source) = match env_value(field, env_override) {
                 Some(v) => (TomlFieldValue::Str(v), format!("env {}", field.env)),
                 None => match file_values.get(field.name) {
@@ -819,7 +804,7 @@ pub(crate) fn toml_values_from_str(
         }
     };
 
-    for field in FIELDS {
+    for field in FIELDS.iter() {
         let Some(val) = get_nested(&raw, field.toml) else {
             continue;
         };
@@ -1782,13 +1767,11 @@ mod tests {
 
     #[test]
     fn test_hcom_config_validation_shell_args() {
-        let mut config = HcomConfig {
-            claude_args: "--model opus".to_string(),
-            ..HcomConfig::default()
-        };
+        let mut config = HcomConfig::default();
+        config.set_field("claude_args", "--model opus").unwrap();
         assert!(!config.collect_errors().contains_key("claude_args"));
 
-        config.claude_args = "unclosed 'quote".to_string();
+        config.set_field("claude_args", "unclosed 'quote").unwrap();
         assert!(config.collect_errors().contains_key("claude_args"));
     }
 
@@ -2104,7 +2087,7 @@ mod tests {
         };
 
         let mut doc = toml_edit::DocumentMut::new();
-        for field in FIELDS {
+        for field in FIELDS.iter() {
             let val = config.get_field(field.name).unwrap();
             set_doc_path(
                 &mut doc,
@@ -2238,7 +2221,7 @@ auto_approve = false
     #[test]
     fn test_get_field_all_fields() {
         let mut config = HcomConfig::default();
-        for field in FIELDS {
+        for field in FIELDS.iter() {
             let val = config
                 .get_field(field.name)
                 .unwrap_or_else(|| panic!("get_field('{}') should return Some", field.name));
@@ -2294,7 +2277,7 @@ auto_approve = false
 
     #[test]
     fn every_field_loads_from_config_toml_and_env() {
-        for field in FIELDS {
+        for field in FIELDS.iter() {
             let expected = sample_value(field);
             assert_ne!(
                 HcomConfig::default().get_field(field.name).unwrap(),
@@ -2357,7 +2340,7 @@ auto_approve = false
         assert_eq!(config.timeout, defaults.timeout);
         assert_eq!(config.subagent_timeout, defaults.subagent_timeout);
         assert_eq!(config.auto_approve, defaults.auto_approve);
-        assert_eq!(config.claude_args, "--model haiku");
+        assert_eq!(config.tool_args(Tool::Claude), "--model haiku");
         assert_eq!(config.relay_id, "group");
         assert_eq!(
             errors.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -2612,7 +2595,7 @@ active = "default"
         let config = HcomConfig::load_from_sources(&values, Some(&HashMap::new())).0;
         assert_eq!(config.claude_delivery, "native");
         assert_eq!(config.copilot_delivery, "native");
-        assert_eq!(config.claude_args, "--model keep");
+        assert_eq!(config.tool_args(Tool::Claude), "--model keep");
 
         let mut doc: toml_edit::DocumentMut = old.parse().unwrap();
         let field = user_field("claude_delivery").unwrap();

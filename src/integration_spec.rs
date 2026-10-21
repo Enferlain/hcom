@@ -1474,6 +1474,205 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn integrations_conform_across_registries() {
+        use crate::config::{HcomConfig, user_field};
+        use crate::launcher::LaunchTool;
+        use crate::shared::tool_detection::{EnvMatch, TOOL_DETECTION_RULES, detect_tool};
+        use crate::tui::model::Tool as TuiTool;
+        use std::collections::{HashMap, HashSet};
+
+        let mut names = HashMap::new();
+        let mut forward = HashSet::new();
+        let mut backward = HashSet::new();
+        for (seen, next) in [
+            (&mut forward, TuiTool::next as fn(&TuiTool) -> TuiTool),
+            (&mut backward, TuiTool::prev as fn(&TuiTool) -> TuiTool),
+        ] {
+            let mut current = TuiTool::Claude;
+            for _ in 0..ALL.len() {
+                let tool = current
+                    .canonical()
+                    .expect("TUI cycle contains unknown tool");
+                if !seen.insert(tool) {
+                    assert_eq!(tool, Tool::Claude, "TUI cycle closes on {tool}");
+                    break;
+                }
+                assert_eq!(current.next().prev(), current, "{tool}: next/prev disagree");
+                assert_eq!(current.prev().next(), current, "{tool}: prev/next disagree");
+                current = next(&current);
+            }
+            assert_eq!(current, TuiTool::Claude, "TUI cycle did not close");
+        }
+
+        for spec in ALL {
+            for name in std::iter::once(&spec.name).chain(spec.aliases.iter()) {
+                assert_eq!(
+                    names.insert(*name, spec.tool),
+                    None,
+                    "{}: duplicate name or alias {name}",
+                    spec.name
+                );
+                assert_eq!(
+                    name.parse::<Tool>().ok(),
+                    Some(spec.tool),
+                    "{}: Tool cannot parse {name}",
+                    spec.name
+                );
+                if spec.tool != Tool::Adhoc {
+                    assert_eq!(
+                        LaunchTool::from_str(name).ok().map(|t| t.tool()),
+                        Some(spec.tool),
+                        "{}: LaunchTool cannot parse {name}",
+                        spec.name
+                    );
+                }
+            }
+            for hook in spec.hooks.names {
+                assert_eq!(
+                    Tool::from_hook_name(hook),
+                    Some(spec.hooks.shared_hooks_with.unwrap_or(spec.tool)),
+                    "{}: hook {hook} routes to wrong tool",
+                    spec.name
+                );
+            }
+            if let Some(env) = spec.launch.args_env {
+                let key = format!("{}_args", spec.name);
+                let field = user_field(&key)
+                    .unwrap_or_else(|| panic!("{}: missing config key {key}", spec.name));
+                assert_eq!(field.env, env, "{}: args env mapping", spec.name);
+                assert_eq!(
+                    field.toml,
+                    format!("launch.{}.args", spec.name),
+                    "{}: args TOML mapping",
+                    spec.name
+                );
+                let mut config = HcomConfig::default();
+                config.set_field(&key, "--model 'test model'").unwrap();
+                assert_eq!(
+                    config.get_field(&key).as_deref(),
+                    Some("--model 'test model'"),
+                    "{}: args get/set round-trip",
+                    spec.name
+                );
+                assert_eq!(
+                    config.tool_args(spec.tool),
+                    "--model 'test model'",
+                    "{}: args accessor",
+                    spec.name
+                );
+                assert_eq!(
+                    config.to_env_dict().get(env).map(String::as_str),
+                    Some("--model 'test model'"),
+                    "{}: args env export",
+                    spec.name
+                );
+                let vars = HashMap::from([(env.to_string(), "--model from-env".to_string())]);
+                let (loaded, errors) = HcomConfig::load_from_sources(&HashMap::new(), Some(&vars));
+                assert!(
+                    errors.is_empty(),
+                    "{}: args env load errors {errors:?}",
+                    spec.name
+                );
+                assert_eq!(
+                    loaded.tool_args(spec.tool),
+                    "--model from-env",
+                    "{}: args env load",
+                    spec.name
+                );
+                let content = format!("[launch.{}]\nargs = \"--model from-toml\"\n", spec.name);
+                let (values, errors) = crate::config::toml_values_from_str(&content);
+                assert!(
+                    errors.is_empty(),
+                    "{}: args TOML parse errors {errors:?}",
+                    spec.name
+                );
+                let (loaded, errors) =
+                    HcomConfig::load_from_sources(&values, Some(&HashMap::new()));
+                assert!(
+                    errors.is_empty(),
+                    "{}: args TOML load errors {errors:?}",
+                    spec.name
+                );
+                assert_eq!(
+                    loaded.tool_args(spec.tool),
+                    "--model from-toml",
+                    "{}: args TOML load",
+                    spec.name
+                );
+                config.set_field(&key, "'unclosed").unwrap();
+                assert!(
+                    config.collect_errors().contains_key(&key),
+                    "{}: args quoting validation missing",
+                    spec.name
+                );
+                assert!(
+                    crate::commands::config::config_help(env).is_some(),
+                    "{}: args help missing",
+                    spec.name
+                );
+            }
+            if spec.tool == Tool::Adhoc {
+                continue;
+            }
+            assert!(
+                forward.contains(&spec.tool),
+                "{}: missing from next TUI cycle",
+                spec.name
+            );
+            assert!(
+                backward.contains(&spec.tool),
+                "{}: missing from prev TUI cycle",
+                spec.name
+            );
+            assert!(
+                TOOL_DETECTION_RULES
+                    .iter()
+                    .any(|rule| rule.tool == spec.tool
+                        && rule.predicates.iter().any(|p| p.var == "HCOM_TOOL"
+                            && matches!(p.condition, EnvMatch::Equals(name) if name == spec.name))),
+                "{}: missing HCOM_TOOL detection predicate",
+                spec.name
+            );
+            assert_eq!(
+                detect_tool(&HashMap::from([(
+                    "HCOM_TOOL".to_string(),
+                    spec.name.to_string()
+                )])),
+                spec.tool,
+                "{}: HCOM_TOOL detection failed",
+                spec.name
+            );
+            let expected_per_run = match spec.tool {
+                Tool::Claude
+                | Tool::Codex
+                | Tool::OpenCode
+                | Tool::Kilo
+                | Tool::Pi
+                | Tool::Omp
+                | Tool::Copilot
+                | Tool::Qoder
+                | Tool::Grok => true,
+                Tool::Gemini | Tool::Antigravity | Tool::Cursor | Tool::Kimi | Tool::Hermes => {
+                    false
+                }
+                Tool::Adhoc => unreachable!(),
+            };
+            let per_run = crate::hooks::runtime::adapter(spec.tool).is_some();
+            assert_eq!(
+                per_run, expected_per_run,
+                "{}: runtime adapter registration disagrees with hook lifecycle",
+                spec.name
+            );
+            let persistent = spec.tool.hook_installer().is_some();
+            assert_ne!(
+                per_run, persistent,
+                "{}: must have exactly one runtime adapter or persistent verify/setup registration",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
     fn kimi_initial_prompt_is_explicitly_unsupported() {
         assert!(matches!(
             KIMI.launch.initial_prompt,
@@ -1765,33 +1964,6 @@ mod tests {
                     "alias help for {alias} must start with 'Usage:'"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn drift_released_tools_have_hook_dispatch() {
-        // Every released hook-bearing tool is either per-run (it has a
-        // runtime adapter) or persistent, in which case it must round-trip
-        // through Tool's install ops: settings_path resolves to a non-empty
-        // path and verify_hooks_installed() can be called without panicking.
-        // Borrowed-hooks specs (Antigravity → Gemini) are checked via their
-        // owning Tool — Antigravity has its own hook module but borrows the
-        // hook command names.
-        for spec in ALL {
-            if !spec.released || spec.hooks.names.is_empty() {
-                continue;
-            }
-            if crate::hooks::runtime::is_per_run(spec.tool) {
-                continue;
-            }
-            let path = spec.tool.hooks_settings_path();
-            assert!(
-                !path.is_empty(),
-                "{}: Tool::hooks_settings_path() must not be empty for a hook-bearing released tool",
-                spec.name
-            );
-            // verify is a read-only check; just confirm it doesn't panic.
-            let _ = spec.tool.verify_hooks_installed(false);
         }
     }
 

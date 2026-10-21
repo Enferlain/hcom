@@ -1207,7 +1207,16 @@ fn show_all_config(db: &HcomDb, ctx: Option<&CommandContext>, json_mode: bool) -
 
 /// Show detailed info for a config key.
 /// Rich per-key help text.
-pub fn config_help(key: &str) -> Option<&'static str> {
+pub fn config_help(key: &str) -> Option<String> {
+    if let Some(spec) = crate::integration_spec::ALL
+        .iter()
+        .find(|s| s.launch.args_env == Some(key))
+    {
+        return Some(format!(
+            "{key} - Default args passed to {} on launch\n\nSet:   hcom config {}_args \"<args>\"\nClear: hcom config {}_args \"\"\n\nPrepended to launch-time cli args.",
+            spec.cli_binary, spec.name, spec.name
+        ));
+    }
     match key {
         "HCOM_TAG" => Some(
             "\
@@ -1356,35 +1365,8 @@ Applies to new launches; kill and resume to change an agent.
 Print (-p) sessions use hook delivery either way.",
         ),
 
-        "HCOM_CLAUDE_ARGS" => Some(
-            "\
-HCOM_CLAUDE_ARGS - Default args passed to claude on launch
 
-Example: hcom config claude_args \"--model opus\"
-Clear:   hcom config claude_args \"\"
 
-Merged with launch-time cli args (launch args win on conflict).",
-        ),
-
-        "HCOM_GEMINI_ARGS" => Some(
-            "\
-HCOM_GEMINI_ARGS - Default args passed to gemini on launch
-
-Example: hcom config gemini_args \"--model flash\"
-Clear:   hcom config gemini_args \"\"
-
-Merged with launch-time cli args (launch args win on conflict).",
-        ),
-
-        "HCOM_CODEX_ARGS" => Some(
-            "\
-HCOM_CODEX_ARGS - Default args passed to codex on launch
-
-Example: hcom config codex_args \"--search\"
-Clear:   hcom config codex_args \"\"
-
-Merged with launch-time cli args (launch args win on conflict).",
-        ),
 
         "HCOM_RELAY" => Some(
             "\
@@ -1521,25 +1503,7 @@ Notes:
   - Works alongside HCOM_PROCESS_ID (always set) for identity",
         ),
 
-        "HCOM_OPENCODE_ARGS" => Some(
-            "\
-HCOM_OPENCODE_ARGS - Default args passed to opencode on launch
 
-Example: hcom config opencode_args \"--agent plan\"
-Clear:   hcom config opencode_args \"\"
-
-Merged with launch-time cli args (launch args win on conflict).",
-        ),
-
-        "HCOM_KILO_ARGS" => Some(
-            "\
-HCOM_KILO_ARGS - Default args passed to kilo on launch
-
-Example: hcom config kilo_args \"--model kilo/kilo-auto/free\"
-Clear:   hcom config kilo_args \"\"
-
-Prepended to launch-time cli args.",
-        ),
 
         "HCOM_COPILOT_DELIVERY" => Some(
             "\
@@ -1563,65 +1527,11 @@ hcom.log has plugin.copilot_* (extension), copilot.ext_* (hcom side) and
 delivery.copilot_extension_stalled when idle messages are not delivered.",
         ),
 
-        "HCOM_COPILOT_ARGS" => Some(
-            "\
-HCOM_COPILOT_ARGS - Default args passed to copilot on launch
 
-Example: hcom config copilot_args \"--model auto\"
-Clear:   hcom config copilot_args \"\"
 
-Prepended to launch-time cli args.",
-        ),
 
-        "HCOM_QODER_ARGS" => Some(
-            "\
-HCOM_QODER_ARGS - Default args passed to qodercli on launch
 
-Example: hcom config qoder_args \"--model Qwen3.8-Flash\"
-Clear:   hcom config qoder_args \"\"
 
-Prepended to launch-time cli args.",
-        ),
-
-        "HCOM_CURSOR_ARGS" => Some(
-            "\
-HCOM_CURSOR_ARGS - Default args passed to cursor-agent on launch
-
-Example: hcom config cursor_args \"--model auto\"
-Clear:   hcom config cursor_args \"\"
-
-Prepended to launch-time cli args.",
-        ),
-
-        "HCOM_GROK_ARGS" => Some(
-            "\
-HCOM_GROK_ARGS - Default args passed to grok on launch
-
-Example: hcom config grok_args \"--always-approve\"
-Clear:   hcom config grok_args \"\"
-
-Prepended to launch-time cli args.",
-        ),
-
-        "HCOM_HERMES_ARGS" => Some(
-            "\
-HCOM_HERMES_ARGS - Default args passed to hermes chat on launch
-
-Example: hcom config hermes_args \"-p work\"
-Clear:   hcom config hermes_args \"\"
-
-Prepended to launch-time cli args.",
-        ),
-
-        "HCOM_KIMI_ARGS" => Some(
-            "\
-HCOM_KIMI_ARGS - Default args passed to kimi on launch
-
-Example: hcom config kimi_args \"--yolo\"
-Clear:   hcom config kimi_args \"\"
-
-Prepended to launch-time cli args.",
-        ),
 
         "HCOM_RELAY_ENABLED" => Some(
             "\
@@ -1636,7 +1546,7 @@ Usage:
         ),
 
         _ => None,
-    }
+    } .map(str::to_string)
 }
 
 /// Build terminal help text (shared between config --info and run docs --config).
