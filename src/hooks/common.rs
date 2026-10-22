@@ -701,10 +701,27 @@ pub fn inject_bootstrap_once(
 
     let bootstrap_text = bootstrap::get_bootstrap(db, ctx, instance_name, tool);
 
-    // Mark as announced
-    let mut updates = serde_json::Map::new();
-    updates.insert("name_announced".into(), serde_json::json!(true));
-    instances::update_instance_position(db, instance_name, &updates);
+    if let Some(parent_name) = instance_data
+        .parent_name
+        .as_deref()
+        .filter(|parent| !parent.is_empty())
+    {
+        // Native subagents can announce through a hook at the same time as a
+        // manual `hcom start`.  The DB CAS emits one durable connected event;
+        // both callers may still return the bootstrap text they prepared.
+        if let Err(error) = db.claim_subagent_connection(instance_name, parent_name, "hook") {
+            log::log_error(
+                "hooks",
+                "subagent_connection_claim",
+                &format!("instance={instance_name} parent={parent_name}: {error}"),
+            );
+        }
+    } else {
+        // Root participants do not have a parent-visible connection event.
+        let mut updates = serde_json::Map::new();
+        updates.insert("name_announced".into(), serde_json::json!(true));
+        instances::update_instance_position(db, instance_name, &updates);
+    }
 
     Some(bootstrap_text)
 }

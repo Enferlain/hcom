@@ -995,7 +995,7 @@ fn parse_status_or_life_row(
     if event_type == "life" {
         let action = json_str(&json, "action", "unknown");
         let kind = match action {
-            "ready" | "started" => ActivityKind::Started,
+            "ready" | "started" | "connected" => ActivityKind::Started,
             "stopped" | "killed" => ActivityKind::Stopped,
             _ => ActivityKind::StateChange,
         };
@@ -1078,7 +1078,7 @@ fn parse_status_or_life_row(
                 }
                 detail_text = text;
             }
-            "created" | "started" => {
+            "created" | "started" | "connected" => {
                 let mut parts = Vec::new();
                 if !by.is_empty() {
                     parts.push(format!("by {}", by));

@@ -194,9 +194,11 @@ fn start_subagent(db: &HcomDb, info: &InstanceRow) -> Result<i32> {
     if !bootstrap.is_empty() {
         println!("{bootstrap}");
     }
-    let mut updates = serde_json::Map::new();
-    updates.insert("name_announced".into(), serde_json::json!(true));
-    instances::update_instance_position(db, &info.name, &updates);
+    // Claim and emit the parent-visible connection event together.  A
+    // SubagentStop activation hook can race this manual start, so the
+    // conditional DB update is the one-shot boundary; only its winner emits
+    // `life.connected`.
+    db.claim_subagent_connection(&info.name, parent_name, "start")?;
 
     Ok(0)
 }

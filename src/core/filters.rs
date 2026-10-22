@@ -515,7 +515,7 @@ pub struct EventFilterArgs {
     pub participant: Vec<String>,
     #[arg(long)]
     pub mention: Vec<String>,
-    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["created", "started", "ready", "stopped", "batch_launched", "launch_failed", "launch_blocked"]))]
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(["created", "started", "connected", "ready", "stopped", "batch_launched", "launch_failed", "launch_blocked"]))]
     pub action: Vec<String>,
     #[arg(long, value_parser = parse_timestamp)]
     pub after: Vec<String>,

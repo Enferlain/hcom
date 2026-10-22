@@ -912,6 +912,54 @@ impl HcomDb {
         Ok(won)
     }
 
+    /// Atomically claim a subagent's one-shot connection gate and, for the
+    /// winner, insert the parent-visible `connected` life event in the same
+    /// transaction.
+    ///
+    /// The conditional `name_announced` 0→1 UPDATE is the ownership CAS (the
+    /// same shape as `finalize_instance_stop`): a manual `hcom start` racing
+    /// the SubagentStop activation ack — or a retried/duplicate ack — all
+    /// target one row, so exactly one caller wins and emits. Losers get
+    /// `Ok(false)` and need no follow-up; they still own whatever output they
+    /// already produced (the bootstrap text). The claim and the event commit
+    /// or roll back together, so the signal can be neither duplicated nor
+    /// lost between the two writes.
+    pub fn claim_subagent_connection(&self, name: &str, parent: &str, via: &str) -> Result<bool> {
+        let mut event_data = serde_json::json!({
+            "action": "connected",
+            "by": via,
+            "reason": "subagent_joined",
+        });
+        if !parent.is_empty() {
+            event_data["parent"] = serde_json::Value::String(parent.to_string());
+        }
+        let data = serde_json::to_string(&event_data)?;
+        let mut event_id = None;
+
+        let won = self.with_immediate_transaction(|tx| {
+            let claimed = tx.execute(
+                "UPDATE instances SET name_announced = 1 WHERE name = ? AND name_announced = 0",
+                params![name],
+            )?;
+            if claimed == 0 {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO events (timestamp, type, instance, data)
+                 VALUES (?, 'life', ?, ?)",
+                params![chrono_now_iso(), name, data],
+            )?;
+            event_id = Some(tx.last_insert_rowid());
+            Ok(true)
+        })?;
+
+        // Subscription notifications are best-effort external effects. Run
+        // them only after the claim and event are durable.
+        if let Some(event_id) = event_id {
+            subscriptions::process_logged_event(self, event_id, "life", name, &event_data);
+        }
+        Ok(won)
+    }
 
     /// Check whether `name`'s *current* identity is a subagent slot.
     ///
@@ -1260,9 +1308,21 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Forward-only cursor advance, optionally marking the name announced, in
-    /// one statement. With `created_at`, only that row incarnation advances;
-    /// returns whether a row was updated.
+    /// Forward-only cursor advance, optionally marking the name announced,
+    /// in ONE immediate transaction. With `created_at`, only that row
+    /// incarnation advances; returns whether a row was updated.
+    ///
+    /// The announcement leg is the same one-shot CAS as
+    /// [`Self::claim_subagent_connection`]: it applies only while
+    /// `name_announced` is still 0, so a manual claim (`hcom start`,
+    /// `inject_bootstrap_once`) that already emitted `connected` makes this
+    /// ack a no-op announce — and vice versa; exactly one path emits. When
+    /// this ack wins the flip on a subagent row (`parent_name` non-empty),
+    /// the parent-visible `life.connected` event is inserted in the SAME
+    /// transaction, so a failed event insert rolls the cursor advance and
+    /// the flag back (the ack is then retried by the caller). Root rows
+    /// announce without an event, matching `inject_bootstrap_once`'s root
+    /// branch. Subscription notifications run only after the commit.
     pub fn ack_hook_delivery(
         &self,
         name: &str,
@@ -1270,13 +1330,60 @@ impl HcomDb {
         announce: bool,
         created_at: Option<f64>,
     ) -> Result<bool> {
-        let changed = self.conn.execute(
-            "UPDATE instances SET last_event_id = MAX(COALESCE(last_event_id, 0), ?),
-             name_announced = CASE WHEN ? THEN 1 ELSE name_announced END
-             WHERE name = ? AND (? IS NULL OR created_at = ?)",
-            params![event_id, announce, name, created_at, created_at],
-        )?;
-        Ok(changed > 0)
+        let mut connected = None;
+        let updated = self.with_immediate_transaction(|tx| {
+            // Read the announcement flag and parent inside the write lock;
+            // the created_at match keeps both on the caller's incarnation.
+            let Some((prior_announced, parent_name)) = tx
+                .query_row(
+                    "SELECT name_announced, COALESCE(parent_name, '')
+                     FROM instances
+                     WHERE name = ?1 AND (?2 IS NULL OR created_at = ?2)",
+                    params![name, created_at],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?
+            else {
+                return Ok(false);
+            };
+
+            tx.execute(
+                "UPDATE instances SET last_event_id = MAX(COALESCE(last_event_id, 0), ?1)
+                 WHERE name = ?2 AND (?3 IS NULL OR created_at = ?3)",
+                params![event_id, name, created_at],
+            )?;
+
+            if announce && prior_announced == 0 {
+                let announced = tx.execute(
+                    "UPDATE instances SET name_announced = 1
+                     WHERE name = ?1 AND name_announced = 0
+                       AND (?2 IS NULL OR created_at = ?2)",
+                    params![name, created_at],
+                )?;
+                if announced == 1 && !parent_name.is_empty() {
+                    let mut event_data = serde_json::json!({
+                        "action": "connected",
+                        "by": "hook",
+                        "reason": "subagent_joined",
+                    });
+                    event_data["parent"] = serde_json::Value::String(parent_name);
+                    tx.execute(
+                        "INSERT INTO events (timestamp, type, instance, data)
+                         VALUES (?, 'life', ?, ?)",
+                        params![chrono_now_iso(), name, serde_json::to_string(&event_data)?],
+                    )?;
+                    connected = Some((tx.last_insert_rowid(), event_data));
+                }
+            }
+            Ok(true)
+        })?;
+
+        // Subscription notifications are best-effort external effects. Run
+        // them only after the cursor/flag/event commit is durable.
+        if let Some((event_id, event_data)) = connected {
+            subscriptions::process_logged_event(self, event_id, "life", name, &event_data);
+        }
+        Ok(updated)
     }
 
     /// Update specific fields on an instance row.
@@ -1488,13 +1595,328 @@ mod tests {
         cleanup_test_db(path);
     }
 
+    #[test]
+    fn subagent_connection_claim_is_one_shot_across_connections() {
+        let (db, path) = setup_full_test_db();
+        db.conn().execute(
+            "INSERT INTO instances(name,parent_name,agent_id,created_at) VALUES ('child','parent','agent',1)",
+            [],
+        ).unwrap();
+        let connections: Vec<_> = (0..4).map(|_| HcomDb::open_raw(&path).unwrap()).collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(connections.len()));
+        let workers: Vec<_> = connections
+            .into_iter()
+            .enumerate()
+            .map(|(index, db)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.claim_subagent_connection(
+                        "child",
+                        "parent",
+                        if index % 2 == 0 { "hook" } else { "start" },
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        let wins = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(wins, 1);
+        assert!(
+            !db.claim_subagent_connection("child", "parent", "retry")
+                .unwrap()
+        );
+        assert!(
+            !db.claim_subagent_connection("missing", "parent", "hook")
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_instance_full("child")
+                .unwrap()
+                .unwrap()
+                .name_announced,
+            1
+        );
+        let events: Vec<String> = db.conn().prepare(
+            "SELECT data FROM events WHERE type='life' AND instance='child' AND json_extract(data,'$.action')='connected'"
+        ).unwrap().query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(events.len(), 1);
+        let event: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(event["parent"], "parent");
+        assert_eq!(event["reason"], "subagent_joined");
+        assert!(matches!(event["by"].as_str(), Some("hook" | "start")));
+        drop(db);
+        cleanup_test_db(path);
+    }
 
+    #[test]
+    fn subagent_connection_event_failure_rolls_back_claim_and_allows_retry() {
+        let (db, path) = setup_full_test_db();
+        db.conn().execute(
+            "INSERT INTO instances(name,parent_name,agent_id,created_at) VALUES ('child','parent','agent',1)",
+            [],
+        ).unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_connected BEFORE INSERT ON events
+             WHEN json_extract(NEW.data,'$.action')='connected'
+             BEGIN SELECT RAISE(ABORT,'connection event failed'); END;",
+            )
+            .unwrap();
+        assert!(
+            db.claim_subagent_connection("child", "parent", "hook")
+                .is_err()
+        );
+        assert_eq!(
+            db.get_instance_full("child")
+                .unwrap()
+                .unwrap()
+                .name_announced,
+            0
+        );
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        db.conn()
+            .execute_batch("DROP TRIGGER reject_connected")
+            .unwrap();
+        assert!(
+            db.claim_subagent_connection("child", "parent", "start")
+                .unwrap()
+        );
+        assert!(
+            !db.claim_subagent_connection("child", "parent", "hook")
+                .unwrap()
+        );
+        drop(db);
+        cleanup_test_db(path);
+    }
 
+    #[test]
+    fn connection_ack_announce_emits_exactly_one_connected_for_subagent() {
+        let (db, path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances(name,parent_name,agent_id,created_at,last_event_id)
+                 VALUES ('child','parent','agent',1,5)",
+                [],
+            )
+            .unwrap();
 
+        // First deferred ack: one-shot announce CAS wins, cursor advances,
+        // and exactly one parent-visible connected event lands with the ack.
+        assert!(db.ack_hook_delivery("child", 10, true, Some(1.0)).unwrap());
+        let row = db.get_instance_full("child").unwrap().unwrap();
+        assert_eq!(row.last_event_id, 10);
+        assert_eq!(row.name_announced, 1);
+        let events: Vec<String> = db
+            .conn()
+            .prepare(
+                "SELECT data FROM events
+                 WHERE type='life' AND instance='child'
+                   AND json_extract(data,'$.action')='connected'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(events.len(), 1);
+        let event: serde_json::Value = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(event["parent"], "parent");
+        assert_eq!(event["reason"], "subagent_joined");
+        assert_eq!(event["by"], "hook");
 
+        // A retried ack still commits (forward-only cursor, no rewind) but
+        // cannot announce or emit a second time.
+        assert!(db.ack_hook_delivery("child", 7, true, Some(1.0)).unwrap());
+        let row = db.get_instance_full("child").unwrap().unwrap();
+        assert_eq!(row.last_event_id, 10, "the cursor must not rewind");
+        assert_eq!(row.name_announced, 1);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance='child'
+                   AND json_extract(data,'$.action')='connected'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
 
+        // A manual claim arriving after the ack loses the same CAS: still
+        // exactly one connected across all paths.
+        assert!(
+            !db.claim_subagent_connection("child", "parent", "start")
+                .unwrap()
+        );
+        drop(db);
+        cleanup_test_db(path);
+    }
 
+    #[test]
+    fn connection_ack_after_manual_claim_advances_without_second_event() {
+        let (db, path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances(name,parent_name,agent_id,created_at,last_event_id)
+                 VALUES ('child','parent','agent',1,5)",
+                [],
+            )
+            .unwrap();
 
+        // The manual claim wins the one-shot gate first and emits connected.
+        assert!(
+            db.claim_subagent_connection("child", "parent", "start")
+                .unwrap()
+        );
+
+        // The deferred ack still commits its cursor but announces nothing.
+        assert!(db.ack_hook_delivery("child", 12, true, Some(1.0)).unwrap());
+        let row = db.get_instance_full("child").unwrap().unwrap();
+        assert_eq!(row.last_event_id, 12);
+        assert_eq!(row.name_announced, 1);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance='child'
+                   AND json_extract(data,'$.action')='connected'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "claim and ack together emit exactly one connected"
+        );
+        drop(db);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn connection_ack_root_announces_without_event() {
+        let (db, path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances(name,created_at,last_event_id)
+                 VALUES ('root',1,3)",
+                [],
+            )
+            .unwrap();
+
+        assert!(db.ack_hook_delivery("root", 8, true, Some(1.0)).unwrap());
+        let row = db.get_instance_full("root").unwrap().unwrap();
+        assert_eq!(row.last_event_id, 8);
+        assert_eq!(row.name_announced, 1);
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "root rows have no parent-visible connection event"
+        );
+        drop(db);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn connection_ack_refuses_replaced_generation() {
+        let (db, path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances(name,parent_name,agent_id,created_at,last_event_id)
+                 VALUES ('child','parent','agent',1,5)",
+                [],
+            )
+            .unwrap();
+
+        // A stop + resume replaced the row: the stale incarnation's ack is
+        // void — no cursor move, no announce, no event.
+        assert!(!db.ack_hook_delivery("child", 10, true, Some(2.0)).unwrap());
+        let row = db.get_instance_full("child").unwrap().unwrap();
+        assert_eq!(row.last_event_id, 5);
+        assert_eq!(row.name_announced, 0);
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(!db.ack_hook_delivery("missing", 10, true, None).unwrap());
+        drop(db);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn connection_ack_without_announce_keeps_flag_and_emits_nothing() {
+        let (db, path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances(name,parent_name,agent_id,created_at,last_event_id)
+                 VALUES ('child','parent','agent',1,5)",
+                [],
+            )
+            .unwrap();
+
+        assert!(db.ack_hook_delivery("child", 9, false, Some(1.0)).unwrap());
+        let row = db.get_instance_full("child").unwrap().unwrap();
+        assert_eq!(row.last_event_id, 9);
+        assert_eq!(row.name_announced, 0, "no announce means no flag flip");
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(db);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn connection_ack_event_failure_rolls_back_cursor_and_flag() {
+        let (db, path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances(name,parent_name,agent_id,created_at,last_event_id)
+                 VALUES ('child','parent','agent',1,5)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_connected BEFORE INSERT ON events
+             WHEN json_extract(NEW.data,'$.action')='connected'
+             BEGIN SELECT RAISE(ABORT,'connection event failed'); END;",
+            )
+            .unwrap();
+
+        // The announce, cursor advance, and connected event are one
+        // transaction: the failed event insert rolls both writes back.
+        assert!(db.ack_hook_delivery("child", 10, true, Some(1.0)).is_err());
+        let row = db.get_instance_full("child").unwrap().unwrap();
+        assert_eq!(row.last_event_id, 5, "cursor advance must roll back");
+        assert_eq!(row.name_announced, 0, "flag flip must roll back");
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // After the failure clears, the caller's retry announces and emits.
+        db.conn()
+            .execute_batch("DROP TRIGGER reject_connected")
+            .unwrap();
+        assert!(db.ack_hook_delivery("child", 10, true, Some(1.0)).unwrap());
+        let row = db.get_instance_full("child").unwrap().unwrap();
+        assert_eq!(row.last_event_id, 10);
+        assert_eq!(row.name_announced, 1);
+        drop(db);
+        cleanup_test_db(path);
+    }
 
     #[test]
     fn test_resolve_owned_approval_requires_matching_token() {
