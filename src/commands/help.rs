@@ -104,7 +104,21 @@ const EVENTS_FOLLOW: &[HelpEntry] = &[
     ),
 ];
 
-const EVENTS_WAIT: &[HelpEntry] = &[("  --after-id ID", "Wait after this exclusive durable cursor")];
+const EVENTS_WAIT: &[HelpEntry] = &[
+    ("Cursor and worker waits:", ""),
+    (
+        "  --after-id ID",
+        "Wait for events after this exclusive durable cursor",
+    ),
+    (
+        "  --result-from NAME",
+        "Correlate one worker attempt; requires --wait, --thread and --after-id",
+    ),
+    (
+        "",
+        "Result exits: 0 result, 1 deadline, 2 error, 3 stopped without result, 4 blocked, 5 launch failure",
+    ),
+];
 
 const EVENTS_STREAM: &[HelpEntry] = &[
     ("Continuous observation:", ""),
@@ -912,6 +926,8 @@ const HOOKS_ABOUT: &[HelpEntry] = &[
         "Without hooks, run `hcom start` inside any AI tool (manual delivery).",
     ),
 ];
+
+
 
 const HOOKS_PAGE: &[&[HelpEntry]] = &[HOOKS_STATUS, HOOKS_ADD, HOOKS_REMOVE, BLANK, HOOKS_ABOUT];
 

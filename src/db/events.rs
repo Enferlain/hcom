@@ -5,6 +5,17 @@ use rusqlite::params;
 
 use super::{HcomDb, chrono_now_iso, subscriptions};
 
+/// Shared launch envelope, with optional classified blocker evidence.
+struct LaunchLifecycleEvent<'a> {
+    action: &'a str,
+    status: &'a str,
+    context: &'a str,
+    reason: Option<&'a str>,
+    detail: Option<&'a str>,
+    blocked_kind: Option<&'a str>,
+    evidence: Option<&'a str>,
+}
+
 /// Message from the events table
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -204,12 +215,17 @@ impl HcomDb {
     fn emit_launch_lifecycle_event(
         &self,
         name: &str,
-        action: &str,
-        status: &str,
-        context: &str,
-        reason: Option<&str>,
-        detail: Option<&str>,
+        event: LaunchLifecycleEvent<'_>,
     ) -> Result<(String, Option<String>)> {
+        let LaunchLifecycleEvent {
+            action,
+            status,
+            context,
+            reason,
+            detail,
+            blocked_kind,
+            evidence,
+        } = event;
         let launcher = std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
         let batch_id = std::env::var("HCOM_LAUNCH_BATCH_ID").ok();
 
@@ -225,6 +241,12 @@ impl HcomDb {
         if let Some(detail) = detail.filter(|s| !s.is_empty()) {
             event_data["detail"] = serde_json::Value::String(detail.to_string());
         }
+        if let Some(kind) = blocked_kind {
+            event_data["blocked_kind"] = serde_json::Value::String(kind.to_string());
+        }
+        if let Some(evidence) = evidence.filter(|text| !text.is_empty()) {
+            event_data["evidence"] = serde_json::Value::String(evidence.to_string());
+        }
         if let Some(ref bid) = batch_id {
             event_data["batch_id"] = serde_json::Value::String(bid.clone());
         }
@@ -237,8 +259,18 @@ impl HcomDb {
     ///
     /// Called on first status update (when status_context was "new").
     pub(crate) fn emit_ready_event(&self, name: &str, status: &str, context: &str) -> Result<()> {
-        let (launcher, batch_id) =
-            self.emit_launch_lifecycle_event(name, "ready", status, context, None, None)?;
+        let (launcher, batch_id) = self.emit_launch_lifecycle_event(
+            name,
+            LaunchLifecycleEvent {
+                action: "ready",
+                status,
+                context,
+                reason: None,
+                detail: None,
+                blocked_kind: None,
+                evidence: None,
+            },
+        )?;
         if launcher != "unknown"
             && let Some(ref bid) = batch_id
         {
@@ -257,11 +289,15 @@ impl HcomDb {
     ) -> Result<()> {
         let (launcher, batch_id) = self.emit_launch_lifecycle_event(
             name,
-            "launch_failed",
-            status,
-            context,
-            Some(reason),
-            Some(detail),
+            LaunchLifecycleEvent {
+                action: "launch_failed",
+                status,
+                context,
+                reason: Some(reason),
+                detail: Some(detail),
+                blocked_kind: None,
+                evidence: None,
+            },
         )?;
         if launcher != "unknown"
             && let Some(ref bid) = batch_id
@@ -282,11 +318,49 @@ impl HcomDb {
     ) -> Result<()> {
         self.emit_launch_lifecycle_event(
             name,
-            "launch_blocked",
-            status,
-            context,
-            Some(reason),
-            Some(detail),
+            LaunchLifecycleEvent {
+                action: "launch_blocked",
+                status,
+                context,
+                reason: Some(reason),
+                detail: Some(detail),
+                blocked_kind: None,
+                evidence: None,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Emit classified evidence through the same launch lifecycle path.
+    pub(crate) fn emit_launch_blocked_event_with_evidence(
+        &self,
+        name: &str,
+        reason: &str,
+        detail: &str,
+        blocked_kind: &str,
+        evidence: Option<&str>,
+    ) -> Result<()> {
+        // Unclassified screens retain the existing generic event shape.
+        if blocked_kind == "unknown" && evidence.is_none() {
+            return self.emit_launch_blocked_event(
+                name,
+                "blocked",
+                "launch_blocked",
+                reason,
+                detail,
+            );
+        }
+        self.emit_launch_lifecycle_event(
+            name,
+            LaunchLifecycleEvent {
+                action: "launch_blocked",
+                status: "blocked",
+                context: "launch_blocked",
+                reason: Some(reason),
+                detail: Some(detail),
+                blocked_kind: Some(blocked_kind),
+                evidence,
+            },
         )?;
         Ok(())
     }
@@ -618,6 +692,46 @@ impl HcomDb {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{cleanup_test_db, setup_full_test_db};
+
+    #[test]
+    fn typed_launch_blocker_preserves_the_lifecycle_envelope() {
+        let (db, db_path) = setup_full_test_db();
+        db.emit_launch_blocked_event_with_evidence(
+            "worker",
+            "screen_settled_not_ready",
+            "Provider quota reached",
+            "quota",
+            Some("Usage limit reached"),
+        )
+        .unwrap();
+        let events = db
+            .get_events_since(0, Some("life"), Some("worker"))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let data = &events[0]["data"];
+        assert_eq!(data["action"], "launch_blocked");
+        assert_eq!(data["status"], "blocked");
+        assert_eq!(data["context"], "launch_blocked");
+        assert_eq!(data["reason"], "screen_settled_not_ready");
+        assert_eq!(data["blocked_kind"], "quota");
+        assert_eq!(data["evidence"], "Usage limit reached");
+
+        db.emit_launch_blocked_event_with_evidence(
+            "unknown",
+            "screen_settled_not_ready",
+            "No ready prompt",
+            "unknown",
+            None,
+        )
+        .unwrap();
+        let events = db
+            .get_events_since(0, Some("life"), Some("unknown"))
+            .unwrap();
+        assert_eq!(events[0]["data"]["action"], "launch_blocked");
+        assert!(events[0]["data"]["blocked_kind"].is_null());
+        assert!(events[0]["data"]["evidence"].is_null());
+        cleanup_test_db(db_path);
+    }
 
     #[test]
     fn test_log_event_returns_id() {

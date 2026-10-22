@@ -11,11 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+mod blocker;
 use crate::db::HcomDb;
 use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
 use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LISTENING};
 use crate::tool::Tool;
+pub(crate) use blocker::classify_launch_blocker;
+use blocker::{BlockedClassification, has_distinctive_trust_prompt};
 
 /// Wakes the PTY proxy after the delivery thread changes title state.
 ///
@@ -1224,6 +1227,7 @@ fn emit_launch_blocked_once(
     current_name: &str,
     outcome: &mut LaunchOutcome,
     detail: &str,
+    classification: &BlockedClassification,
 ) {
     if !outcome.is_pending() || std::env::var("HCOM_LAUNCHED").as_deref() != Ok("1") {
         return;
@@ -1262,12 +1266,12 @@ fn emit_launch_blocked_once(
         }
     }
 
-    if let Err(e) = db.emit_launch_blocked_event(
+    if let Err(e) = db.emit_launch_blocked_event_with_evidence(
         current_name,
-        ST_BLOCKED,
-        "launch_blocked",
         "screen_settled_not_ready",
         detail,
+        classification.kind.as_str(),
+        classification.evidence.as_deref(),
     ) {
         log_warn(
             "native",
@@ -1311,7 +1315,7 @@ fn maybe_emit_launch_blocked(
     // Gemini's animated startup banner keeps emitting output for ~60s, defeating
     // the settle heuristic. Its trust prompt is distinctive — fire immediately
     // when it appears rather than waiting for the banner animation to stop.
-    let trust_prompt_visible = tail_text.contains("Do you trust the files in this folder?");
+    let trust_prompt_visible = has_distinctive_trust_prompt(tail_text);
     if !trust_prompt_visible && screen.last_output.elapsed() < settle_threshold {
         return;
     }
@@ -1332,8 +1336,9 @@ fn maybe_emit_launch_blocked(
         "launch blocked: {reason}; run `hcom term {}`\n{}",
         current_name, tail
     );
+    let classification = classify_launch_blocker(tail, screen.approval);
     drop(screen);
-    emit_launch_blocked_once(db, state, current_name, outcome, &detail);
+    emit_launch_blocked_once(db, state, current_name, outcome, &detail, &classification);
 }
 
 /// Inject text to PTY via TCP (text only, no Enter).

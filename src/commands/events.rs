@@ -14,6 +14,7 @@ use std::net::TcpListener;
 mod generation;
 mod listener;
 mod observation;
+mod result;
 mod wait;
 use generation::*;
 use listener::*;
@@ -56,6 +57,9 @@ pub struct EventsArgs {
     /// Print the current durable cursor for arming a later wait
     #[arg(long, conflicts_with_all = ["wait", "follow", "last", "all", "full", "sql", "remote_fetch"])]
     pub cursor: bool,
+    /// Wait for a result from one worker generation (requires a thread and attempt cursor)
+    #[arg(long, requires = "wait", conflicts_with_all = ["follow", "remote_fetch"])]
+    pub result_from: Option<String>,
     /// Start after this event id (with --follow or --wait)
     #[arg(long = "after-id", requires = "cursor_mode")]
     pub after_id: Option<i64>,
@@ -1100,6 +1104,7 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
             || args.filters.has_filters()
             || args.device.is_some()
             || args.after_id.is_some()
+            || args.result_from.is_some()
         {
             eprintln!("Error: --cursor cannot be combined with filters or other event modes");
             return 1;
@@ -1111,8 +1116,8 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
 
     // Handle subcommands
     if let Some(ref subcmd) = args.subcmd {
-        if args.follow {
-            eprintln!("Error: --follow is not supported with subcommands");
+        if args.follow || args.result_from.is_some() {
+            eprintln!("Error: --follow and --result-from are not supported with subcommands");
             return 1;
         }
         if args.remote_fetch {
@@ -1177,6 +1182,13 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
 
     // Convert clap filter args to FilterMap
     let mut filters = args.filters.to_filter_map();
+    let result_correlation = match result::apply_result_correlation(db, args, &mut filters) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return 1;
+        }
+    };
     resolve_filter_names(&mut filters, db);
     // --all also searches archives, where an agent may exist only historically;
     // --wait/--follow may legitimately target an agent that hasn't started yet.
@@ -1284,6 +1296,20 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
     // Wait mode
     if let Some(timeout) = wait_timeout {
         crate::cli_context::claim_inline_delivery();
+        if result_correlation.is_some() {
+            return result::wait_for_result(
+                db,
+                &filter_query,
+                timeout,
+                result::ResultWaitOptions {
+                    after_id: args.after_id,
+                    full_output,
+                    filters: &filters,
+                    instance_name: instance_name.as_deref(),
+                    result_correlation: result_correlation.as_ref(),
+                },
+            );
+        }
         if args.after_id.is_some() || !filter_query.is_empty() {
             return wait::wait_for_event(
                 db,

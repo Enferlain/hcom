@@ -13,4 +13,5 @@ pub mod filters;
 pub mod helpers;
 pub mod launch_status;
 pub mod progress;
+pub mod result_wait;
 pub mod tips;

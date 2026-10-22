@@ -4,8 +4,6 @@
 //! each tool's own UI. Agents use `hcom` CLI commands (learnt through bootstrap.rs)
 //! as a side-channel for messaging and coordination with other agents.
 
-#[cfg(test)]
-mod fork_conformance;
 mod bootstrap;
 mod claude_actor;
 mod cli_context;
@@ -14,6 +12,8 @@ mod config;
 pub mod core;
 mod db;
 mod delivery;
+#[cfg(test)]
+mod fork_conformance;
 pub mod hooks;
 pub mod identity;
 mod instance_binding;
@@ -27,6 +27,7 @@ pub mod messages;
 mod notify;
 mod paths;
 mod pidtrack;
+mod provider_result;
 mod pty;
 pub mod relay;
 pub mod router;
