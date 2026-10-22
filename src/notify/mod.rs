@@ -14,7 +14,7 @@ pub mod server;
 pub mod wake;
 
 pub use server::NotifyServer;
-pub use wake::{WAKE_TARGETED_MS, snapshot_wake_ports, wake, wake_all, wake_ports};
+pub use wake::{WAKE_TARGETED_MS, snapshot_wake_ports, wake, wake_all, wake_observers, wake_ports};
 
 /// Kinds of wake endpoint stored in the `notify_endpoints` table.
 ///
@@ -36,6 +36,8 @@ pub enum WakeKind {
     ListenFilter,
     /// `hcom events --wait` blocking poll.
     EventsWait,
+    /// Continuous event streaming loop.
+    EventsStream,
     /// Temporary launch-confirmation waiter.
     LaunchWait,
     /// OpenCode plugin runtime.
@@ -54,6 +56,7 @@ impl WakeKind {
         WakeKind::Listen,
         WakeKind::ListenFilter,
         WakeKind::EventsWait,
+        WakeKind::EventsStream,
         WakeKind::LaunchWait,
         WakeKind::Plugin,
     ];
@@ -66,6 +69,7 @@ impl WakeKind {
         WakeKind::Listen,
         WakeKind::ListenFilter,
         WakeKind::EventsWait,
+        WakeKind::EventsStream,
         WakeKind::Plugin,
     ];
 
@@ -82,6 +86,7 @@ impl WakeKind {
             WakeKind::Listen => "listen",
             WakeKind::ListenFilter => "listen_filter",
             WakeKind::EventsWait => "events_wait",
+            WakeKind::EventsStream => "events_stream",
             WakeKind::LaunchWait => "launch_wait",
             WakeKind::Plugin => "plugin",
             WakeKind::SessionStart => "session_start",

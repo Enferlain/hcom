@@ -521,7 +521,7 @@ fn send_strips_redundant_trailing_name_from_auto_resolved_sender() {
 }
 
 #[test]
-fn ai_tool_broadcast_to_many_requires_go_preview() {
+fn ai_tool_explicit_broadcast_to_many_requires_go_preview() {
     let h = Hcom::new();
     let sender = h.start();
     for _ in 0..4 {
@@ -533,6 +533,7 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
         "send",
         "--name",
         &sender,
+        "--broadcast",
         "--",
         "probably meant one person",
     ]);
@@ -564,6 +565,7 @@ fn ai_tool_broadcast_to_many_requires_go_preview() {
         "send",
         "--name",
         &sender,
+        "--broadcast",
         "--",
         "confirmed broadcast",
     ]);
@@ -2175,7 +2177,10 @@ fn send_rejects_ambiguous_bare_word_and_self_target() {
 
     let (code, _stdout, stderr) = h.run(["send", "hello", "--name", &me]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("hcom send -- hello"), "stderr={stderr}");
+    assert!(
+        stderr.contains("hcom send --broadcast -- hello"),
+        "stderr={stderr}"
+    );
 
     let (code, _stdout, stderr) = h.run(["send", &format!("@{me}"), "--name", &me, "--", "x"]);
     assert_eq!(code, 1);
@@ -2210,8 +2215,10 @@ fn send_warns_when_name_disagrees_with_the_shell_identity() {
 
     // pid-sender's shell is bound to `sender`, but it sends under `other` —
     // exactly the shape of an identity that drifted after a rebind or recovery.
-    let (code, stdout, stderr) =
-        h.run_as_process("pid-sender", ["send", "--name", &other, "--", "hi"]);
+    let (code, stdout, stderr) = h.run_as_process(
+        "pid-sender",
+        ["send", "--broadcast", "--name", &other, "--", "hi"],
+    );
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(
         stderr.contains(&sender) && stderr.contains(&other),
@@ -2224,8 +2231,10 @@ fn send_is_quiet_when_name_matches_the_shell_identity() {
     let h = Hcom::new();
     let sender = h.start_with_process_id("pid-sender");
 
-    let (code, stdout, stderr) =
-        h.run_as_process("pid-sender", ["send", "--name", &sender, "--", "hi"]);
+    let (code, stdout, stderr) = h.run_as_process(
+        "pid-sender",
+        ["send", "--broadcast", "--name", &sender, "--", "hi"],
+    );
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(
         !stderr.contains("warning"),
@@ -2243,7 +2252,16 @@ fn send_with_from_skips_the_name_drift_warning() {
     // the shell's binding says nothing about who is sending.
     let (code, stdout, stderr) = h.run_as_process(
         "pid-sender",
-        ["send", "--name", &other, "--from", "bigboss", "--", "hi"],
+        [
+            "send",
+            "--broadcast",
+            "--name",
+            &other,
+            "--from",
+            "bigboss",
+            "--",
+            "hi",
+        ],
     );
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(
@@ -2260,7 +2278,16 @@ fn from_in_message_text_does_not_suppress_the_name_drift_warning() {
 
     let (code, stdout, stderr) = h.run_as_process(
         "pid-sender",
-        ["send", "--name", &other, "--", "use", "--from", "x"],
+        [
+            "send",
+            "--broadcast",
+            "--name",
+            &other,
+            "--",
+            "use",
+            "--from",
+            "x",
+        ],
     );
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(
@@ -2277,7 +2304,15 @@ fn send_with_attached_from_skips_the_name_drift_warning() {
 
     let (code, stdout, stderr) = h.run_as_process(
         "pid-sender",
-        ["send", "--name", &other, "--from=bigboss", "--", "hi"],
+        [
+            "send",
+            "--broadcast",
+            "--name",
+            &other,
+            "--from=bigboss",
+            "--",
+            "hi",
+        ],
     );
     assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
     assert!(

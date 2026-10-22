@@ -191,6 +191,14 @@ fn instance_tool(db: &HcomDb, name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Whether a message intent completes a request watch: only an authored
+/// completion (inform, or the legacy absent/empty intent) does. A receipt
+/// ACK or a nested request is not a completion — the watch stays open for
+/// the actual result.
+fn intent_completes_request(intent: Option<&str>) -> bool {
+    intent.is_none_or(|intent| intent.is_empty() || intent.eq_ignore_ascii_case("inform"))
+}
+
 fn reqwatch_reply_exists(db: &HcomDb, request_id: i64, target: &str, sub_caller: &str) -> bool {
     if sub_caller.is_empty() {
         return false;
@@ -198,7 +206,8 @@ fn reqwatch_reply_exists(db: &HcomDb, request_id: i64, target: &str, sub_caller:
     db.conn()
         .query_row(
             "SELECT 1 FROM events_v WHERE id > ? AND type = 'message' \
-             AND msg_from = ? AND (\
+             AND msg_from = ? \
+             AND COALESCE(NULLIF(LOWER(msg_intent), ''), 'inform') = 'inform' AND (\
                (msg_scope = 'mentions' AND EXISTS (\
                   SELECT 1 FROM json_each(msg_delivered_to) WHERE value = ?\
                 )) \
@@ -288,6 +297,7 @@ fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
                    AND NOT EXISTS (
                        SELECT 1 FROM events_v
                        WHERE id > ?4 AND type = 'message' AND msg_from = ?3
+                         AND COALESCE(NULLIF(LOWER(msg_intent), ''), 'inform') = 'inform'
                          AND (
                              (msg_scope = 'mentions' AND EXISTS (
                                  SELECT 1 FROM json_each(msg_delivered_to) WHERE value = ?5
@@ -678,8 +688,14 @@ fn apply_request_watch_transitions(
     if event_type == "message" {
         let msg_sender = data.get("from").and_then(|v| v.as_str()).unwrap_or("");
         let reply_to_id = data.get("reply_to_local").and_then(|v| v.as_i64());
+        let has_reply_reference = data.get("reply_to").is_some();
+        let completes_request =
+            intent_completes_request(data.get("intent").and_then(|v| v.as_str()));
 
-        if let Some("mentions") = data.get("scope").and_then(|v| v.as_str()) {
+        if completes_request
+            && (!has_reply_reference || reply_to_id.is_some())
+            && let Some("mentions") = data.get("scope").and_then(|v| v.as_str())
+        {
             let msg_delivered_to: Vec<String> = data
                 .get("delivered_to")
                 .and_then(|v| v.as_array())
@@ -700,7 +716,8 @@ fn apply_request_watch_transitions(
             }
         }
 
-        if let Some(rid) = reply_to_id
+        if completes_request
+            && let Some(rid) = reply_to_id
             && !msg_sender.is_empty()
         {
             cancel_request_watches_by_reply_id(db, msg_sender, rid, only);
@@ -2307,8 +2324,91 @@ mod tests {
     }
 
     #[test]
-    fn test_cancel_request_watches_by_reply_id_via_log_event() {
-        // End-to-end: log a broadcast message with reply_to_local → should cancel reqwatch via Path 2
+    fn test_unresolved_reply_reference_does_not_cancel_flow_watch() {
+        let (db, db_path) = setup_full_test_db();
+        let request_id = setup_reqwatch_pair(&db, "requester", "responder", "claude");
+        let sub_key = format!("events_sub:reqwatch-{request_id}-responder");
+
+        let unresolved = serde_json::json!({
+            "from": "responder",
+            "scope": "mentions",
+            "delivered_to": ["requester"],
+            "intent": "inform",
+            "reply_to": "not-a-canonical-origin",
+            "text": "the explicit reference is unresolved",
+        });
+        db.log_event("message", "responder", &unresolved).unwrap();
+        assert!(
+            db.kv_get(&sub_key).unwrap().is_some(),
+            "an unresolved explicit reply must not cancel every matching flow watch"
+        );
+
+        let implicit = serde_json::json!({
+            "from": "responder",
+            "scope": "mentions",
+            "delivered_to": ["requester"],
+            "intent": "inform",
+            "text": "an implicit reply has no reference",
+        });
+        db.log_event("message", "responder", &implicit).unwrap();
+        assert!(
+            db.kv_get(&sub_key).unwrap().is_none(),
+            "a reply without a reference should retain implicit flow cancellation"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_reply_to_different_request_id_does_not_cancel_flow_watch() {
+        let (db, db_path) = setup_full_test_db();
+        let req1_id = setup_reqwatch_pair(&db, "requester", "responder", "claude");
+        let sub_key1 = format!("events_sub:reqwatch-{req1_id}-responder");
+
+        // Log a second, distinct request to responder
+        let req2_data = serde_json::json!({
+            "from": "requester",
+            "sender_kind": "instance",
+            "scope": "mentions",
+            "text": "second request",
+            "delivered_to": ["responder"],
+            "intent": "request",
+            "mentions": ["responder"],
+        });
+        let req2_id = db.log_event("message", "requester", &req2_data).unwrap();
+        create_request_watches(&db, "requester", req2_id, &["responder".to_string()]);
+        let sub_key2 = format!("events_sub:reqwatch-{req2_id}-responder");
+
+        // Responder replies referencing req2_id
+        let reply_to_req2 = serde_json::json!({
+            "from": "responder",
+            "scope": "mentions",
+            "delivered_to": ["requester"],
+            "intent": "inform",
+            "reply_to": format!("#{req2_id}"),
+            "reply_to_local": req2_id,
+            "text": "replying specifically to req 2",
+        });
+        db.log_event("message", "responder", &reply_to_req2)
+            .unwrap();
+
+        // sub_key1 should still exist (not cancelled because req_id != rid)
+        assert!(
+            db.kv_get(&sub_key1).unwrap().is_some(),
+            "reply referencing different request id must not cancel watch for request 1"
+        );
+        // sub_key2 should be cancelled
+        assert!(
+            db.kv_get(&sub_key2).unwrap().is_none(),
+            "reply referencing request 2 must cancel watch for request 2"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_ack_does_not_cancel_request_watch_but_result_does() {
+        // End-to-end: ACK confirms receipt, while a later non-ACK result completes the watch.
         let (db, db_path) = setup_full_test_db();
 
         db.conn
@@ -2353,12 +2453,12 @@ mod tests {
         let sub_key = format!("events_sub:reqwatch-{}-responder", request_id);
         db.kv_set(&sub_key, Some(&reqwatch.to_string())).unwrap();
 
-        // Now log a BROADCAST ack from responder with reply_to_local = request_id
+        // An ACK with the correct reply ID is explicitly non-terminal.
         let ack_data = serde_json::json!({
             "from": "responder",
             "sender_kind": "instance",
             "scope": "broadcast",
-            "text": "done with the task",
+            "text": "received",
             "delivered_to": ["requester"],
             "intent": "ack",
             "reply_to": request_id.to_string(),
@@ -2366,10 +2466,26 @@ mod tests {
         });
         db.log_event("message", "responder", &ack_data).unwrap();
 
-        // Reqwatch should be cancelled via Path 2
+        assert!(
+            db.kv_get(&sub_key).unwrap().is_some(),
+            "An ACK must not cancel a completion watch"
+        );
+
+        let result_data = serde_json::json!({
+            "from": "responder",
+            "sender_kind": "instance",
+            "scope": "broadcast",
+            "text": "done with the task",
+            "delivered_to": ["requester"],
+            "intent": "inform",
+            "reply_to": request_id.to_string(),
+            "reply_to_local": request_id
+        });
+        db.log_event("message", "responder", &result_data).unwrap();
+
         assert!(
             db.kv_get(&sub_key).unwrap().is_none(),
-            "Request-watch should be cancelled when target sends broadcast with reply_to_local matching request_id"
+            "A non-ACK result with the matching reply ID should cancel the request watch"
         );
 
         cleanup_test_db(db_path);
@@ -2557,6 +2673,43 @@ mod tests {
             .unwrap();
         assert_eq!(mentions, r#"["giru"]"#);
         assert_eq!(delivered_to, r#"["giru"]"#);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_reqwatch_reply_ignores_ack_intent() {
+        let (db, db_path) = setup_full_test_db();
+
+        let ack = serde_json::json!({
+            "from": "lasa",
+            "scope": "mentions",
+            "delivered_to": ["giru"],
+            "intent": "ack",
+            "text": "received",
+        });
+        let ack_id = db.log_event("message", "lasa", &ack).unwrap();
+        assert!(!reqwatch_reply_exists(&db, 0, "lasa", "giru"));
+
+        let nested_request = serde_json::json!({
+            "from": "lasa",
+            "scope": "mentions",
+            "delivered_to": ["giru"],
+            "intent": "request",
+            "text": "one question before I finish",
+        });
+        let request_id = db.log_event("message", "lasa", &nested_request).unwrap();
+        assert!(!reqwatch_reply_exists(&db, ack_id, "lasa", "giru"));
+
+        let result = serde_json::json!({
+            "from": "lasa",
+            "scope": "mentions",
+            "delivered_to": ["giru"],
+            "intent": "inform",
+            "text": "finished",
+        });
+        db.log_event("message", "lasa", &result).unwrap();
+        assert!(reqwatch_reply_exists(&db, request_id, "lasa", "giru"));
 
         cleanup_test_db(db_path);
     }

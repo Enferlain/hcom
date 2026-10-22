@@ -73,6 +73,45 @@ pub fn wake_all(db: &HcomDb) {
     wake_ports(&ports, WAKE_FANOUT_MS);
 }
 
+/// Wake all event observer endpoints (events_wait, events_stream, listen_filter)
+/// regardless of instance owner.
+///
+/// These endpoints represent general observers waiting on events. When a
+/// targeted or thread-resolved message is sent, the recipient instance's inbox
+/// loops are woken specifically, while observer loops across all instances
+/// are woken so they can process the newly logged event.
+pub fn wake_observers(db: &HcomDb) {
+    let kinds = [
+        WakeKind::EventsWait,
+        WakeKind::EventsStream,
+        WakeKind::ListenFilter,
+    ];
+    let kinds_sql = kinds
+        .iter()
+        .map(|k| format!("'{}'", k.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT DISTINCT port FROM notify_endpoints \
+         WHERE port > 0 AND kind IN ({kinds_sql})"
+    );
+    let Ok(mut stmt) = db.conn().prepare(&sql) else {
+        return;
+    };
+
+    let ports: Vec<u16> = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.ok())
+        .filter_map(|p| u16::try_from(p).ok())
+        .filter(|p| *p > 0)
+        .collect();
+
+    wake_ports(&ports, WAKE_FANOUT_MS);
+}
+
 /// Wake launch confirmations for this batch, including aggregate waiters.
 /// Events without batch metadata still wake all launch waiters; their status
 /// query may discover a stopped or failed child, so skipping them is unsafe.

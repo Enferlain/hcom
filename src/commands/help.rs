@@ -289,7 +289,10 @@ const LIST_HELP: &[HelpEntry] = &[
 const SEND_HELP: &[HelpEntry] = &[
     ("send @name -- message text", "Direct message"),
     ("send @name1 @name2 -- message", "Multiple targets"),
-    ("send -- message text", "Broadcast to all"),
+    (
+        "send --broadcast -- message text",
+        "Explicit broadcast to all",
+    ),
     ("send @name", "Message from stdin (pipe or heredoc)"),
     ("send @name --file <path>", "Message from file"),
     (
@@ -322,7 +325,7 @@ const SEND_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "  broadcast + --thread reuses prior thread members; seed with @mentions first",
+        "  --thread without @targets reuses prior members; seed with @mentions first",
     ),
     ("", ""),
     ("Sender:", ""),
@@ -355,7 +358,10 @@ const SEND_HELP: &[HelpEntry] = &[
         "  hcom send @luna @nova --intent request -- Can you help?",
         "",
     ),
-    ("  hcom send -- Broadcast message to everyone", ""),
+    (
+        "  hcom send --broadcast -- Broadcast message to everyone",
+        "",
+    ),
     ("  echo 'Complex message' | hcom send @luna", ""),
     ("  hcom send @luna <<'EOF'", ""),
     ("  Multi-line message with special chars", ""),

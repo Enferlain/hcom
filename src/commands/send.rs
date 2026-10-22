@@ -7,12 +7,14 @@ use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
 use crate::identity;
 use crate::messages::{
-    InstanceInfo, MessageEnvelope, MessageScope, compute_scope, should_deliver_message,
-    validate_intent, validate_message,
+    InstanceInfo, MessageEnvelope, MessageScope, compute_scope, sender_instance_key,
+    should_deliver_message, validate_intent, validate_message,
 };
 use crate::shared::{
     CommandContext, SENDER, SenderIdentity, SenderKind, is_inside_ai_tool, status_icon,
 };
+
+pub(crate) const RECIPIENT_FEEDBACK_PREFIX: &str = "Sent to:";
 
 const SEND_AFTER_HELP: &str = "\
 Target matching:
@@ -91,6 +93,10 @@ pub struct SendArgs {
     /// Threaded routing: seed recipients once, then reuse thread members
     #[arg(long)]
     pub thread: Option<String>,
+
+    /// Explicitly allow delivery to every available agent
+    #[arg(long)]
+    pub broadcast: bool,
 
     // ── Sender ──
     /// External sender identity
@@ -410,6 +416,11 @@ pub fn send_message(
         "text": message,
         "delivered_to": delivery.delivered_to.clone(),
     });
+    if let Some(instance_data) = identity.instance_data.as_ref()
+        && let Some(instance_key) = sender_instance_key(&identity.name, instance_data)
+    {
+        data["sender_instance_key"] = serde_json::json!(instance_key);
+    }
 
     // Add scope extra data (mentions)
     if !delivery.effective_mentions.is_empty() {
@@ -472,14 +483,25 @@ pub fn send_message(
         if env.intent.as_ref().map(|i| i.as_str()) == Some("request")
             && matches!(identity.kind, SenderKind::Instance)
             && delivery.effective_scope == MessageScope::Mentions
-            && !delivery.is_thread_resolved
         {
             create_request_watches(db, &identity.name, event_id, &delivery.delivered_to);
         }
     }
 
-    // Notify all instances (wake delivery loops)
-    crate::notify::wake_all(db);
+    // Wake recipient endpoints. Targeted and thread-resolved sends wake only
+    // their resolved local recipients — `wake` on an instance with no registered
+    // endpoints is a no-op, so stopped/unavailable names stay safe. Explicit
+    // broadcasts keep the system-wide fan-out. Event observer loops
+    // (events_wait, events_stream, listen_filter) are woken across all instances
+    // so they see the newly logged event.
+    if delivery.effective_scope == MessageScope::Broadcast {
+        crate::notify::wake_all(db);
+    } else {
+        for recipient in &delivery.delivered_to {
+            crate::notify::wake(db, recipient, &[]);
+        }
+        crate::notify::wake_observers(db);
+    }
 
     // Trigger relay push so remote devices see the message immediately
     crate::relay::trigger_push();
@@ -736,23 +758,67 @@ fn print_stopped_target_hints(db: &HcomDb, explicit_targets: &[String], message:
 
 /// Reject `hcom send hi` / `hcom send luna`: a lone bare word with no `@` and
 /// no `--` is as likely a target missing its `@` as a broadcast, and guessing
-/// broadcast interrupts every agent. Quoted phrases stay broadcasts.
+/// broadcast interrupts every agent. Explicit broadcasts and seeded threads
+/// bypass this diagnostic.
 fn ambiguous_bare_word_error(db: &HcomDb, targets: &[String], word: &str) -> Option<String> {
     if !targets.is_empty() || word.split_whitespace().nth(1).is_some() {
         return None;
     }
-    let mut msg =
-        format!("Error: '{word}' is ambiguous: a target needs '@', a broadcast needs '--'");
+    let mut msg = format!(
+        "Error: '{word}' is ambiguous: a target needs '@', a broadcast needs '--broadcast'"
+    );
     if identity::resolve_display_name_or_stopped(db, word).is_some() {
         msg.push_str(&format!(
             "\nDid you mean @{word}? hcom send @{word} -- <message>"
         ));
     } else {
         msg.push_str(&format!(
-            "\n  Direct:    hcom send @name -- {word}\n  Broadcast: hcom send -- {word}"
+            "\n  Direct:    hcom send @name -- {word}\n  Broadcast: hcom send --broadcast -- {word}"
         ));
     }
     Some(msg)
+}
+
+/// Outcome of validating positional args on the no-separator send path.
+#[derive(Debug, PartialEq)]
+enum PositionalSend {
+    /// `hcom send <agent> <message words...>`: the first bare word resolved to
+    /// an agent, so it acts as an @target and the rest is the message.
+    Targeted { target: String, message: String },
+    /// Multiple bare words that cannot form one message under the current
+    /// rules (bare-word send requires `@`, `--`, or exact agent shorthand).
+    Ambiguous,
+    /// Arguments that pass through to `process_positionals`.
+    Other,
+}
+
+fn validate_positional_send(
+    db: &HcomDb,
+    positionals: &[String],
+    allow_bare_target: bool,
+) -> PositionalSend {
+    // A caller using a seeded thread or explicit broadcast wants to send words,
+    // not pick an agent. Preserve their arguments for normal processing rather
+    // than interpreting the first message word as an agent name.
+    if !allow_bare_target {
+        return PositionalSend::Other;
+    }
+    let bare_count = positionals
+        .iter()
+        .filter(|arg| !arg.starts_with('@'))
+        .count();
+    if bare_count < 2 {
+        return PositionalSend::Other;
+    }
+    if let Some(first) = positionals.first().filter(|arg| !arg.starts_with('@'))
+        && let Some(target) = identity::resolve_display_name(db, first)
+    {
+        return PositionalSend::Targeted {
+            target,
+            message: positionals[1..].join(" "),
+        };
+    }
+    PositionalSend::Ambiguous
 }
 
 /// Main entry point for `hcom send` command.
@@ -861,37 +927,72 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     //   - Single "@name message" (with space) → entire text is message, @mention parsed by compute_scope
     //   - Non-@ args → message text (broadcast)
     //   - Pure @targets → explicit targets
-    let (effective_targets, compat_message) =
-        if !args.has_separator() && !args.stdin && args.file.is_none() && args.base64.is_none() {
-            let (targets, message) = process_positionals(&args.positionals);
-            if let Some(word) = message.as_deref()
-                && let Some(err) = ambiguous_bare_word_error(db, &targets, word)
-            {
-                eprintln!("{err}");
+    let (effective_targets, compat_message) = if !args.has_separator()
+        && !args.stdin
+        && args.file.is_none()
+        && args.base64.is_none()
+    {
+        match validate_positional_send(
+            db,
+            &args.positionals,
+            !args.broadcast && args.thread.is_none(),
+        ) {
+            PositionalSend::Targeted { target, message } => (vec![target], Some(message)),
+            PositionalSend::Ambiguous => {
+                eprintln!("Error: ambiguous send — multiple bare words cannot form one message.");
+                if let Some(first) = args.positionals.first().filter(|arg| !arg.starts_with('@'))
+                    && let Some(stopped) = identity::resolve_display_name_or_stopped(db, first)
+                {
+                    eprintln!("Did you mean @{stopped}? hcom send @{stopped} -- <message>");
+                    eprintln!("Resume with: hcom r {stopped}");
+                } else {
+                    eprintln!(
+                        "Targets require @; put the message after '--' or quote it as one argument:"
+                    );
+                    eprintln!("  hcom send @<agent> -- your message");
+                    eprintln!("  Or: echo 'your message' | hcom send @<agent>");
+                }
                 return 1;
             }
-            (targets, message)
-        } else {
-            // With -- separator or explicit source: validate @targets
-            let mut validated = Vec::new();
-            for arg in &args.positionals {
-                if let Some(stripped) = arg.strip_prefix('@') {
-                    if stripped.is_empty() {
-                        eprintln!("Error: Empty target '@' is not allowed");
-                        return 1;
-                    }
-                    validated.push(stripped.to_string());
-                } else {
-                    let mut msg = format!("Error: Unexpected argument '{arg}'");
-                    if arg.chars().all(|c| c.is_alphabetic()) && arg.len() <= 20 {
-                        msg.push_str(&format!("\nDid you mean @{arg}? Targets require @"));
-                    }
-                    eprintln!("{msg}");
+            PositionalSend::Other => {
+                let (targets, message) = process_positionals(&args.positionals);
+                if !args.broadcast
+                    && args.thread.is_none()
+                    && let Some(word) = message.as_deref()
+                    && let Some(err) = ambiguous_bare_word_error(db, &targets, word)
+                {
+                    eprintln!("{err}");
                     return 1;
                 }
+                (targets, message)
             }
-            (validated, None)
-        };
+        }
+    } else {
+        // With -- separator or explicit source: validate @targets
+        let mut validated = Vec::new();
+        for arg in &args.positionals {
+            if let Some(stripped) = arg.strip_prefix('@') {
+                if stripped.is_empty() {
+                    eprintln!("Error: Empty target '@' is not allowed");
+                    return 1;
+                }
+                validated.push(stripped.to_string());
+            } else {
+                let mut msg = format!("Error: Unexpected argument '{arg}'");
+                if arg.chars().all(|c| c.is_alphabetic()) && arg.len() <= 20 {
+                    msg.push_str(&format!("\nDid you mean @{arg}? Targets require @"));
+                }
+                eprintln!("{msg}");
+                return 1;
+            }
+        }
+        (validated, None)
+    };
+
+    if args.broadcast && (args.thread.is_some() || !effective_targets.is_empty()) {
+        eprintln!("Error: --broadcast cannot be combined with agent targets or --thread");
+        return 1;
+    }
 
     // ── Resolve message ──
     let (mut message, name_was_stripped) = if let Some(msg) = compat_message {
@@ -969,7 +1070,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     }
 
     let targets_to_pass: Option<&[String]> =
-        if args.has_separator() || !effective_targets.is_empty() {
+        if args.has_separator() || !effective_targets.is_empty() || args.broadcast {
             Some(&effective_targets)
         } else {
             None
@@ -977,6 +1078,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
     let preview_has_envelope =
         envelope.intent.is_some() || envelope.reply_to.is_some() || envelope.thread.is_some();
+
     let preview_delivery = match resolve_delivery(
         db,
         &sender_identity,
@@ -995,6 +1097,22 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             return 1;
         }
     };
+
+    if preview_delivery.original_scope == MessageScope::Broadcast
+        && !preview_delivery.is_thread_resolved
+        && !args.broadcast
+    {
+        eprintln!("Error: Refusing implicit broadcast: no explicit recipient was resolved.");
+        eprintln!("Target an agent with @name, reuse a seeded --thread, or add --broadcast.");
+        return 1;
+    }
+    if args.broadcast
+        && (preview_delivery.original_scope != MessageScope::Broadcast
+            || preview_delivery.is_thread_resolved)
+    {
+        eprintln!("Error: --broadcast cannot be combined with agent targets or --thread");
+        return 1;
+    }
 
     if is_inside_ai_tool()
         && !ctx.map(|c| c.go).unwrap_or(false)
@@ -1662,11 +1780,12 @@ mod tests {
 
     #[test]
     #[serial]
-    fn send_message_thread_request_does_not_create_request_watch_rows() {
+    fn send_message_thread_request_creates_and_cancels_request_watch_rows() {
         let (db, path, _env) = setup_test_db();
         db.conn()
             .execute(
-                "INSERT INTO instances (name, created_at) VALUES ('luna', 1000.0), ('nova', 1000.0)",
+                "INSERT INTO instances (name, created_at)
+                 VALUES ('luna', 1000.0), ('nova', 1000.0), ('miso', 1000.0)",
                 [],
             )
             .unwrap();
@@ -1686,7 +1805,7 @@ mod tests {
             &sender,
             "seed",
             Some(&seed_envelope),
-            Some(&["nova".to_string()]),
+            Some(&["nova".to_string(), "miso".to_string()]),
         )
         .unwrap();
 
@@ -1697,7 +1816,7 @@ mod tests {
         };
         let (_, delivered) =
             send_message(&db, &sender, "status?", Some(&request_envelope), None).unwrap();
-        assert_eq!(delivered, vec!["nova".to_string()]);
+        assert_eq!(delivered, vec!["nova".to_string(), "miso".to_string()]);
 
         let reqwatch_count: i64 = db
             .conn()
@@ -1707,7 +1826,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(reqwatch_count, 0);
+        assert_eq!(reqwatch_count, 2);
 
         let (scope, mentions_json): (String, String) = db
             .conn()
@@ -1723,6 +1842,51 @@ mod tests {
             .unwrap();
         assert_eq!(scope, "mentions");
         assert!(mentions_json.contains("nova"));
+
+        let responder = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "nova".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let reply_envelope = MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Inform),
+            thread: Some("ops".into()),
+            ..Default::default()
+        };
+        let (_, delivered) =
+            send_message(&db, &responder, "done", Some(&reply_envelope), None).unwrap();
+        assert_eq!(delivered, vec!["luna".to_string(), "miso".to_string()]);
+
+        let reqwatch_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reqwatch_count, 1);
+
+        let responder = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "miso".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let (_, delivered) =
+            send_message(&db, &responder, "done", Some(&reply_envelope), None).unwrap();
+        assert_eq!(delivered, vec!["luna".to_string(), "nova".to_string()]);
+
+        let reqwatch_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:reqwatch-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reqwatch_count, 0);
 
         cleanup_test_db(path);
     }
@@ -1810,6 +1974,38 @@ mod tests {
         let (targets, msg) = process_positionals(&["hello everyone".to_string()]);
         assert!(targets.is_empty());
         assert_eq!(msg.as_deref(), Some("hello everyone"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_ambiguous_bare_word_error_known_and_unknown() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_time, created_at)
+                 VALUES ('luna', 'claude', 'active', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        // 1. Lone known agent -> Did you mean @luna?
+        let err = ambiguous_bare_word_error(&db, &[], "luna").unwrap();
+        assert!(err.contains("Error: 'luna' is ambiguous"));
+        assert!(err.contains("Did you mean @luna? hcom send @luna -- <message>"));
+
+        // 2. Lone unknown word -> direct + explicit broadcast syntax
+        let err = ambiguous_bare_word_error(&db, &[], "unknownword").unwrap();
+        assert!(err.contains("Error: 'unknownword' is ambiguous"));
+        assert!(err.contains("Direct:    hcom send @name -- unknownword"));
+        assert!(err.contains("Broadcast: hcom send --broadcast -- unknownword"));
+
+        // 3. Multi-word string -> None
+        assert!(ambiguous_bare_word_error(&db, &[], "hello world").is_none());
+
+        // 4. Non-empty targets -> None
+        assert!(ambiguous_bare_word_error(&db, &["luna".to_string()], "msg").is_none());
+
+        cleanup_test_db(path);
     }
 
     #[test]
