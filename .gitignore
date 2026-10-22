@@ -3,3 +3,6 @@
 /.hcom/
 /node_modules/
 __pycache__/
+
+# Local qualification evidence and pristine upstream test snapshots
+.patch-artifacts/

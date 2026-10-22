@@ -1,0 +1,520 @@
+{
+  "format_version": 1,
+  "upstream_base": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+  "reference_fork": "c34bb9f9f1eeb8aee2ef658cb40cf1e7cca3fb3d",
+  "policy": "Upstream owns shared capabilities; retain missing behavior using small integration points. No isolation implementation. Preserve upstream membership persistence and Hermes provider/plugin/parser.",
+  "upstream_owned": {
+    "contracts": [
+      "hermes-core-provider",
+      "hermes-tool-detection",
+      "hermes-backend-plugin",
+      "hermes-backend-ownership",
+      "hermes-launch-resume-config",
+      "hermes-bootstrap"
+    ],
+    "validation": [
+      "cargo test --locked --all-targets hermes -- --test-threads=1",
+      "cargo test --locked --bin hcom fork_conformance -- --test-threads=1",
+      "python3 -I tests/hermes_plugin.py"
+    ],
+    "note": "Run conformance on pristine upstream first. No legacy Hermes backend/plugin/spec/parser port."
+  },
+  "patches": [
+    {
+      "id": "transcript-diagnostics",
+      "contracts": [
+        "transcript-path-diagnostic"
+      ],
+      "depends_on": [],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "commands::transcript",
+          "--",
+          "--test-threads=1"
+        ]
+      ]
+    },
+    {
+      "id": "messaging",
+      "contracts": [
+        "explicit-send-policy",
+        "targeted-recipient-wake",
+        "request-ack-result-separation",
+        "thread-membership-lifetime"
+      ],
+      "depends_on": [],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "message_contracts",
+          "--",
+          "--test-threads=1"
+        ]
+      ]
+    },
+    {
+      "id": "approval-ownership",
+      "contracts": [
+        "approval-owner-race-safety"
+      ],
+      "depends_on": [],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "approval",
+          "--",
+          "--test-threads=1"
+        ],
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "fork_schema",
+          "--",
+          "--test-threads=1"
+        ]
+      ]
+    },
+    {
+      "id": "antigravity-banner",
+      "contracts": [
+        "antigravity-idle-mode-banner"
+      ],
+      "depends_on": [],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "banner",
+          "--",
+          "--test-threads=1"
+        ]
+      ]
+    },
+    {
+      "id": "antigravity-survey",
+      "contracts": [
+        "antigravity-feedback-survey"
+      ],
+      "depends_on": [
+        "approval-ownership"
+      ],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "survey",
+          "--",
+          "--test-threads=1"
+        ]
+      ]
+    },
+    {
+      "id": "connection-signal",
+      "contracts": [
+        "subagent-connected-signal"
+      ],
+      "depends_on": [],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "subagent_connection",
+          "--",
+          "--test-threads=1"
+        ]
+      ]
+    },
+    {
+      "id": "native-participation",
+      "contracts": [
+        "claude-native-session-start-adoption",
+        "codex-wrapperless-vscode-adoption",
+        "codex-thread-sender-resolution",
+        "tool-family-authoritative-binding",
+        "recent-kimi-bind-safety"
+      ],
+      "depends_on": [],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "native_participation",
+          "--",
+          "--test-threads=1"
+        ]
+      ]
+    },
+    {
+      "id": "hermes-extensions",
+      "contracts": [
+        "hermes-session-attribution",
+        "hermes-session-adoption",
+        "hermes-hook-dispatch",
+        "hermes-transcript"
+      ],
+      "depends_on": [
+        "native-participation"
+      ],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "hermes",
+          "--",
+          "--test-threads=1"
+        ]
+      ]
+    },
+    {
+      "id": "filtered-observation",
+      "contracts": [
+        "filtered-listen-isolation",
+        "events-wait-boundaries"
+      ],
+      "depends_on": [],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "event_observation",
+          "--",
+          "--test-threads=1"
+        ]
+      ]
+    },
+    {
+      "id": "worker-progress",
+      "contracts": [
+        "durable-events-stream",
+        "compact-progress-stream"
+      ],
+      "depends_on": [
+        "messaging"
+      ],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "worker_progress",
+          "--",
+          "--test-threads=1"
+        ]
+      ]
+    },
+    {
+      "id": "worker-results",
+      "contracts": [
+        "correlated-result-outcomes",
+        "provider-result-recovery",
+        "typed-launch-blockers"
+      ],
+      "depends_on": [
+        "messaging",
+        "approval-ownership",
+        "worker-progress"
+      ],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "worker_results",
+          "--",
+          "--test-threads=1"
+        ]
+      ]
+    }
+  ],
+  "contracts": {
+    "transcript-path-diagnostic": {
+      "behavior": "Missing executable with inaccessible PATH, real nonexecutable candidate and explicit paths have distinct diagnostics. No missing tool becomes an empty successful result.",
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork distinguishes inaccessible PATH directories from a real non-executable candidate/explicit path; upstream run_search_tool has only NotFound vs general spawn error."
+    },
+    "recent-kimi-bind-safety": {
+      "behavior": "Competing connection lock, old session-binding removal, canonical primary repair, foreign ownership rejection and historical SessionEnd safety.",
+      "classification_at_base": "partial overlap",
+      "upstream_difference": "Upstream has immediate transaction/tool-owner checks; fork additionally repairs Kimi primary session and purges stale aliases in bind_session_to_process_for_tool."
+    },
+    "claude-native-session-start-adoption": {
+      "behavior": [
+        "Two explicit direct hcom starts in one Claude native session converge on one existing binding and do not mint a second row.",
+        "Without the explicit native-participation opt-in, a direct no-process Claude hook remains silent and does not claim a pending row.",
+        "If native participation is opted in, its session export/handshake is scoped to that authoritative opt-in and cannot by itself claim an unrelated pending row.",
+        "An hcom-launched Claude still binds and validates through the upstream process path.",
+        "If Claude-tagged vanilla participation is selected later, add an explicit product test for its ownership and cross-tool constraints instead of reviving the old fallback implicitly."
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork explicit native hook opt-in plus session-keyed direct start; upstream native delivery refers to launched-agent transport, not this participation path."
+    },
+    "codex-wrapperless-vscode-adoption": {
+      "behavior": [
+        "A VS Code SessionStart with no HCOM_PROCESS_ID creates one codex row and a session binding using the supplied transcript/cwd.",
+        "A repeated or concurrent SessionStart/UserPromptSubmit for that session returns the same row and never creates a duplicate.",
+        "The first ordinary UserPromptSubmit can deliver pending hcom context after adoption.",
+        "Wrong originator, missing session, SessionEnd, tool hooks, and stop hooks do not create identities or bypass the gate.",
+        "A failed transaction leaves no partially created row or session binding."
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork narrowly enrolls codex_vscode SessionStart/UserPromptSubmit without launch process ID; upstream resolves launched process binding."
+    },
+    "codex-thread-sender-resolution": {
+      "behavior": [
+        "A no-process command with a previously bound Codex thread resolves the same sender and session ID.",
+        "An unknown thread returns identity-required and creates no row.",
+        "Explicit session/name and process binding retain precedence over the thread lookup.",
+        "A thread bound to a non-Codex row is rejected or ignored rather than attributed to Codex.",
+        "No transcript text or marker is consulted by command identity resolution."
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork permits read-only lookup of an already Codex-owned session through CODEX_THREAD_ID without HCOM_PROCESS_ID; upstream lacks that final identity fallback."
+    },
+    "tool-family-authoritative-binding": {
+      "behavior": [
+        "A process/session/stopped owner of another tool returns Rejected and leaves every binding and placeholder mutation unchanged.",
+        "A same-tool existing owner remains idempotent and a permitted unbound case creates the expected row only when create_if_unbound is true.",
+        "Claude generation attach preserves a live foreign process binding and removes only a stale conflict.",
+        "Wrapperless Codex adoption cannot overwrite a Claude, Kimi, Qoder, or stopped foreign row keyed by the same native ID.",
+        "Database failure rolls back both binding and any attempted orphan creation."
+      ],
+      "classification_at_base": "partial overlap",
+      "upstream_difference": "Checked binder exists upstream; fork extends its use into native Codex/Hermes callers and enrollment paths."
+    },
+    "hermes-core-provider": {
+      "behavior": "Hermes Core Provider Integration & Spec Registration",
+      "classification_at_base": "shared capability",
+      "upstream_difference": "Upstream provides this Hermes capability at feature level through its own implementation; this does not certify a drop-in replacement for every edge case."
+    },
+    "hermes-tool-detection": {
+      "behavior": "Hermes Tool Detection Predicates & Child Environment Scrubbing",
+      "classification_at_base": "shared capability",
+      "upstream_difference": "Upstream provides this Hermes capability at feature level through its own implementation; this does not certify a drop-in replacement for every edge case."
+    },
+    "hermes-session-attribution": {
+      "behavior": "Hermes Subprocess Identity Attribution & Read-Only Resolution",
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork resolves ordinary terminal commands from an enrolled HERMES_SESSION_ID without process binding; upstream normal terminal plugin remains launch-gated."
+    },
+    "hermes-hook-dispatch": {
+      "behavior": "Extend upstream Hermes Pi-family RPC only for guarded ordinary-terminal participation; preserve its plugin, gateway bridges and delivery acknowledgement protocol.",
+      "classification_at_base": "partial overlap",
+      "upstream_difference": "Both have Hermes RPC/lifecycle handlers; fork adds ordinary-session/read-only resolution and checked ownership. Upstream adds shared Pi-family RPC and gateway paths."
+    },
+    "hermes-session-adoption": {
+      "behavior": "Ordinary Session Adoption & Stopped Row Recovery",
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork can adopt ordinary Hermes terminals without hcom launch and recover their session row; upstream normal terminal handle_start requires HCOM_PROCESS_ID (gateway bridges are separate)."
+    },
+    "hermes-backend-plugin": {
+      "behavior": "Hcom-Owned Hermes Backend Extension Package",
+      "classification_at_base": "shared capability",
+      "upstream_difference": "Upstream provides this Hermes capability at feature level through its own implementation; this does not certify a drop-in replacement for every edge case."
+    },
+    "hermes-backend-ownership": {
+      "behavior": "Hermes Plugin Ownership, Installation, and Readiness Evaluation",
+      "classification_at_base": "shared capability",
+      "upstream_difference": "Upstream provides this Hermes capability at feature level through its own implementation; this does not certify a drop-in replacement for every edge case."
+    },
+    "hermes-launch-resume-config": {
+      "behavior": "Hermes Launch Formatting, Resume Argument Merging, and Config",
+      "classification_at_base": "shared capability",
+      "upstream_difference": "Upstream provides this Hermes capability at feature level through its own implementation; this does not certify a drop-in replacement for every edge case."
+    },
+    "hermes-bootstrap": {
+      "behavior": "Hermes Runtime Bootstrap Guidance",
+      "classification_at_base": "shared capability",
+      "upstream_difference": "Upstream provides this Hermes capability at feature level through its own implementation; this does not certify a drop-in replacement for every edge case."
+    },
+    "hermes-transcript": {
+      "behavior": "Hermes SQLite Transcript Parser & Multi-Profile Search",
+      "classification_at_base": "partial overlap",
+      "upstream_difference": "SQLite transcript support exists upstream. Fork --all search additionally gathers recorded DBs from live and stopped Hermes rows across profiles; upstream database_search_path selects ambient profile."
+    },
+    "filtered-listen-isolation": {
+      "behavior": [
+        "After-id is exclusive and catches results preceding arm; default cursor observes future events",
+        "Unrelated inbox remains unread; no temporary subscription or synthetic notice",
+        "Final scan precedes timeout; JSON discriminates match/timeout; timeout exit1 unless --timeout-ok",
+        "Normal CLI/TUI masks internal markers; verbose retains diagnostic detail",
+        "Short listens never change persistent wait_timeout"
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork direct event query does not consume unrelated inbox messages or create synthetic subscription notices; upstream listen_filtered creates temp subscription and consumes InlineBatch inbox messages."
+    },
+    "events-wait-boundaries": {
+      "behavior": [
+        "Filtered or explicit-cursor waits return only matching events",
+        "A prelaunch cursor catches an event before arm; no historical replay",
+        "Default snapshots and persistent subscription behavior remain unchanged",
+        "Filtered or explicit-cursor waits emit no unrelated preview; unfiltered waits retain upstream preview-once-and-continue behavior."
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork one-shot waits accept durable after-id and suppress unrelated previews for filtered/cursor waits; upstream --after-id is follow-only and wait prints unread preview."
+    },
+    "durable-events-stream": {
+      "behavior": [
+        "Ordered flush after each record; resume no replay",
+        "Soft stop retains generation; exact terminal stop ends follow; reused name excluded",
+        "Broken pipe/signals cleanly exit and clean only this endpoint",
+        "No subscription, inbox, request-watch or worker-state mutations"
+      ],
+      "classification_at_base": "partial overlap",
+      "upstream_difference": "Both have ordered flushed event tails/cursor resume/broken-pipe handling. Fork stream --follow NAME pins exact worker generation and stops on its terminal end; upstream --follow is a generic boolean stream mode."
+    },
+    "compact-progress-stream": {
+      "behavior": [
+        "Typed schema and optional thread; no raw command/env/message/transcript fields",
+        "Hostile file detail excluded; accepted path-like text remains untrusted",
+        "Quiet heartbeats bounded; real phase transitions immediate",
+        "Independent request/reply remains functional while compact observer runs"
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork-only compact typed records, cadence coalescing and quiet heartbeat projection; no raw message/command/env fields in compact schema."
+    },
+    "correlated-result-outcomes": {
+      "behavior": [
+        "Reject ambiguous generation or conflicting filters; require one thread and durable attempt cursor",
+        "ACKs, other threads/workers and reused names cannot satisfy result",
+        "Pre-arm blockers found; cleared blockers ignored; final poll precedes deadline",
+        "Exit0 result,1 deadline,2 SQL,3 unavailable,4 blocker,5 launch failure; preserve recovery/correlation evidence"
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork --result-from pins worker generation/thread/attempt and returns typed result/deadline/SQL/unavailable/blocker/launch-failure outcomes. No counterpart in upstream EventsArgs."
+    },
+    "provider-result-recovery": {
+      "behavior": [
+        "Wrong session/thread, ambiguous or unsupported provider returns unavailable",
+        "Earlier resumed turn cannot replay as new result",
+        "Normal authored report takes precedence; recovery records provenance"
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork scoped stopped-generation transcript result recovery with provider/session/thread provenance; upstream has no corresponding result-wait subsystem."
+    },
+    "typed-launch-blockers": {
+      "behavior": [
+        "Ordinary text mentioning trust is not a blocker",
+        "Actual trust/approval/quota/auth states retain correct kind and evidence",
+        "Resolved blockers cannot terminate a later wait; recovery cannot clear an outstanding provider approval"
+      ],
+      "classification_at_base": "partial overlap",
+      "upstream_difference": "Both report launch blockage. Fork additionally classifies auth/quota/trust/etc as structured blocker records and integrates them with correlated waits."
+    },
+    "thread-membership-lifetime": {
+      "behavior": [
+        "Targeted messages seed thread delivery membership; recipient-free followups address known members.",
+        "Thread-resolved requests receive request-watch coverage.",
+        "Preserve upstream membership/subscription persistence across stop/resume and ownership guards; do not restore the older downstream stop-cleanup policy."
+      ],
+      "classification_at_base": "partial overlap",
+      "upstream_difference": "Thread routing/memberships exist upstream. Fork differs in automatic membership cleanup and includes thread-resolved requests in request-watch coverage; upstream currently excludes is_thread_resolved requests and restores memberships on resume."
+    },
+    "request-ack-result-separation": {
+      "behavior": [
+        "Correct ACK does not close completion watch; later inform does",
+        "Nested request is not a completion",
+        "Absent/empty legacy intent stays inform; ACK never required"
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork only inform/legacy intent completes a request watch; upstream cancellation paths receive no intent and may cancel on ACK or nested request."
+    },
+    "explicit-send-policy": {
+      "behavior": [
+        "No accidental implicit global send",
+        "Exact bare target accepted; ambiguous input gives canonical syntax before stdin",
+        "--broadcast rejects explicit targets/thread conflict",
+        "Seeded thread followup remains recipient-free without global fanout"
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork requires explicit --broadcast for global fanout and validates target/thread conflicts; upstream accepts recipient-free text broadcasts with preview/ambiguity handling."
+    },
+    "targeted-recipient-wake": {
+      "behavior": [
+        "Only actual targeted/thread recipients wake",
+        "Explicit broadcast still wakes all",
+        "No endpoint remains harmless; unrelated event subscribers still get relevant wake"
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork wakes resolved recipients for targeted/thread sends; upstream send_message calls wake_all."
+    },
+    "approval-owner-race-safety": {
+      "behavior": [
+        "Sibling PostToolUse/failure/denial leaves owning approval blocked",
+        "Owner completion/denial resolves it; replaced approval survives stale token",
+        "Late approval survives nonapproval restore; DB errors fail closed",
+        "PTY falling edge does not clear a different replacement approval"
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork tracks pending approval owner/tool-use token and rejects stale/sibling clears; upstream has general delivery gate race guards but PostToolUse clears a blocked row without this owner token protocol."
+    },
+    "subagent-connected-signal": {
+      "behavior": [
+        "Concurrent manual start/hook ACK emits exactly one connected event",
+        "Failed transaction emits neither claim nor event",
+        "Bootstrap write/ACK contract remains intact",
+        "TUI and filters recognize connection as startup activity"
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork emits one atomic durable life.connected event on actual bootstrap/start ACK; upstream has no corresponding life event path."
+    },
+    "antigravity-idle-mode-banner": {
+      "behavior": [
+        "Known accept-edits, plan and best-of-N composer mode banners, including narrow-pane wraps, represent an empty prompt even when not dim-styled.",
+        "Real typed input remains protected; delivery follows existing inject/verify/submit gates and submit-edge tracking."
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork treats exact/wrapped known non-dim mode placeholders as empty prompt; upstream extractor relies on dim styling/readiness without banner recognition."
+    },
+    "antigravity-feedback-survey": {
+      "behavior": [
+        "Recognize a complete active non-task survey, reject quotes/partial frames/real prompts and approval dialogs; Skip uses only byte0, never Enter.",
+        "Bounded stable-frame retries, redraw grace and wall-clock escalation publish pty:survey after failed dismissal; publication and release preserve foreign blocker ownership.",
+        "Unix and Windows share the same controller; row and status event changes commit atomically before notifications."
+      ],
+      "classification_at_base": "fork extension",
+      "upstream_difference": "Fork recognizes complete active survey and performs bounded Skip-only dismissal/typed fallback preserving blocker ownership. No corresponding upstream survey controller."
+    }
+  }
+}
