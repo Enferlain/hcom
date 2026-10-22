@@ -2658,5 +2658,76 @@ No session found matching 'never-saved'"
 
     // ---- Antigravity mode-banner delivery wiring (hcom-f6g.10) ----
 
+    /// Tracker showing a ready, empty agy prompt in accept-edits mode: the
+    /// mode banner on the `>` row plus the ready footer. Built with the real
+    /// constructor exactly as the PTY loops do; the pty-debug flag only adds
+    /// logging and cannot affect extraction.
+    fn banner_tracker() -> ScreenTracker {
+        let mut tracker =
+            ScreenTracker::new_with_instance(24, 80, &[String::from("? for shortcuts")], None);
+        tracker.process(
+            "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\r\n".as_bytes(),
+        );
+        tracker.process("? for shortcuts\r\n".as_bytes());
+        tracker
+    }
 
+    #[test]
+    fn delivery_state_maps_antigravity_mode_banner_to_empty_prompt() {
+        // hcom-f6g.10: a ready agy prompt whose only contents is the visible
+        // accept-edits mode banner must reach the delivery gate as an empty
+        // prompt (input_text=Some("")), so a targeted send injects, submits
+        // exactly one turn, and the submit-edge stamping below still fires on
+        // the injected text clearing — instead of blocking forever on
+        // prompt_has_text with the banner read back as uncommitted text.
+        let screen_state = Arc::new(RwLock::new(ScreenState::default()));
+        let tracker = banner_tracker();
+        let launch_phase_active = Arc::new(AtomicBool::new(true));
+        update_delivery_state(
+            &screen_state,
+            &tracker,
+            &PtyTarget::Known(Tool::Antigravity),
+            &launch_phase_active,
+            &|_| {},
+        );
+        {
+            let state = screen_state.read().unwrap();
+            assert!(state.ready);
+            assert!(state.prompt_empty);
+            assert_eq!(state.input_text.as_deref(), Some(""));
+            assert!(!state.approval);
+        }
+
+        // Injected wake text replaces the banner; on Enter it clears back to
+        // the banner — still an empty prompt, with the submit edge stamped.
+        let mut mid_turn = banner_tracker();
+        mid_turn.process("\x1b[1;1H\x1b[2J".as_bytes());
+        mid_turn.process("> <hcom>test</hcom>\r\n? for shortcuts\r\n".as_bytes());
+        update_delivery_state(
+            &screen_state,
+            &mid_turn,
+            &PtyTarget::Known(Tool::Antigravity),
+            &launch_phase_active,
+            &|_| {},
+        );
+        {
+            let state = screen_state.read().unwrap();
+            assert!(!state.prompt_empty);
+            assert_eq!(state.input_text.as_deref(), Some("<hcom>test</hcom>"));
+            assert!(state.last_prompt_submit.is_none());
+        }
+
+        let cleared = banner_tracker();
+        update_delivery_state(
+            &screen_state,
+            &cleared,
+            &PtyTarget::Known(Tool::Antigravity),
+            &launch_phase_active,
+            &|_| {},
+        );
+        let state = screen_state.read().unwrap();
+        assert!(state.prompt_empty);
+        assert_eq!(state.input_text.as_deref(), Some(""));
+        assert!(state.last_prompt_submit.is_some());
+    }
 }
