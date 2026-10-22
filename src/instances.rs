@@ -98,6 +98,7 @@ mod tests {
             last_seen: 0,
             status_context: String::new(),
             status_detail: String::new(),
+            pending_tool_use_id: String::new(),
             directory: String::new(),
             created_at: 0.0,
             transcript_path: String::new(),

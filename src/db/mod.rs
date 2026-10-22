@@ -31,7 +31,9 @@ pub(crate) mod reqwatch_policy;
 mod sessions;
 pub(crate) mod subscriptions;
 
+mod fork_schema;
 pub use events::Message;
+pub use instances::ApprovalToken;
 pub use instances::InstanceRow;
 #[allow(unused_imports)]
 pub use instances::InstanceStatus;
@@ -246,6 +248,7 @@ impl HcomDb {
         })
     }
 
+
     /// Reconnect if the DB file was replaced (e.g., by hcom reset / schema bump).
     /// Long-lived threads (PTY delivery, listeners) hold an open connection to the
     /// old inode; this moves them onto the new DB file.
@@ -307,6 +310,11 @@ impl HcomDb {
     /// Creates all tables, indexes, events_v view, FTS5 virtual table + trigger,
     /// and sets PRAGMA user_version.
     pub fn init_db(&self) -> Result<()> {
+        self.init_upstream_db()?;
+        self.ensure_fork_schema()
+    }
+
+    fn init_upstream_db(&self) -> Result<()> {
         // Skip if already at current version (avoids DROP VIEW race with concurrent readers)
         let current: i32 = self
             .conn
@@ -503,6 +511,15 @@ impl HcomDb {
     /// Checks schema version, archives DB if mismatched, reconnects, and reinitializes.
     /// Call after open() for production use.
     pub fn ensure_schema(&mut self) -> Result<()> {
+        let legacy_fork = self.has_legacy_fork_stamp()?;
+        self.ensure_upstream_schema()?;
+        if legacy_fork {
+            self.repair_legacy_fork_fts()?;
+        }
+        self.ensure_fork_schema()
+    }
+
+    fn ensure_upstream_schema(&mut self) -> Result<()> {
         match self.check_schema_compat()? {
             SchemaCompat::Ok => {
                 self.init_db()?;

@@ -314,6 +314,22 @@ pub(super) fn note_user_keystroke(
     approval_cleared
 }
 
+/// After a refused guarded release, mirror the actual row into the shared
+/// title status: a standing (possibly replaced) approval keeps the blocked
+/// title, while an approval another path already resolved must not be
+/// re-blocked.
+fn mirror_shared_status_after_refusal(
+    db: &HcomDb,
+    instance_name: &str,
+    current_status: &Arc<RwLock<String>>,
+) {
+    if let Ok(Some(row)) = db.get_instance_full(instance_name)
+        && let Ok(mut shared_status) = current_status.write()
+    {
+        *shared_status = row.status;
+    }
+}
+
 /// Publish PTY approval edges independently of the delivery queue.
 ///
 /// Approval is agent state: `hcom list` must report it even when no message
@@ -360,9 +376,13 @@ pub(super) fn publish_approval_status(
             return;
         }
     };
-    let already_blocked = current
+    let pty_blocked = current
         .as_ref()
         .is_some_and(|row| row.status == ST_BLOCKED && row.status_context == "pty:approval");
+    let hook_blocked = current
+        .as_ref()
+        .is_some_and(|row| row.status == ST_BLOCKED && row.status_context == "approval");
+    let already_blocked = pty_blocked || hook_blocked;
 
     // Resolve the approval edge to publish: block on the rising edge, release
     // on the falling edge, and stay silent when the row already matches.
@@ -373,7 +393,9 @@ pub(super) fn publish_approval_status(
     let edge = if approval {
         (!already_blocked).then_some((ST_BLOCKED, "pty:approval"))
     } else {
-        already_blocked.then_some((ST_ACTIVE, "pty:approval_cleared"))
+        pty_blocked
+            .then_some((ST_ACTIVE, "pty:approval_cleared"))
+            .or_else(|| hook_blocked.then_some((ST_ACTIVE, "denied:screen")))
     };
     let Some((status, context)) = edge else {
         // No transition to publish. Still reflect a standing block in the
@@ -384,47 +406,129 @@ pub(super) fn publish_approval_status(
         return;
     };
 
-    // Write the instance row, then log a paired status event. The bare
-    // `set_status` leaves `status_detail` (the gated-command preview) intact,
-    // while the explicit event keeps the block/release visible to the events
-    // table, `events sub`, and the TUI — mirroring how the sibling
-    // launch_blocked path pairs a row write with its own emitted event.
-    // Without the event, the row updates silently and event consumers never
-    // see the approval gate (Codex's only PTY-driven block path).
-    if let Err(error) = db.set_status(&instance_name, status, context) {
-        log_warn(
-            "native",
-            "pty.approval_status_failed",
-            &format!(
-                "Failed to publish approval={} for {}: {}",
-                approval, instance_name, error
-            ),
-        );
-        return;
-    }
-
-    let position = current.as_ref().map(|row| row.last_event_id).unwrap_or(0);
-    let detail = current
-        .as_ref()
-        .map(|row| row.status_detail.as_str())
-        .unwrap_or("");
-    let mut data = serde_json::json!({
-        "status": status,
-        "context": context,
-        "position": position,
-    });
-    if !detail.is_empty() {
-        data["detail"] = serde_json::json!(detail);
-    }
-    if let Err(error) = db.log_event("status", &instance_name, &data) {
-        log_warn(
-            "native",
-            "pty.approval_status_event_failed",
-            &format!(
-                "Failed to emit approval status event ({}) for {}: {}",
-                context, instance_name, error
-            ),
-        );
+    // A falling edge releases whatever approval the row held, including a
+    // hook-owned one — as ONE guarded transition that re-verifies the blocked
+    // approval state and its snapshotted identity (owner, status_time,
+    // detail) at write time. A PermissionRequest that landed after the
+    // snapshot above (or an approval another path already resolved) refuses
+    // the update: the newer approval survives, no owner is cleared, and no
+    // release event is emitted. The release and its paired status event
+    // commit in ONE write scope — a failed event insert rolls the release
+    // back — and the wake/subscription side effects fire only after that
+    // commit. The rising edge below mirrors this shape with its own guard.
+    if !approval {
+        let token = current
+            .as_ref()
+            .map(crate::db::ApprovalToken::from_row)
+            .unwrap_or_default();
+        let release = db.with_write_scope(|| {
+            if !db.resolve_owned_approval(&instance_name, &token, status, context, None)? {
+                return Ok(None);
+            }
+            let position = current.as_ref().map(|row| row.last_event_id).unwrap_or(0);
+            let detail = current
+                .as_ref()
+                .map(|row| row.status_detail.as_str())
+                .unwrap_or("");
+            let mut data = serde_json::json!({
+                "status": status,
+                "context": context,
+                "position": position,
+            });
+            if !detail.is_empty() {
+                data["detail"] = serde_json::json!(detail);
+            }
+            let event_id = db.insert_event_row("status", &instance_name, &data, None)?;
+            Ok(Some((event_id, data)))
+        });
+        match release {
+            Ok(Some((event_id, data))) => {
+                crate::notify::wake(&db, &instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+                db.after_event_logged(event_id, "status", &instance_name, &data);
+            }
+            Ok(None) => {
+                log_info(
+                    "native",
+                    "pty.approval_replaced_before_release",
+                    &format!(
+                        "instance={} expected_owner={} context={}",
+                        instance_name, token.owner, context
+                    ),
+                );
+                mirror_shared_status_after_refusal(&db, &instance_name, current_status);
+                return;
+            }
+            Err(error) => {
+                log_warn(
+                    "native",
+                    "pty.approval_status_failed",
+                    &format!(
+                        "Failed to publish approval={} for {}: {}",
+                        approval, instance_name, error
+                    ),
+                );
+                return;
+            }
+        }
+    } else {
+        // A rising edge publishes pty:approval as ONE guarded write: if an
+        // interactive approval (hook-owned PermissionRequest or sibling PTY
+        // approval) landed concurrently after the unlocked snapshot above,
+        // the update is refused. The existing approval survives with its
+        // owner, context, and detail untouched, and no spurious pty:approval
+        // event is emitted. The block and its paired status event commit in
+        // ONE write scope — a failed event insert rolls the block back (the
+        // next screen tick re-detects the prompt and retries) — and the
+        // wake/subscription side effects fire only after that commit.
+        let rising = db.with_write_scope(|| {
+            if !db.record_pty_approval(&instance_name)? {
+                return Ok(None);
+            }
+            let position = current.as_ref().map(|row| row.last_event_id).unwrap_or(0);
+            let detail = current
+                .as_ref()
+                .map(|row| row.status_detail.as_str())
+                .unwrap_or("");
+            let mut data = serde_json::json!({
+                "status": status,
+                "context": context,
+                "position": position,
+            });
+            if !detail.is_empty() {
+                data["detail"] = serde_json::json!(detail);
+            }
+            let event_id = db.insert_event_row("status", &instance_name, &data, None)?;
+            Ok(Some((event_id, data)))
+        });
+        match rising {
+            Ok(Some((event_id, data))) => {
+                crate::notify::wake(&db, &instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+                db.after_event_logged(event_id, "status", &instance_name, &data);
+            }
+            Ok(None) => {
+                log_info(
+                    "native",
+                    "pty.approval_rising_edge_refused",
+                    &format!(
+                        "instance={} already has pending approval; retaining owner/context",
+                        instance_name
+                    ),
+                );
+                mirror_shared_status_after_refusal(&db, &instance_name, current_status);
+                return;
+            }
+            Err(error) => {
+                log_warn(
+                    "native",
+                    "pty.approval_status_failed",
+                    &format!(
+                        "Failed to publish approval={} for {}: {}",
+                        approval, instance_name, error
+                    ),
+                );
+                return;
+            }
+        }
     }
 
     if let Ok(mut shared_status) = current_status.write() {
@@ -2255,4 +2359,304 @@ No session found matching 'never-saved'"
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.get("pane_id").is_none());
     }
+
+    #[test]
+    #[serial]
+    fn publish_approval_status_falling_edge_clears_hook_owned_approval_owner() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, pending_tool_use_id, status_time, created_at)
+                 VALUES ('hera', 'claude', 'blocked', 'approval', 'Read ~/.config/app.cfg', 'tool-x', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+        let shared_status = Arc::new(RwLock::new(crate::shared::ST_BLOCKED.to_string()));
+
+        publish_approval_status(false, Some("hera"), &shared_status);
+
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "denied:screen");
+        assert_eq!(
+            row.pending_tool_use_id, "",
+            "the falling edge must clear the hook-owned approval's recorded owner"
+        );
+        assert_eq!(*shared_status.read().unwrap(), ST_ACTIVE);
+    }
+
+    #[test]
+    #[serial]
+    fn publish_approval_status_falling_edge_emits_release_event() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, pending_tool_use_id, status_time, last_event_id, created_at)
+                 VALUES ('hera', 'claude', 'blocked', 'pty:approval', 'Bash: cargo test', '', 0, 42, 1000.0)",
+                [],
+            )
+            .unwrap();
+        let shared_status = Arc::new(RwLock::new(crate::shared::ST_BLOCKED.to_string()));
+
+        publish_approval_status(false, Some("hera"), &shared_status);
+
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "pty:approval_cleared");
+        let events = db
+            .get_events_since(0, Some("status"), Some("hera"))
+            .unwrap();
+        let release = events
+            .iter()
+            .find(|e| {
+                e.get("data")
+                    .and_then(|d| d.get("context"))
+                    .and_then(|v| v.as_str())
+                    == Some("pty:approval_cleared")
+            })
+            .expect("the falling edge must emit its paired release status event");
+        let data = release.get("data").unwrap();
+        assert_eq!(data.get("status").and_then(|v| v.as_str()), Some(ST_ACTIVE));
+        assert_eq!(
+            data.get("detail").and_then(|v| v.as_str()),
+            Some("Bash: cargo test"),
+            "the release event keeps the gated-command preview"
+        );
+        assert_eq!(
+            data.get("position").and_then(|v| v.as_i64()),
+            Some(42),
+            "the release event carries the snapshot cursor position"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn publish_approval_status_release_event_failure_rolls_back_release() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, pending_tool_use_id, status_time, created_at)
+                 VALUES ('hera', 'claude', 'blocked', 'pty:approval', 'Bash: cargo test', 'tool-x', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+        // Force the paired status-event insert to fail inside the write scope.
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_status_event BEFORE INSERT ON events
+                 WHEN NEW.type = 'status'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced status event failure');
+                 END;",
+            )
+            .unwrap();
+        let shared_status = Arc::new(RwLock::new(crate::shared::ST_BLOCKED.to_string()));
+
+        publish_approval_status(false, Some("hera"), &shared_status);
+
+        // The release and its event are one transaction: the failed event
+        // insert rolls the row back to the standing approval.
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "pty:approval");
+        assert_eq!(
+            row.pending_tool_use_id, "tool-x",
+            "the owner must survive the rolled-back release"
+        );
+        assert_eq!(row.status_detail, "Bash: cargo test");
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "no event may survive a rolled-back release");
+        assert_eq!(*shared_status.read().unwrap(), crate::shared::ST_BLOCKED);
+    }
+
+    #[test]
+    #[serial]
+    fn publish_approval_status_rising_edge_event_failure_rolls_back_block() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, status_time, created_at)
+                 VALUES ('hera', 'claude', 'listening', 'idle', 'original_detail', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+        // Force the paired status-event insert to fail inside the write scope.
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER fail_status_event BEFORE INSERT ON events
+                 WHEN NEW.type = 'status'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced status event failure');
+                 END;",
+            )
+            .unwrap();
+        let shared_status = Arc::new(RwLock::new(crate::shared::ST_LISTENING.to_string()));
+
+        publish_approval_status(true, Some("hera"), &shared_status);
+
+        // The block and its event are one transaction: the failed event
+        // insert rolls the row back; the next screen tick retries the edge.
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, crate::shared::ST_LISTENING);
+        assert_eq!(row.status_context, "idle");
+        assert_eq!(row.status_detail, "original_detail");
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "no event may survive a rolled-back block");
+        assert_eq!(*shared_status.read().unwrap(), crate::shared::ST_LISTENING);
+    }
+
+    #[test]
+    #[serial]
+    fn publish_approval_status_release_refuses_replaced_approval() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, pending_tool_use_id, status_time, created_at)
+                 VALUES ('hera', 'claude', 'blocked', 'approval', 'Read ~/.config/app.cfg', 'tool-x', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let snapshot = db.get_instance_full("hera").unwrap().unwrap();
+        db.record_pending_approval("hera", "tool-z", "Bash: cargo test")
+            .unwrap();
+        assert!(
+            !db.resolve_owned_approval(
+                "hera",
+                &crate::db::ApprovalToken::from_row(&snapshot),
+                crate::shared::ST_LISTENING,
+                "denied:screen",
+                None
+            )
+            .unwrap()
+        );
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-z");
+        assert_eq!(row.status_detail, "Bash: cargo test");
+
+        let current = db.get_instance_full("hera").unwrap().unwrap();
+        assert!(
+            db.resolve_owned_approval(
+                "hera",
+                &crate::db::ApprovalToken::from_row(&current),
+                crate::shared::ST_LISTENING,
+                "denied:screen",
+                None
+            )
+            .unwrap()
+        );
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, crate::shared::ST_LISTENING);
+        assert_eq!(row.status_context, "denied:screen");
+        assert_eq!(row.pending_tool_use_id, "");
+        assert_eq!(
+            row.status_detail, "Bash: cargo test",
+            "the guarded release preserves the gated-command preview"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mirror_shared_status_after_refusal_mirrors_the_row() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('hera', 'claude', 'listening', 'pty:approval_cleared', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+        let shared_status = Arc::new(RwLock::new(crate::shared::ST_LISTENING.to_string()));
+
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'blocked', status_context = 'approval',
+                     pending_tool_use_id = 'tool-z' WHERE name = 'hera'",
+                [],
+            )
+            .unwrap();
+        mirror_shared_status_after_refusal(&db, "hera", &shared_status);
+        assert_eq!(*shared_status.read().unwrap(), ST_BLOCKED);
+
+        db.conn()
+            .execute(
+                "UPDATE instances SET status = 'listening', status_context = 'denied:Read',
+                     pending_tool_use_id = '' WHERE name = 'hera'",
+                [],
+            )
+            .unwrap();
+        mirror_shared_status_after_refusal(&db, "hera", &shared_status);
+        assert_eq!(*shared_status.read().unwrap(), crate::shared::ST_LISTENING);
+    }
+
+    #[test]
+    #[serial]
+    fn publish_approval_status_rising_edge_refuses_when_permission_request_pending() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, tool, status, status_context, status_detail, pending_tool_use_id, status_time, created_at)
+                 VALUES ('hera', 'claude', 'blocked', 'approval', 'Run rm -rf', 'tool-xyz', 0, 1000.0)",
+                [],
+            )
+            .unwrap();
+        let shared_status = Arc::new(RwLock::new(crate::shared::ST_BLOCKED.to_string()));
+
+        // Rising edge approval publish must refuse to overwrite hook-owned approval!
+        publish_approval_status(true, Some("hera"), &shared_status);
+
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(
+            row.status_context, "approval",
+            "context must not be overwritten to pty:approval"
+        );
+        assert_eq!(
+            row.pending_tool_use_id, "tool-xyz",
+            "owner must be retained"
+        );
+        assert_eq!(row.status_detail, "Run rm -rf", "detail must be retained");
+        assert_eq!(*shared_status.read().unwrap(), ST_BLOCKED);
+
+        // Verify no pty:approval status event was emitted
+        let events = db
+            .get_events_since(0, Some("status"), Some("hera"))
+            .unwrap();
+        let pty_approval_event = events.iter().find(|e| {
+            e.get("data")
+                .and_then(|d| d.get("context"))
+                .and_then(|v| v.as_str())
+                == Some("pty:approval")
+        });
+        assert!(
+            pty_approval_event.is_none(),
+            "no pty:approval event should be emitted"
+        );
+    }
+
+    // ---- Antigravity mode-banner delivery wiring (hcom-f6g.10) ----
+
+
 }

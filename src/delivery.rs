@@ -1151,14 +1151,36 @@ fn emit_launch_ready_once(
     } else {
         "ready_observed"
     };
-    if let Err(e) = db.set_status(current_name, ST_LISTENING, context) {
-        log_warn(
-            "native",
-            "delivery.launch_ready_status_fail",
-            &format!("Failed to mark launch ready for {}: {}", current_name, e),
-        );
-        return;
+    match crate::instance_lifecycle::restore_status_if_no_approval(
+        db,
+        current_name,
+        None,
+        ST_LISTENING,
+        context,
+        crate::instance_lifecycle::StatusUpdate::default(),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            log_info(
+                "native",
+                "delivery.launch_ready_refused_approval",
+                &format!(
+                    "Launch ready status update refused for {}: pending approval active",
+                    current_name
+                ),
+            );
+            return;
+        }
+        Err(e) => {
+            log_warn(
+                "native",
+                "delivery.launch_ready_status_fail",
+                &format!("Failed to mark launch ready for {}: {}", current_name, e),
+            );
+            return;
+        }
     }
+
     if let Err(e) = db.emit_ready_event(current_name, ST_LISTENING, context) {
         log_warn(
             "native",
@@ -1207,16 +1229,37 @@ fn emit_launch_blocked_once(
         return;
     }
 
-    if let Err(e) = db.set_status(current_name, ST_BLOCKED, "launch_blocked") {
-        log_warn(
-            "native",
-            "delivery.launch_blocked_status_fail",
-            &format!(
-                "Failed to set launch_blocked status for {}: {}",
-                current_name, e
-            ),
-        );
-        return;
+    match crate::instance_lifecycle::restore_status_if_no_approval(
+        db,
+        current_name,
+        None,
+        ST_BLOCKED,
+        "launch_blocked",
+        crate::instance_lifecycle::StatusUpdate::default(),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            log_info(
+                "native",
+                "delivery.launch_blocked_refused_approval",
+                &format!(
+                    "Launch blocked status update refused for {}: pending approval active",
+                    current_name
+                ),
+            );
+            return;
+        }
+        Err(e) => {
+            log_warn(
+                "native",
+                "delivery.launch_blocked_status_fail",
+                &format!(
+                    "Failed to set launch_blocked status for {}: {}",
+                    current_name, e
+                ),
+            );
+            return;
+        }
     }
 
     if let Err(e) = db.emit_launch_blocked_event(

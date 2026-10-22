@@ -4,7 +4,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::db::{HcomDb, InstanceRow};
+use crate::db::{ApprovalToken, HcomDb, InstanceRow};
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
 use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_INACTIVE, ST_LAUNCHING, ST_LISTENING};
 
@@ -684,7 +684,47 @@ pub fn try_set_status(
         let old_status = current_data.as_ref().map(|d| d.status.as_str());
         let status_changed = old_status != Some(status);
 
-        db.update_instance_fields(instance_name, &updates)?;
+        // Leaving an interactive approval (any transition off blocked:approval /
+        // pty:approval — idle_prompt, user prompt, stop, session end, stale
+        // cleanup) must drop the recorded owner so no later terminal hook can
+        // claim a stale tool_use_id against a future approval — and must do so
+        // as a write-time guarded transition: if a replacement PermissionRequest
+        // landed after the snapshot above, the guard refuses, no stale event or
+        // wake is emitted, and the newer approval stays intact. Staying inside
+        // the approval contexts keeps the plain write (a replacement
+        // PermissionRequest already recorded its owner atomically).
+        let leaves_approval = current_data.as_ref().is_some_and(|d| {
+            d.status == ST_BLOCKED
+                && matches!(d.status_context.as_str(), "approval" | "pty:approval")
+                && !(status == ST_BLOCKED && matches!(context, "approval" | "pty:approval"))
+        });
+
+        let applied = if leaves_approval {
+            let snapshot = current_data
+                .as_ref()
+                .expect("leaves_approval implies a row");
+            match db.resolve_owned_approval(
+                instance_name,
+                &ApprovalToken::from_row(snapshot),
+                status,
+                context,
+                Some(detail),
+            ) {
+                Ok(applied) => applied,
+                Err(e) => {
+                    eprintln!(
+                        "[hcom] warn: set_status leave-approval DB write failed for {instance_name}: {e}"
+                    );
+                    return Ok((false, None));
+                }
+            }
+        } else {
+            db.update_instance_fields(instance_name, &updates)?;
+            true
+        };
+        if !applied {
+            return Ok((false, None));
+        }
 
         let position = current_data.as_ref().map(|d| d.last_event_id).unwrap_or(0);
         let mut data = serde_json::json!({
@@ -726,6 +766,226 @@ pub fn try_set_status(
         db.after_event_logged(event_id, "status", instance_name, &data);
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn status_event_data(
+    current_data: Option<&InstanceRow>,
+    status: &str,
+    context: &str,
+    detail: &str,
+    msg_ts: &str,
+    tool_name: &str,
+    tool_use_id: &str,
+    writer: &std::panic::Location<'_>,
+) -> serde_json::Value {
+    let position = current_data.map(|d| d.last_event_id).unwrap_or(0);
+    let mut data = serde_json::json!({
+        "status": status,
+        "context": context,
+        "position": position,
+    });
+    if !detail.is_empty() {
+        data["detail"] = serde_json::json!(detail);
+    }
+    if !msg_ts.is_empty() {
+        data["msg_ts"] = serde_json::json!(msg_ts);
+    }
+    data["old_status"] = serde_json::json!(current_data.map(|d| d.status.as_str()));
+    data["old_context"] = serde_json::json!(current_data.map(|d| d.status_context.as_str()));
+    data["old_detail"] = serde_json::json!(current_data.map(|d| d.status_detail.as_str()));
+    data["new_status"] = serde_json::json!(status);
+    data["new_context"] = serde_json::json!(context);
+    data["new_detail"] = serde_json::json!(detail);
+    data["writer"] = serde_json::json!(format!("{}:{}", writer.file(), writer.line()));
+    if let Some(session_id) = current_data.and_then(|d| d.session_id.as_deref()) {
+        data["session"] = serde_json::json!(session_id);
+    }
+    if let Some(agent_id) = current_data.and_then(|d| d.agent_id.as_deref()) {
+        data["agent_id"] = serde_json::json!(agent_id);
+    }
+    if !tool_name.is_empty() {
+        data["tool_name"] = serde_json::json!(tool_name);
+    }
+    if !tool_use_id.is_empty() {
+        data["tool_use_id"] = serde_json::json!(tool_use_id);
+    }
+    data
+}
+
+/// Resolve a pending interactive approval under an atomic ownership guard.
+#[track_caller]
+pub fn resolve_approval_status(
+    db: &HcomDb,
+    snapshot: &InstanceRow,
+    status: &str,
+    context: &str,
+    upd: StatusUpdate<'_>,
+) -> bool {
+    let StatusUpdate {
+        detail,
+        msg_ts,
+        tool_name,
+        tool_use_id,
+    } = upd;
+    let writer = std::panic::Location::caller();
+    let instance_name = snapshot.name.as_str();
+
+    let token = ApprovalToken::from_row(snapshot);
+    let committed = db.with_write_scope(|| {
+        let applied =
+            db.resolve_owned_approval(instance_name, &token, status, context, Some(detail))?;
+        if !applied {
+            return Ok((false, None));
+        }
+        let data = status_event_data(
+            Some(snapshot),
+            status,
+            context,
+            detail,
+            msg_ts,
+            tool_name,
+            tool_use_id,
+            writer,
+        );
+        let event_id = db.insert_event_row("status", instance_name, &data, None)?;
+        Ok((true, Some((event_id, data))))
+    });
+
+    let (applied, event) = match committed {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[hcom] warn: resolve_approval_status DB write failed for {instance_name}: {e}"
+            );
+            return false;
+        }
+    };
+    if !applied {
+        return false;
+    }
+    crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+    if let Some((event_id, data)) = event {
+        db.after_event_logged(event_id, "status", instance_name, &data);
+    }
+    true
+}
+
+/// Record a PermissionRequest's approval atomically and log the paired
+/// status event.
+#[track_caller]
+pub fn mark_pending_approval(
+    db: &HcomDb,
+    instance_name: &str,
+    detail: &str,
+    tool_name: &str,
+    tool_use_id: &str,
+) {
+    let writer = std::panic::Location::caller();
+
+    let committed = db.with_write_scope(|| {
+        let current_data = match db.get_instance_full(instance_name) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!(
+                    "[hcom] warn: mark_pending_approval DB read failed for {instance_name}: {e}"
+                );
+                None
+            }
+        };
+        db.record_pending_approval(instance_name, tool_use_id, detail)?;
+        let status_changed = current_data.as_ref().is_none_or(|d| d.status != ST_BLOCKED);
+        let data = status_event_data(
+            current_data.as_ref(),
+            ST_BLOCKED,
+            "approval",
+            detail,
+            "",
+            tool_name,
+            tool_use_id,
+            writer,
+        );
+        let event_id = db.insert_event_row("status", instance_name, &data, None)?;
+        Ok((status_changed, (event_id, data)))
+    });
+
+    let (status_changed, (event_id, data)) = match committed {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[hcom] warn: mark_pending_approval DB write failed for {instance_name}: {e}"
+            );
+            return;
+        }
+    };
+    if status_changed {
+        crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+    }
+    db.after_event_logged(event_id, "status", instance_name, &data);
+}
+
+/// Restore a non-approval status transition under a write-time no-approval guard.
+///
+/// Ensures atomic row update and status event logging within a single write scope.
+/// Refuses if an interactive approval is current at write time.
+/// Returns Ok(true) if applied, Ok(false) if refused, or Err on DB error.
+#[track_caller]
+pub fn restore_status_if_no_approval(
+    db: &HcomDb,
+    instance_name: &str,
+    snapshot: Option<&InstanceRow>,
+    status: &str,
+    context: &str,
+    upd: StatusUpdate<'_>,
+) -> anyhow::Result<bool> {
+    let StatusUpdate {
+        detail,
+        msg_ts,
+        tool_name,
+        tool_use_id,
+    } = upd;
+    let writer = std::panic::Location::caller();
+
+    let committed = db.with_write_scope(|| {
+        let Some(current) = db.get_instance_full(instance_name)? else {
+            return Ok((false, None));
+        };
+        if snapshot.is_some_and(|prior| prior.created_at != current.created_at) {
+            return Ok((false, None));
+        }
+        // Launch readiness callers previously used the upstream status-only
+        // write, which preserved the launch detail. Tool updates with a row
+        // snapshot still deliberately replace/clear their own detail.
+        let detail = if snapshot.is_none() && detail.is_empty() && tool_name.is_empty() {
+            current.status_detail.as_str()
+        } else {
+            detail
+        };
+        let applied = db.set_status_if_no_approval(instance_name, status, context, detail)?;
+        if !applied {
+            return Ok((false, None));
+        }
+        let data = status_event_data(
+            Some(&current),
+            status,
+            context,
+            detail,
+            msg_ts,
+            tool_name,
+            tool_use_id,
+            writer,
+        );
+        let event_id = db.insert_event_row("status", instance_name, &data, None)?;
+        Ok((true, Some((event_id, data))))
+    })?;
+
+    if let (true, Some((event_id, data))) = committed {
+        crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
+        db.after_event_logged(event_id, "status", instance_name, &data);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 /// Delete placeholder instances that have been launching too long.
@@ -1043,7 +1303,7 @@ mod tests {
     /// into any reaper test running beside it. Serialize the ones that care.
     static WAKE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn wake_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn wake_test_guard() -> std::sync::MutexGuard<'static, ()> {
         let guard = WAKE_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1644,6 +1904,7 @@ mod tests {
             last_seen: 0,
             status_context: String::new(),
             status_detail: String::new(),
+            pending_tool_use_id: String::new(),
             directory: String::new(),
             created_at: 0.0,
             transcript_path: String::new(),
@@ -2024,6 +2285,191 @@ WARNING: proceeding, even though we could not update PATH: Operation not permitt
         let deleted = cleanup_stale_placeholders(&db);
         assert_eq!(deleted, 0);
         assert!(db.get_instance_full("real").unwrap().is_some());
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_mark_pending_approval_event_failure_rolls_back_row() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("hera"));
+        data.insert("status".into(), serde_json::json!(ST_ACTIVE));
+        data.insert("status_context".into(), serde_json::json!("prompt"));
+        data.insert("created_at".into(), serde_json::json!(1000.0));
+        db.save_instance_named("hera", &data).unwrap();
+
+        // Install a trigger that aborts any event insertion to simulate event write failure.
+        db.conn()
+            .execute(
+                "CREATE TRIGGER fail_events BEFORE INSERT ON events
+                 BEGIN SELECT RAISE(ABORT, 'simulated event failure'); END;",
+                [],
+            )
+            .unwrap();
+
+        mark_pending_approval(&db, "hera", "Read /path", "Read", "tool-1");
+
+        // The row update must have been rolled back when the event insert failed.
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "prompt");
+        assert_eq!(row.pending_tool_use_id, "");
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_resolve_approval_status_event_failure_rolls_back_row() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("hera"));
+        data.insert("status".into(), serde_json::json!(ST_BLOCKED));
+        data.insert("status_context".into(), serde_json::json!("approval"));
+        data.insert("status_detail".into(), serde_json::json!("Read /path"));
+        data.insert("pending_tool_use_id".into(), serde_json::json!("tool-1"));
+        data.insert("status_time".into(), serde_json::json!(500));
+        data.insert("created_at".into(), serde_json::json!(1000.0));
+        db.save_instance_named("hera", &data).unwrap();
+
+        let snapshot = db.get_instance_full("hera").unwrap().unwrap();
+
+        db.conn()
+            .execute(
+                "CREATE TRIGGER fail_events BEFORE INSERT ON events
+                 BEGIN SELECT RAISE(ABORT, 'simulated event failure'); END;",
+                [],
+            )
+            .unwrap();
+
+        let applied = resolve_approval_status(
+            &db,
+            &snapshot,
+            ST_ACTIVE,
+            "approved:Read",
+            StatusUpdate {
+                tool_name: "Read",
+                tool_use_id: "tool-1",
+                ..Default::default()
+            },
+        );
+        assert!(!applied);
+
+        // The row update must have been rolled back: remains blocked:approval with owner.
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        assert_eq!(row.status_context, "approval");
+        assert_eq!(row.pending_tool_use_id, "tool-1");
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn guarded_launch_status_uses_current_cursor_and_preserves_detail() {
+        let (db, path) = setup_test_db();
+        db.conn().execute(
+            "INSERT INTO instances(name,created_at,last_event_id,status,status_context,status_detail)
+             VALUES ('worker',1000.0,42,'launching','startup','trust details')", []
+        ).unwrap();
+        assert!(
+            restore_status_if_no_approval(
+                &db,
+                "worker",
+                None,
+                ST_LISTENING,
+                "ready",
+                Default::default()
+            )
+            .unwrap()
+        );
+        let row = db.get_instance_full("worker").unwrap().unwrap();
+        assert_eq!(row.status_detail, "trust details");
+        let data: String = db
+            .conn()
+            .query_row(
+                "SELECT data FROM events WHERE type='status' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["position"], 42);
+        assert_eq!(data["old_status"], "launching");
+        assert_eq!(data["old_detail"], "trust details");
+        let snapshot = row;
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at=2000.0 WHERE name='worker'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !restore_status_if_no_approval(
+                &db,
+                "worker",
+                Some(&snapshot),
+                ST_ACTIVE,
+                "stale",
+                Default::default()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            db.get_instance_full("worker")
+                .unwrap()
+                .unwrap()
+                .status_context,
+            "ready"
+        );
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_restore_status_if_no_approval_event_failure_rolls_back_row() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("hera"));
+        data.insert("status".into(), serde_json::json!(ST_ACTIVE));
+        data.insert("status_context".into(), serde_json::json!("prompt"));
+        data.insert("status_detail".into(), serde_json::json!("old_detail"));
+        data.insert("created_at".into(), serde_json::json!(1000.0));
+        db.save_instance_named("hera", &data).unwrap();
+
+        let snapshot = db.get_instance_full("hera").unwrap().unwrap();
+
+        db.conn()
+            .execute(
+                "CREATE TRIGGER fail_events BEFORE INSERT ON events
+                 BEGIN SELECT RAISE(ABORT, 'simulated event failure'); END;",
+                [],
+            )
+            .unwrap();
+
+        let res = restore_status_if_no_approval(
+            &db,
+            "hera",
+            Some(&snapshot),
+            ST_ACTIVE,
+            "tool:Write",
+            StatusUpdate {
+                detail: "new_file.rs",
+                tool_name: "Write",
+                ..Default::default()
+            },
+        );
+        assert!(res.is_err());
+
+        // The row update must have been rolled back.
+        let row = db.get_instance_full("hera").unwrap().unwrap();
+        assert_eq!(row.status, ST_ACTIVE);
+        assert_eq!(row.status_context, "prompt");
+        assert_eq!(row.status_detail, "old_detail");
 
         cleanup(path);
     }
