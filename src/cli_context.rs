@@ -77,6 +77,54 @@ pub fn build_ctx_for_command(
     })
 }
 
+/// Resolve enrolled native Claude and Hermes subprocess commands only after
+/// authoritative name/process/Claude-actor paths. This looks up existing enrollment;
+/// `start` remains responsible for explicit enrollment itself.
+#[allow(clippy::too_many_arguments)]
+pub fn build_ctx_for_native_tool(
+    db: &HcomDb,
+    cmd: Option<&str>,
+    explicit_name: Option<&str>,
+    go: bool,
+    process_id: Option<&str>,
+    codex_thread_id: Option<&str>,
+    hermes_session_id: Option<&str>,
+    native_claude_session_id: Option<&str>,
+    detected_tool: crate::tool::Tool,
+) -> Result<CommandContext, HcomError> {
+    let mut ctx = build_ctx_for_command(db, cmd, explicit_name, go, process_id, codex_thread_id)?;
+    if ctx.identity.is_none()
+        && explicit_name.is_none()
+        && process_id.is_none_or(str::is_empty)
+        && cmd != Some("start")
+        && detected_tool == crate::tool::Tool::Claude
+        && let Some(sid) = native_claude_session_id.filter(|sid| !sid.is_empty())
+        && let Some(row) = crate::hooks::native::resolve_bound_owner(
+            db,
+            sid,
+            crate::hooks::native::NativeTool::Claude,
+        )
+        && db
+            .get_validated_claude_session_owner(sid)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(row.name.as_str())
+    {
+        ctx.identity = identity::resolve_from_name(db, &row.name).ok();
+    }
+    if ctx.identity.is_none()
+        && explicit_name.is_none()
+        && process_id.is_none_or(str::is_empty)
+        && cmd != Some("start")
+        && detected_tool.as_str() == "hermes"
+    {
+        ctx.identity =
+            hermes_session_id.and_then(|sid| identity::resolve_hermes_session_identity(db, sid));
+    }
+    Ok(ctx)
+}
+
 /// Warn when an explicit `--name` names a different instance than the one this
 /// shell's process binding points at.
 ///
@@ -254,8 +302,6 @@ pub struct InlineBatch {
     pub messages: Vec<crate::db::Message>,
     /// Unread messages left after this batch.
     pub remaining: usize,
-    /// Event id of the last unread message when the batch was taken.
-    pub backlog_end: Option<i64>,
 }
 
 impl InlineBatch {
@@ -265,12 +311,10 @@ impl InlineBatch {
             return None;
         }
         let remaining = messages.len().saturating_sub(MAX_MESSAGES_PER_DELIVERY);
-        let backlog_end = messages.last().and_then(|m| m.event_id);
         messages.truncate(MAX_MESSAGES_PER_DELIVERY);
         Some(Self {
             messages,
             remaining,
-            backlog_end,
         })
     }
 

@@ -929,7 +929,19 @@ const HOOKS_ABOUT: &[HelpEntry] = &[
 
 
 
-const HOOKS_PAGE: &[&[HelpEntry]] = &[HOOKS_STATUS, HOOKS_ADD, HOOKS_REMOVE, BLANK, HOOKS_ABOUT];
+const HOOKS_NATIVE: &[HelpEntry] = &[(
+    "hooks native <add|remove|status> <claude|codex> [--json]",
+    "Manage native tool hooks (internal native run dispatcher)",
+)];
+
+const HOOKS_PAGE: &[&[HelpEntry]] = &[
+    HOOKS_STATUS,
+    HOOKS_ADD,
+    HOOKS_REMOVE,
+    HOOKS_NATIVE,
+    BLANK,
+    HOOKS_ABOUT,
+];
 
 const TERM_SCREEN: &[HelpEntry] = &[
     ("term", "Screen dump (all PTY instances)"),
@@ -982,6 +994,7 @@ const SUBCOMMAND_HELP: &[(&str, &[&[HelpEntry]])] = &[
     ("relay daemon", &[RELAY_DAEMON]),
     ("hooks add", &[HOOKS_ADD]),
     ("hooks remove", &[HOOKS_REMOVE]),
+    ("hooks native", &[HOOKS_NATIVE]),
     ("term inject", &[TERM_INJECT]),
     ("term debug", &[TERM_DEBUG]),
 ];

@@ -132,10 +132,11 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
     let ctx = HcomContext::from_os();
     let mut payload = HookPayload::from_claude(raw);
 
-    // Per-run hooks only load in hcom launches, which always set
-    // HCOM_PROCESS_ID. Anything else (a leftover global hook, a manual run) is
-    // not an hcom participant: stay silent.
-    if ctx.process_id.is_none() {
+    // Native global hooks require their explicit command handshake. Ordinary
+    // per-run hooks continue to require the launch process identity.
+    if ctx.process_id.is_none()
+        && !crate::hooks::native::is_opted_in(&ctx, crate::hooks::native::NativeTool::Claude)
+    {
         return 0;
     }
 
@@ -307,6 +308,38 @@ fn route_claude_hook(
         obj.insert("session_id".into(), Value::String(session_id.clone()));
     }
     timing.session_ms = Some(session_start.elapsed().as_secs_f64() * 1000.0);
+
+    if ctx.process_id.is_none()
+        && crate::hooks::native::is_opted_in(ctx, crate::hooks::native::NativeTool::Claude)
+    {
+        if hook_type == HOOK_SESSIONSTART
+            && let Err(error) =
+                crate::hooks::native::persist_claude_session_opt_in(ctx, &session_id)
+        {
+            log::log_warn(
+                "hooks",
+                "claude.native_handshake_failed",
+                &format!("{error:#}"),
+            );
+            return (0, String::new(), None, timing);
+        }
+        // A native SessionStart exports the session handshake but cannot
+        // enroll an unknown session or claim an unrelated pending launch.
+        let owner = crate::hooks::native::resolve_bound_owner(
+            db,
+            &session_id,
+            crate::hooks::native::NativeTool::Claude,
+        );
+        if owner.as_ref().is_none_or(|owner| {
+            db.get_validated_claude_session_owner(&session_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                != Some(owner.name.as_str())
+        }) {
+            return (0, String::new(), None, timing);
+        }
+    }
 
     // SessionStart — no instance resolution needed
     if hook_type == HOOK_SESSIONSTART {
@@ -483,7 +516,7 @@ fn route_claude_hook(
 
     if hook_type == HOOK_PRE && is_subagent_tool(tool_name) {
         let task_start = Instant::now();
-        common::update_tool_status(db, instance_name, "claude", tool_name, &payload.tool_input);
+        update_tool_status_unless_approval(db, instance_name, tool_name, &payload.tool_input);
         timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
         return (0, String::new(), None, timing);
     }

@@ -113,7 +113,12 @@ pub fn tool_marker_vars() -> &'static [&'static str] {
         crate::integration_spec::ALL
             .iter()
             .flat_map(|spec| tool_env_vars(spec.tool))
-            .chain([HCOM_TOOL])
+            .chain([
+                HCOM_TOOL,
+                "CLAUDE_CODE_SESSION_ID",
+                "HCOM_NATIVE_PARTICIPATION",
+                "HCOM_CLAUDE_UNIX_SESSION_ID",
+            ])
             .filter(|var| seen.insert(*var))
             .collect()
     });
@@ -123,6 +128,17 @@ pub fn tool_marker_vars() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_participation_markers_are_scrubbed_from_children() {
+        for marker in [
+            "CLAUDE_CODE_SESSION_ID",
+            "HCOM_NATIVE_PARTICIPATION",
+            "HCOM_CLAUDE_UNIX_SESSION_ID",
+        ] {
+            assert!(tool_marker_vars().contains(&marker), "{marker}");
+        }
+    }
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

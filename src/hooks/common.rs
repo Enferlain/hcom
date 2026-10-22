@@ -20,6 +20,18 @@ use crate::shared::constants::MAX_MESSAGES_PER_DELIVERY;
 use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_INACTIVE, ST_LISTENING};
 
+/// Environment handshake written by an explicitly installed native hook.
+///
+/// Native participation is deliberately opt-in.  A tool hook dispatcher sets
+/// this value only for the hcom-owned native command, and Claude's SessionStart
+/// path persists it through `CLAUDE_ENV_FILE` for the user's later `hcom
+/// start`.  Merely looking like a tool process is not enough to pass this
+/// boundary.
+pub const NATIVE_PARTICIPATION_ENV: &str = "HCOM_NATIVE_PARTICIPATION";
+pub const NATIVE_CLAUDE_VALUE: &str = "claude";
+pub const NATIVE_CODEX_VALUE: &str = "codex";
+pub const NATIVE_CLAUDE_SESSION_ENV: &str = "HCOM_CLAUDE_UNIX_SESSION_ID";
+
 /// Run a hook handler with panic safety.
 ///
 /// Catches panics in the handler closure, logs them, and returns the fallback
@@ -124,6 +136,25 @@ pub fn hook_gate_check(ctx: &HcomContext) -> bool {
     ctx.process_id
         .as_deref()
         .is_some_and(|token| !token.is_empty())
+}
+
+/// Pre-gate check for an explicitly installed native hook.
+///
+/// This keeps the ordinary no-process gate unchanged.  Callers must provide
+/// the tool they are dispatching so a Claude marker cannot authorize a Codex
+/// hook (or vice versa).  The marker is a command/env handshake owned by hcom;
+/// no database row is created or selected here.
+pub fn native_hook_gate_check(ctx: &HcomContext, _db: &HcomDb, expected_tool: &str) -> bool {
+    if let Some(tool) = ctx.raw_env.get(NATIVE_PARTICIPATION_ENV) {
+        // An explicit but mismatched marker is a failed handshake.  Do not
+        // fall through to the ordinary binding gate, which would turn a
+        // cross-tool marker into passive identity inference.
+        return tool == expected_tool;
+    }
+    if ctx.process_id.is_some() || ctx.is_launched {
+        return true;
+    }
+    hook_gate_check(ctx)
 }
 
 /// Convert a db::Message to a serde_json::Value object.
@@ -1794,6 +1825,20 @@ mod tests {
     use crate::hooks::test_helpers::isolated_test_env;
     use serial_test::serial;
     use std::io::Write;
+
+    #[test]
+    #[serial]
+    fn native_gate_rejects_an_explicit_cross_tool_marker() {
+        let (_dir, db) = make_test_db();
+        let env = std::collections::HashMap::from([(
+            NATIVE_PARTICIPATION_ENV.to_string(),
+            NATIVE_CODEX_VALUE.to_string(),
+        )]);
+        let ctx =
+            crate::shared::context::HcomContext::from_env(&env, std::path::PathBuf::from("/tmp"));
+        assert!(!native_hook_gate_check(&ctx, &db, NATIVE_CLAUDE_VALUE));
+        assert!(native_hook_gate_check(&ctx, &db, NATIVE_CODEX_VALUE));
+    }
 
     #[test]
     fn test_check_stdin_closed_does_not_panic() {

@@ -878,6 +878,30 @@ pub fn bind_session_to_process_for_tool(
         if !owner_matches("bound", name, tool.as_deref()) {
             return ToolCheckedBind::Rejected;
         }
+        // The stale-binding purge and primary repair are Kimi's integration
+        // contract. Claude's lineage binder deliberately keeps historical
+        // session aliases, so do not apply this cleanup to other tools.
+        if expected_tool == "kimi" {
+            if let Err(error) = db.rebind_instance_session(name, session_id) {
+                crate::log::log_error(
+                    "binding",
+                    "bind_for_tool.rebind_session",
+                    &format!("session_id={session_id} instance={name} err={error}"),
+                );
+                return ToolCheckedBind::Rejected;
+            }
+            if let Err(error) = db.conn().execute(
+                "UPDATE instances SET session_id = ? WHERE name = ?",
+                rusqlite::params![session_id, name],
+            ) {
+                crate::log::log_error(
+                    "binding",
+                    "bind_for_tool.update_session_id",
+                    &format!("session_id={session_id} instance={name} err={error}"),
+                );
+                return ToolCheckedBind::Rejected;
+            }
+        }
     }
 
     if let Err(error) = transaction.commit() {
@@ -2436,6 +2460,141 @@ mod tests {
         // Default HcomConfig::timeout is 86400 (schema-equivalent default),
         // preserved for anyone who hasn't set HCOM_TIMEOUT.
         assert_eq!(row.wait_timeout, Some(86400));
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bind_session_for_tool_competing_connection_immediate_lock() {
+        crate::config::Config::init();
+        let (_db_a, path) = setup_test_db();
+        let db_b = HcomDb::open_at(&path).unwrap();
+        // Give db_b a short busy timeout so contention fails quickly instead of waiting 5s.
+        db_b.conn()
+            .busy_timeout(std::time::Duration::from_millis(50))
+            .unwrap();
+
+        let (tx_held, rx_held) = std::sync::mpsc::channel();
+        let (tx_release, rx_release) = std::sync::mpsc::channel();
+
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            let db_worker = HcomDb::open_at(&worker_path).unwrap();
+            let tx = rusqlite::Transaction::new_unchecked(
+                db_worker.conn(),
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .unwrap();
+            tx_held.send(()).unwrap();
+            rx_release.recv().unwrap();
+            tx.commit().unwrap();
+        });
+
+        // Wait until db_worker has acquired the immediate write lock.
+        rx_held.recv().unwrap();
+
+        // The checked binder must acquire its immediate lock before reading owners.
+        let rejected = bind_session_to_process_for_tool(
+            &db_b,
+            "ses-race-imm",
+            Some("pid-race-imm"),
+            "kimi",
+            true,
+        );
+        assert_eq!(
+            rejected,
+            ToolCheckedBind::Rejected,
+            "competing write lock must cause bind_session_to_process_for_tool to reject"
+        );
+
+        tx_release.send(()).unwrap();
+        worker.join().unwrap();
+
+        let bound = bind_session_to_process_for_tool(
+            &db_b,
+            "ses-race-imm",
+            Some("pid-race-imm"),
+            "kimi",
+            true,
+        );
+        assert!(
+            matches!(bound, ToolCheckedBind::Bound(_)),
+            "bind must succeed once competing write lock is released"
+        );
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_bind_session_for_tool_session_switching_purges_stale_bindings() {
+        crate::config::Config::init();
+        let (db, path) = setup_test_db();
+        let now = now_epoch_i64();
+
+        // Seed an active Kimi instance bound to ses-1 on pid-1.
+        let mut inst_data = serde_json::Map::new();
+        inst_data.insert("name".into(), serde_json::json!("kima"));
+        inst_data.insert("tool".into(), serde_json::json!("kimi"));
+        inst_data.insert("session_id".into(), serde_json::json!("ses-1"));
+        inst_data.insert("status".into(), serde_json::json!("active"));
+        inst_data.insert("created_at".into(), serde_json::json!(now));
+        db.save_instance_named("kima", &inst_data).unwrap();
+        db.set_process_binding("pid-1", "ses-1", "kima").unwrap();
+        db.rebind_session("ses-1", "kima").unwrap();
+
+        assert_eq!(
+            db.get_session_binding("ses-1").unwrap(),
+            Some("kima".to_string())
+        );
+        assert_eq!(
+            db.get_process_binding("pid-1").unwrap(),
+            Some("kima".to_string())
+        );
+        let count_1: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM session_bindings WHERE instance_name = 'kima'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_1, 1);
+
+        // SessionStart switches the process to a new session.
+        let bind = bind_session_to_process_for_tool(&db, "ses-2", Some("pid-1"), "kimi", false);
+        assert_eq!(bind, ToolCheckedBind::Bound("kima".to_string()));
+
+        assert_eq!(
+            db.get_session_binding("ses-2").unwrap(),
+            Some("kima".to_string()),
+            "new session must be bound to canonical instance"
+        );
+        assert_eq!(
+            db.get_session_binding("ses-1").unwrap(),
+            None,
+            "old session binding must be purged by rebind_instance_session"
+        );
+        let count_2: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM session_bindings WHERE instance_name = 'kima'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count_2, 1,
+            "only the canonical active session must exist in session_bindings for kima"
+        );
+
+        let kima = db.get_instance_full("kima").unwrap().unwrap();
+        assert_eq!(
+            kima.session_id.as_deref(),
+            Some("ses-2"),
+            "instance record session_id must be updated to new session"
+        );
 
         cleanup(path);
     }

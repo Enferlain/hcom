@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item};
 
@@ -33,6 +34,22 @@ use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_LISTENING};
 use super::common::SAFE_HCOM_COMMANDS;
 use super::runtime::{self, LaunchCtx, LegacyFile, PerRunAdapter, RuntimeInjection};
 use anyhow::{Context as _, Result as AnyResult, bail};
+
+const NATIVE_CODEX_ORIGINATOR: &str = "codex_vscode";
+const NATIVE_CODEX_EVENTS: &[(&str, &str)] = &[
+    ("SessionStart", "codex-sessionstart"),
+    ("UserPromptSubmit", "codex-userpromptsubmit"),
+    ("PreToolUse", "codex-pretooluse"),
+    ("PostToolUse", "codex-posttooluse"),
+    ("Stop", "codex-stop"),
+    ("Interrupt", "codex-interrupt"),
+];
+const NATIVE_CODEX_ADOPTION_EVENTS: &[&str] = &[
+    "codex-sessionstart",
+    "codex-userpromptsubmit",
+    "SessionStart",
+    "UserPromptSubmit",
+];
 
 const HCOM_TRIGGER: &str = "<hcom>";
 // `fork` is its own SessionStart source since Codex 0.155 (earlier releases
@@ -548,7 +565,7 @@ fn is_hcom_legacy_notify(item: &Item) -> bool {
 
 /// `(event_label, group, handler)`: a handler's place in hooks.json, in the
 /// form Codex uses for `hooks.state` keys.
-type HandlerPosition = (String, usize, usize);
+pub(crate) type HandlerPosition = (String, usize, usize);
 
 fn is_hcom_handler(handler: &Value) -> bool {
     handler
@@ -559,7 +576,10 @@ fn is_hcom_handler(handler: &Value) -> bool {
 }
 
 /// Positions of the handlers `select` accepts, in document order.
-fn handler_positions(hooks: &Value, select: impl Fn(&Value) -> bool) -> Vec<HandlerPosition> {
+pub(crate) fn handler_positions(
+    hooks: &Value,
+    select: impl Fn(&Value) -> bool,
+) -> Vec<HandlerPosition> {
     let mut positions = Vec::new();
     let Some(events) = hooks.get("hooks").and_then(Value::as_object) else {
         return positions;
@@ -579,7 +599,7 @@ fn handler_positions(hooks: &Value, select: impl Fn(&Value) -> bool) -> Vec<Hand
 }
 
 /// `<source>:<label>:<group>:<handler>` with the position replaced.
-fn rekey_state_position(key: &str, (label, group, handler): &HandlerPosition) -> String {
+pub(crate) fn rekey_state_position(key: &str, (label, group, handler): &HandlerPosition) -> String {
     let source = key.rsplitn(4, ':').nth(3).unwrap_or_default();
     format!("{source}:{label}:{group}:{handler}")
 }
@@ -612,11 +632,11 @@ struct CodexHookTrustEntry {
 /// codex-rs/app-server-protocol/src/protocol/v2/plugin.rs:513-542); the
 /// snake_case spellings of the core protocol are accepted too.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct CodexHookListEntry {
-    key: Option<String>,
-    command: Option<String>,
-    source: Option<String>,
-    current_hash: Option<String>,
+pub(crate) struct CodexHookListEntry {
+    pub(crate) key: Option<String>,
+    pub(crate) command: Option<String>,
+    pub(crate) source: Option<String>,
+    pub(crate) current_hash: Option<String>,
 }
 
 fn hook_noop() -> HookResult {
@@ -696,11 +716,15 @@ fn normalize_codex_transcript_path(path: &str) -> String {
 }
 
 fn resolve_instance_codex(db: &HcomDb, ctx: &HcomContext, session_id: &str) -> Option<InstanceRow> {
-    instance_binding::resolve_instance_from_binding(
+    let instance = instance_binding::resolve_instance_from_binding(
         db,
         Some(session_id).filter(|s| !s.is_empty()),
         ctx.process_id.as_deref(),
-    )
+    )?;
+    // A native Codex hook can see a session id that happens to collide with a
+    // Claude/Hermes row.  Treat that as foreign ownership rather than allowing
+    // a Codex event to mutate the other tool's lifecycle.
+    (instance.tool == "codex").then_some(instance)
 }
 
 fn resolve_codex_instance(
@@ -710,6 +734,211 @@ fn resolve_codex_instance(
 ) -> Option<InstanceRow> {
     let session_id = payload.session_id.as_deref().unwrap_or("");
     resolve_instance_codex(db, ctx, session_id)
+}
+
+fn is_codex_vscode_originator(ctx: &HcomContext) -> bool {
+    ctx.raw_env
+        .get("CODEX_INTERNAL_ORIGINATOR_OVERRIDE")
+        .is_some_and(|originator| originator == NATIVE_CODEX_ORIGINATOR)
+}
+
+fn is_codex_native_opted_in(ctx: &HcomContext) -> bool {
+    is_codex_vscode_originator(ctx)
+        && ctx
+            .raw_env
+            .get(common::NATIVE_PARTICIPATION_ENV)
+            .is_some_and(|tool| tool == common::NATIVE_CODEX_VALUE)
+}
+
+fn can_adopt_codex_native(hook_name: &str, ctx: &HcomContext, payload: &HookPayload) -> bool {
+    is_codex_native_opted_in(ctx)
+        && NATIVE_CODEX_ADOPTION_EVENTS.contains(&hook_name)
+        && payload
+            .session_id
+            .as_deref()
+            .is_some_and(|session_id| !session_id.is_empty())
+        && !payload
+            .raw
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .is_some_and(|agent_id| !agent_id.is_empty())
+}
+
+/// Register a wrapperless VS Code Codex session after an explicit native hook
+/// dispatch.  The lock covers the lookup/create/bind sequence, while the
+/// SQLite transaction makes rollback leave no placeholder or session binding.
+fn adopt_native_codex_instance(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    payload: &HookPayload,
+) -> Option<InstanceRow> {
+    if !can_adopt_codex_native(&payload.hook_name, ctx, payload) {
+        return None;
+    }
+    let session_id = payload.session_id.as_deref()?.to_string();
+
+    let lock_dir = db.path().parent()?.join(".tmp");
+    std::fs::create_dir_all(&lock_dir).ok()?;
+    let lock_file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_dir.join("codex_native_adopt.lock"))
+        .ok()?;
+    crate::sys::fs::lock_exclusive(&lock_file).ok()?;
+
+    // Use the tool-checked binding API before creating anything.  In
+    // particular, a live or stopped row owned by another tool is a hard
+    // rejection; it is never treated as an available slot.
+    match instance_binding::bind_session_to_process_for_tool(
+        db,
+        &session_id,
+        None,
+        common::NATIVE_CODEX_VALUE,
+        false,
+    ) {
+        instance_binding::ToolCheckedBind::Bound(name) => {
+            return db
+                .get_instance_full(&name)
+                .ok()
+                .flatten()
+                .filter(|row| row.tool == common::NATIVE_CODEX_VALUE);
+        }
+        instance_binding::ToolCheckedBind::Rejected => return None,
+        instance_binding::ToolCheckedBind::Unbound => {}
+    }
+
+    let transcript_path = payload
+        .transcript_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .map(normalize_codex_transcript_path)
+        .or_else(|| derive_codex_transcript_path(&session_id))?;
+    let cwd = payload
+        .raw
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+        .unwrap_or_else(|| ctx.cwd.to_str().unwrap_or(""))
+        .to_string();
+    if cwd.is_empty() {
+        return None;
+    }
+
+    // Reserve a name before BEGIN IMMEDIATE so the same process cannot choose
+    // it concurrently.  The reservation is deleted on every failure path.
+    let name = crate::instance_names::generate_unique_name(db).ok()?;
+    let result = db.with_immediate_transaction(|_| {
+        // The file lock serializes hcom native adopters; this second check
+        // closes the race with a regular process/session binder.
+        if let Some(bound) = db.get_session_binding(&session_id)? {
+            let row = db
+                .get_instance_full(&bound)?
+                .context("native Codex session binding points to a missing row")?;
+            if row.tool != common::NATIVE_CODEX_VALUE {
+                bail!("native Codex session is owned by another tool");
+            }
+            return Ok(Some(bound));
+        }
+        // A row can outlive its index if a legacy cleanup or a failed
+        // migration removed `session_bindings` first.  Do not let native
+        // adoption create a second owner and have `rebind_instance_session`
+        // clear the existing row's session_id.  Repair an already-Codex row;
+        // reject a foreign live owner while the transaction is still open.
+        if let Some(live_name) = db
+            .conn()
+            .query_row(
+                "SELECT name FROM instances WHERE session_id = ? LIMIT 1",
+                [&session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let row = db
+                .get_instance_full(&live_name)?
+                .context("native Codex session row disappeared during adoption")?;
+            if row.tool != common::NATIVE_CODEX_VALUE {
+                bail!("native Codex session is owned by another tool");
+            }
+            db.rebind_instance_session(&live_name, &session_id)?;
+            return Ok(Some(live_name));
+        }
+        if !instance_binding::initialize_instance_in_position_file(
+            db,
+            &name,
+            Some(&session_id),
+            None,
+            None,
+            None,
+            Some(&transcript_path),
+            Some(common::NATIVE_CODEX_VALUE),
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(&cwd),
+        ) || db.get_instance_full(&name)?.is_none()
+        {
+            bail!("native Codex instance initialization did not produce a row");
+        }
+        db.rebind_instance_session(&name, &session_id)?;
+        let row = db
+            .get_instance_full(&name)?
+            .context("native Codex instance disappeared during adoption")?;
+        if row.tool != common::NATIVE_CODEX_VALUE
+            || db.get_session_binding(&session_id)?.as_deref() != Some(name.as_str())
+        {
+            bail!("native Codex session binding verification failed");
+        }
+        Ok(Some(name.clone()))
+    });
+
+    let bound_name = match result {
+        Ok(Some(bound_name)) => {
+            // The reserved name is only needed for the create path.  A
+            // concurrent binder may win between the first ownership check and
+            // BEGIN IMMEDIATE; drop our placeholder before reusing its row so
+            // the race cannot strand an orphan reservation.
+            if bound_name != name {
+                let _ = db.delete_session_bindings_for_instance(&name);
+                let _ = db.delete_instance(&name);
+            }
+            bound_name
+        }
+        Ok(None) | Err(_) => {
+            let _ = db.delete_session_bindings_for_instance(&name);
+            let _ = db.delete_instance(&name);
+            return None;
+        }
+    };
+    let instance = match db.get_instance_full(&bound_name).ok().flatten() {
+        Some(instance) => instance,
+        None => {
+            if bound_name == name {
+                let _ = db.delete_session_bindings_for_instance(&name);
+                let _ = db.delete_instance(&name);
+            }
+            return None;
+        }
+    };
+    instance_binding::capture_and_store_launch_context(db, &bound_name);
+    common::notify_hook_instance_with_db(db, &bound_name);
+    log::log_info(
+        "hooks",
+        "codex.native_adopt.success",
+        &format!("instance={} session_id={session_id}", bound_name),
+    );
+    Some(instance)
+}
+
+fn resolve_or_adopt_codex_instance(
+    db: &HcomDb,
+    ctx: &HcomContext,
+    payload: &HookPayload,
+) -> Option<InstanceRow> {
+    resolve_codex_instance(db, ctx, payload)
+        .or_else(|| adopt_native_codex_instance(db, ctx, payload))
 }
 
 fn update_codex_position(
@@ -798,7 +1027,7 @@ fn resolve_and_update_codex_instance(
     ctx: &HcomContext,
     payload: &HookPayload,
 ) -> Option<InstanceRow> {
-    let instance = resolve_codex_instance(db, ctx, payload)?;
+    let instance = resolve_or_adopt_codex_instance(db, ctx, payload)?;
     if is_internal_thread(&instance, payload) {
         return None;
     }
@@ -830,6 +1059,10 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
 
     if instance_name.is_none() {
         instance_name = resolve_codex_instance(db, ctx, payload).map(|i| i.name);
+    }
+
+    if instance_name.is_none() {
+        instance_name = adopt_native_codex_instance(db, ctx, payload).map(|i| i.name);
     }
 
     let instance_name = match instance_name {
@@ -1058,7 +1291,7 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
     };
 
     let ctx = HcomContext::from_os();
-    if !common::hook_gate_check(&ctx) {
+    if !common::native_hook_gate_check(&ctx, &db, common::NATIVE_CODEX_VALUE) {
         return 0;
     }
 
@@ -1165,7 +1398,10 @@ fn paths_equivalent(a: &Path, b: &Path) -> bool {
 
 /// The `(event_label, group, handler)` a `hooks.state` key names inside hcom's
 /// hooks.json, or None when the key names another source or event.
-fn hcom_hooks_json_state_position(key: &str, hooks_path: &Path) -> Option<(String, usize, usize)> {
+pub(crate) fn hcom_hooks_json_state_position(
+    key: &str,
+    hooks_path: &Path,
+) -> Option<(String, usize, usize)> {
     let mut parts = key.rsplitn(4, ':');
     let (Some(handler_index), Some(group_index), Some(event_label), Some(key_source)) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -1218,6 +1454,11 @@ fn build_expected_hook_json() -> Value {
 /// hcom's hook commands are `<hcom prefix> codex-<event>`. Matching the last
 /// word alone would also claim a user's own `/usr/local/bin/codex-stop`.
 fn is_hcom_codex_command(command: &str) -> bool {
+    // Explicit native declarations belong to the user's opt-in profile and
+    // must survive the ordinary per-run legacy cleanup below.
+    if is_native_codex_command(command) {
+        return false;
+    }
     let mut words = command.split_whitespace().rev();
     let Some(last) = words.next() else {
         return false;
@@ -1226,6 +1467,33 @@ fn is_hcom_codex_command(command: &str) -> bool {
         .iter()
         .any(|(_, suffix, _)| last == *suffix)
         && words.any(|word| word.contains("hcom"))
+}
+
+fn is_native_codex_command(command: &str) -> bool {
+    let words = shell_words::split(command).unwrap_or_else(|_| {
+        command
+            .split_whitespace()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+    NATIVE_CODEX_EVENTS.iter().any(|(event, _)| {
+        let expected = ["hooks", "native", "run", common::NATIVE_CODEX_VALUE, *event];
+        words
+            .windows(expected.len())
+            .enumerate()
+            .any(|(start, window)| {
+                let prefix = &words[..start];
+                window
+                    .iter()
+                    .map(String::as_str)
+                    .eq(expected.iter().copied())
+                    && prefix.last().is_some_and(|word| {
+                        let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
+                        name.strip_suffix(".exe").unwrap_or(name) == "hcom"
+                    })
+                    && (prefix.len() == 1 || (prefix.len() == 2 && prefix[0] == "uvx"))
+            })
+    })
 }
 
 fn remove_hcom_hooks_from_json(existing: &mut Value) {
@@ -1447,6 +1715,27 @@ fn fetch_codex_hook_list_with_overrides(
         let _ = child.wait();
         parse_codex_hook_list_entries(&response?)
     }
+}
+
+/// Fetch the current Codex hook inventory for the explicit native installer.
+///
+/// This is intentionally a narrow wrapper around the same `hooks/list`
+/// machinery used by per-run trust setup.  Native installation never invents
+/// or reuses a stale hash; the caller must receive one current hash per exact
+/// declaration before writing `hooks.state`.
+pub(crate) fn fetch_codex_hook_list_for_native(
+    cwd: &Path,
+    codex_home: &Path,
+) -> Result<Vec<CodexHookListEntry>, String> {
+    // Keep native installation on the same version-checked trust path as the
+    // ordinary per-run adapter. Native has no trust cache, so the current
+    // version check is still required before accepting hooks/list hashes.
+    let _version = codex_cli_version_output_for_hook_trust()?;
+    fetch_codex_hook_list_with_overrides(
+        cwd,
+        codex_home,
+        &["-c".to_string(), "features.hooks=true".to_string()],
+    )
 }
 
 #[cfg(not(test))]
@@ -1778,6 +2067,36 @@ mod tests {
             cleaned["hooks"]["Stop"][0]["hooks"][0]["command"],
             "user-stop"
         );
+    }
+
+    #[test]
+    fn ordinary_cleanup_preserves_explicit_native_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        let native = "hcom hooks native run codex SessionStart";
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "hooks": {
+                    "SessionStart": [{"hooks": [
+                        {"type": "command", "command": "hcom codex-sessionstart"},
+                        {"type": "command", "command": native}
+                    ]}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        cleanup_codex_hooks_in_dir(dir.path()).unwrap();
+        let hooks: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let commands: Vec<_> = hooks["hooks"]["SessionStart"][0]["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hook| hook["command"].as_str())
+            .collect();
+        assert_eq!(commands, vec![native]);
     }
 
     #[test]
@@ -2274,5 +2593,132 @@ mod tests {
             let content = std::fs::read_to_string(local_dir.join("hooks.json")).unwrap();
             assert!(!content.contains("codex-"));
         }
+    }
+
+    fn native_codex_context(cwd: &Path) -> HcomContext {
+        let env = HashMap::from([
+            ("CODEX_THREAD_ID".to_string(), "native-session".to_string()),
+            (
+                "CODEX_INTERNAL_ORIGINATOR_OVERRIDE".to_string(),
+                NATIVE_CODEX_ORIGINATOR.to_string(),
+            ),
+            (
+                common::NATIVE_PARTICIPATION_ENV.to_string(),
+                common::NATIVE_CODEX_VALUE.to_string(),
+            ),
+        ]);
+        HcomContext::from_env(&env, cwd.to_path_buf())
+    }
+
+    fn native_codex_payload(event: &str, cwd: &Path) -> HookPayload {
+        HookPayload::from_codex_native(
+            event,
+            serde_json::json!({
+                "session_id": "native-session",
+                "transcript_path": cwd.join("rollout-native.jsonl"),
+                "cwd": cwd,
+                "source": "startup",
+            }),
+        )
+    }
+
+    #[test]
+    fn opted_in_vscode_codex_adoption_is_idempotent_and_persists_authoritative_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let ctx = native_codex_context(dir.path());
+        let payload = native_codex_payload("SessionStart", dir.path());
+
+        let first = adopt_native_codex_instance(&db, &ctx, &payload).unwrap();
+        let second = resolve_or_adopt_codex_instance(&db, &ctx, &payload).unwrap();
+        assert_eq!(first.name, second.name);
+        assert_eq!(first.tool, common::NATIVE_CODEX_VALUE);
+        assert_eq!(first.session_id.as_deref(), Some("native-session"));
+        assert_eq!(
+            first.transcript_path,
+            dir.path().join("rollout-native.jsonl").to_string_lossy()
+        );
+        assert_eq!(first.directory, dir.path().to_string_lossy());
+        assert_eq!(
+            db.get_session_binding("native-session").unwrap(),
+            Some(first.name)
+        );
+        assert_eq!(db.iter_instances_full().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn native_codex_adoption_requires_exact_originator_and_allowed_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let payload = native_codex_payload("PreToolUse", dir.path());
+
+        let mut wrong_origin = native_codex_context(dir.path());
+        wrong_origin.raw_env.insert(
+            "CODEX_INTERNAL_ORIGINATOR_OVERRIDE".to_string(),
+            "other-host".to_string(),
+        );
+        assert!(adopt_native_codex_instance(&db, &wrong_origin, &payload).is_none());
+        assert!(
+            adopt_native_codex_instance(&db, &native_codex_context(dir.path()), &payload).is_none()
+        );
+        assert_eq!(db.iter_instances_full().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn native_codex_adoption_rejects_live_and_stopped_foreign_owners() {
+        for stopped in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+            db.init_db().unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, session_id, directory, transcript_path)
+                     VALUES ('foreign', 'claude', ?1, '', 0, 0, 'native-session', '/foreign', '')",
+                    [if stopped { "stopped" } else { "listening" }],
+                )
+                .unwrap();
+            db.set_session_binding("native-session", "foreign").unwrap();
+            if stopped {
+                db.log_event(
+                    "life",
+                    "foreign",
+                    &serde_json::json!({
+                        "action": "stopped",
+                        "snapshot": {"tool": "claude", "session_id": "native-session"}
+                    }),
+                )
+                .unwrap();
+                db.delete_session_binding("native-session").unwrap();
+            }
+
+            let ctx = native_codex_context(dir.path());
+            let payload = native_codex_payload("SessionStart", dir.path());
+            assert!(adopt_native_codex_instance(&db, &ctx, &payload).is_none());
+            assert_eq!(db.iter_instances_full().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn native_codex_adoption_rejects_foreign_live_row_without_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, session_id, directory, transcript_path)
+                 VALUES ('foreign', 'claude', 'listening', '', 0, 0, 'native-session', '/foreign', '')",
+                [],
+            )
+            .unwrap();
+
+        let ctx = native_codex_context(dir.path());
+        let payload = native_codex_payload("SessionStart", dir.path());
+        assert!(adopt_native_codex_instance(&db, &ctx, &payload).is_none());
+        let row = db.get_instance_full("foreign").unwrap().unwrap();
+        assert_eq!(row.tool, "claude");
+        assert_eq!(row.session_id.as_deref(), Some("native-session"));
+        assert_eq!(db.get_session_binding("native-session").unwrap(), None);
     }
 }

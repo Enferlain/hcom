@@ -12,6 +12,7 @@ pub mod gemini;
 pub mod hermes;
 pub mod hermes_bridge;
 pub mod kimi;
+pub mod native;
 pub mod opencode;
 pub mod pi;
 pub(crate) mod pi_family;

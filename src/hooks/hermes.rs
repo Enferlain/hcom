@@ -16,6 +16,10 @@ use super::pi_family::HERMES;
 use super::runtime::LaunchCtx;
 use crate::tool::Tool;
 
+#[path = "hermes_native.rs"]
+pub mod hermes_native;
+pub use hermes_native::*;
+
 pub fn dispatch_hermes_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
     // Bridges run in a gateway hcom did not launch: no HCOM_PROCESS_ID gate.
     if hook_name == "hermes-bridge" {
