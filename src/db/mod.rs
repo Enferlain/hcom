@@ -248,6 +248,13 @@ impl HcomDb {
         })
     }
 
+    /// Whether this connection still refers to a replaced database file.
+    /// Read-only observers must stop at this boundary: event IDs and worker
+    /// generations cannot be carried across a reset.
+    pub fn is_stale(&self) -> bool {
+        let current_inode = get_inode(&self.db_path);
+        current_inode != 0 && current_inode != self.db_inode
+    }
 
     /// Reconnect if the DB file was replaced (e.g., by hcom reset / schema bump).
     /// Long-lived threads (PTY delivery, listeners) hold an open connection to the

@@ -104,6 +104,31 @@ const EVENTS_FOLLOW: &[HelpEntry] = &[
     ),
 ];
 
+const EVENTS_WAIT: &[HelpEntry] = &[("  --after-id ID", "Wait after this exclusive durable cursor")];
+
+const EVENTS_STREAM: &[HelpEntry] = &[
+    ("Continuous observation:", ""),
+    (
+        "events stream [filters]",
+        "Stream ordered events; flush each record",
+    ),
+    (
+        "  --after-id ID",
+        "Resume after an exclusive cursor (default: current cursor)",
+    ),
+    ("  --timeout SEC", "Stop observing after this many seconds"),
+    ("  --full", "Full event JSON"),
+    (
+        "  --follow NAME",
+        "Follow one exact worker generation; requires --after-id",
+    ),
+    ("  --compact", "Bounded typed progress; requires --follow"),
+    (
+        "  --heartbeat SEC",
+        "Quiet heartbeat interval; requires --compact",
+    ),
+];
+
 const EVENTS_SHORTCUTS: &[HelpEntry] = &[
     ("Shortcuts:", ""),
     (
@@ -203,6 +228,8 @@ const EVENTS_SQL_POINTER: &[HelpEntry] = &[("", ""), ("", "SQL columns: hcom eve
 
 const EVENTS_PAGE: &[&[HelpEntry]] = &[
     EVENTS_QUERY,
+    EVENTS_WAIT,
+    EVENTS_STREAM,
     FILTERS_HEADER,
     FILTER_HELP,
     EVENTS_SHORTCUTS,

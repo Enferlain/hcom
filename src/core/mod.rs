@@ -7,8 +7,10 @@
 //! - `bundles`: Structured context sharing (bundle create/validate/parse)
 
 pub mod bundles;
+pub mod compact;
 pub mod detail_levels;
 pub mod filters;
 pub mod helpers;
 pub mod launch_status;
+pub mod progress;
 pub mod tips;

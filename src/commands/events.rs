@@ -11,9 +11,13 @@
 use std::collections::HashMap;
 use std::net::TcpListener;
 
+mod generation;
 mod listener;
+mod observation;
 mod wait;
+use generation::*;
 use listener::*;
+pub use observation::EventsStreamArgs;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -78,6 +82,8 @@ pub enum EventsSubcmd {
     Unsub(EventsUnsubArgs),
     /// Wait for launch to complete
     Launch(EventsLaunchArgs),
+    /// Observe a worker generation, compact progress, or a timed event stream
+    Stream(EventsStreamArgs),
 }
 
 /// Args for `hcom events sub`.
@@ -1114,6 +1120,21 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
             return 1;
         }
         match subcmd {
+            EventsSubcmd::Stream(stream_args) => {
+                if args.wait.is_some()
+                    || args.after_id.is_some()
+                    || args.full
+                    || args.all
+                    || args.last.is_some()
+                    || args.sql.is_some()
+                    || args.device.is_some()
+                    || args.filters.has_filters()
+                {
+                    eprintln!("Error: pass stream flags and filters after `events stream`");
+                    return 1;
+                }
+                return observation::cmd_events_stream(db, stream_args, instance_name.as_deref());
+            }
             EventsSubcmd::Launch(launch_args) => {
                 return cmd_events_launch(db, launch_args, instance_name.as_deref());
             }
