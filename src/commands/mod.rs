@@ -1,6 +1,7 @@
 //! CLI commands for hcom.
 //!
 
+pub mod listen_result;
 // Messaging
 pub mod listen;
 pub mod send;

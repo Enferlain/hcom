@@ -64,6 +64,7 @@ const EVENTS_QUERY: &[HelpEntry] = &[
         "Last 20 events as JSON Lines (one object per line)",
     ),
     ("  --last N", "Limit count (default: 20)"),
+    ("  --cursor", "Print the current durable event cursor"),
     ("  --all", "Include archived sessions"),
     ("  --full", "Full event JSON (default: streamlined)"),
     ("  --wait [SEC]", "Block until match (default: 60s)"),
@@ -105,7 +106,10 @@ const EVENTS_FOLLOW: &[HelpEntry] = &[
 
 const EVENTS_SHORTCUTS: &[HelpEntry] = &[
     ("Shortcuts:", ""),
-    ("  --idle NAME", "--agent NAME --status listening"),
+    (
+        "  --idle NAME",
+        "Task-idle transition, excluding transport waits",
+    ),
     ("  --blocked NAME", "--agent NAME --status blocked"),
 ];
 
@@ -547,6 +551,18 @@ const LISTEN_HELP: &[HelpEntry] = &[
     ("  [timeout]", "Timeout in seconds (alias for --timeout)"),
     ("  --timeout N", "Timeout in seconds (default: 86400)"),
     ("  --json", "Output messages as JSON"),
+    (
+        "  --after-id ID",
+        "Filtered mode: match events after this exclusive cursor",
+    ),
+    (
+        "  --timeout-ok",
+        "Filtered mode: return 0 on timeout (default: 1)",
+    ),
+    (
+        "",
+        "Filtered --json returns a versioned match/timeout result; inbox messages remain unread",
+    ),
     ("", ""),
     ("Filter flags:", ""),
     ("", "Supports all filter flags from 'events' command"),

@@ -576,16 +576,19 @@ fn listen_delivers_capped_prefix() {
     assert_eq!(cursor(&db, &receiver), ids[99]);
 }
 
-/// A filter listen that returns on a recent match, before reading the inbox,
-/// still gets the router's delivery.
+/// Direct filtered observation finds recent matches via --after-id 0 without
+/// advancing the inbox cursor; a later ordinary listen delivers and acknowledges the message.
 #[test]
-fn early_filter_listen_match_still_delivers() {
+fn early_filter_listen_match_leaves_inbox_for_ordinary_listen() {
     let (h, db, sender, receiver) = setup("adhoc");
+    let before = cursor(&db, &receiver);
     let id = queue(&db, &sender, &receiver, "early-sentinel");
     let (code, out, err) = h.run([
         "listen",
         "--name",
         &receiver,
+        "--after-id",
+        "0",
         "--timeout",
         "1",
         "--sql",
@@ -593,7 +596,18 @@ fn early_filter_listen_match_still_delivers() {
     ]);
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("[Match found]"), "{out}");
+    assert!(out.contains(&format!("#{id} message:{sender}")), "{out}");
+    assert!(!out.contains("early-sentinel"), "{out}");
+    assert_eq!(cursor(&db, &receiver), before);
+
+    let (code, out, err) = h.run(["listen", "--name", &receiver, "--timeout", "1"]);
+    assert_eq!(code, 0, "{err}");
     assert!(out.contains("early-sentinel"), "{out}");
+    assert_eq!(cursor(&db, &receiver), id);
+
+    let (code, out, err) = h.run(["listen", "--name", &receiver, "--timeout", "0"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains("early-sentinel"), "{out}");
     assert_eq!(cursor(&db, &receiver), id);
 }
 
@@ -618,12 +632,14 @@ fn failed_command_delivery_write_fails_command() {
     assert_eq!(cursor(&db, &receiver), before);
 }
 
-/// Filter listen shows system messages it acknowledges instead of dropping them.
+/// Direct filtered observation sees no unrelated messages and leaves the cursor;
+/// a later ordinary listen shows and acknowledges the system message.
 #[test]
-fn filter_listen_shows_system_messages() {
+fn filter_listen_leaves_system_messages_for_ordinary_listen() {
     let (h, db, _sender, receiver) = setup("adhoc");
+    let before = cursor(&db, &receiver);
     let id = queue(&db, "[hcom-launcher]", &receiver, "launcher-sentinel");
-    let (_, out, err) = h.run([
+    let (code, out, err) = h.run([
         "listen",
         "--name",
         &receiver,
@@ -632,16 +648,25 @@ fn filter_listen_shows_system_messages() {
         "--sql",
         "type='status' AND 0",
     ]);
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(err.contains("[Timeout:"), "{out}\n{err}");
+    assert!(!out.contains("launcher-sentinel"), "{out}\n{err}");
+    assert_eq!(cursor(&db, &receiver), before);
+
+    let (code, out, err) = h.run(["listen", "--name", &receiver, "--timeout", "1"]);
+    assert_eq!(code, 0, "{err}");
     assert!(out.contains("launcher-sentinel"), "{out}\n{err}");
     assert_eq!(cursor(&db, &receiver), id);
 }
 
-/// A listen that exits before reading the inbox leaves delivery to the router.
+/// A filtered listen exiting immediately on timeout leaves unread messages
+/// untouched; a later ordinary listen delivers and acknowledges them.
 #[test]
-fn listen_exiting_before_reading_still_delivers() {
+fn filter_listen_timeout_zero_leaves_messages_for_ordinary_listen() {
     let (h, db, sender, receiver) = setup("adhoc");
+    let before = cursor(&db, &receiver);
     let id = queue(&db, &sender, &receiver, "unread-sentinel");
-    let (_, out, err) = h.run([
+    let (code, out, err) = h.run([
         "listen",
         "--name",
         &receiver,
@@ -650,29 +675,67 @@ fn listen_exiting_before_reading_still_delivers() {
         "--sql",
         "type='status' AND 0",
     ]);
+    assert_eq!(code, 1, "{out}\n{err}");
+    assert!(err.contains("[Timeout:"), "{out}\n{err}");
+    assert!(!out.contains("unread-sentinel"), "{out}\n{err}");
+    assert_eq!(cursor(&db, &receiver), before);
+
+    let (code, out, err) = h.run(["listen", "--name", &receiver, "--timeout", "1"]);
+    assert_eq!(code, 0, "{err}");
     assert!(out.contains("unread-sentinel"), "{out}\n{err}");
     assert_eq!(cursor(&db, &receiver), id);
 }
 
-/// Filter listen keeps reading past a capped batch (a match may sit beyond it).
+/// Direct filtered observation reads past a capped batch without advancing the inbox;
+/// subsequent ordinary listens deliver and acknowledge all queued messages respecting the batch cap.
 #[test]
-fn filter_listen_reads_past_capped_batch() {
+fn filter_listen_reads_past_capped_batch_without_consuming_inbox() {
     let (h, db, sender, receiver) = setup("adhoc");
+    let before = cursor(&db, &receiver);
     let ids: Vec<i64> = (0..60)
         .map(|i| queue(&db, &sender, &receiver, &format!("sentinel-{i:03}-end")))
         .collect();
-    let (_, out, err) = h.run([
+    let (code, out, err) = h.run([
         "listen",
         "--name",
         &receiver,
+        "--after-id",
+        "0",
         "--timeout",
         "2",
         "--sql",
-        "type='status' AND 0",
+        "json_extract(data, '$.text') = 'sentinel-059-end'",
     ]);
-    assert!(out.contains("sentinel-059-end"), "{out}\n{err}");
-    assert!(!out.contains("more unread"), "{out}");
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("[Match found]"), "{out}");
+    assert!(
+        out.contains(&format!("#{} message:{sender}", ids[59])),
+        "{out}"
+    );
+    assert_eq!(cursor(&db, &receiver), before);
+
+    let (code, out, err) = h.run(["listen", "--name", &receiver, "--timeout", "1"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(cursor(&db, &receiver), ids[49]);
+    assert!(out.contains("sentinel-049-end") && !out.contains("sentinel-050-end"));
+    assert!(out.contains("[+10 more unread"), "{out}");
+    let first_batch = out;
+
+    let (code, out, err) = h.run(["listen", "--name", &receiver, "--timeout", "1"]);
+    assert_eq!(code, 0, "{err}");
     assert_eq!(cursor(&db, &receiver), ids[59]);
+    assert!(out.contains("sentinel-059-end"), "{out}");
+    assert!(!out.contains("more unread"), "{out}");
+    let delivered = first_batch + &out;
+    for index in 0..60 {
+        assert_eq!(
+            delivered
+                .matches(&format!("sentinel-{index:03}-end"))
+                .count(),
+            1,
+            "{delivered}"
+        );
+    }
 }
 
 /// A message arriving while listen writes its batch gets a notice.

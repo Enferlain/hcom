@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::cli_context::InlineBatch;
+mod filtered;
 use crate::cli_context::format_envelope_prefix;
 use crate::core::filters::{EventFilterArgs, build_sql_from_flags, resolve_filter_names};
 use crate::db::HcomDb;
@@ -18,6 +19,7 @@ use crate::instance_lifecycle::set_status;
 use crate::instances;
 use crate::notify::NotifyServer;
 use crate::shared::{CommandContext, ST_INACTIVE, ST_LISTENING};
+use filtered::{listen_with_filter, validate_filter_sql};
 
 /// Parsed arguments for `hcom listen`.
 #[derive(clap::Parser, Debug)]
@@ -32,6 +34,12 @@ pub struct ListenArgs {
     /// JSON output
     #[arg(long)]
     pub json: bool,
+    /// Exclusive event cursor (requires filter mode)
+    #[arg(long)]
+    pub after_id: Option<i64>,
+    /// Return success on a filtered timeout
+    #[arg(long)]
+    pub timeout_ok: bool,
     /// SQL WHERE filter
     #[arg(long)]
     pub sql: Option<String>,
@@ -200,6 +208,8 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
         86400.0
     };
 
+    let requested_timeout = timeout;
+
     // Quick check mode
     if timeout <= 1.0 {
         timeout = 0.1;
@@ -245,6 +255,11 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
         }
     };
 
+    if (args.after_id.is_some() || args.timeout_ok) && combined_sql.is_none() {
+        eprintln!("Error: --after-id and --timeout-ok require --sql or an event filter");
+        return 1;
+    }
+
     let instance_data = identity.instance_data.as_ref();
     if instance_data.is_none() {
         eprintln!("Error: hcom not started for '{instance_name}'.");
@@ -253,6 +268,11 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
 
     // Branch: SQL filter mode (combined from flags + --sql)
     if let Some(ref filter) = combined_sql {
+        if let Err(error) = validate_filter_sql(db, filter) {
+            eprintln!("Invalid SQL filter: {error}");
+            return 1;
+        }
+        crate::cli_context::claim_inline_delivery();
         // Setup SIGTERM handler for filter mode
         let shutdown = Arc::new(AtomicBool::new(false));
         crate::sys::signal::register_term(&shutdown);
@@ -261,6 +281,9 @@ pub fn cmd_listen(db: &HcomDb, args: &ListenArgs, ctx: Option<&CommandContext>) 
             filter,
             &instance_name,
             timeout,
+            requested_timeout,
+            args.after_id,
+            args.timeout_ok,
             json_output,
             instance_data.unwrap(),
             &shutdown,
@@ -401,270 +424,6 @@ fn listen_loop(
         update_heartbeat(db, instance_name);
 
         // Wait for notification or short poll
-        let remaining = timeout - elapsed;
-        if remaining <= 0.0 {
-            continue;
-        }
-
-        // TCP select for local notifications. Relay imports (pull.rs) call
-        // `crate::notify::wake_all` after every batch, so the TCP wake fires
-        // as soon as remote events land — no separate relay polling needed.
-        let wait_time = if notify_server.is_some() {
-            remaining.min(30.0)
-        } else {
-            remaining.min(0.1)
-        };
-
-        if let Some(server) = notify_server {
-            server.wait(Duration::from_secs_f64(wait_time));
-        } else {
-            std::thread::sleep(Duration::from_secs_f64(wait_time));
-        }
-    }
-}
-
-/// Listen with SQL filter — uses temp subscription.
-fn listen_with_filter(
-    db: &HcomDb,
-    sql_filter: &str,
-    instance_name: &str,
-    timeout: f64,
-    json_output: bool,
-    instance_data: &serde_json::Value,
-    shutdown: &AtomicBool,
-) -> i32 {
-    // Validate SQL syntax (use events_v view for computed columns)
-    let test_query = format!("SELECT 1 FROM events_v WHERE ({sql_filter}) LIMIT 0");
-    if let Err(e) = db.conn().execute_batch(&test_query) {
-        eprintln!("Invalid SQL filter: {e}");
-        return 1;
-    }
-
-    // Check for recent match (10s lookback)
-    let now_ts = crate::shared::time::now_epoch_f64();
-    let lookback_ts = chrono::DateTime::from_timestamp((now_ts - 10.0) as i64, 0)
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string())
-        .unwrap_or_default();
-
-    let recent_query = format!(
-        "SELECT id, type, instance, data FROM events_v WHERE timestamp > ? AND ({sql_filter}) ORDER BY id DESC LIMIT 1"
-    );
-    if let Ok(mut stmt) = db.conn().prepare(&recent_query)
-        && let Ok(row) = stmt.query_row(rusqlite::params![lookback_ts], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-    {
-        if json_output {
-            let data: serde_json::Value = serde_json::from_str(&row.3).unwrap_or_default();
-            let j = serde_json::json!({
-                "event_id": row.0,
-                "type": row.1,
-                "instance": row.2,
-                "data": data,
-            });
-            println!("{}", serde_json::to_string(&j).unwrap_or_default());
-        } else {
-            println!("[Match found] #{} {}:{}", row.0, row.1, row.2);
-        }
-        return 0;
-    }
-
-    // Create temp subscription — SHA256 over instance+filter+time to avoid collisions
-    let sub_id = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(format!("{instance_name}{sql_filter}{now_ts}").as_bytes());
-        let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        format!("listen-{}", &hex[..6])
-    };
-    let sub_key = format!("events_sub:{sub_id}");
-
-    // Adhoc: mark listening BEFORE capturing last_id so the status event is
-    // excluded from the subscription.
-    set_adhoc_listening(
-        db,
-        instance_name,
-        instance_data,
-        &format!("filter:{sub_id}"),
-    );
-
-    let sub_data = serde_json::json!({
-        "id": sub_id,
-        "sql": sql_filter,
-        "caller": instance_name,
-        "once": true,
-        "last_id": db.get_last_event_id(),
-        "created": now_ts,
-    });
-    let _ = db.kv_set(&sub_key, Some(&sub_data.to_string()));
-
-    // Setup notify
-    let notify_server = NotifyServer::new().ok();
-    if let Some(ref server) = notify_server {
-        let _ = db.upsert_notify_endpoint(instance_name, "listen_filter", server.port());
-    }
-
-    update_heartbeat(db, instance_name);
-
-    let start_time = std::time::Instant::now();
-
-    if !json_output {
-        eprintln!("[Listening for events matching filter. Timeout: {timeout}s]");
-    }
-
-    let result = filter_listen_loop(
-        db,
-        instance_name,
-        &sub_id,
-        timeout,
-        json_output,
-        instance_data,
-        start_time,
-        notify_server.as_ref(),
-        shutdown,
-    );
-
-    // Cleanup
-    let _ = db.kv_set(&sub_key, None);
-    let _ = db.delete_notify_endpoint(instance_name, "listen_filter");
-
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-fn filter_listen_loop(
-    db: &HcomDb,
-    instance_name: &str,
-    sub_id: &str,
-    timeout: f64,
-    json_output: bool,
-    instance_data: &serde_json::Value,
-    start_time: std::time::Instant,
-    notify_server: Option<&NotifyServer>,
-    shutdown: &AtomicBool,
-) -> i32 {
-    let mut backlog_end: Option<Option<i64>> = None;
-    loop {
-        // Check for SIGTERM
-        if shutdown.load(Ordering::Relaxed) {
-            if !json_output {
-                eprintln!("\n[SIGTERM received, shutting down]");
-            }
-            return 130;
-        }
-
-        let elapsed = start_time.elapsed().as_secs_f64();
-        if elapsed >= timeout {
-            if !json_output {
-                eprintln!("\n[Timeout: no match after {timeout}s]");
-            }
-            set_listen_done_status(db, instance_name, instance_data, "listen timeout");
-            return 0;
-        }
-
-        // Check if stopped
-        if db.get_instance_full(instance_name).ok().flatten().is_none() {
-            if !json_output {
-                eprintln!("\n[Disconnected: HCOM stopped for {instance_name}]");
-            }
-            return 0;
-        }
-
-        // Check for messages (subscription notification or regular). Everything
-        // in the batch is shown before it is acknowledged; only the match or a
-        // real message ends the listen.
-        if let Some(batch) = InlineBatch::take(db, instance_name) {
-            // listen delivers this batch itself (or leaves it unread on a failed
-            // write); the router must not deliver another one after it.
-            crate::cli_context::claim_inline_delivery();
-            let sub_tag = format!("[sub:{sub_id}]");
-            let is_match =
-                |m: &crate::db::Message| m.from == "[hcom-events]" && m.text.contains(&sub_tag);
-            let matched = batch.messages.iter().find(|m| is_match(m));
-            let others: Vec<crate::db::Message> = batch
-                .messages
-                .iter()
-                .filter(|m| !is_match(m))
-                .cloned()
-                .collect();
-
-            // Event order, with the match in its place among the other messages.
-            let mut output = String::new();
-            let mut run: Vec<crate::db::Message> = Vec::new();
-            let flush = |run: &mut Vec<crate::db::Message>, output: &mut String| {
-                if run.is_empty() {
-                    return;
-                }
-                if json_output {
-                    for msg in run.iter() {
-                        output.push_str(&(message_json(msg) + "\n"));
-                    }
-                } else {
-                    output.push_str(&format!(
-                        "\n{}\n",
-                        format_messages_text(db, run, instance_name)
-                    ));
-                }
-                run.clear();
-            };
-            for msg in &batch.messages {
-                if !is_match(msg) {
-                    run.push(msg.clone());
-                    continue;
-                }
-                flush(&mut run, &mut output);
-                if json_output {
-                    let j = serde_json::json!({"matched": true, "notification": msg.text});
-                    output.push_str(&format!("{j}\n"));
-                } else {
-                    output.push_str(&format!("\n{}\n", msg.text));
-                }
-            }
-            flush(&mut run, &mut output);
-            if let Err(e) = batch.emit(db, instance_name, &output, false) {
-                eprintln!("hcom: {e}");
-                set_listen_done_status(db, instance_name, instance_data, "delivery failed");
-                return 1;
-            }
-            if matched.is_some() {
-                let note = batch.remaining_note(instance_name)
-                    + &batch.arrived_since_note(db, instance_name);
-                if json_output {
-                    eprint!("{note}");
-                } else {
-                    print!("{note}");
-                }
-                set_listen_done_status(db, instance_name, instance_data, "filter matched");
-                return 0;
-            }
-            // The match may sit beyond this capped batch: keep reading through the
-            // backlog that existed at the first batch, but not newer arrivals, so
-            // sustained traffic can't keep the listen draining.
-            let end = *backlog_end.get_or_insert(batch.backlog_end);
-            let batch_end = batch.messages.last().and_then(|m| m.event_id);
-            if batch.remaining > 0 && batch_end < end {
-                continue;
-            }
-            if others.iter().any(|m| !m.from.starts_with('[')) {
-                let late = batch.remaining_note(instance_name)
-                    + &batch.arrived_since_note(db, instance_name);
-                if json_output {
-                    eprint!("{late}");
-                } else {
-                    print!("{late}");
-                }
-                set_listen_done_status(db, instance_name, instance_data, "message received");
-                return 0;
-            }
-        }
-
-        update_heartbeat(db, instance_name);
-
         let remaining = timeout - elapsed;
         if remaining <= 0.0 {
             continue;
@@ -832,11 +591,11 @@ mod tests {
             )
             .unwrap();
 
-        for args in [
-            listen_args(&["1"]),
-            listen_args(&["--timeout", "1", "--from", "nobody"]),
+        for (args, expected_exit) in [
+            (listen_args(&["1"]), 0),
+            (listen_args(&["--timeout", "1", "--from", "nobody"]), 1),
         ] {
-            assert_eq!(cmd_listen(&db, &args, Some(&ctx("luna"))), 0);
+            assert_eq!(cmd_listen(&db, &args, Some(&ctx("luna"))), expected_exit);
             assert_eq!(row(&db).status, ST_INACTIVE);
             assert_eq!(row(&db).status_context, "listen timeout");
             backdate_status(&db, 120);
@@ -876,11 +635,11 @@ mod tests {
             )
             .unwrap();
 
-        for args in [
-            listen_args(&["1"]),
-            listen_args(&["--timeout", "1", "--from", "nobody"]),
+        for (args, expected_exit) in [
+            (listen_args(&["1"]), 0),
+            (listen_args(&["--timeout", "1", "--from", "nobody"]), 1),
         ] {
-            assert_eq!(cmd_listen(&db, &args, Some(&ctx("luna"))), 0);
+            assert_eq!(cmd_listen(&db, &args, Some(&ctx("luna"))), expected_exit);
             assert_eq!(row(&db).status, "active", "{args:?}");
             assert_eq!(row(&db).status_context, "tool:Bash", "{args:?}");
         }

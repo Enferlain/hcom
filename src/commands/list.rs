@@ -273,10 +273,15 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
 
         match db.get_instance_full(&lookup_name) {
             Ok(Some(data)) => {
+                let display_status_context = crate::shared::constants::display_status_context(
+                    &data.status_context,
+                    verbose_output,
+                );
                 let mut payload = serde_json::json!({
                     "name": lookup_name,
                     "session_id": data.session_id,
                     "status": data.status,
+                    "status_context": display_status_context,
                     "directory": data.directory,
                     "transcript_path": data.transcript_path,
                     "parent_name": data.parent_name,
@@ -311,7 +316,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 } else if json_output {
                     println!("{}", serde_json::to_string(&payload).unwrap_or_default());
                 } else {
-                    print_instance_details(db, &data, &lookup_name, usage.as_ref());
+                    print_instance_details(db, &data, &lookup_name, usage.as_ref(), verbose_output);
                 }
                 return 0;
             }
@@ -379,10 +384,15 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(serde_json::json!({}));
 
+            let display_status_context = crate::shared::constants::display_status_context(
+                &data.status_context,
+                verbose_output,
+            );
+
             let payload = serde_json::json!({
                 "name": full_name,
                 "status": status,
-                "status_context": data.status_context,
+                "status_context": display_status_context,
                 "status_detail": data.status_detail,
                 "status_age_seconds": age_seconds,
                 "description": description,
@@ -731,15 +741,19 @@ fn print_instance_details(
     data: &InstanceRow,
     display_name: &str,
     usage: Option<&crate::transcript::SessionUsage>,
+    verbose: bool,
 ) {
     let cs = get_instance_status(data, db);
     let status = cs.status;
 
+    let display_context =
+        crate::shared::constants::display_status_context(&data.status_context, verbose);
+
     // Status line construction
-    let status_line = if data.status_context.is_empty() {
+    let status_line = if display_context.is_empty() {
         status.clone()
     } else {
-        format!("{status} ({})", data.status_context)
+        format!("{status} ({display_context})")
     };
 
     println!("{display_name}:");

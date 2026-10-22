@@ -10,6 +10,10 @@
 
 use std::collections::HashMap;
 use std::net::TcpListener;
+
+mod listener;
+mod wait;
+use listener::*;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -25,6 +29,7 @@ use crate::shared::CommandContext;
 /// Parsed arguments for `hcom events`.
 #[derive(clap::Parser, Debug)]
 #[command(name = "events", about = "Query and subscribe to events")]
+#[command(group(clap::ArgGroup::new("cursor_mode").args(["wait", "follow"])))]
 pub struct EventsArgs {
     /// Subcommand (sub, unsub, launch) or handled as query mode
     #[command(subcommand)]
@@ -44,8 +49,11 @@ pub struct EventsArgs {
     /// Stream matching events as JSON Lines until interrupted
     #[arg(long)]
     pub follow: bool,
-    /// With --follow: start after this event id (resume from a saved cursor)
-    #[arg(long = "after-id")]
+    /// Print the current durable cursor for arming a later wait
+    #[arg(long, conflicts_with_all = ["wait", "follow", "last", "all", "full", "sql", "remote_fetch"])]
+    pub cursor: bool,
+    /// Start after this event id (with --follow or --wait)
+    #[arg(long = "after-id", requires = "cursor_mode")]
     pub after_id: Option<i64>,
     /// Raw SQL WHERE clause
     #[arg(long)]
@@ -999,138 +1007,17 @@ fn events_wait(
     filters: &HashMap<String, Vec<String>>,
     instance_name: Option<&str>,
 ) -> i32 {
-    use std::time::Instant;
-
-    // Quick lookback: check last 10s for already-matching events
-    let now_ts = crate::shared::time::now_epoch_i64() - 10;
-    let lookback_ts = chrono::DateTime::from_timestamp(now_ts, 0)
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_default();
-
-    let lookback_query = format!(
-        "SELECT * FROM events_v WHERE timestamp > ?{filter_query} ORDER BY id DESC LIMIT 1"
-    );
-    if let Ok(mut stmt) = db.conn().prepare(&lookback_query)
-        && let Ok(mut rows) = stmt.query(rusqlite::params![lookback_ts])
-        && let Ok(Some(row)) = rows.next()
-        && let Ok(event) = parse_event_row(row)
-    {
-        let output = if full_output {
-            event.clone()
-        } else {
-            streamline_event(&event, filters)
-        };
-        println!("{}", serde_json::to_string(&output).unwrap_or_default());
-        return 0;
-    }
-
-    // Setup TCP notify server for instant wake — only useful when we can
-    // register an `events_wait` wake endpoint for `crate::notify::wake_all`
-    // to poke. Anonymous waits (no instance_name) skip the listener and
-    // fall through to a short poll.
-    let mut notify_server: Option<TcpListener> = None;
-    let mut notify_port: Option<u16> = None;
-    if let Some(name) = instance_name
-        && let Ok(server) = TcpListener::bind("127.0.0.1:0")
-        && let Ok(addr) = server.local_addr()
-    {
-        let port = addr.port();
-        server.set_nonblocking(true).ok();
-        if db.upsert_notify_endpoint(name, "events_wait", port).is_ok() {
-            notify_server = Some(server);
-            notify_port = Some(port);
-        }
-    }
-
-    let start = Instant::now();
-    let mut last_id = db.get_last_event_id();
-    let mut unread_preview_shown = false;
-
-    let result = loop {
-        if start.elapsed() >= Duration::from_secs(wait_timeout) {
-            println!("{}", json!({"timed_out": true}));
-            break 1;
-        }
-
-        // Query for new matching events
-        let query = format!("SELECT * FROM events_v WHERE id > ?{filter_query} ORDER BY id");
-        let mut found = false;
-        match db.conn().prepare(&query) {
-            Ok(mut stmt) => {
-                if let Ok(mut rows) = stmt.query(rusqlite::params![last_id]) {
-                    while let Ok(Some(row)) = rows.next() {
-                        // Always advance last_id regardless of parse success
-                        if let Ok(id) = row.get::<_, i64>("id") {
-                            last_id = id;
-                        }
-                        if let Ok(event) = parse_event_row(row) {
-                            let output = if full_output {
-                                event.clone()
-                            } else {
-                                streamline_event(&event, filters)
-                            };
-                            println!("{}", serde_json::to_string(&output).unwrap_or_default());
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Error in SQL WHERE clause: {e}");
-                break 2;
-            }
-        }
-
-        if found {
-            break 0;
-        }
-
-        // Check for unread messages (optional preview notification) — use <hcom> XML tag format
-        if let Some(name) = instance_name
-            && !unread_preview_shown
-        {
-            let messages = db.get_unread_messages(name);
-            if !messages.is_empty() {
-                // Format as <hcom> XML tag
-                let preview = build_message_preview(db, name);
-                println!("{preview}");
-                unread_preview_shown = true;
-            }
-        }
-
-        // Wait for TCP notification or timeout
-        let remaining = wait_timeout.saturating_sub(start.elapsed().as_secs());
-        if remaining == 0 {
-            println!("{}", json!({"timed_out": true}));
-            break 1;
-        }
-
-        if let Some(ref server) = notify_server {
-            // Use poll-based wait (500ms intervals since TcpListener is non-blocking)
-            let wait_time = std::cmp::min(remaining, 5);
-            let poll_end = Instant::now() + Duration::from_secs(wait_time);
-            while Instant::now() < poll_end {
-                // Try accept (non-blocking)
-                if let Ok((conn, _)) = server.accept() {
-                    let _ = conn.shutdown(std::net::Shutdown::Both);
-                    break; // Got notification, re-check events
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        } else {
-            // No registered listener (anonymous wait or bind failed) — nothing
-            // can TCP-wake us, so re-check the events query on a short tick.
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    };
-
-    // Cleanup TCP notify endpoint
-    if let (Some(name), Some(_port)) = (instance_name, notify_port) {
-        let _ = db.delete_notify_endpoint(name, "events_wait");
-    }
-
-    result
+    wait::wait_for_event(
+        db,
+        filter_query,
+        wait_timeout,
+        wait::WaitOptions {
+            after_id: None,
+            full_output,
+            filters,
+            instance_name,
+        },
+    )
 }
 
 /// Parse a row from events_v into a JSON value.
@@ -1202,8 +1089,26 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
         .map(|id| id.name.clone());
     let caller_name = instance_name.clone();
 
+    if args.cursor {
+        if args.subcmd.is_some()
+            || args.filters.has_filters()
+            || args.device.is_some()
+            || args.after_id.is_some()
+        {
+            eprintln!("Error: --cursor cannot be combined with filters or other event modes");
+            return 1;
+        }
+        crate::cli_context::claim_inline_delivery();
+        println!("{}", db.get_last_event_id());
+        return 0;
+    }
+
     // Handle subcommands
     if let Some(ref subcmd) = args.subcmd {
+        if args.follow {
+            eprintln!("Error: --follow is not supported with subcommands");
+            return 1;
+        }
         if args.remote_fetch {
             eprintln!("Error: --remote-fetch is only supported in query mode");
             return 1;
@@ -1237,8 +1142,8 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
             eprintln!("Error: {message}");
             return 1;
         }
-    } else if args.after_id.is_some() {
-        eprintln!("Error: --after-id requires --follow");
+    } else if args.after_id.is_some() && args.wait.is_none() {
+        eprintln!("Error: --after-id requires --follow or --wait");
         return 1;
     }
 
@@ -1345,6 +1250,7 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
     }
 
     if args.follow {
+        crate::cli_context::claim_inline_delivery();
         return events_follow(
             &filter_query,
             args.last,
@@ -1356,6 +1262,20 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
 
     // Wait mode
     if let Some(timeout) = wait_timeout {
+        crate::cli_context::claim_inline_delivery();
+        if args.after_id.is_some() || !filter_query.is_empty() {
+            return wait::wait_for_event(
+                db,
+                &filter_query,
+                timeout,
+                wait::WaitOptions {
+                    after_id: args.after_id,
+                    full_output,
+                    filters: &filters,
+                    instance_name: instance_name.as_deref(),
+                },
+            );
+        }
         return events_wait(
             db,
             &filter_query,

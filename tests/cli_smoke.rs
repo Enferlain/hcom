@@ -2476,11 +2476,11 @@ fn events_follow_rejects_conflicting_flags() {
     for (args, expected) in [
         (
             vec!["events", "--after-id", "1"],
-            "--after-id requires --follow",
+            "Missing required argument: <--wait [<wait>]|--follow>",
         ),
         (
             vec!["events", "--follow", "--wait", "5"],
-            "--follow cannot be combined with --wait",
+            "cannot be used with '--wait",
         ),
         (
             vec!["events", "--follow", "--after-id", "1", "--last", "2"],
