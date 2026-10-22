@@ -248,7 +248,13 @@ pub(crate) fn detect_agent_type(path: &str) -> &'static str {
 }
 
 fn transcript_search_key(path: &str, session_id: Option<&str>) -> String {
-    format!("{path}\u{0}{}", session_id.unwrap_or(""))
+    let canonical = std::fs::canonicalize(path).ok();
+    let canonical = canonical.as_ref().map(|p| p.to_string_lossy());
+    format!(
+        "{}\u{0}{}",
+        canonical.as_deref().unwrap_or(path),
+        session_id.unwrap_or("")
+    )
 }
 
 /// Attribute a `--all` disk match to a canonical tool.
@@ -605,18 +611,27 @@ fn search_transcript<'a>(
     source: &'a TrackedTranscript,
     tool: Tool,
     re: &regex::Regex,
-) -> Vec<SearchHit<'a>> {
-    let Ok(exchanges) = get_exchanges(
+) -> Result<Vec<SearchHit<'a>>, String> {
+    // Shared database backends (such as Hermes) require a session_id to isolate an
+    // agent's transcript. When a tracked record lacks a session_id, skip it safely
+    // with empty hits rather than failing the entire multi-agent search or broadening
+    // attribution to foreign sessions in the shared database.
+    if tool == Tool::Hermes && source.session_id.as_deref().unwrap_or("").is_empty() {
+        return Ok(Vec::new());
+    }
+    let exchanges = match get_exchanges(
         &source.path,
         &source.tool,
         usize::MAX,
         true,
         source.session_id.as_deref(),
         false,
-    ) else {
-        return Vec::new();
+    ) {
+        Ok(ex) => ex,
+        Err(err) if tool == Tool::Hermes => return Err(err),
+        Err(_) => return Ok(Vec::new()),
     };
-    exchanges
+    Ok(exchanges
         .iter()
         .filter_map(|ex| {
             let (field, snippet) = match_exchange(ex, re)?;
@@ -629,7 +644,7 @@ fn search_transcript<'a>(
                 snippet,
             })
         })
-        .collect()
+        .collect())
 }
 
 /// Transcript files that contain `pattern` on disk, or `None` when that can't
@@ -742,25 +757,38 @@ fn cmd_transcript_search(
     let workers = std::thread::available_parallelism()
         .map_or(1, |n| n.get())
         .min(to_parse.len().max(1));
-    let mut hits: Vec<SearchHit> = std::thread::scope(|scope| {
+    let search_results: Vec<Result<Vec<SearchHit>, String>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|w| {
                 let (to_parse, re) = (&to_parse, &re);
                 scope.spawn(move || {
-                    to_parse
-                        .iter()
-                        .skip(w)
-                        .step_by(workers)
-                        .flat_map(|(source, tool, _)| search_transcript(source, *tool, re))
-                        .collect::<Vec<_>>()
+                    let mut hits = Vec::new();
+                    for (source, tool, _) in to_parse.iter().skip(w).step_by(workers) {
+                        hits.extend(search_transcript(source, *tool, re)?);
+                    }
+                    Ok(hits)
                 })
             })
             .collect();
         handles
             .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err("search worker panicked".to_string()))
+            })
             .collect()
     });
+
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for res in search_results {
+        match res {
+            Ok(h) => hits.extend(h),
+            Err(err) => {
+                eprintln!("Error: {err}");
+                return 1;
+            }
+        }
+    }
 
     let total = hits.len();
     hits.sort_by_key(|h| std::cmp::Reverse(parse_timestamp(&h.timestamp)));
@@ -831,6 +859,58 @@ fn cmd_transcript_search(
     0
 }
 
+/// Gather unique Hermes database paths: ambient database if present, plus any
+/// databases recorded in active instance records or stopped lifecycle events.
+/// Paths are canonicalized for deduplication while preserving recorded paths.
+/// Malformed unrelated life-event data is filtered with json_valid, and
+/// preparation/query errors are propagated.
+pub(crate) fn gather_hermes_database_paths(db: &HcomDb) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    let mut canonical_seen = Vec::new();
+
+    if let Some(ambient) = transcript::database_search_path(Tool::Hermes)
+        && ambient.exists()
+    {
+        let canonical = std::fs::canonicalize(&ambient).unwrap_or_else(|_| ambient.clone());
+        canonical_seen.push(canonical);
+        paths.push(ambient);
+    }
+
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT DISTINCT transcript_path FROM instances WHERE lower(tool) = 'hermes' AND transcript_path IS NOT NULL AND transcript_path != '' \
+             UNION \
+             SELECT DISTINCT json_extract(data, '$.snapshot.transcript_path') \
+             FROM events WHERE type = 'life' \
+             AND json_valid(data) \
+             AND json_extract(data, '$.action') = 'stopped' \
+             AND lower(json_extract(data, '$.snapshot.tool')) = 'hermes' \
+             AND json_extract(data, '$.snapshot.transcript_path') IS NOT NULL AND json_extract(data, '$.snapshot.transcript_path') != '' \
+             AND json_type(data, '$.snapshot.transcript_path') = 'text'",
+        )
+        .map_err(|e| format!("failed to prepare query for hermes database paths: {e}"))?;
+
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("failed to query hermes database paths: {e}"))?;
+
+    for row in rows {
+        let path_str = row.map_err(|e| format!("failed to read hermes database path row: {e}"))?;
+        let path = PathBuf::from(path_str);
+        if !path.exists() {
+            continue;
+        }
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !canonical_seen.contains(&canonical) {
+            canonical_seen.push(canonical);
+            paths.push(path);
+        }
+    }
+
+    Ok(paths)
+}
+
 /// `transcript search --all`: raw ripgrep over every transcript on disk,
 /// including sessions hcom never tracked.
 fn cmd_transcript_search_all(
@@ -861,12 +941,46 @@ fn cmd_transcript_search_all(
             }
         }
     }
-    let database_sources: Vec<(Tool, PathBuf)> = selected_tools
+    let mut database_sources: Vec<(Tool, PathBuf)> = selected_tools
         .iter()
+        .filter(|tool| **tool != Tool::Hermes)
         .filter_map(|tool| transcript::database_search_path(*tool).map(|path| (*tool, path)))
         .collect();
 
+    let mut db_errors: Vec<String> = Vec::new();
+
+    // Hermes sessions may belong to different profiles from the caller.
+    // Include their recorded databases, deduplicating equivalent paths.
+    if selected_tools.contains(&Tool::Hermes) {
+        match gather_hermes_database_paths(db) {
+            Ok(hermes_paths) => {
+                for path in hermes_paths {
+                    database_sources.push((Tool::Hermes, path));
+                }
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                db_errors.push(err);
+            }
+        }
+    }
+
     if search_dirs.is_empty() && database_sources.is_empty() {
+        if !db_errors.is_empty() {
+            if args.json {
+                let payload = json!({
+                    "count": 0,
+                    "results": [],
+                    "scope": "all",
+                    "partial": true,
+                    "errors": db_errors,
+                });
+                println!("{}", payload);
+            } else {
+                println!("No transcript directories or databases found on disk.");
+            }
+            return 1;
+        }
         println!("No transcript directories or databases found on disk.");
         return 0;
     }
@@ -911,30 +1025,37 @@ fn cmd_transcript_search_all(
 
     let mut database_matches = Vec::new();
     for (tool, db_path) in &database_sources {
-        if database_matches.len() >= limit {
-            break;
-        }
-        match transcript::search_database_sessions(
-            *tool,
-            db_path,
-            pattern,
-            limit - database_matches.len(),
-        ) {
-            Ok(matches) => database_matches.extend(matches),
+        let remaining_limit = limit.saturating_sub(database_matches.len());
+        let search_limit = remaining_limit.max(1);
+        match transcript::search_database_sessions(*tool, db_path, pattern, search_limit) {
+            Ok(matches) => {
+                if remaining_limit > 0 {
+                    database_matches.extend(matches.into_iter().take(remaining_limit));
+                }
+            }
             Err(err) => {
-                eprintln!("Error: {err}");
-                return 1;
+                let msg = format!(
+                    "error searching transcript database {}: {err}",
+                    db_path.display()
+                );
+                eprintln!("Error: {msg}");
+                db_errors.push(msg);
             }
         }
     }
 
     if file_counts.is_empty() && database_matches.is_empty() {
         if args.json {
-            println!("{}", json!({"count": 0, "results": [], "scope": "all"}));
+            let mut payload = json!({"count": 0, "results": [], "scope": "all"});
+            if !db_errors.is_empty() {
+                payload["partial"] = json!(true);
+                payload["errors"] = json!(db_errors);
+            }
+            println!("{}", payload);
         } else {
             println!("No matches for \"{pattern}\"");
         }
-        return 0;
+        return if db_errors.is_empty() { 0 } else { 1 };
     }
 
     // Correlate transcript paths/session IDs to hcom names via DB.
@@ -1007,15 +1128,21 @@ fn cmd_transcript_search_all(
     }
 
     if args.json {
-        println!(
-            "{}",
-            json!({"count": results.len(), "results": results, "scope": "all"})
-        );
-        return 0;
+        let mut payload = json!({
+            "count": results.len(),
+            "results": results,
+            "scope": "all",
+        });
+        if !db_errors.is_empty() {
+            payload["partial"] = json!(true);
+            payload["errors"] = json!(db_errors);
+        }
+        println!("{}", payload);
+        return if db_errors.is_empty() { 0 } else { 1 };
     }
     if results.is_empty() {
         println!("No matches for \"{pattern}\"");
-        return 0;
+        return if db_errors.is_empty() { 0 } else { 1 };
     }
     let total = file_counts.len() + database_matches.len();
     if results.len() < total {
@@ -1059,7 +1186,7 @@ fn cmd_transcript_search_all(
             println!("    {snippet}");
         }
     }
-    0
+    if db_errors.is_empty() { 0 } else { 1 }
 }
 
 /// Timeline: `hcom transcript timeline [--last N] [--full] [--json]`
@@ -2193,10 +2320,151 @@ View transport messages with: hcom events --remote-fetch --device ABCD --partici
     }
 
     #[test]
+    #[serial_test::serial]
     fn missing_search_tool_is_an_error_not_an_empty_result() {
         let err =
             run_search_tool("__hcom_definitely_missing_search_tool__", &["pattern"]).unwrap_err();
         assert!(err.contains("was not found on PATH"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn search_tool_candidate_scan_tolerates_inaccessible_path_entries() {
+        use std::ffi::OsString;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let inacc_dir = temp_dir.path().join("inaccessible");
+        std::fs::create_dir(&inacc_dir).unwrap();
+        std::fs::set_permissions(&inacc_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let acc_dir = temp_dir.path().join("accessible");
+        std::fs::create_dir(&acc_dir).unwrap();
+        // A real candidate, but not executable.
+        let bad_tool = acc_dir.join("bad_tool");
+        std::fs::write(&bad_tool, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&bad_tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A directory named like a tool is not an executable candidate.
+        std::fs::create_dir(acc_dir.join("sub_dir")).unwrap();
+
+        let path_env = OsString::from(format!("{}:{}", inacc_dir.display(), acc_dir.display()));
+
+        // A missing bare tool stays missing even though one PATH entry EACCESes.
+        assert!(!search_tool_candidate_on_path(
+            "__hcom_definitely_missing_search_tool__",
+            Some(&path_env)
+        ));
+        // A real (even non-executable) candidate file is found.
+        assert!(search_tool_candidate_on_path("bad_tool", Some(&path_env)));
+        // A directory named like the tool does not count.
+        assert!(!search_tool_candidate_on_path("sub_dir", Some(&path_env)));
+
+        // Restore so the tempdir can be removed on hosts where deletion needs it.
+        let _ = std::fs::set_permissions(&inacc_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn missing_search_tool_with_inaccessible_path_entry_is_still_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct EnvGuard {
+            original_path: Option<std::ffi::OsString>,
+            inacc_dir: PathBuf,
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.inacc_dir,
+                    std::fs::Permissions::from_mode(0o700),
+                );
+                // SAFETY: serialized test restoring process env
+                unsafe {
+                    match &self.original_path {
+                        Some(val) => std::env::set_var("PATH", val),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        // PATH shape matching the WSL failure: an inaccessible directory
+        // ahead of an accessible one holding a real candidate.
+        let inacc_dir = temp_dir.path().join("inaccessible");
+        std::fs::create_dir(&inacc_dir).unwrap();
+        std::fs::set_permissions(&inacc_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let acc_dir = temp_dir.path().join("accessible");
+        std::fs::create_dir(&acc_dir).unwrap();
+        let unexec_file = acc_dir.join("test_unexec_search_tool");
+        std::fs::write(&unexec_file, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&unexec_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let orig_path = std::env::var_os("PATH");
+        // Bound as `_guard` so it stays alive until test end and restores
+        // PATH even on assertion panic.
+        let _guard = EnvGuard {
+            original_path: orig_path.clone(),
+            inacc_dir: inacc_dir.clone(),
+        };
+        let test_path = match &orig_path {
+            Some(p) => format!(
+                "{}:{}:{}",
+                inacc_dir.display(),
+                acc_dir.display(),
+                p.to_string_lossy()
+            ),
+            None => format!("{}:{}", inacc_dir.display(), acc_dir.display()),
+        };
+        // SAFETY: serialized test mutating process env
+        unsafe {
+            std::env::set_var("PATH", &test_path);
+        }
+
+        // Missing bare tool: the actionable missing-tool diagnostic, not
+        // "could not run: Permission denied" leaked from the PATH entry.
+        let missing_err =
+            run_search_tool("__hcom_definitely_missing_search_tool__", &["pattern"]).unwrap_err();
+        assert!(
+            missing_err.contains("was not found on PATH"),
+            "expected 'was not found on PATH', got: {missing_err}"
+        );
+
+        // Real non-executable candidate: keeps the permission error.
+        let unexec_err = run_search_tool("test_unexec_search_tool", &["pattern"]).unwrap_err();
+        assert!(
+            unexec_err.contains("could not run `test_unexec_search_tool`"),
+            "expected 'could not run `test_unexec_search_tool`', got: {unexec_err}"
+        );
+        assert!(
+            unexec_err.contains("Permission denied") || unexec_err.contains("os error 13"),
+            "expected permission error detail, got: {unexec_err}"
+        );
+        assert!(
+            !unexec_err.contains("was not found on PATH"),
+            "must not report a real candidate as missing, got: {unexec_err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn non_executable_search_tool_at_explicit_path_keeps_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let tool = temp_dir.path().join("hcom_unexecutable_search_tool");
+        std::fs::write(&tool, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Explicit paths never do PATH search, so PermissionDenied is real.
+        let err = run_search_tool(tool.to_str().unwrap(), &["pattern"]).unwrap_err();
+        assert!(
+            err.contains("could not run") && !err.contains("was not found on PATH"),
+            "expected permission error for explicit path, got: {err}"
+        );
     }
 
     fn insert_test_instance(db: &HcomDb, name: &str, transcript_path: &str, tool: &str) {
@@ -2652,145 +2920,248 @@ View transport messages with: hcom events --remote-fetch --device ABCD --partici
     }
 
     #[test]
-    #[cfg(unix)]
-    fn search_tool_candidate_scan_tolerates_inaccessible_path_entries() {
-        use std::ffi::OsString;
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let inacc_dir = temp_dir.path().join("inaccessible");
-        std::fs::create_dir(&inacc_dir).unwrap();
-        std::fs::set_permissions(&inacc_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        let acc_dir = temp_dir.path().join("accessible");
-        std::fs::create_dir(&acc_dir).unwrap();
-        // A real candidate, but not executable.
-        let bad_tool = acc_dir.join("bad_tool");
-        std::fs::write(&bad_tool, b"#!/bin/sh\necho hi\n").unwrap();
-        std::fs::set_permissions(&bad_tool, std::fs::Permissions::from_mode(0o644)).unwrap();
-        // A directory named like a tool is not an executable candidate.
-        std::fs::create_dir(acc_dir.join("sub_dir")).unwrap();
-
-        let path_env = OsString::from(format!("{}:{}", inacc_dir.display(), acc_dir.display()));
-
-        // A missing bare tool stays missing even though one PATH entry EACCESes.
-        assert!(!search_tool_candidate_on_path(
-            "__hcom_definitely_missing_search_tool__",
-            Some(&path_env)
-        ));
-        // A real (even non-executable) candidate file is found.
-        assert!(search_tool_candidate_on_path("bad_tool", Some(&path_env)));
-        // A directory named like the tool does not count.
-        assert!(!search_tool_candidate_on_path("sub_dir", Some(&path_env)));
-
-        // Restore so the tempdir can be removed on hosts where deletion needs it.
-        let _ = std::fs::set_permissions(&inacc_dir, std::fs::Permissions::from_mode(0o700));
-    }
-
-
-    #[test]
-    #[cfg(unix)]
     #[serial_test::serial]
-    fn missing_search_tool_with_inaccessible_path_entry_is_still_not_found() {
-        use std::os::unix::fs::PermissionsExt;
+    fn test_gather_hermes_database_paths() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
 
-        struct EnvGuard {
-            original_path: Option<std::ffi::OsString>,
-            inacc_dir: PathBuf,
-        }
+        let active_path = dir.path().join("active_hermes.db");
+        let stopped_path = dir.path().join("stopped_hermes.db");
+        let missing_path = dir.path().join("missing_hermes.db");
+        fs::write(&active_path, "").unwrap();
+        fs::write(&stopped_path, "").unwrap();
 
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                let _ = std::fs::set_permissions(
-                    &self.inacc_dir,
-                    std::fs::Permissions::from_mode(0o700),
-                );
-                // SAFETY: serialized test restoring process env
-                unsafe {
-                    match &self.original_path {
-                        Some(val) => std::env::set_var("PATH", val),
-                        None => std::env::remove_var("PATH"),
-                    }
-                }
-            }
-        }
+        // 1. Active instance with tool = 'hermes'
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) \
+                 VALUES ('active_h', 100.0, ?1, 'hermes')",
+                rusqlite::params![active_path.to_str().unwrap()],
+            )
+            .unwrap();
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        // PATH shape matching the WSL failure: an inaccessible directory
-        // ahead of an accessible one holding a real candidate.
-        let inacc_dir = temp_dir.path().join("inaccessible");
-        std::fs::create_dir(&inacc_dir).unwrap();
-        std::fs::set_permissions(&inacc_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // 2. Active instance with non-existent path (should be filtered out by exists())
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) \
+                 VALUES ('missing_h', 101.0, ?1, 'hermes')",
+                rusqlite::params![missing_path.to_str().unwrap()],
+            )
+            .unwrap();
 
-        let acc_dir = temp_dir.path().join("accessible");
-        std::fs::create_dir(&acc_dir).unwrap();
-        let unexec_file = acc_dir.join("test_unexec_search_tool");
-        std::fs::write(&unexec_file, b"#!/bin/sh\necho hi\n").unwrap();
-        std::fs::set_permissions(&unexec_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // 3. Stopped snapshot with tool = 'hermes'
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', ?2, ?3)",
+                rusqlite::params![
+                    "2026-03-27T10:00:00Z",
+                    "stopped_h",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "transcript_path": stopped_path.to_str().unwrap(),
+                            "tool": "hermes"
+                        }
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
 
-        let orig_path = std::env::var_os("PATH");
-        // Bound as `_guard` so it stays alive until test end and restores
-        // PATH even on assertion panic.
-        let _guard = EnvGuard {
-            original_path: orig_path.clone(),
-            inacc_dir: inacc_dir.clone(),
-        };
-        let test_path = match &orig_path {
-            Some(p) => format!(
-                "{}:{}:{}",
-                inacc_dir.display(),
-                acc_dir.display(),
-                p.to_string_lossy()
-            ),
-            None => format!("{}:{}", inacc_dir.display(), acc_dir.display()),
-        };
-        // SAFETY: serialized test mutating process env
-        unsafe {
-            std::env::set_var("PATH", &test_path);
-        }
+        // 4. Duplicate entry for active_path in another stopped event (should be deduped)
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', ?2, ?3)",
+                rusqlite::params![
+                    "2026-03-27T11:00:00Z",
+                    "dup_h",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "transcript_path": active_path.to_str().unwrap(),
+                            "tool": "hermes"
+                        }
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
 
-        // Missing bare tool: the actionable missing-tool diagnostic, not
-        // "could not run: Permission denied" leaked from the PATH entry.
-        let missing_err =
-            run_search_tool("__hcom_definitely_missing_search_tool__", &["pattern"]).unwrap_err();
+        // 5. Malformed unrelated life-event data (not valid JSON; must be skipped via json_valid)
+        // Disable FTS trigger temporarily to seed historic malformed data without altering production schema.
+        db.conn()
+            .execute_batch("DROP TRIGGER IF EXISTS events_fts_insert;")
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', ?2, ?3)",
+                rusqlite::params![
+                    "2026-03-27T12:00:00Z",
+                    "malformed_event",
+                    "not-a-valid-json-object-just-raw-bytes",
+                ],
+            )
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TRIGGER IF NOT EXISTS events_fts_insert
+                 AFTER INSERT ON events BEGIN
+                     INSERT INTO events_fts(rowid, searchable) VALUES (
+                         new.id,
+                         COALESCE(json_extract(new.data, '$.text'), '') || ' ' ||
+                         COALESCE(json_extract(new.data, '$.from'), '') || ' ' ||
+                         COALESCE(new.instance, '') || ' ' ||
+                         COALESCE(json_extract(new.data, '$.context'), '') || ' ' ||
+                         COALESCE(json_extract(new.data, '$.detail'), '') || ' ' ||
+                         COALESCE(json_extract(new.data, '$.action'), '') || ' ' ||
+                         COALESCE(json_extract(new.data, '$.reason'), '')
+                     );
+                 END;",
+            )
+            .unwrap();
+
+        // 6. Valid JSON life-event data with non-string transcript_path (must be skipped via json_type = 'text')
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', ?2, ?3)",
+                rusqlite::params![
+                    "2026-03-27T12:05:00Z",
+                    "nonstring_path_event",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "transcript_path": 12345,
+                            "tool": "hermes"
+                        }
+                    })
+                    .to_string(),
+                ],
+            )
+            .unwrap();
+
+        let paths = gather_hermes_database_paths(&db)
+            .expect("gathering should succeed despite malformed events");
+
+        let canonical_active = fs::canonicalize(&active_path).unwrap();
+        let canonical_stopped = fs::canonicalize(&stopped_path).unwrap();
+
         assert!(
-            missing_err.contains("was not found on PATH"),
-            "expected 'was not found on PATH', got: {missing_err}"
+            paths.contains(&active_path) || paths.contains(&canonical_active),
+            "paths should contain active hermes db: {paths:?}"
+        );
+        assert!(
+            paths.contains(&stopped_path) || paths.contains(&canonical_stopped),
+            "paths should contain stopped hermes db: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.ends_with("missing_hermes.db")),
+            "missing db should be filtered out: {paths:?}"
         );
 
-        // Real non-executable candidate: keeps the permission error.
-        let unexec_err = run_search_tool("test_unexec_search_tool", &["pattern"]).unwrap_err();
-        assert!(
-            unexec_err.contains("could not run `test_unexec_search_tool`"),
-            "expected 'could not run `test_unexec_search_tool`', got: {unexec_err}"
-        );
-        assert!(
-            unexec_err.contains("Permission denied") || unexec_err.contains("os error 13"),
-            "expected permission error detail, got: {unexec_err}"
-        );
-        assert!(
-            !unexec_err.contains("was not found on PATH"),
-            "must not report a real candidate as missing, got: {unexec_err}"
+        // Check dedup: canonical_active must only occur once
+        let active_count = paths
+            .iter()
+            .filter(|p| **p == active_path || **p == canonical_active)
+            .count();
+        assert_eq!(
+            active_count, 1,
+            "active_path should appear exactly once (dedup): {paths:?}"
         );
     }
-
 
     #[test]
-    #[cfg(unix)]
-    fn non_executable_search_tool_at_explicit_path_keeps_permission_error() {
-        use std::os::unix::fs::PermissionsExt;
+    fn test_search_transcript_skips_non_hermes_errors_but_propagates_hermes() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_file = dir.path().join("corrupt.jsonl");
+        std::fs::write(&bad_file, b"corrupted non-jsonl garbage").unwrap();
 
-        let temp_dir = tempfile::tempdir().unwrap();
-        let tool = temp_dir.path().join("hcom_unexecutable_search_tool");
-        std::fs::write(&tool, b"#!/bin/sh\necho hi\n").unwrap();
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        // Explicit paths never do PATH search, so PermissionDenied is real.
-        let err = run_search_tool(tool.to_str().unwrap(), &["pattern"]).unwrap_err();
+        let claude_source = TrackedTranscript {
+            name: "claude_worker".to_string(),
+            path: bad_file.to_str().unwrap().to_string(),
+            tool: "claude".to_string(),
+            session_id: None,
+            stopped_at: None,
+        };
+        let re = regex::Regex::new("pattern").unwrap();
+        let claude_res = search_transcript(&claude_source, Tool::Claude, &re);
         assert!(
-            err.contains("could not run") && !err.contains("was not found on PATH"),
-            "expected permission error for explicit path, got: {err}"
+            claude_res.is_ok(),
+            "non-Hermes unreadable transcript should be skipped as empty hits"
+        );
+        assert_eq!(claude_res.unwrap().len(), 0);
+
+        let hermes_source = TrackedTranscript {
+            name: "hermes_worker".to_string(),
+            path: bad_file.to_str().unwrap().to_string(),
+            tool: "hermes".to_string(),
+            session_id: Some("session-123".to_string()),
+            stopped_at: None,
+        };
+        let hermes_res = search_transcript(&hermes_source, Tool::Hermes, &re);
+        assert!(
+            hermes_res.is_err(),
+            "Hermes unreadable database must return an Err"
+        );
+
+        let hermes_blank = TrackedTranscript {
+            name: "hermes_blank".to_string(),
+            path: bad_file.to_str().unwrap().to_string(),
+            tool: "hermes".to_string(),
+            session_id: Some("".to_string()),
+            stopped_at: None,
+        };
+        let blank_res = search_transcript(&hermes_blank, Tool::Hermes, &re);
+        assert!(
+            blank_res.is_ok(),
+            "Hermes blank session must be safely skipped as empty hits"
+        );
+        assert_eq!(blank_res.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_gather_hermes_database_paths_propagates_query_errors() {
+        let db = test_db();
+        db.conn().execute_batch("DROP TABLE instances;").unwrap();
+        let err = gather_hermes_database_paths(&db).unwrap_err();
+        assert!(
+            err.contains("failed to prepare query for hermes database paths"),
+            "expected prepare failure error, got: {err}"
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn test_cmd_transcript_search_all_no_sources_with_db_errors_exits_one() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = test_db();
+        db.conn().execute_batch("DROP TABLE instances;").unwrap();
+        let args = TranscriptSearchArgs {
+            pattern: "needle".to_string(),
+            live: false,
+            all: true,
+            json: false,
+            exclude_self: false,
+            limit: 20,
+            agent: Some("hermes".to_string()),
+        };
+        let code = cmd_transcript_search_all(&db, &args, Some(Tool::Hermes));
+        assert_eq!(code, 1);
+
+        let json_args = TranscriptSearchArgs {
+            pattern: "needle".to_string(),
+            live: false,
+            all: true,
+            json: true,
+            exclude_self: false,
+            limit: 20,
+            agent: Some("hermes".to_string()),
+        };
+        let code_json = cmd_transcript_search_all(&db, &json_args, Some(Tool::Hermes));
+        assert_eq!(code_json, 1);
+
+        let valid_db = test_db();
+        let code_ok = cmd_transcript_search_all(&valid_db, &args, Some(Tool::Hermes));
+        assert_eq!(code_ok, 0);
+    }
 }

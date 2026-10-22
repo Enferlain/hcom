@@ -9,7 +9,7 @@ use crate::db::HcomDb;
 use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
-use crate::log::{log_error, log_info};
+use crate::log::{log_error, log_info, log_warn};
 use crate::shared::ST_LISTENING;
 use crate::shared::context::HcomContext;
 use crate::tool::Tool;
@@ -100,16 +100,188 @@ impl PiFamily {
         let cwd = parse_flag(argv, "--cwd");
         let notify_port: Option<u16> =
             parse_flag(argv, "--notify-port").and_then(|s| s.parse().ok());
+        let existing_only = plugin_rpc::has_flag(argv, "--existing-only");
 
-        let process_id = match &ctx.process_id {
-            Some(pid) => pid.clone(),
-            None => return (0, r#"{"error":"HCOM_PROCESS_ID not set"}"#.to_string()),
-        };
+        let instance_name = if self.tool == Tool::Hermes {
+            // Hermes branch: handles launched Hermes AND ordinary Hermes terminals.
+            // Lock MUST fail closed: abort if lock cannot be acquired.
+            let _lock = match crate::hooks::hermes::lock_hermes_adopt(db) {
+                Ok(file) => file,
+                Err(error) => {
+                    log_warn("hooks", "hermes-start.lock_failed", &error.to_string());
+                    return (
+                        0,
+                        serde_json::json!({
+                            "error": format!("Hermes adopt lock unavailable: {error}")
+                        })
+                        .to_string(),
+                    );
+                }
+            };
+            if let Some(pid) = &ctx.process_id {
+                // Launched or attached Hermes process: strict toolchecked bind
+                match instance_binding::bind_session_to_process_for_tool(
+                    db,
+                    &session_id,
+                    Some(pid),
+                    "hermes",
+                    false,
+                ) {
+                    instance_binding::ToolCheckedBind::Bound(name) => Some(name),
+                    _ => self.recover_binding(ctx, &session_id, pid, db),
+                }
+            } else {
+                // Ordinary Hermes terminal (not launched by hcom)
+                // Single lock held across lookup, recovery, and adoption:
+                let binding = match db.get_session_binding(&session_id) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        log_warn("hooks", "hermes-start.binding_read_failed", &e.to_string());
+                        return (
+                            0,
+                            serde_json::json!({
+                                "error": format!("Database error reading binding: {e}")
+                            })
+                            .to_string(),
+                        );
+                    }
+                };
+                let mut canonical = None;
+                if let Some(bound_name) = binding {
+                    match db.get_instance_full(&bound_name) {
+                        Ok(Some(row)) if row.tool == "hermes" => {
+                            if row.session_id.as_deref() == Some(&session_id) {
+                                canonical = Some(bound_name);
+                            } else {
+                                return (
+                                    0,
+                                    serde_json::json!({
+                                        "error": format!(
+                                            "Hermes session {session_id} is bound to '{bound_name}', attributed to session {:?}",
+                                            row.session_id
+                                        )
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                        }
+                        Ok(Some(_)) => {
+                            return (
+                                0,
+                                serde_json::json!({
+                                    "error": format!(
+                                        "Hermes session {session_id} is bound to '{bound_name}', which is not a Hermes instance"
+                                    )
+                                })
+                                .to_string(),
+                            );
+                        }
+                        Ok(None) => {} // stale binding, fall through to recovery
+                        Err(e) => {
+                            log_warn("hooks", "hermes-start.instance_read_failed", &e.to_string());
+                            return (
+                                0,
+                                serde_json::json!({
+                                    "error": format!("Database error reading instance: {e}")
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
+                }
+                if let Some(name) = canonical {
+                    Some(name)
+                } else {
+                    let recovered =
+                        match crate::hooks::hermes::recover_stopped_hermes_row(db, &session_id) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                log_warn("hooks", "hermes-start.recovery_failed", &e.to_string());
+                                return (
+                                    0,
+                                    serde_json::json!({
+                                        "error": format!(
+                                            "Database error recovering stopped row: {e}"
+                                        )
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                        };
+                    if let Some(name) = recovered {
+                        Some(name)
+                    } else if existing_only {
+                        return (
+                            0,
+                            serde_json::json!({"name": serde_json::Value::Null, "session_id": session_id})
+                                .to_string(),
+                        );
+                    } else {
+                        // Check if row already holds session_id before minting
+                        match crate::hooks::hermes::hermes_row_holding_session_id(db, &session_id) {
+                            Ok(Some(row)) => {
+                                return (
+                                    0,
+                                    serde_json::json!({
+                                        "error": format!(
+                                            "Hermes session {session_id} already held by instance '{}'",
+                                            row.name
+                                        )
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                            Err(e) => {
+                                return (
+                                    0,
+                                    serde_json::json!({
+                                        "error": format!(
+                                            "Database error checking row holders: {e}"
+                                        )
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                            Ok(None) => {}
+                        }
+                        // Adopt with locked helper (single lock held!)
+                        match crate::hooks::hermes::adopt_ordinary_hermes_instance_locked(
+                            db,
+                            &session_id,
+                            transcript_path.as_deref(),
+                            cwd.as_deref().or_else(|| ctx.cwd.to_str()),
+                        ) {
+                            Ok(name) => Some(name),
+                            Err(e) => {
+                                log_error("hooks", "hermes-start.adopt_failed", &e.to_string());
+                                return (
+                                    0,
+                                    serde_json::json!({"error": format!("Adoption failed: {e}")})
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            let process_id = match &ctx.process_id {
+                Some(pid) => pid.clone(),
+                None => return (0, r#"{"error":"HCOM_PROCESS_ID not set"}"#.to_string()),
+            };
 
-        let Some(instance_name) =
             instance_binding::bind_session_to_process(db, &session_id, Some(&process_id))
                 .or_else(|| self.recover_binding(ctx, &session_id, &process_id, db))
-        else {
+        };
+
+        let Some(instance_name) = instance_name else {
+            if existing_only {
+                return (
+                    0,
+                    serde_json::json!({"name": serde_json::Value::Null, "session_id": session_id})
+                        .to_string(),
+                );
+            }
             return (
                 0,
                 r#"{"error":"No instance bound to this process"}"#.to_string(),
@@ -173,7 +345,17 @@ impl PiFamily {
                 return plugin_rpc::error(format!("DB open failed: {}", e));
             }
         };
-        if !common::hook_gate_check(&ctx) {
+        // Upstream launch gate: hooks run only for the process hcom launched.
+        // The Hermes branches below also serve ordinary (not-launched) Hermes
+        // terminals, which have no HCOM_PROCESS_ID by design — their RPCs are
+        // authorized per-call instead of by ambient env (the plugin host env
+        // may not even carry HERMES_SESSION_ID): a read-only enrolled-session
+        // resolve, a `--name` participant checked for tool and session
+        // attribution, or the explicit `hermes-start` enrollment ladder.
+        // Nothing adopts an unknown session passively. Pi/OMP keep the strict
+        // gate unchanged.
+        let launched = common::hook_gate_check(&ctx);
+        if !launched && self.tool != Tool::Hermes {
             return (0, String::new());
         }
         let handler_argv = argv.strip_prefix(&[hook_name.to_string()]).unwrap_or(argv);
@@ -181,10 +363,62 @@ impl PiFamily {
             .strip_prefix(self.name())
             .and_then(|s| s.strip_prefix('-'))
             .unwrap_or("");
-        if matches!(hook, "status" | "read" | "beforetool" | "stop")
-            && let Err(reply) = plugin_rpc::require_attached(&ctx, &db, handler_argv)
-        {
-            return reply;
+        if matches!(hook, "status" | "read" | "beforetool" | "stop") {
+            // Hermes read-only session resolve mode: hermes-read --session-id <sid>
+            if self.tool == Tool::Hermes
+                && hook == "read"
+                && parse_flag(handler_argv, "--name").is_none()
+                && parse_flag(handler_argv, "--session-id").is_some()
+            {
+                let session_id = parse_flag(handler_argv, "--session-id").unwrap();
+                let name = crate::hooks::hermes::resolve_enrolled_hermes_session(&db, &session_id);
+                return (
+                    0,
+                    serde_json::json!({
+                        "name": name,
+                        "session_id": session_id,
+                    })
+                    .to_string(),
+                );
+            }
+            if self.tool == Tool::Hermes && !launched {
+                if let Some(name) = parse_flag(handler_argv, "--name") {
+                    // An ordinary terminal must prove its session: correlate
+                    // the explicit --session-id with the row's attribution.
+                    // The plugin host forwards the participant's bound
+                    // session id with every participant RPC, so a bare
+                    // --name cannot mutate anything. Same-user CLI is not
+                    // authentication — this is fail-closed attribution, not
+                    // proof of identity.
+                    let Some(claimed_session) = parse_flag(handler_argv, "--session-id") else {
+                        return plugin_rpc::error("Missing --session-id");
+                    };
+                    match db.get_instance_full(&name) {
+                        Ok(Some(row)) => {
+                            if row.tool != "hermes" {
+                                return plugin_rpc::error(format!(
+                                    "{name} is not a Hermes instance"
+                                ));
+                            }
+                            if row.session_id.as_deref() != Some(&claimed_session) {
+                                return plugin_rpc::error(format!(
+                                    "{name} is attributed to a different session"
+                                ));
+                            }
+                        }
+                        Ok(None) => {
+                            return plugin_rpc::error(format!("Unknown instance: {name}"));
+                        }
+                        Err(e) => {
+                            return plugin_rpc::error(format!("Instance lookup failed: {e}"));
+                        }
+                    }
+                } else {
+                    return plugin_rpc::error("Missing --name");
+                }
+            } else if let Err(reply) = plugin_rpc::require_attached(&ctx, &db, handler_argv) {
+                return reply;
+            }
         }
         let handler_start = Instant::now();
         let (exit_code, output) = common::dispatch_with_panic_guard(

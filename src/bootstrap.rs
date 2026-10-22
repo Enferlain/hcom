@@ -604,9 +604,12 @@ fn render_bootstrap_with_exclusions(
     }
 
     // Every integration delivers automatically when launched through hcom;
-    // anything else (plain `hcom start`) has to poll with `hcom listen`.
+    // Ordinary sessions poll with `hcom listen`, except an enrolled Hermes
+    // session served by the profile plugin.
     if !excluded.contains("messages") {
-        if hcom_ctx.is_launched && tool != Tool::Adhoc {
+        // An enrolled ordinary Hermes session uses the same plugin delivery
+        // path as a launched session.
+        if tool == Tool::Hermes || (hcom_ctx.is_launched && tool != Tool::Adhoc) {
             parts.push(DELIVERY_AUTO.to_string());
             parts.extend(tool_delivery_section(tool).map(str::to_string));
         } else {
@@ -904,11 +907,15 @@ mod tests {
                 spec.name,
                 false,
             );
-            assert!(
-                unlaunched.contains("Messages do NOT arrive automatically"),
-                "{}",
-                spec.name
-            );
+            if spec.tool == Tool::Hermes {
+                assert!(unlaunched.contains("Messages instantly and automatically arrive"));
+            } else {
+                assert!(
+                    unlaunched.contains("Messages do NOT arrive automatically"),
+                    "{}",
+                    spec.name
+                );
+            }
             let auto = launched.contains("Messages instantly and automatically arrive");
             assert_eq!(auto, spec.tool != Tool::Adhoc, "{}", spec.name);
             assert_eq!(

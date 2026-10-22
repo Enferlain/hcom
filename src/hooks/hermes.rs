@@ -4,8 +4,9 @@
 //! Hermes has no per-run plugin path, so the plugin is installed per profile
 //! (`hcom hooks add hermes`, or the first `hcom hermes` in that profile) and
 //! enabled with Hermes's own CLI. It loads in every process of the profile,
-//! including a running gateway, and stays inert unless hcom launched that
-//! process (see `hermes_plugin/__init__.py`).
+//! including a running gateway, and supports both launched Hermes agents
+//! and ordinary Hermes terminals that join hcom mid-session without hcom launcher
+//! (session-keyed transactional enrollment and stopped-row recovery).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

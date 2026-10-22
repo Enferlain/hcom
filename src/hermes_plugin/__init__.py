@@ -1,10 +1,11 @@
 """hcom plugin for Hermes Agent: connects an `hcom hermes` launch to hcom.
 
 Written by hcom (`hcom hooks add hermes`, or the first `hcom hermes` for a
-profile); edits are overwritten. Inert unless this process is the Hermes that
-hcom launched: the plugin loads in every process of the profile (gateway,
-one-off subcommands, nested runs), so `register()` only scrubs foreign agent
-markers there and binds nothing.
+profile); edits are overwritten. Supports both launched Hermes agents
+(`hcom hermes`) and ordinary Hermes terminals that join hcom mid-session
+(e.g. via `hcom start`). In non-terminal processes (multiplexed gateways,
+one-off subcommands, nested runs), `register()` scrubs foreign agent markers
+and isolates identities.
 
 Delivery, one batch outstanding per participant at a time:
 - mid-turn: appended to a tool result (`transform_tool_result`);
@@ -405,7 +406,16 @@ class Participant:
 
     def bind(self, session_id):
         """Bind (or rebind after /new) this identity to `session_id`. The first
-        bind is launch readiness for hcom."""
+        bind is launch readiness for hcom.
+
+        An INITIAL attach of the UNBOUND GatewayHost terminal participant
+        (an ordinary terminal discovered through the read-only enrollment
+        check) is attach-only: `--existing-only` means hcom must already
+        know the session, so the bind can never race a deleted enrollment
+        into minting a fresh instance. Bridges (rows an explicit start
+        created), rebinds (/new, a CLI session move), and the launched
+        Host's launch-readiness bind keep the full ladder; only the
+        explicit `hcom start` CLI (or `/hcom start`) mints."""
         if not session_id:
             return False
         with self.bind_lock:
@@ -414,7 +424,11 @@ class Participant:
             if self.name and session_id == self.session_id:
                 return True
             port = self.host.notify_port()
-            args = ["hermes-start", "--session-id", session_id, "--cwd", os.getcwd()]
+            args = ["hermes-start", "--session-id", session_id]
+            if (self.name is None and self is self.host.me
+                    and isinstance(self.host, GatewayHost)):
+                args.append("--existing-only")
+            args += ["--cwd", os.getcwd()]
             if self.host.home:
                 args += ["--transcript-path", os.path.join(self.host.home, "state.db")]
             if port:
@@ -738,6 +752,13 @@ class Participant:
             self.detach()
 
 
+# Participant RPCs that read or mutate a mailbox by --name: the host
+# forwards the participant's bound session id so hcom can correlate the
+# caller with the row's session attribution (fail-closed attribution for
+# ordinary terminals; the same-user CLI is not authentication).
+SESSION_SCOPED_RPC = ("hermes-status", "hermes-read", "hermes-beforetool", "hermes-stop")
+
+
 class Host:
     """The plugin in one Hermes process: hcom RPC, the notify port, the
     delivery and status threads, and hook routing."""
@@ -764,6 +785,10 @@ class Host:
     def rpc(self, args, participant=None, timeout=HCOM_TIMEOUT):
         """Run `hcom <args>`; every plugin RPC exits 0 with a JSON payload or
         `{"error": ...}`. Returns the payload, or None (logged)."""
+        session_id = getattr(participant, "session_id", None)
+        if (session_id and args and args[0] in SESSION_SCOPED_RPC
+                and "--session-id" not in args):
+            args = [*args, "--session-id", session_id]
         name = participant.name if participant else None
 
         def fail(**extra):
@@ -1133,28 +1158,37 @@ class Bridge(Participant):
 
 class GatewayHost(Host):
     """The plugin in a Hermes process hcom did not launch. Inert unless this
-    process runs the messaging gateway and the profile has bridges; it always
-    offers `/hcom` so a chat can start hcom.
+    process runs the messaging gateway and the profile has bridges, or this
+    terminal explicitly joins hcom; it always offers `/hcom` so a chat or
+    terminal can start hcom.
 
     hcom's registry is the only authority: `sync` at gateway readiness and on
     every heartbeat says which bridges to serve."""
 
     def __init__(self, ctx, env, home, settings):
         super().__init__(ctx, env, home)
-        self.me = None
         self.bridges = {}  # name -> Bridge
         self.previous = None  # the copy this one replaced in this process
         self.synced = False
         self.reload_requested = False  # once per loaded copy
         self.sessions = {}  # session_id -> (session_key, delegated), bounded
+        self.terminal_session = None
         self.env = dict(env, **(settings.get("env") or {}))
         self.hcom = shutil.which("hcom", path=self.env.get("PATH")) or settings.get("hcom") or "hcom"
 
     def participants(self):
-        return [] if self.stopped else list(self.bridges.values())
+        if self.stopped:
+            return []
+        parts = list(self.bridges.values())
+        if self.me and self.me.name:
+            parts.append(self.me)
+        return parts
 
     def all_participants(self):
-        return list(self.bridges.values())
+        parts = list(self.bridges.values())
+        if self.me:
+            parts.append(self.me)
+        return parts
 
     def serving(self):
         return bool(getattr(self.manager, "has_gateway_message_injector", False))
@@ -1349,6 +1383,8 @@ class GatewayHost(Host):
         return facts
 
     def route(self, session_id):
+        if self.me and not self.stopped and self.me.is_main(session_id):
+            return self.me
         return next((b for b in self.participants() if b.is_main(session_id)), None)
 
     def route_chat(self, session_id):
@@ -1364,15 +1400,55 @@ class GatewayHost(Host):
     def by_key(self, key):
         return next((b for b in self.participants() if key and b.session_key == key), None)
 
+    def is_terminal_session(self, session_id):
+        if not session_id or self.serving():
+            return False
+        cli = self.me.cli() if self.me else None
+        cli_sid = getattr(cli, "session_id", None)
+        if cli_sid:
+            return session_id == cli_sid
+        return session_id == self.terminal_session
+
     # ── Hermes hooks ─────────────────────────────────────────────────────
 
-    def on_session_reset(self, **_):
-        pass
+    def on_session_reset(self, session_id=None, platform=None, **_):
+        if not self.serving() and session_id:
+            self.terminal_session = session_id
+        if self.me and not self.stopped:
+            if self.me.cli() is None:
+                self.me.kind = "tui"
+            if self.me.name:
+                # An enrolled participant follows /new explicitly.
+                self.me.bind(session_id)
+            elif session_id:
+                # An unknown TUI must not adopt: only the read-only
+                # enrollment check may look, exactly like the other
+                # discovery hooks. Enrolling is `/hcom start` (or
+                # `hcom start`), never a session reset.
+                self.check_enrolled_terminal(session_id)
 
-    def on_session_start(self, **_):
-        pass
+    def on_session_start(self, session_id=None, **_):
+        if not self.serving() and session_id:
+            self.terminal_session = session_id
+        if self.me and not self.stopped:
+            if self.me.name:
+                if session_id != self.me.session_id and session_id == getattr(
+                    self.me.cli(), "session_id", None
+                ):
+                    self.me.bind(session_id)
+            elif session_id:
+                self.check_enrolled_terminal(session_id)
+
+    def transform_tool_result(self, result=None, session_id=None, **kwargs):
+        if self.me and not self.me.name and session_id:
+            self.check_enrolled_terminal(session_id)
+        return super().transform_tool_result(result=result, session_id=session_id, **kwargs)
 
     def pre_llm_call(self, session_id=None, user_message=None, **_):
+        if self.me and not self.me.name and session_id:
+            self.check_enrolled_terminal(session_id)
+        if self.me and not self.stopped and self.me.is_main(session_id):
+            return self.me.turn_start(session_id, user_message)
         if not self.participants():
             return None
         key, delegated = self.session_facts(session_id)
@@ -1385,14 +1461,34 @@ class GatewayHost(Host):
         return bridge.turn_start(session_id, user_message)
 
     def on_session_end(self, session_id=None, **_):
+        if self.me and not self.stopped and self.me.is_main(session_id):
+            self.me.turn_end()
         bridge = self.route_chat(session_id)
         if bridge:
             bridge.turn_end()
 
     def on_session_finalize(self, session_id=None, reason=None, **_):
+        if self.me and not self.stopped and self.me.is_main(session_id):
+            self.me.session_finalized(reason)
         bridge = self.route_chat(session_id)
         if bridge:
             bridge.session_finalized(reason)
+
+    # ── terminal helpers ──────────────────────────────────────────────────
+
+    def check_enrolled_terminal(self, session_id):
+        """Check if an ordinary terminal session was already enrolled in hcom."""
+        if not self.is_terminal_session(session_id):
+            return False
+        if not self.me or self.me.name or self.me.detached or self.stopped:
+            return False
+        key, delegated = self.session_facts(session_id)
+        if delegated or (key and self.by_key(key)):
+            return False
+        reply = self.rpc(["hermes-read", "--session-id", session_id])
+        if reply and isinstance(reply.get("name"), str) and reply["name"]:
+            return self.me.bind(session_id)
+        return False
 
     # ── /hcom ────────────────────────────────────────────────────────────
 
