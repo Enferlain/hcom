@@ -18,6 +18,8 @@ pub mod screen;
 mod shared;
 #[cfg(windows)]
 mod stdout_queue;
+#[cfg(any(unix, windows))]
+pub(super) mod survey;
 #[cfg(unix)]
 mod terminal;
 #[cfg(windows)]
@@ -877,6 +879,10 @@ impl Proxy {
         // iteration after, so at most one poll cycle of latency for new connections.
         let mut listener_backoff = false;
 
+        // Antigravity feedback-survey dismissal state (hcom-f6g.9); a no-op
+        // for every other target.
+        let mut survey_dismissal = survey::SurveyDismissal::default();
+
         // Start delivery after the integration's explicit fallback timeout if
         // its ready pattern is hidden or never appears. Ad-hoc commands use the
         // explicit Adhoc PTY profile rather than inheriting a known tool's value.
@@ -1013,6 +1019,13 @@ impl Proxy {
                     delivery_start_timeout,
                     startup_time.elapsed(),
                 ));
+            }
+            // While an Antigravity feedback-survey sighting is active, cap
+            // the poll so the dismissal controller's stability window and
+            // retries fire on time instead of waiting out the 10s idle poll
+            // (hcom-f6g.9).
+            if survey_dismissal.caps_poll() {
+                poll_timeout = poll_timeout.min(survey::SURVEY_POLL_CAP_MS);
             }
             if child_exited {
                 poll_timeout = poll_timeout.min(100);
@@ -1400,6 +1413,20 @@ impl Proxy {
                 }
             }
 
+            // Antigravity feedback survey: auto-dismiss with Skip (`0`), or
+            // surface the typed pty:survey blocker when dismissal fails. A
+            // non-task UX prompt — never an approval (hcom-f6g.9). Runs on
+            // data and timeout iterations alike so the stability window and
+            // retry cooldown hold even once output goes quiet.
+            survey::run_survey_dismissal(
+                &self.screen,
+                &mut survey_dismissal,
+                &self.config.target,
+                self.config.instance_name.as_deref(),
+                &self.current_status,
+                |bytes| write_all(&self.pty_master, bytes),
+            );
+
             // Drain title notifications. The shared status is read below; the
             // pipe only interrupts poll and coalesces repeated transitions.
             if poll_fds[title_notify_idx]
@@ -1710,6 +1737,32 @@ fn title_wake_callback(write_fd: Arc<OwnedFd>) -> crate::delivery::TitleWake {
         // the authoritative shared title state after it wakes.
         let _ = write(write_fd.as_ref(), &[1]);
     })
+}
+
+#[cfg(unix)]
+fn write_all<F: AsFd>(fd: &F, data: &[u8]) -> Result<()> {
+    const MAX_RETRIES: usize = 3;
+    let mut written = 0;
+    let mut retries = 0;
+    while written < data.len() {
+        match write(fd, &data[written..]) {
+            Ok(0) => bail!("write to pty returned 0 bytes"),
+            Ok(n) => {
+                written += n;
+                retries = 0;
+            }
+            Err(Errno::EINTR) => continue,
+            Err(Errno::EAGAIN) => {
+                retries += 1;
+                if retries > MAX_RETRIES {
+                    bail!("write to pty would block after {retries} retries");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => bail!("write failed: {}", e),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

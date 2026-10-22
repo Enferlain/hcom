@@ -24,6 +24,7 @@ use super::inject::{InjectResult, InjectServer, QueryCommand};
 use super::screen::ScreenTracker;
 use super::shared;
 use super::stdout_queue::{Cutoff, StdoutQueue};
+use super::survey;
 use super::trace::{self, Hop};
 
 use crate::db::HcomDb;
@@ -635,6 +636,35 @@ impl Proxy {
             let publish =
                 |a: bool| shared::publish_approval_status(a, instance.as_deref(), &current_status);
 
+            // Antigravity feedback survey (hcom-f6g.9): auto-dismiss with
+            // Skip (`0`) once the frame settles, or surface the typed
+            // pty:survey blocker when dismissal fails. A non-task UX prompt —
+            // never an approval. No-op for every other target.
+            let mut survey_dismissal = survey::SurveyDismissal::default();
+            let survey_tick =
+                |screen: &ScreenTracker, survey_dismissal: &mut survey::SurveyDismissal| {
+                    survey::run_survey_dismissal(
+                        screen,
+                        survey_dismissal,
+                        &target,
+                        instance.as_deref(),
+                        &current_status,
+                        |bytes| {
+                            // Surface lock/write/flush failures so the
+                            // dismissal controller counts the failed attempt
+                            // and escalates — same policy as the Unix loop's
+                            // write_all error path.
+                            let mut w = writer
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("ConPTY writer mutex poisoned"))?;
+                            w.write_all(bytes)
+                                .context("ConPTY survey Skip write failed")?;
+                            w.flush().context("ConPTY survey Skip flush failed")?;
+                            Ok(())
+                        },
+                    );
+                };
+
             loop {
                 // Runtime debug toggle and periodic dump. Both rate-limit
                 // themselves to 5s; they run every iteration so sustained output
@@ -678,6 +708,10 @@ impl Proxy {
                                 &publish,
                             );
                         }
+                        // The survey's stability window only completes once
+                        // output settles, so the quiet tick is where the
+                        // dismissal decision usually lands (hcom-f6g.9).
+                        survey_tick(&screen, &mut survey_dismissal);
                         if !ready_signaled.load(Ordering::Acquire) {
                             trace.check_not_ready();
                         }
@@ -778,6 +812,7 @@ impl Proxy {
                             &launch_phase,
                             &publish,
                         );
+                        survey_tick(&screen, &mut survey_dismissal);
 
                         // Latch the ready signal for the delivery coordinator. A
                         // latch never regresses (unlike re-reading a screen flag
