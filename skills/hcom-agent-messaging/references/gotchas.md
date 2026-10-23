@@ -59,6 +59,13 @@ case-insensitive for ASCII; it does not understand protocol meaning.
 
 ## Preserve wait failures
 
+Do not respond to a quiet reviewer by repeatedly issuing short result waits,
+`list`, or transcript commands. Use [watch-result.py](scripts/watch-result.py)
+for one task-sized wait with streamed progress. The deadline payload's
+re-arm example is recovery guidance, not a polling loop. Keep the same host
+execution session when the tool yields; avoid commentary that only repeats
+that the review is still running.
+
 For a valid correlated wait, outcomes use 0 result, 1 deadline, 2 error,
 3 stopped without result, 4 blocked, 5 launch failure. Plain SQL waits use
 0 match, 1 timeout, 2 error. Input/correlation validation can fail before the
@@ -92,6 +99,10 @@ hcom send @actual-sender --reply-to 42 --intent ack -- "Received"
 
 Use the real incoming request ID. For a reply to an ordinary information
 message, use `inform`; do not invent an ID to satisfy acknowledgement checks.
+A final report fulfills a request for a response; an immediate ack is optional.
+An `ack` does not satisfy an `inform`-only result wait, so it may acknowledge
+the request on its result thread without falsely completing that wait. The
+restriction is on extra progress `inform` messages, not all message intents.
 
 ## Launch and cleanup
 

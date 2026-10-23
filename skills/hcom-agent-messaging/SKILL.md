@@ -87,20 +87,49 @@ Capture the worker's actual name from launch output. Scripts can use
 Select model and permission flags according to the user's request and the
 tool's supported options; `--go` only accepts hcom's launch preview.
 
-When progress observation is useful, keep one durable observer:
+For interactive delegation, run one persistent observer that streams progress
+and returns the final report. Run this helper from the installed skill's
+directory (or use its absolute path):
 
 ```bash
-hcom events stream --follow "$worker" --compact --heartbeat 15 --after-id "$cursor"
+python3 references/scripts/watch-result.py --worker "$worker" \
+  --after-id "$cursor" --thread "$result_thread" --timeout 1500
 ```
 
-Quiet intervals are normal. After a plausible stall, inspect the terminal
-once with `hcom term "$worker" --clean` and resolve the surfaced blocker.
-Avoid repeated short waits, status polls, and transcript tails for healthy
-workers.
+Agree on the unique result thread before dispatch. Only the final publisher
+sends `inform` there; progress uses another thread. The helper starts one
+normal generation-following stream and one correlated result wait. The stream
+includes intermediate messages from the followed worker, with their text,
+intent and thread, as well as status/activity events. It prints event JSON
+Lines followed by a `kind: result`
+record containing the wait's `exit_code` and full `payload`, preserves the
+wait's exit status, and stops only its observers. It does not launch or kill
+workers. Forward `--name <caller>` when operating for an explicit caller.
+An approval-gated host may ask to approve the Python helper even when it
+auto-approves direct `hcom events` commands; the helper changes no permissions.
 
-For a completion wait, agree that the worker sends one final `inform` on a
-unique result thread; keep progress messages on another thread. Capture the
-cursor before launching the worker, then use:
+Run the helper directly, not inside `$(...)` or another output capture that
+buffers progress until completion. Keep the same tool execution/session running
+while it emits progress. Resume
+that execution if the host tool yields a session handle; do not launch another
+hcom command or narrate an unchanged status on every heartbeat. Use a task-sized
+overall deadline, not repeated 45/60-second waits. At the deadline, assess the
+outcome instead of automatically restarting the wait. Intermediate messages
+do not complete the wait; only the correlated final report does. Use a
+resumable host execution so the main agent can read incoming stream output
+and normal hook-delivered messages at tool boundaries. After a plausible
+stall, inspect once with `hcom term "$worker" --clean`.
+
+For observation alone, use `hcom events stream --follow "$worker"
+--after-id "$cursor"`. It ends at the worker's stop boundary, not at the
+final inform; idle is not completion. Use compact mode only when a bounded
+activity display is sufficient: add `--compact` to the helper (optionally
+`--heartbeat 15`). Compact emits phases, file paths, command categories and
+quiet heartbeats, but suppresses all message events and their contents. A
+heartbeat means the observer is alive, not proof of worker progress.
+
+For scripts that only need the result, a single bounded silent wait remains
+available. Capture the cursor before launching the worker, then use:
 
 ```bash
 hcom events --wait 180 --after-id "$cursor" --thread "$result_thread" --result-from "$worker"

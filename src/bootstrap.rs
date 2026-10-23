@@ -75,12 +75,14 @@ You run hcom commands on behalf of the human user. The human uses natural langua
 const MESSAGES: &str = r#"## MESSAGES
 
 Sending rules:
-- Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
+- Use --intent on sends: request (want reply), inform (report/update), ack (receipt only).
+- An ack requires --reply-to <request-id>, using the received request's #id.
 
 Response rules:
-- From {SENDER} or intent=request → always respond
+- From {SENDER} or intent=request → respond; a requested final report fulfills this (no separate ack required)
 - intent=inform → respond only if useful
-- intent=ack → don't respond
+- intent=ack → don't respond (including acknowledgements from {SENDER})
+- An ack is not a final inform and does not complete an inform-only result wait.
 
 Routing rules:
 - hcom message (<hcom> tags, hook feedback) → run `hcom send` to respond
@@ -266,9 +268,11 @@ Messages instantly auto-arrive via <hcom> tags — end your turn to receive them
 - For non-hcom pause/yield, use `hcom listen` instead of `sleep`.
 
 Response rules:
-- From {SENDER} or intent=request → always respond
+- From {SENDER} or intent=request → respond; a requested final report fulfills this (no separate ack required)
 - intent=inform → respond only if useful
-- intent=ack → don't respond
+- intent=ack → don't respond (including acknowledgements from {SENDER})
+- Send ack only for receipt, with --reply-to <request-id> from the received #id.
+- An ack is not a final inform and does not complete an inform-only result wait.
 
 hcom message → respond via hcom send
 
@@ -281,7 +285,7 @@ Commands:
 
 Rules:
 - Authority: @{SENDER} > others
-- Use --intent on sends: request (want reply), inform (FYI), ack (responding)"#;
+- Use --intent on sends: request (want reply), inform (report/update), ack (receipt only)"#;
 
 // HELPERS
 

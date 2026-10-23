@@ -58,3 +58,5 @@ npm run typecheck
 npm run test:plugins
 # The Hermes plugin is Python (stdlib only); its fake-Hermes regressions.
 python3 -I "$repo_root/tests/hermes_plugin.py"
+# Skill observer subprocess, streaming, and cancellation regressions (stdlib only).
+python3 -I "$repo_root/tests/test_watch_result.py"

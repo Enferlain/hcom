@@ -59,9 +59,42 @@ send `inform` on the result thread; otherwise progress can look like a result.
 For an existing worker, capture a cursor before dispatch and use a fresh
 result thread for each assignment, or an ordinary event wait with explicit
 sender/thread/protocol filters when message matching is needed. For interactive
-progress, use one `events stream --follow <name> --compact --heartbeat 15
---after-id <cursor>` observer. Use bounded waits instead of sleep-based status
-polls, and propagate a failed wait's status to the caller.
+progress and completion together, run the supplied observer once:
+
+```bash
+python3 references/scripts/watch-result.py --worker "$worker" \
+  --after-id "$cursor" --thread "$result_thread" --timeout 1500
+```
+
+It starts exactly one normal generation-following stream and one long result wait. Events flow
+as JSON Lines; the last record is `{"kind":"result","exit_code":...,"payload":...}`.
+The normal stream includes intermediate worker messages with their text,
+thread and intent, plus activity/status events. Events have no `kind` field;
+the final helper record carries the authoritative result/recovery payload.
+The final report can also appear earlier as an ordinary stream event. Its exit code
+is the wait's outcome, not a verdict on the report. Interrupting the helper
+stops both observation commands and leaves the worker running. An observer
+failure returns 2; a clean stream stop still lets result recovery finish.
+Use the installed helper's absolute path when your cwd is the target repo.
+Keep it in the skill folder; the example-install command above intentionally
+copies only the six workflows and their Bash helper. Copying `watch-result.py`
+into hcom's user script directory would also expose it in `hcom run` listings.
+Approval-gated hosts may require approval for this Python command even when
+direct hcom observation commands are auto-approved.
+
+Run it directly so progress reaches the execution tool; command substitution
+or `capture_output=True` hides that progress until completion. When the
+execution tool yields, resume its existing session. Do not restart
+this helper or repeatedly re-arm 45/60-second waits while a healthy reviewer
+is running. An
+expired overall deadline calls for assessment, not an automatic restart.
+For observation alone, use `events stream --follow <name> --after-id <cursor>`.
+Propagate a failed wait's status to the caller.
+
+Compact display is opt-in: add `--compact` to the helper, with optional
+`--heartbeat SEC` (default 15). It preserves hcom's typed `activity.type`
+projection but omits all message events, so it is unsuitable when intermediate
+communication matters. Heartbeats mean the observer is alive, not task progress.
 
 Valid result-wait outcomes use 0 receipt, 1 deadline, 2 error, 3 stopped without
 result, 4 blocked, 5 launch failure. Input validation can also exit 1 before
