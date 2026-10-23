@@ -31,8 +31,8 @@ def main():
             contracts.add(contract)
         if not patch["focused_tests"]:
             raise ValueError(f"no focused checks: {patch_id}")
-        for command in patch["focused_tests"]:
-            if not command or command[:2] != ["cargo", "test"]:
+        for command in patch["focused_tests"] + patch.get("additional_checks", []):
+            if not command or command[:2] not in (["cargo", "test"], ["python3", "-I"]):
                 raise ValueError(f"invalid focused test command: {patch_id}")
     if contracts != manifest["contracts"].keys():
         raise ValueError("contract definitions and patch/upstream ownership differ")
@@ -73,7 +73,7 @@ def main():
             parser.error(f"unknown patch: {args.test}")
         for patch in selected:
             print(f"Checking {patch['id']}", flush=True)
-            for command in patch["focused_tests"]:
+            for command in patch["focused_tests"] + patch.get("additional_checks", []):
                 subprocess.run(command, cwd=ROOT, check=True)
     elif not args.verify_series:
         for patch in patches:

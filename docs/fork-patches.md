@@ -16,11 +16,17 @@ Feature commits carry a `Fork-Patch: <id>` trailer and list contract IDs in thei
 | antigravity-banner | `antigravity-idle-mode-banner` | — |
 | antigravity-survey | `antigravity-feedback-survey` | approval-ownership |
 | connection-signal | `subagent-connected-signal` | — |
-| native-participation | `claude-native-session-start-adoption`, `codex-wrapperless-vscode-adoption`, `codex-thread-sender-resolution`, `tool-family-authoritative-binding`, `recent-kimi-bind-safety` | — |
-| hermes-extensions | `hermes-session-attribution`, `hermes-session-adoption`, `hermes-hook-dispatch`, `hermes-transcript` | native-participation |
 | filtered-observation | `filtered-listen-isolation`, `events-wait-boundaries` | — |
-| worker-progress | `durable-events-stream`, `compact-progress-stream` | messaging |
+| worker-progress | `durable-events-stream`, `compact-progress-stream` | messaging, filtered-observation |
 | worker-results | `correlated-result-outcomes`, `provider-result-recovery`, `typed-launch-blockers` | messaging, approval-ownership, worker-progress |
+| native-participation | `claude-native-session-start-adoption`, `codex-wrapperless-vscode-adoption`, `codex-thread-sender-resolution`, `tool-family-authoritative-binding`, `recent-kimi-bind-safety`, `hermes-session-attribution`, `hermes-session-adoption` | approval-ownership, connection-signal |
+| hermes-extensions | `hermes-hook-dispatch`, `hermes-transcript` | native-participation |
+
+Corrected retained transcript tests also pass upstream's session-scoped tracked search, while exposing four extension gaps: recorded-profile discovery under `--all`, tracked corrupt-database failure reporting, and two partial-error cases under `--all` (including a reached result limit). The local search extension covers those gaps; blank session attribution never broadens to the whole shared database.
+
+Ordinary Hermes session ownership and explicit `hcom start` share the native participation binding layer. The later Hermes extension adds plugin hook discovery/delivery and recorded-profile transcript search, while retaining upstream gateway and parser implementations. Compact progress omits raw messages and command text; projected file paths remain untrusted input.
+
+Waits without `--after-id` arm at the current durable cursor, including unfiltered waits; they do not retain upstream's 10-second quick lookback. Capture `events --cursor` before launching work and pass that cursor to include an event that arrives before the wait begins. Unfiltered waits retain the one-time unread preview, while filtered or explicit-cursor waits leave unrelated messages out of their output. `events --cursor` suppresses after-command inbox delivery to keep stdout machine-readable, leaving messages unread. One-shot wait and result output may add `data.message` as an alias of `data.text`, including with `--full`; it is not an exact stored-event representation.
 
 ## Checking a checkout
 
@@ -36,7 +42,7 @@ The manifest's focused checks run against the complete checkout. At series creat
 
 1. Fetch upstream and choose an exact revision R.
 2. Run conformance checks for any behavior upstream may now cover. Adapt tests to the current public behavior; an obsolete internal API or screen glyph is not evidence that upstream lacks the feature.
-3. Start the next candidate branch at R. Use the manifest and `--verify-series` output to select retained feature commits in dependency order; replay them oldest first. Repository-local `rerere` is enabled, but review every reused resolution.
+3. Start the next candidate branch at R. Carry the supporting manifest, checker and useful conformance tests too, adapting their registration to R rather than copying an old entry point. Use the manifest and `--verify-series` output to select retained feature commits in dependency order; replay them oldest first. Repository-local `rerere` is enabled, but review every reused resolution.
 4. Resolve conflicts against the behavior contracts and current upstream implementation. If upstream covers a contract, remove its local implementation and keep useful conformance tests. If it covers part, retain only the missing extension. Preserve upstream thread persistence and Hermes plugin/parser/gateway handling.
 5. Run focused checks at each replayed patch, then the complete gates and independent review. Update manifest ownership, dependencies, checks, and `last_checked_upstream` values.
 6. Qualify a candidate executable before changing the installed release. Preserve a working rollback and current messages. Publication, main-branch migration, installation and removal of reference worktrees follow the user's authorized scope.

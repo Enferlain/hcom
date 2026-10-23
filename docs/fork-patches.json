@@ -17,7 +17,8 @@
       "cargo test --locked --bin hcom fork_conformance -- --test-threads=1",
       "python3 -I tests/hermes_plugin.py"
     ],
-    "note": "Run conformance on pristine upstream first. No legacy Hermes backend/plugin/spec/parser port."
+    "note": "Run conformance on pristine upstream first. No legacy Hermes backend/plugin/spec/parser port.",
+    "disposition": "upstream-conformance-only"
   },
   "patches": [
     {
@@ -38,7 +39,8 @@
           "--",
           "--test-threads=1"
         ]
-      ]
+      ],
+      "disposition": "retain-extension"
     },
     {
       "id": "messaging",
@@ -59,8 +61,18 @@
           "message_contracts",
           "--",
           "--test-threads=1"
+        ],
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "send_delivery",
+          "--",
+          "--test-threads=1"
         ]
-      ]
+      ],
+      "disposition": "retain-extension"
     },
     {
       "id": "approval-ownership",
@@ -90,7 +102,8 @@
           "--",
           "--test-threads=1"
         ]
-      ]
+      ],
+      "disposition": "retain-extension"
     },
     {
       "id": "antigravity-banner",
@@ -110,7 +123,8 @@
           "--",
           "--test-threads=1"
         ]
-      ]
+      ],
+      "disposition": "retain-extension"
     },
     {
       "id": "antigravity-survey",
@@ -132,7 +146,8 @@
           "--",
           "--test-threads=1"
         ]
-      ]
+      ],
+      "disposition": "retain-extension"
     },
     {
       "id": "connection-signal",
@@ -151,54 +166,19 @@
           "subagent_connection",
           "--",
           "--test-threads=1"
-        ]
-      ]
-    },
-    {
-      "id": "native-participation",
-      "contracts": [
-        "claude-native-session-start-adoption",
-        "codex-wrapperless-vscode-adoption",
-        "codex-thread-sender-resolution",
-        "tool-family-authoritative-binding",
-        "recent-kimi-bind-safety"
-      ],
-      "depends_on": [],
-      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
-      "focused_tests": [
+        ],
         [
           "cargo",
           "test",
           "--locked",
-          "--test",
-          "native_participation",
+          "--bin",
+          "hcom",
+          "connection_ack",
           "--",
           "--test-threads=1"
         ]
-      ]
-    },
-    {
-      "id": "hermes-extensions",
-      "contracts": [
-        "hermes-session-attribution",
-        "hermes-session-adoption",
-        "hermes-hook-dispatch",
-        "hermes-transcript"
       ],
-      "depends_on": [
-        "native-participation"
-      ],
-      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
-      "focused_tests": [
-        [
-          "cargo",
-          "test",
-          "--locked",
-          "hermes",
-          "--",
-          "--test-threads=1"
-        ]
-      ]
+      "disposition": "retain-extension"
     },
     {
       "id": "filtered-observation",
@@ -217,8 +197,38 @@
           "event_observation",
           "--",
           "--test-threads=1"
+        ],
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "commands::listen",
+          "--",
+          "--test-threads=1"
+        ],
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "cli_smoke",
+          "events_follow_rejects_conflicting_flags",
+          "--",
+          "--test-threads=1"
+        ],
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "send_delivery",
+          "--",
+          "--test-threads=1"
         ]
-      ]
+      ],
+      "disposition": "retain-extension"
     },
     {
       "id": "worker-progress",
@@ -227,7 +237,8 @@
         "compact-progress-stream"
       ],
       "depends_on": [
-        "messaging"
+        "messaging",
+        "filtered-observation"
       ],
       "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
       "focused_tests": [
@@ -239,8 +250,29 @@
           "worker_progress",
           "--",
           "--test-threads=1"
+        ],
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "core::compact",
+          "--",
+          "--test-threads=1"
+        ],
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "commands::events::observation",
+          "--",
+          "--test-threads=1"
         ]
-      ]
+      ],
+      "disposition": "retain-extension"
     },
     {
       "id": "worker-results",
@@ -264,8 +296,121 @@
           "worker_results",
           "--",
           "--test-threads=1"
+        ],
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "core::result_wait",
+          "--",
+          "--test-threads=1"
+        ],
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "provider_result",
+          "--",
+          "--test-threads=1"
         ]
-      ]
+      ],
+      "disposition": "retain-extension"
+    },
+    {
+      "id": "native-participation",
+      "contracts": [
+        "claude-native-session-start-adoption",
+        "codex-wrapperless-vscode-adoption",
+        "codex-thread-sender-resolution",
+        "tool-family-authoritative-binding",
+        "recent-kimi-bind-safety",
+        "hermes-session-attribution",
+        "hermes-session-adoption"
+      ],
+      "depends_on": [
+        "approval-ownership",
+        "connection-signal"
+      ],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "native_participation",
+          "--",
+          "--test-threads=1"
+        ],
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "hooks::native",
+          "--",
+          "--test-threads=1"
+        ],
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--bin",
+          "hcom",
+          "commands::start",
+          "--",
+          "--test-threads=1"
+        ]
+      ],
+      "disposition": "retain-extension"
+    },
+    {
+      "id": "hermes-extensions",
+      "contracts": [
+        "hermes-hook-dispatch",
+        "hermes-transcript"
+      ],
+      "depends_on": [
+        "native-participation"
+      ],
+      "last_checked_upstream": "de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf",
+      "focused_tests": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "hermes",
+          "--",
+          "--test-threads=1"
+        ],
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--test",
+          "hermes_transcript",
+          "--",
+          "--test-threads=1"
+        ]
+      ],
+      "additional_checks": [
+        [
+          "python3",
+          "-I",
+          "tests/hermes_plugin.py"
+        ],
+        [
+          "python3",
+          "-I",
+          "tests/hermes_native_plugin.py"
+        ]
+      ],
+      "disposition": "retain-extension"
     }
   ],
   "contracts": {
@@ -389,10 +534,11 @@
         "Filtered or explicit-cursor waits return only matching events",
         "A prelaunch cursor catches an event before arm; no historical replay",
         "Default snapshots and persistent subscription behavior remain unchanged",
-        "Filtered or explicit-cursor waits emit no unrelated preview; unfiltered waits retain upstream preview-once-and-continue behavior."
+        "Filtered or explicit-cursor waits emit no unrelated preview; unfiltered waits retain upstream preview-once-and-continue behavior.",
+        "Without after-id, waits arm at the current durable cursor, including unfiltered waits; upstream's 10-second quick lookback is intentionally not retained. Capture a cursor before launching work to include events that precede the wait."
       ],
       "classification_at_base": "fork extension",
-      "upstream_difference": "Fork one-shot waits accept durable after-id and suppress unrelated previews for filtered/cursor waits; upstream --after-id is follow-only and wait prints unread preview."
+      "upstream_difference": "Fork one-shot waits accept durable after-id and suppress unrelated previews for filtered/cursor waits; upstream --after-id is follow-only and wait prints unread preview. Default unfiltered wait also moves from upstream's 10-second lookback to cursor-at-arm semantics; its preview-once-and-continue behavior is retained."
     },
     "durable-events-stream": {
       "behavior": [
@@ -449,7 +595,7 @@
         "Preserve upstream membership/subscription persistence across stop/resume and ownership guards; do not restore the older downstream stop-cleanup policy."
       ],
       "classification_at_base": "partial overlap",
-      "upstream_difference": "Thread routing/memberships exist upstream. Fork differs in automatic membership cleanup and includes thread-resolved requests in request-watch coverage; upstream currently excludes is_thread_resolved requests and restores memberships on resume."
+      "upstream_difference": "Thread routing, stop/resume membership and subscription persistence stay upstream-owned. Retained delta adds request-watch coverage for thread-resolved requests; older downstream stop-cleanup policy is intentionally dropped."
     },
     "request-ack-result-separation": {
       "behavior": [

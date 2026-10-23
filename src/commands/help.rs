@@ -927,8 +927,6 @@ const HOOKS_ABOUT: &[HelpEntry] = &[
     ),
 ];
 
-
-
 const HOOKS_NATIVE: &[HelpEntry] = &[(
     "hooks native <add|remove|status> <claude|codex> [--json]",
     "Manage native tool hooks (internal native run dispatcher)",
