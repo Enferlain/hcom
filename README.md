@@ -39,6 +39,12 @@ irm https://github.com/aannoo/hcom/releases/latest/download/hcom-installer.ps1 |
 
 </details>
 
+Installing the executable, loading tool hooks, injecting startup instructions,
+and exposing the optional messaging skill are separate steps. `hcom claude`
+and `hcom codex` prepare their integrations per launch; `hcom hooks add` does
+not install the skill. See [setup and skill distribution](skills/hcom-agent-messaging/references/setup.md)
+for the tool matrix, discovery paths, and inspection commands.
+
 ## Quickstart
 
 <table>
@@ -99,13 +105,18 @@ hcom
 
 ## How it works
 
-Hooks record activity to a local SQLite database and deliver messages from it.
+Tool integrations record activity to a local SQLite database and deliver messages from it.
 
 ```text
-agent → hooks → db → hooks → other agent
+agent → integration → db → integration → other agent
 ```
 
-Hooks activate only when an agent is launched with `hcom` in front. Normal usage is unaffected.
+Launching with `hcom` prepares the tool integration and connects the session.
+Claude, Codex, OpenCode, Kilo, Pi, OMP, Copilot, and Qoder load their integration
+per launch. Gemini, Antigravity, Cursor, and Kimi use persistent hooks; Grok
+connects natively. Hermes uses a profile plugin, and its chats can enroll
+explicitly as described below. The [setup guide](skills/hcom-agent-messaging/references/setup.md)
+explains which mechanism each tool uses.
 
 <details>
 <summary>Any other AI tool without hooks can join by running <code>hcom start</code></summary>

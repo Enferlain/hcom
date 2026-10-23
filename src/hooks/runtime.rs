@@ -2,9 +2,9 @@
 //!
 //! A per-run tool loads hcom's hooks/plugin for one invocation (a flag or an
 //! env var the launcher adds) instead of from a global install in the tool's
-//! config dir. There is no persistent mode for these tools: a plain run of the
-//! tool never carries hcom, and nested same-tool children started from an
-//! agent's shell don't inherit the parent's hooks.
+//! config dir. Plain runs and nested same-tool children do not inherit this
+//! per-run configuration. Explicit native-session enrollment is a separate,
+//! opt-in path in `hooks::native`.
 //!
 //! Each tool supplies a [`PerRunAdapter`] (schema and merge logic stay in
 //! `src/hooks/<tool>.rs`); tools without one keep the persistent install path in

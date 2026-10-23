@@ -633,20 +633,26 @@ const RESET_HELP: &[HelpEntry] = &[
         "Stop all + clear db + remove hooks + reset config",
     ),
     ("", ""),
-    ("Sandbox / local mode:", ""),
+    ("Project-local hcom state:", ""),
     ("", "If you can't write to ~/.hcom, set:"),
     ("", "  export HCOM_DIR=\"$PWD/.hcom\""),
     (
         "",
-        "Hooks install under the parent of HCOM_DIR; state stays in HCOM_DIR.",
+        "HCOM_DIR changes hcom state (db, logs, generated integrations).",
     ),
     (
         "",
-        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .pi, .omp, .antigravity, .cursor, .kimi, .copilot, .grok",
+        "Tool configuration and persistent hook locations do not move.",
     ),
     ("", ""),
-    ("", "To remove local setup:"),
-    ("", "  hcom hooks remove && rm -rf \"$HCOM_DIR\""),
+    (
+        "",
+        "hooks remove can also remove persistent hooks in tool profiles.",
+    ),
+    (
+        "",
+        "Stop local participants before removing their state directory.",
+    ),
     ("", ""),
     ("", "Explicit location:"),
     ("", "  export HCOM_DIR=/your/path/.hcom"),
@@ -885,7 +891,18 @@ const HOOKS_ADD: &[HelpEntry] = &[
         "",
         "  No tool: auto-detect the current tool, or add all outside one.",
     ),
-    ("", "  Restart the tool after adding hooks to activate."),
+    (
+        "",
+        "  All skips Hermes; use hooks add hermes for its ambient profile.",
+    ),
+    (
+        "",
+        "  Restart as instructed; Hermes can activate in a running gateway.",
+    ),
+    (
+        "",
+        "  Does not install optional skills or AGENTS.md/CLAUDE.md files.",
+    ),
 ];
 
 const HOOKS_REMOVE: &[HelpEntry] = &[
@@ -896,7 +913,7 @@ const HOOKS_REMOVE: &[HelpEntry] = &[
     ("", "  No tool: remove from all tools."),
     (
         "",
-        "  Cleans both global (~/) and HCOM_DIR-local hooks if set.",
+        "  Cleans effective tool profiles and owned legacy local installs.",
     ),
 ];
 
@@ -904,11 +921,11 @@ const HOOKS_ABOUT: &[HelpEntry] = &[
     ("", "Per-run: {per_run_tools}"),
     (
         "",
-        "  Hooks load only in sessions launched with `hcom <tool>`. Nothing to",
+        "  Ordinary hcom launches load hooks per session; no persistent install",
     ),
     (
         "",
-        "  install; remove clears installs left by older hcom versions.",
+        "  is needed. `hooks native` is a separate, opt-in path.",
     ),
     ("", "Persistent: {persistent_list}"),
     (
@@ -929,7 +946,7 @@ const HOOKS_ABOUT: &[HelpEntry] = &[
 
 const HOOKS_NATIVE: &[HelpEntry] = &[(
     "hooks native <add|remove|status> <claude|codex> [--json]",
-    "Manage native tool hooks (internal native run dispatcher)",
+    "Manage opt-in persistent hooks for native Claude/Codex sessions",
 )];
 
 const HOOKS_PAGE: &[&[HelpEntry]] = &[

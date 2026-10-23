@@ -2,154 +2,147 @@
 name: hcom-agent-messaging
 description: >
   Multi-agent communication for AI coding tools. Agents message, watch,
-  and spawn each other across terminals. Use when setting up hcom or
-  troubleshooting.
+  and spawn each other across terminals. Use when setting up hcom,
+  troubleshooting delivery, or writing multi-agent scripts.
 ---
 
 # hcom — multi-agent communication for AI coding tools
 
-AI agents running in separate terminals are isolated. hcom connects them via hooks and a shared database so they can message, watch, and spawn each other in real-time.
+hcom connects agents through a shared event database and tool integrations.
+Use it to send requests, share results, inspect transcripts, and coordinate
+authorized workers. Launching a worker requires authorization from the task
+or applicable instructions; loading this skill does not grant it.
 
-Start an agent with `hcom` in front, then prompt normally.
+These references target this hcom checkout, including correlated result waits
+and compact progress streams. Check `hcom <command> --help` when using another
+version.
 
-Use hcom to:
+## Connect and diagnose
 
-- coordinate multi-agent pipelines
-- run different AI CLIs as each other's subagents
-- avoid copy-pasting
+For installation paths and the distinction between hooks, startup instructions,
+and optional skills, read [setup and distribution](references/setup.md).
 
-```bash
-uv tool install hcom
-hcom claude       # or: hcom gemini, hcom codex, hcom opencode, hcom kilo, hcom pi, hcom omp, hcom agy, hcom cursor, hcom kimi, hcom copilot, hcom qoder, hcom grok, hcom hermes
-hcom              # TUI dashboard
-```
+Start with `hcom status` and `hcom list`. An existing working installation
+does not need reinstalling. Launch supported tools with `hcom <tool>` for
+automatic message delivery. Use `hcom start` inside other tools for manual
+delivery through `hcom listen`.
 
-Quickstart:
+| Integration | Tools | Setup |
+|-------------|-------|-------|
+| Per launch | Claude Code, Codex, OpenCode, Kilo, Pi, OMP, Copilot, Qoder | Launch with `hcom <tool>`; no persistent hooks to install |
+| Persistent | Gemini, Antigravity (`agy`), Cursor (`cursor-agent`), Kimi | Inspect `hcom hooks status <tool>`; install missing hooks with `hcom hooks add <tool>`, then restart |
+| Hermes profile plugin | Hermes | `hcom hermes` prepares its selected profile; `hcom hooks add hermes` explicitly installs into the ambient profile and reports activation details |
+| Native connection | Grok | Launch with `hcom grok`; no hooks required |
 
-```bash
-# terminal 1
-hcom claude
+Bare `hcom hooks add` detects the current tool, or selects all outside a
+recognized tool. `hcom hooks add all` skips per-launch integrations and
+Hermes; use the explicit Hermes command when needed. Hook setup, startup
+bootstrap, executable installation, and discovery of this skill are separate.
 
-# terminal 2
-hcom codex
-```
+If a supported agent is not participating, relaunch it through hcom or use
+`hcom r --help` to resume its supported session. Inspect `hcom hooks status`
+for integration problems and `hcom relay status` for cross-device problems.
+Use reset only when intentionally archiving and clearing hcom state.
 
-Prompt normally — e.g. `review what claude did and send it fixes`
-
----
-
-## what humans can do
-
-tell any agent:
-
-> send a message to claude
-
-> when codex goes idle send it the next task
-
-> watch gemini's file edits, review each and send feedback if any bugs
-
-> fork yourself to investigate the bug and report back
-
-> find which agent worked on terminal_id code, resume them and ask why it sucks
-
----
-
-## what agents can do
-
-**Message** each other in real time: mid-turn or wake immediately when idle
-
-**Observe** each other: status, transcripts, file edits, live terminal screens, command history.
-
-**Subscribe** and notify on status changes, file edits, collisions, specific events. React automatically.
-
-**Spawn**, **fork**, **resume**, **kill** in any terminal emulator or headless.
-
-run `hcom --help` for full command syntax and flags.
-
----
-
-Works with Claude Code, Gemini CLI, Codex, OpenCode, Kilo Code, Pi, Oh My Pi, Antigravity, Cursor, Kimi, Copilot, Qoder CLI, Grok Build, Hermes Agent, and other tools
-
----
-
-## setup
-
-When this skill is invoked, first run:
+## Send messages and share context
 
 ```bash
-hcom status
+hcom send @worker-name --thread task-unique-id --intent request -- "Do the bounded task; report the outcome."
+hcom send @worker-name --thread task-unique-id --intent inform -- "Additional context."
+hcom send @worker-name --reply-to 42 --intent ack -- "Received."
+hcom send --broadcast --intent inform -- "Team-wide announcement."
 ```
 
-If hcom status works: run `hcom list`
+Replace example names and event IDs with actual values. Forward an explicit
+`--name <caller>` when issuing commands for that caller. Outside an agent,
+`hcom send -b ...` uses the external `bigboss` identity.
 
-If hcom list shows "Your name: <name>" where `<name>` is not "(not participating)": congratulations!
+- Exact names target one agent; `@tag-` targets all local agents with that
+  exact tag. Prefer captured exact names for individual assignments.
+- A first threaded message needs explicit targets. A later thread-only send
+  reuses the thread's members. Threads organize conversations and routing;
+  they are not access controls or inbox subscription filters.
+- An unthreaded send without targets requires `--broadcast`.
+- `request` asks for a response; `inform` permits a useful response; `ack`
+  asks for no response and requires `--reply-to` to a request.
+- All flags go before `--`. For complex payloads, use stdin or `--file`.
 
-If running `hcom status` returns "command not found", install first:
-```bash
-uv tool install hcom
-```
+Use `hcom transcript @name --full --detailed` for conversation and tool I/O,
+`hcom bundle --help` for structured context, and Git for file changes. Check
+the actual diff and relevant tests before accepting a worker's result.
 
-See the [hcom README](https://github.com/aannoo/hcom#install) for other install options.
+## Ordinary interactive delegation
 
-If hcom status shows a list of CLI tools and you are not any of them, run `hcom start` to connect to hcom.
-
-If you've just installed hcom now or if hcom list shows "Your name: (not participating)" and you are a tool in the hcom status list of CLI tools:
-
-Relaunch into hcom properly for automatic message delivery and full hcom functionality. User should exit and run `hcom <tool>`.
-Or if you know your sessionID/ses_/thread_name: user can exit and run `hcom r <session-id>` to resume you inside hcom. See `hcom r --help`.
-
----
-
-## troubleshooting
-
-### "hcom not working"
-
-```bash
-hcom status          # check installation
-hcom hooks status    # check hooks specifically
-hcom relay status    # check cross-device relay
-```
-
-still broken?
-```bash
-hcom reset all # backup config/db + reset it
-hcom claude          # fresh start
-```
-
-still broken after that?
-```bash
-git clone https://github.com/aannoo/hcom.git
-cd hcom
-```
-Read code and figure out what is going on.
-
-
-### sandbox / permission issues
-
-Use project-local hcom state when the normal hcom directory is unavailable:
+Use the normal visible launch unless the user asks for a background worker.
+`--headless` opens no terminal window. For Claude, it keeps a live PTY by
+default; explicit `-p`/`--print` selects the separate print backend.
 
 ```bash
-HCOM_DIR=$PWD/.hcom hcom <tool>
+cursor=$(hcom events --cursor)  # exclusive boundary; capture before launch
+hcom 1 claude --dir /absolute/project/path --go --hcom-prompt "<non-empty bounded task>"
 ```
 
-## files
+Capture the worker's actual name from launch output. Scripts can use
+`--json` and parse the `names` array, including on a partial failure.
+Select model and permission flags according to the user's request and the
+tool's supported options; `--go` only accepts hcom's launch preview.
 
-| what | location |
-|------|----------|
-| database | `~/.hcom/hcom.db` |
-| config | `~/.hcom/config.toml` |
-| env | `~/.hcom/env` |
-| logs | `~/.hcom/.tmp/logs/` |
-| user scripts | `~/.hcom/scripts/` |
-
----
-
-## more info
+When progress observation is useful, keep one durable observer:
 
 ```bash
-hcom --help
-hcom <command> --help
-hcom run docs --scripts   # script authoring info
+hcom events stream --follow "$worker" --compact --heartbeat 15 --after-id "$cursor"
 ```
 
-Github: https://github.com/aannoo/hcom
+Quiet intervals are normal. After a plausible stall, inspect the terminal
+once with `hcom term "$worker" --clean` and resolve the surfaced blocker.
+Avoid repeated short waits, status polls, and transcript tails for healthy
+workers.
+
+For a completion wait, agree that the worker sends one final `inform` on a
+unique result thread; keep progress messages on another thread. Capture the
+cursor before launching the worker, then use:
+
+```bash
+hcom events --wait 180 --after-id "$cursor" --thread "$result_thread" --result-from "$worker"
+```
+
+This correlates an exact worker generation and its `inform` message, not the
+meaning of its text. Exit 0 means a result was received or recovered; inspect
+it before claiming success. Wait outcomes use 1 deadline, 2 error, 3 stopped
+without result, 4 blocked, 5 launch failure. Input validation can also exit 1
+before waiting; read diagnostics rather than calling every exit 1 a timeout.
+Supported stopped-provider recovery
+includes provenance. Do not combine `--result-from` with SQL or extra event
+filters. See [gotchas](references/gotchas.md) for timing and routing details.
+
+## Workflow scripts
+
+Place `.sh` or `.py` scripts in `${HCOM_DIR:-$HOME/.hcom}/scripts/`; run them
+with `hcom run <name>`. Parse and forward an injected `--name` using an argument
+array. Capture a cursor before launch or dispatch, give each run a unique
+thread, and target exact captured worker names. Use bounded event waits;
+preserve their exit status. Track every launched worker and use an `EXIT`
+trap plus signal handling to clean up script-owned workers with `hcom kill`.
+Keep interactive workers available when the task calls for follow-up.
+
+| Reference | When to read |
+|-----------|--------------|
+| [Setup and distribution](references/setup.md) | Install/locate the optional skill, inspect hook/bootstrap setup, or resolve client/profile differences |
+| [Script template](references/script-template.md) | Write a workflow or install the examples |
+| [Patterns](references/patterns.md) | Choose among six coordination examples |
+| [Cross-tool behavior](references/cross-tool.md) | Mix tools, check launch/permission differences |
+| [Gotchas](references/gotchas.md) | Diagnose waits, delivery, setup, and cleanup |
+
+## State location
+
+By default, hcom stores `hcom.db`, `config.toml`, `env`, `.tmp/logs/`, and
+`scripts/` under `~/.hcom`. `HCOM_DIR` changes hcom's state root; participants
+must use the same root to share its local database. It does not relocate tool
+configuration or persistent hooks.
+
+```bash
+HCOM_DIR="$PWD/.hcom" hcom claude
+```
+
+For full command details, use `hcom --help`, `hcom <command> --help`, and
+`hcom run docs --cli`.
