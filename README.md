@@ -45,6 +45,8 @@ and `hcom codex` prepare their integrations per launch; `hcom hooks add` does
 not install the skill. See [setup and skill distribution](skills/hcom-agent-messaging/references/setup.md)
 for the tool matrix, discovery paths, and inspection commands.
 
+Fork maintainers can find the current upstream and patch refs, installed binary, and archived work in the [checkout and installation guide](docs/fork-environment.md).
+
 ## Quickstart
 
 <table>

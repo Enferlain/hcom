@@ -1,5 +1,7 @@
 # Maintaining the downstream patch series
 
+See [hcom checkout and installation](fork-environment.md) for the current source refs, installed executable, and historical archives.
+
 The foundation is upstream `de33e31a0cdbba4c5863f7cc050d8b79aa50bcdf` (0.7.31). The accepted previous rebuild is reference material, not a replacement source tree. The machine-readable [manifest](fork-patches.json) assigns each retained contract to a patch or to upstream, records dependencies and focused checks, and defines the intended behavior. Beads tracks implementation progress; this document describes the maintenance contract.
 
 Upstream supplies Hermes provider registration, detection, plugin/backend ownership, installation, launch/resume/configuration and launched-session bootstrap. It also supplies the generic `events --follow` stream. Keep these implementations. Add only missing participation/search and observation/result behavior. Six shared Hermes contracts received no legacy implementation port: pristine-upstream Hermes Rust tests (32 passed, one ignored), its Python plugin suite (71 passed), and two adapted retained conformance tests passed. Four upstream generic-follow integration tests also passed. These checks establish the exercised behavior, not exhaustive equivalence.
@@ -57,4 +59,4 @@ Approval-owner state is an additive column managed by `db/fork_schema.rs`; it do
 
 Source, regression tests, the manifest, this procedure and portable validation summaries belong in Git. `.patch-artifacts/` holds ignored reference copies, pristine-source test snapshots, raw review output, logs and executable candidates. `target/` is regenerable Cargo output. Provider/model preferences and user workflow scripts remain external assets.
 
-The candidate is a linked Git worktree. Preserve the original repository's common Git directory until the maintained branch is deliberately consolidated into `/home/imi/Projects/hcom`; remove other worktrees through Git after checking their tracked and untracked contents. Building this candidate does not change the installed release.
+The maintained branch is checked out in `~/Projects/hcom`, which holds the common Git directory. Use a temporary linked worktree when a pristine build or replay candidate needs its own working files. Remove it through `git worktree remove` after preserving any local changes and validation evidence. Candidate builds produce artifacts under `target/`; installation is a separate step.
