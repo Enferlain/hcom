@@ -10,12 +10,10 @@ use crate::claude_actor;
 use crate::db::HcomDb;
 use crate::identity;
 use crate::instance_lifecycle as lifecycle;
-use crate::instances;
-#[cfg(test)]
-use crate::shared::SenderIdentity;
 use crate::shared::ansi::{BOLD, DIM, FG_CYAN, RESET};
 use crate::shared::{
-    CommandContext, HcomError, ST_ACTIVE, ST_INACTIVE, SenderKind, status_fg, status_icon,
+    CommandContext, HcomError, MAX_MESSAGES_PER_DELIVERY, ST_ACTIVE, ST_INACTIVE, SenderIdentity,
+    SenderKind, status_fg, status_icon,
 };
 use crate::tool::Tool;
 
@@ -203,88 +201,148 @@ pub fn set_hookless_command_status(db: &HcomDb, cmd_name: &str, ctx: &CommandCon
     lifecycle::set_status(db, &identity.name, status, &context, Default::default());
 }
 
-/// For hookless instances (codex/adhoc): append unread messages after command output.
-///
-/// Codex and adhoc instances have no delivery hooks, so messages are delivered
-/// via CLI command output. Skips for --json output to preserve machine-readable format.
-///
-/// Not display-only: also advances the instance cursor and updates delivery status.
-/// This is the hookless counterpart to hook-based delivery.
-///
-/// Returns formatted output string if messages were delivered, None otherwise.
-pub fn maybe_deliver_pending_messages(
-    db: &HcomDb,
-    ctx: &CommandContext,
-    has_json_flag: bool,
-) -> Option<String> {
-    if has_json_flag {
-        return None;
-    }
+/// Set when the running command has taken over inline delivery for this
+/// invocation (send after persisting its message, listen once it reads the
+/// inbox), or reserved stdout for an event stream, so the router's
+/// after-command delivery must not run.
+static COMMAND_OWNS_INLINE_DELIVERY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
+pub fn claim_inline_delivery() {
+    COMMAND_OWNS_INLINE_DELIVERY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The invoking instance, if the router delivers its messages inline in the
+/// command output. Only adhoc instances use this fallback; Codex has native
+/// delivery hooks and must leave its inbox for those hooks. `send` may still
+/// explicitly display the sending instance's own unread messages.
+pub fn inline_receiver(ctx: &CommandContext) -> Option<&SenderIdentity> {
     let identity = ctx.identity.as_ref()?;
     if !matches!(identity.kind, SenderKind::Instance) {
         return None;
     }
+    let tool = identity.instance_data.as_ref()?.get("tool")?.as_str()?;
+    (tool == "adhoc").then_some(identity)
+}
 
-    let instance_data = identity.instance_data.as_ref()?;
-    let tool = instance_data
-        .get("tool")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+/// One chronological prefix of an instance's unread messages, capped per
+/// delivery. A single cursor acknowledges everything up to the batch's last
+/// event, so the batch must be a prefix: capping per sender would skip events.
+pub struct InlineBatch {
+    pub messages: Vec<crate::db::Message>,
+    pub remaining: usize,
+}
 
-    if tool != "codex" && tool != "adhoc" {
-        return None;
+impl InlineBatch {
+    pub fn take(db: &HcomDb, name: &str) -> Option<Self> {
+        let mut messages = db.get_unread_messages(name);
+        if messages.is_empty() {
+            return None;
+        }
+        let remaining = messages.len().saturating_sub(MAX_MESSAGES_PER_DELIVERY);
+        messages.truncate(MAX_MESSAGES_PER_DELIVERY);
+        Some(Self {
+            messages,
+            remaining,
+        })
     }
 
-    // Get unread messages
-    let messages = db.get_unread_messages(&identity.name);
-    if messages.is_empty() {
-        return None;
+    pub fn remaining_note(&self, name: &str) -> String {
+        if self.remaining == 0 {
+            return String::new();
+        }
+        format!(
+            "[+{} more unread — run: hcom listen --name {name}]\n",
+            self.remaining
+        )
     }
 
-    // Advance cursor — update last_event_id on the instance
-    if let Some(last) = messages.last()
-        && let Some(id) = last.event_id
-    {
-        let mut updates = serde_json::Map::new();
-        updates.insert("last_event_id".into(), serde_json::json!(id));
-        instances::update_instance_position(db, &identity.name, &updates);
+    pub fn arrived_since_note(&self, db: &HcomDb, name: &str) -> String {
+        if self.remaining > 0 || db.get_unread_messages(name).is_empty() {
+            return String::new();
+        }
+        format!("[hcom] new message(s) arrived — run: hcom listen --name {name}\n")
     }
 
-    // Format with divider
-    let formatted = format_hook_messages_simple_from_msgs(db, &messages, &identity.name);
+    /// Write and flush output before advancing the cursor. A failed write
+    /// leaves the batch unread so callers can retry without dropping messages.
+    pub fn emit(
+        &self,
+        db: &HcomDb,
+        name: &str,
+        output: &str,
+        set_status: bool,
+    ) -> Result<(), String> {
+        use std::io::Write;
+
+        let written = {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(output.as_bytes())
+                .and_then(|_| stdout.flush())
+        };
+        if let Err(e) = written {
+            return Err(format!(
+                "incoming message output failed; unread messages retained: {e}"
+            ));
+        }
+
+        if let Some(id) = self.messages.last().and_then(|m| m.event_id) {
+            db.advance_instance_cursor(name, id)
+                .map_err(|e| format!("receive acknowledgment failed: {e}"))?;
+        }
+
+        if set_status {
+            let last = self.messages.last();
+            let sender_display = identity::get_display_name(db, &self.messages[0].from);
+            lifecycle::set_status(
+                db,
+                name,
+                ST_INACTIVE,
+                &format!("deliver:{sender_display}"),
+                lifecycle::StatusUpdate {
+                    msg_ts: last.and_then(|m| m.timestamp.as_deref()).unwrap_or(""),
+                    ..Default::default()
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// For adhoc instances: append unread messages after command output.
+///
+/// Adhoc instances have no delivery hooks, so messages are delivered via CLI
+/// command output. Codex messages remain for its native hooks. Skips for
+/// --json output to preserve machine-readable format.
+///
+/// Not display-only: also advances the instance cursor and updates delivery status.
+///
+/// Returns whether messages were delivered. Output is written and flushed
+/// before the cursor is advanced.
+pub fn maybe_deliver_pending_messages(
+    db: &HcomDb,
+    ctx: &CommandContext,
+    has_json_flag: bool,
+) -> Result<bool, String> {
+    if has_json_flag || COMMAND_OWNS_INLINE_DELIVERY.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(false);
+    }
+    let Some(identity) = inline_receiver(ctx) else {
+        return Ok(false);
+    };
+    let Some(batch) = InlineBatch::take(db, &identity.name) else {
+        return Ok(false);
+    };
+    let formatted = format_hook_messages_simple_from_msgs(db, &batch.messages, &identity.name);
     let output = format!(
-        "\n{}\n[hcom]\n{}\n{}",
+        "\n{}\n[hcom]\n{}\n{}\n",
         "─".repeat(40),
         "─".repeat(40),
         formatted,
-    );
-
-    // Update status after delivery
-    let msg_ts = messages
-        .last()
-        .and_then(|m| m.timestamp.as_deref())
-        .unwrap_or("");
-    let sender_display = identity::get_display_name(db, &messages[0].from);
-    let context = format!("deliver:{sender_display}");
-
-    let status = if tool == "codex" {
-        ST_ACTIVE
-    } else {
-        ST_INACTIVE
-    };
-    lifecycle::set_status(
-        db,
-        &identity.name,
-        status,
-        &context,
-        lifecycle::StatusUpdate {
-            msg_ts,
-            ..Default::default()
-        },
-    );
-
-    Some(output)
+    ) + &batch.remaining_note(&identity.name);
+    batch.emit(db, &identity.name, &output, true)?;
+    Ok(true)
 }
 
 /// Format messages for human terminal display.
@@ -361,38 +419,38 @@ pub fn format_messages_human(
     }
 }
 
-/// Build message prefix from envelope fields.
-///
-/// Format: `[intent:thread #id]` or `[intent #id]` or `[thread:name #id]` or `[new message #id]`
+/// Build message prefix from envelope fields of a raw message event.
 fn build_message_prefix(
     intent: Option<&str>,
     thread: Option<&str>,
     event_id: Option<i64>,
     msg: &serde_json::Value,
 ) -> String {
-    // Build ID reference (local or remote)
-    let relay = msg.get("_relay");
-    let id_ref = if let Some(relay) = relay {
-        let short = relay.get("short").and_then(|v| v.as_str()).unwrap_or("");
-        let rid = relay.get("id").and_then(|v| v.as_i64());
-        if !short.is_empty() {
-            if let Some(id) = rid {
-                format!("#{id}:{short}")
+    // Relayed messages are referenced by origin id + device, local ones by event id.
+    let reply_id = match msg.get("_relay") {
+        Some(relay) => {
+            let short = relay.get("short").and_then(|v| v.as_str()).unwrap_or("");
+            if short.is_empty() {
+                event_id.map(|id| id.to_string())
             } else {
-                String::new()
+                relay
+                    .get("id")
+                    .and_then(|v| v.as_i64())
+                    .map(|id| format!("{id}:{short}"))
             }
-        } else if let Some(id) = event_id {
-            format!("#{id}")
-        } else {
-            String::new()
         }
-    } else if let Some(id) = event_id {
-        format!("#{id}")
-    } else {
-        String::new()
+        None => event_id.map(|id| id.to_string()),
     };
+    format_envelope_prefix(intent, thread, reply_id.as_deref())
+}
 
-    // Build prefix based on envelope fields
+/// Format: `[intent:thread #id]` or `[intent #id]` or `[thread:name #id]` or `[new message #id]`,
+/// where `id` is what `hcom send --reply-to` accepts.
+pub(crate) fn format_envelope_prefix(
+    intent: Option<&str>,
+    thread: Option<&str>,
+    reply_id: Option<&str>,
+) -> String {
     let prefix = match (intent, thread) {
         (Some(i), Some(t)) => format!("{i}:{t}"),
         (Some(i), None) => i.to_string(),
@@ -400,10 +458,9 @@ fn build_message_prefix(
         (None, None) => "new message".to_string(),
     };
 
-    if id_ref.is_empty() {
-        format!("[{prefix}]")
-    } else {
-        format!("[{prefix} {id_ref}]")
+    match reply_id {
+        Some(id) => format!("[{prefix} #{id}]"),
+        None => format!("[{prefix}]"),
     }
 }
 
@@ -499,11 +556,10 @@ fn format_hook_messages_simple_from_msgs(
 
     if messages.len() == 1 {
         let msg = &messages[0];
-        let prefix = build_message_prefix(
+        let prefix = format_envelope_prefix(
             msg.intent.as_deref(),
             msg.thread.as_deref(),
-            msg.event_id,
-            &serde_json::json!({}),
+            msg.reply_id().as_deref(),
         );
         let sender_display = identity::get_display_name(db, &msg.from);
 
@@ -524,11 +580,10 @@ fn format_hook_messages_simple_from_msgs(
         let parts: Vec<String> = messages
             .iter()
             .map(|msg| {
-                let prefix = build_message_prefix(
+                let prefix = format_envelope_prefix(
                     msg.intent.as_deref(),
                     msg.thread.as_deref(),
-                    msg.event_id,
-                    &serde_json::json!({}),
+                    msg.reply_id().as_deref(),
                 );
                 let sender_display = identity::get_display_name(db, &msg.from);
 
@@ -1244,7 +1299,7 @@ mod tests {
             }),
             go: false,
         };
-        assert!(maybe_deliver_pending_messages(&db, &ctx, true).is_none());
+        assert!(maybe_deliver_pending_messages(&db, &ctx, true).is_ok());
     }
 
     #[test]
@@ -1260,7 +1315,7 @@ mod tests {
             }),
             go: false,
         };
-        assert!(maybe_deliver_pending_messages(&db, &ctx, false).is_none());
+        assert!(maybe_deliver_pending_messages(&db, &ctx, false).is_ok());
     }
 
     #[test]
@@ -1271,6 +1326,6 @@ mod tests {
             identity: None,
             go: false,
         };
-        assert!(maybe_deliver_pending_messages(&db, &ctx, false).is_none());
+        assert!(maybe_deliver_pending_messages(&db, &ctx, false).is_ok());
     }
 }

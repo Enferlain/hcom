@@ -1,5 +1,6 @@
 //! Codex launch preprocessing — sandbox flags, DB access, bootstrap injection.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -13,7 +14,6 @@ const BYPASS_HOOK_TRUST_MIN_VERSION: (u64, u64, u64) = (0, 131, 0);
 /// Sandbox modes aligned with Codex TUI presets.
 ///
 /// - `workspace`: Default — --sandbox workspace-write (interactive: on-request approvals)
-/// - `untrusted`: Workspace writes, approval before untrusted commands
 /// - `danger-full-access`: Full Access — --dangerously-bypass-approvals-and-sandbox
 /// - `none`: Raw codex, user's own settings (hcom may not work)
 ///
@@ -35,24 +35,12 @@ pub fn get_sandbox_flags(mode: &str) -> Vec<String> {
             flags.extend(net);
             flags
         }
-        "untrusted" => {
-            // Read-only-equivalent UX for hcom: codex's actual read-only sandbox
-            // can't be used (hcom needs DB writes), so we keep workspace-write FS
-            // and gate every non-safe command on user approval via -a untrusted.
-            let mut flags = vec![
-                "--sandbox".to_string(),
-                "workspace-write".to_string(),
-                "-a".to_string(),
-                "untrusted".to_string(),
-            ];
-            flags.extend(net);
-            flags
-        }
         "danger-full-access" => {
             vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
         }
         "none" => vec![],
-        // Default to workspace
+        // Default to workspace (config normalizes the retired `untrusted` and
+        // `full-auto` to it; this also covers them arriving via raw env).
         _ => {
             let mut flags = vec!["--sandbox".to_string(), "workspace-write".to_string()];
             flags.extend(net);
@@ -195,6 +183,60 @@ fn resolve_codex_home() -> Option<(PathBuf, bool)> {
     dirs::home_dir().map(|h| (h.join(".codex"), false))
 }
 
+/// Resolve the Codex state directory from the effective child launch
+/// environment, including values supplied through `~/.hcom/env` or `--env`.
+pub(crate) fn resolve_codex_home_from_env(
+    env: &HashMap<String, String>,
+    launch_dir: &Path,
+) -> Option<(PathBuf, bool)> {
+    // `dirs::home_dir()` reads HOME on Unix but uses the platform profile API
+    // on Windows. Reproduce that distinction from the child's effective env.
+    #[cfg(windows)]
+    let default_home = dirs::home_dir();
+    #[cfg(not(windows))]
+    let default_home = env
+        .get("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir);
+    resolve_codex_home_from_env_with(
+        env,
+        launch_dir,
+        default_home.or_else(|| Some(crate::runtime_env::tool_config_root())),
+        cfg!(windows),
+    )
+}
+
+fn resolve_codex_home_from_env_with(
+    env: &HashMap<String, String>,
+    launch_dir: &Path,
+    default_home: Option<PathBuf>,
+    case_insensitive: bool,
+) -> Option<(PathBuf, bool)> {
+    let configured = if case_insensitive {
+        env.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("CODEX_HOME"))
+            .map(|(_, value)| value.as_str())
+    } else {
+        env.get("CODEX_HOME").map(String::as_str)
+    };
+    if let Some(value) = configured.filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(value);
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            launch_dir.join(path)
+        };
+        return Some((crate::shared::platform::child_process_path(&resolved), true));
+    }
+    default_home.map(|home| {
+        (
+            crate::shared::platform::child_process_path(&home.join(".codex")),
+            false,
+        )
+    })
+}
+
 /// Probe whether `CODEX_HOME` is writable before launching codex.
 ///
 /// When hcom is invoked from inside a sandboxed parent codex (e.g.
@@ -211,8 +253,12 @@ pub fn ensure_codex_home_writable() -> Result<()> {
     let Some((codex_home, explicit_env)) = resolve_codex_home() else {
         return Ok(());
     };
+    ensure_codex_home_writable_at(&codex_home, explicit_env)
+}
+
+pub(crate) fn ensure_codex_home_writable_at(codex_home: &Path, explicit_env: bool) -> Result<()> {
     let probe_dir = if codex_home.exists() {
-        codex_home.as_path()
+        codex_home
     } else if explicit_env {
         return Ok(());
     } else {
@@ -301,6 +347,17 @@ impl CodexHookTrustOutcome {
 /// Split from `preprocess_codex_args` because the outcome also governs
 /// workspace-trust injection, which happens earlier in the launch sequence.
 pub fn resolve_codex_hook_trust(codex_args: &[String], launch_dir: &Path) -> CodexHookTrustOutcome {
+    let Some((codex_home, _)) = resolve_codex_home() else {
+        return CodexHookTrustOutcome::NoActionNeeded;
+    };
+    resolve_codex_hook_trust_at(codex_args, launch_dir, &codex_home)
+}
+
+pub(crate) fn resolve_codex_hook_trust_at(
+    codex_args: &[String],
+    launch_dir: &Path,
+    codex_home: &Path,
+) -> CodexHookTrustOutcome {
     if !codex_supports_bypass_hook_trust() {
         return CodexHookTrustOutcome::NoActionNeeded;
     }
@@ -310,7 +367,7 @@ pub fn resolve_codex_hook_trust(codex_args: &[String], launch_dir: &Path) -> Cod
         return CodexHookTrustOutcome::NoActionNeeded;
     }
 
-    match crate::hooks::codex::resolve_codex_hook_trust_state(launch_dir) {
+    match crate::hooks::codex::resolve_codex_hook_trust_state_at(launch_dir, codex_home) {
         crate::hooks::codex::CodexHookTrustState::Trusted => CodexHookTrustOutcome::NoActionNeeded,
         crate::hooks::codex::CodexHookTrustState::BypassSafeFromHooksList => {
             warn_bypass_granted("Codex's own hook list");
@@ -669,12 +726,11 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_flags_untrusted() {
+    fn test_sandbox_flags_retired_untrusted_is_workspace() {
+        // Codex 0.152 removed `-a untrusted`; passing it makes Codex exit.
         let flags = get_sandbox_flags("untrusted");
-        assert!(flags.contains(&"--sandbox".to_string()));
-        assert!(flags.contains(&"workspace-write".to_string()));
-        assert!(flags.contains(&"-a".to_string()));
-        assert!(flags.contains(&"untrusted".to_string()));
+        assert_eq!(flags, get_sandbox_flags("workspace"));
+        assert!(!flags.contains(&"-a".to_string()));
     }
 
     #[test]
@@ -816,6 +872,80 @@ mod tests {
 
         assert!(!home.join(".codex").exists());
         assert!(!home.join(".hcom_writable_probe").exists());
+    }
+
+    #[test]
+    fn test_resolve_codex_home_uses_effective_child_env_override() {
+        let env = HashMap::from([
+            ("HOME".to_string(), "/readonly-parent-home".to_string()),
+            (
+                "CODEX_HOME".to_string(),
+                "/writable-child-codex-home".to_string(),
+            ),
+        ]);
+
+        let resolved = resolve_codex_home_from_env(&env, Path::new("/workspace")).unwrap();
+
+        assert_eq!(resolved.0, PathBuf::from("/writable-child-codex-home"));
+        assert!(resolved.1);
+    }
+
+    #[test]
+    fn test_resolve_codex_home_uses_platform_home_not_child_home_env() {
+        let env = HashMap::from([
+            ("HOME".to_string(), "/different-child-home".to_string()),
+            (
+                "USERPROFILE".to_string(),
+                r"C:\different-child-home".to_string(),
+            ),
+        ]);
+
+        let resolved = resolve_codex_home_from_env_with(
+            &env,
+            Path::new("/workspace"),
+            Some(PathBuf::from("/platform-home")),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(resolved, (PathBuf::from("/platform-home/.codex"), false));
+    }
+
+    #[test]
+    fn test_resolve_codex_home_handles_windows_key_casing_and_child_cwd() {
+        let env = HashMap::from([("Codex_Home".to_string(), "relative-home".to_string())]);
+
+        let resolved = resolve_codex_home_from_env_with(
+            &env,
+            Path::new("/child-workspace"),
+            Some(PathBuf::from("/platform-home")),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            (PathBuf::from("/child-workspace/relative-home"), true)
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_resolve_codex_home_strips_windows_verbatim_prefix_on_relative_path() {
+        let env = HashMap::from([("Codex_Home".to_string(), "relative-home".to_string())]);
+
+        let resolved = resolve_codex_home_from_env_with(
+            &env,
+            Path::new(r"\\?\C:\child-workspace"),
+            Some(PathBuf::from(r"C:\platform-home")),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved,
+            (PathBuf::from(r"C:\child-workspace\relative-home"), true)
+        );
     }
 
     /// Resolve the hook-trust decision and apply it, the way the launcher does
@@ -1481,13 +1611,12 @@ mod tests {
         let result = preprocess_codex_args(
             &args,
             "BOOTSTRAP",
-            "untrusted",
+            "workspace",
             CodexHookTrustOutcome::NoActionNeeded,
         );
         let approval_position = result.iter().position(|t| t == "-a").unwrap();
         assert_eq!(result[approval_position + 1], "on-request");
         assert_eq!(result.iter().filter(|t| *t == "-a").count(), 1);
-        assert!(!result.contains(&"untrusted".to_string()));
         assert!(!result.contains(&"--sandbox".to_string()));
         assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
         assert!(!has_writable_roots(&result));
@@ -1501,7 +1630,7 @@ mod tests {
         let result = preprocess_codex_args(
             &args,
             "BOOTSTRAP",
-            "untrusted",
+            "workspace",
             CodexHookTrustOutcome::NoActionNeeded,
         );
 

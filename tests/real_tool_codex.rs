@@ -12,8 +12,9 @@
 //! The full lifecycle runs through the shared [`support::real_tool`] runner so
 //! Codex and Claude assert one tool-independent contract; the Codex-specific
 //! wire codec lives in [`support::codex_mock::CodexCase`]. Only the approval
-//! gate stays here, because its trigger (hcom's `--sandbox untrusted` mode) and
-//! terminal-scraped detection are Codex-specific.
+//! gate stays here, because its trigger (an escalation request under Codex's
+//! default `on-request` policy) and terminal-scraped detection are
+//! Codex-specific.
 
 mod support;
 
@@ -21,9 +22,7 @@ use serde_json::Value;
 use serial_test::serial;
 use std::fs;
 use std::time::Duration;
-use support::codex_mock::{
-    CodexCase, MockResponses, Reply, completed, created, message, shell_call, sse,
-};
+use support::codex_mock::{CodexCase, MockResponses, Reply, completed, created, message, sse};
 use support::real_tool::{inject_prompt_until, require_pinned};
 use support::{Hcom, parse_launch_names, unique_suffix};
 
@@ -34,11 +33,37 @@ fn real_codex_full_lifecycle_send_fork_kill_resume_and_cleanup() {
     support::real_tool::run_full_lifecycle(CodexCase);
 }
 
+/// A shell call that asks to run outside the sandbox. Under Codex's default
+/// `on-request` policy (hcom's `workspace` mode) that request is what makes
+/// Codex stop for the user's approval.
+fn escalated_shell_call(
+    call_id: &str,
+    command: &str,
+    justification: &str,
+) -> (&'static str, Value) {
+    let (name, command_key) = if cfg!(windows) {
+        ("shell_command", "command")
+    } else {
+        ("exec_command", "cmd")
+    };
+    support::codex_mock::function_call(
+        call_id,
+        name,
+        &serde_json::json!({
+            command_key: command,
+            "sandbox_permissions": "require_escalated",
+            "justification": justification,
+        })
+        .to_string(),
+    )
+}
+
 /// Codex's approval gate is hcom's only PTY-driven block path, and
 /// `blocked(pty:approval)` only latches when a message is pending behind a
-/// visible approval prompt. This drives that exact race: hcom's `--sandbox
-/// untrusted` mode (translated to `-a untrusted`) gates a scripted shell call,
-/// an inbound hcom message is held while the prompt is up, then a real approval
+/// visible approval prompt. This drives that exact race: under hcom's default
+/// `workspace` mode (Codex's `on-request` policy), a scripted shell call that
+/// asks to run outside the sandbox raises Codex's approval prompt, an inbound
+/// hcom message is held while the prompt is up, then a real approval
 /// keystroke must both run the command and release the held message.
 ///
 /// Detection does NOT rely on Codex's OSC9 notification. Codex 0.139 only writes
@@ -97,7 +122,7 @@ fn real_codex_approval_gate_blocks_pending_message_then_clears_on_approval() {
         } else if body.contains(&scenario_token) {
             Reply::Sse(sse(&[
                 created("RESP_A1"),
-                shell_call("CALLG", &scenario_gated),
+                escalated_shell_call("CALLG", &scenario_gated, "Write the approval proof file"),
                 completed("RESP_A1"),
             ]))
         } else {
@@ -108,22 +133,11 @@ fn real_codex_approval_gate_blocks_pending_message_then_clears_on_approval() {
 
     h.prepare_codex_config(&mock.base_url());
 
-    // Drive the approval gate through hcom's real sandbox-mode translation: the
-    // `untrusted` mode is `get_sandbox_flags("untrusted")` →
-    // `--sandbox workspace-write -a untrusted`, gating every non-safe command on
-    // user approval. The localhost model call itself is never sandboxed, so the
-    // turn still reaches the mock. The mode is selected exactly as a real user
-    // would — via the `codex_sandbox_mode` config knob (`HCOM_CODEX_SANDBOX_MODE`)
-    // — so a regression in that translation fails this test. Setting
-    // `approval_policy` directly in config.toml would force the same gate while
-    // bypassing the translation, so we don't.
-    let (config_code, config_stdout, config_stderr) =
-        h.run(["config", "codex_sandbox_mode", "untrusted"]);
-    assert_eq!(
-        config_code, 0,
-        "set codex_sandbox_mode failed: stdout={config_stdout} stderr={config_stderr}"
-    );
-
+    // Launch in hcom's default `workspace` mode, exactly as a user would. Its
+    // `--sandbox workspace-write` leaves Codex's `on-request` approval policy
+    // in place, and the escalation request above is what that policy asks the
+    // user about. Setting `approval_policy` in config.toml instead would bypass
+    // hcom's launch translation, so a regression there could pass unnoticed.
     let (launch_code, launch_stdout, launch_stderr) = h.run([
         "codex",
         "--headless",

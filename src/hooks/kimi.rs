@@ -91,14 +91,19 @@ fn build_kimi_hook_command(command: &str) -> String {
 }
 
 fn is_hcom_kimi_command(command: &str) -> bool {
-    // Compare against the canonical command string for each hook suffix.
-    // (An earlier `format!("{}{}", prefix.trim_end(), suffix)` dropped the space
-    // between prefix and suffix, so this never matched — causing every re-setup
-    // to duplicate all hcom hooks instead of replacing them.)
+    // Recognize the canonical command for each hook suffix under the current
+    // runtime prefix AND under both install prefixes ("hcom" vs "uvx hcom").
+    // Without the dual-prefix match, a re-setup launched the other way would
+    // duplicate every hcom hook row instead of replacing the stale ones.
+    // (An earlier `format!("{}{}", prefix.trim_end(), suffix)` also dropped
+    // the separating space and matched nothing at all.)
     let trimmed = command.trim();
-    KIMI_HOOK_COMMANDS
-        .iter()
-        .any(|(_, suffix)| trimmed == build_kimi_hook_command(suffix))
+    KIMI_HOOK_COMMANDS.iter().any(|(_, suffix)| {
+        trimmed == build_kimi_hook_command(suffix)
+            || ["hcom", "uvx hcom"]
+                .iter()
+                .any(|prefix| trimmed == format!("{prefix} {suffix}"))
+    })
 }
 
 // ── TOML manipulation ───────────────────────────────────────────────────
@@ -469,38 +474,51 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
         None => return hook_noop(),
     };
 
-    let instance_name =
-        instance_binding::bind_session_to_process(db, session_id, ctx.process_id.as_deref());
+    // A hook process carries the environment of the tool that spawned it;
+    // refuse to run the kimi bind path when HCOM_TOOL names another tool.
+    let env_tool = ctx.raw_env.get("HCOM_TOOL").cloned();
+    if env_tool.as_deref().is_some_and(|tool| tool != "kimi") {
+        log::log_warn(
+            "hooks",
+            "kimi.sessionstart.tool_env_refused",
+            &format!(
+                "session_id={} process_id={:?} env_tool={:?}",
+                session_id, ctx.process_id, env_tool
+            ),
+        );
+        return hook_noop();
+    }
+
+    // Tool-checked bind: one transaction verifies every existing owner (live
+    // process, canonical session, stopped-session snapshot) is kimi before
+    // `bind_session_to_process` mutates anything, and creates the orphan
+    // identity only when nothing foreign owns the session. A mismatch rolls
+    // the whole bind back — a kimi hook must not adopt another tool's
+    // identity (this also replaces the unconditional orphan fallback that
+    // used to live here).
+    let bind = instance_binding::bind_session_to_process_for_tool(
+        db,
+        session_id,
+        ctx.process_id.as_deref(),
+        "kimi",
+        true,
+    );
 
     log::log_info(
         "hooks",
         "kimi.sessionstart.bind",
         &format!(
             "instance={:?} session_id={} process_id={:?}",
-            instance_name, session_id, ctx.process_id,
+            bind, session_id, ctx.process_id,
         ),
     );
 
-    let instance_name = match instance_name {
-        Some(name) => name,
-        None => {
-            if let Some(ref pid) = ctx.process_id {
-                match instance_binding::create_orphaned_pty_identity(
-                    db,
-                    session_id,
-                    Some(pid.as_str()),
-                    "kimi",
-                ) {
-                    Some(name) => name,
-                    None => return hook_noop(),
-                }
-            } else {
-                return hook_noop();
-            }
-        }
+    let instance_name = match bind {
+        instance_binding::ToolCheckedBind::Bound(name) => name,
+        instance_binding::ToolCheckedBind::Rejected => return hook_noop(),
+        instance_binding::ToolCheckedBind::Unbound => return hook_noop(),
     };
 
-    let _ = db.rebind_instance_session(&instance_name, session_id);
     instance_binding::capture_and_store_launch_context(db, &instance_name);
     update_position(db, ctx, payload, &instance_name);
 
@@ -583,21 +601,10 @@ fn handle_pretooluse(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
     hook_noop()
 }
 
-fn handle_posttooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let instance = match resolve_instance(db, ctx, payload) {
-        Some(inst) => inst,
-        None => return hook_noop(),
-    };
-    let instance_name = &instance.name;
-
-    if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-        return HookResult::Allow {
-            additional_context: Some(prepared.formatted),
-            system_message: None,
-            delivery_ack: Some(prepared.ack),
-        };
-    }
-
+fn handle_posttooluse(_db: &HcomDb, _ctx: &HcomContext, _payload: &HookPayload) -> HookResult {
+    // Kimi treats PostToolUse as observation-only; hook output is ignored and
+    // must not advance the delivery cursor — silently acking here caused
+    // vanish. Delivery happens at UserPromptSubmit and Stop only.
     hook_noop()
 }
 
@@ -674,14 +681,20 @@ fn handle_stop(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookRes
     let instance_name = &instance.name;
 
     if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-        // The Stop hook delivers via Block{reason}, which cannot carry the ack
-        // back to the dispatch — commit inline so the cursor advances.
-        common::commit_delivery_ack(db, &prepared.ack);
+        // Defer the ack to dispatch: it is committed only after the Block
+        // stdout write is handed to kimi and flushed. Committing here would
+        // consume the messages even if stdout never reaches the model. Leave
+        // the status active — listening is only set by an empty Stop.
         return HookResult::Block {
             reason: prepared.formatted,
+            delivery_ack: Some(prepared.ack),
         };
     }
 
+    // Empty Stop: the turn really ended. Signal listening and wake the
+    // delivery observers so a pending `--wait`/listen sees the agent idle.
+    lifecycle::set_status(db, instance_name, ST_LISTENING, "", Default::default());
+    common::notify_hook_instance_with_db(db, instance_name);
     hook_noop()
 }
 
@@ -692,6 +705,38 @@ fn handle_sessionend(db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> 
     };
     let instance_name = &instance.name;
 
+    if instance.tool != "kimi" {
+        log::log_warn(
+            "hooks",
+            "kimi.sessionend.tool_mismatch_ignored",
+            &format!(
+                "instance={} tool={} payload_session_id={:?}",
+                instance_name, instance.tool, payload.session_id
+            ),
+        );
+        return hook_noop();
+    }
+
+    if let Some(incoming) = payload.session_id.as_deref()
+        && let Some(primary) = instance.session_id.as_deref()
+        && incoming != primary
+    {
+        log::log_warn(
+            "hooks",
+            "kimi.sessionend.historical_ignored",
+            &format!(
+                "instance={} incoming={} primary={}",
+                instance_name, incoming, primary
+            ),
+        );
+        return hook_noop();
+    }
+
+    // Current Kimi emits SessionEnd for a real session close (`exit` or
+    // `archive`). The process is necessarily still alive while this
+    // synchronous hook runs, so PID liveness cannot identify a resumable
+    // transition. A new in-process session starts before the old SessionEnd
+    // and is protected by the historical-session guard above.
     common::finalize_session(db, instance_name, "sessionend", None);
 
     hook_noop()
@@ -705,21 +750,10 @@ fn handle_subagentstop(_db: &HcomDb, _ctx: &HcomContext, _payload: &HookPayload)
     hook_noop()
 }
 
-fn handle_notification(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let instance = match resolve_instance(db, ctx, payload) {
-        Some(inst) => inst,
-        None => return hook_noop(),
-    };
-    let instance_name = &instance.name;
-
-    if let Some(prepared) = common::prepare_pending_messages(db, instance_name) {
-        return HookResult::Allow {
-            additional_context: Some(prepared.formatted),
-            system_message: None,
-            delivery_ack: Some(prepared.ack),
-        };
-    }
-
+fn handle_notification(_db: &HcomDb, _ctx: &HcomContext, _payload: &HookPayload) -> HookResult {
+    // Kimi treats Notification as observation-only; hook output is ignored
+    // and must not advance the delivery cursor — silently acking here caused
+    // vanish. Delivery happens at UserPromptSubmit and Stop only.
     hook_noop()
 }
 
@@ -749,6 +783,28 @@ fn get_handler(hook_name: &str) -> Option<fn(&HcomDb, &HcomContext, &HookPayload
 }
 
 // ── Dispatch ────────────────────────────────────────────────────────────
+
+/// Write one JSON line to `writer` and commit `ack` only when both the write
+/// and the flush succeed, so a failed stdout leaves messages unread for the
+/// next delivery attempt instead of consuming them behind a lost write.
+fn commit_ack_after_write<W: std::io::Write>(
+    db: &HcomDb,
+    writer: &mut W,
+    output: &Value,
+    ack: Option<&crate::hooks::DeliveryAck>,
+) {
+    let mut line = output.to_string();
+    line.push('\n');
+    // Advance the delivery cursor only after the message is handed to kimi
+    // (stdout write AND flush). Without this the PTY delivery loop never
+    // observes the cursor advancing and keeps re-injecting `<hcom>`.
+    if writer.write_all(line.as_bytes()).is_err() || writer.flush().is_err() {
+        return;
+    }
+    if let Some(ack) = ack {
+        common::commit_delivery_ack(db, ack);
+    }
+}
 
 pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
     let start = Instant::now();
@@ -841,24 +897,26 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
 
     match result {
         HookResult::Allow {
-            additional_context: Some(ctx),
+            additional_context: Some(context),
             delivery_ack,
             ..
         } => {
             let output = json!({
                 "hookSpecificOutput": {
-                    "message": ctx,
+                    "message": context,
                 }
             });
-            println!("{}", output);
-            // Advance the delivery cursor only after the message is handed to
-            // kimi (stdout). Without this the PTY delivery loop never observes
-            // the cursor advancing and keeps re-injecting `<hcom>`.
-            if let Some(ack) = delivery_ack {
-                common::commit_delivery_ack(&db, &ack);
-            }
+            commit_ack_after_write(
+                &db,
+                &mut std::io::stdout().lock(),
+                &output,
+                delivery_ack.as_ref(),
+            );
         }
-        HookResult::Block { reason } => {
+        HookResult::Block {
+            reason,
+            delivery_ack,
+        } => {
             let output = json!({
                 "hookSpecificOutput": {
                     "permissionDecision": "deny",
@@ -866,7 +924,12 @@ pub fn dispatch_kimi_hook(hook_name: &str) -> i32 {
                 }
             });
             eprintln!("{}", reason);
-            println!("{}", output);
+            commit_ack_after_write(
+                &db,
+                &mut std::io::stdout().lock(),
+                &output,
+                delivery_ack.as_ref(),
+            );
         }
         _ => {}
     }
@@ -933,6 +996,58 @@ mod tests {
         }
         assert!(!is_hcom_kimi_command("echo hello"));
         assert!(!is_hcom_kimi_command("hcom send @x -- hi"));
+        for (_, suffix) in KIMI_HOOK_COMMANDS {
+            assert!(
+                is_hcom_kimi_command(&format!("hcom {suffix}")),
+                "should recognize bare hcom {suffix}"
+            );
+            assert!(
+                is_hcom_kimi_command(&format!("uvx hcom {suffix}")),
+                "should recognize uvx hcom {suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_hooks_strips_stale_uvx_prefix_rows() {
+        let mut doc = DocumentMut::new();
+        // Simulate a prior uvx-based install left in config.toml.
+        {
+            let hooks = doc
+                .entry("hooks")
+                .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+            let Item::ArrayOfTables(arr) = hooks else {
+                panic!("hooks");
+            };
+            for (event, suffix) in KIMI_HOOK_COMMANDS {
+                let mut table = Table::new();
+                table.insert("event", toml_edit::value(*event));
+                table.insert("command", toml_edit::value(format!("uvx hcom {suffix}")));
+                table.insert("timeout", toml_edit::value(HOOK_TIMEOUT_SECS));
+                arr.push(table);
+            }
+        }
+        merge_hcom_hooks(&mut doc);
+        let Item::ArrayOfTables(arr) = doc.get("hooks").unwrap() else {
+            panic!("expected [[hooks]]");
+        };
+        assert_eq!(arr.len(), KIMI_HOOK_COMMANDS.len());
+        for i in 0..arr.len() {
+            let cmd = arr
+                .get(i)
+                .unwrap()
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap();
+            assert!(
+                !cmd.starts_with("uvx "),
+                "stale uvx hook must be stripped: {cmd}"
+            );
+            assert!(
+                is_hcom_kimi_command(cmd),
+                "replacement must be current-prefix hcom command: {cmd}"
+            );
+        }
     }
 
     #[test]
@@ -1080,5 +1195,567 @@ pattern = "Bash(rm -rf*)"
         kimi_permission_patterns()
             .iter()
             .all(|expected| present.iter().any(|p| p == expected))
+    }
+
+    // ── Handler-level delivery/cursor regressions ──────────────────────────
+
+    fn make_test_db() -> (tempfile::TempDir, HcomDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        (dir, db)
+    }
+
+    fn ctx_with_process(process_id: &str) -> crate::shared::context::HcomContext {
+        let mut env = std::collections::HashMap::new();
+        env.insert("HCOM_PROCESS_ID".to_string(), process_id.to_string());
+        env.insert("HCOM_TOOL".to_string(), "kimi".to_string());
+        crate::shared::context::HcomContext::from_env(&env, std::env::current_dir().unwrap())
+    }
+
+    fn kimi_payload(session_id: &str, hook_name: &str) -> HookPayload {
+        HookPayload {
+            session_id: Some(session_id.to_string()),
+            transcript_path: None,
+            hook_name: hook_name.to_string(),
+            tool: "kimi".to_string(),
+            tool_name: String::new(),
+            tool_input: serde_json::Value::Null,
+            tool_result: String::new(),
+            notification_type: None,
+            raw: serde_json::Value::Null,
+        }
+    }
+
+    fn seed_bound_kimi_instance(db: &HcomDb, name: &str, session_id: &str, process_id: &str) {
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at, tool, session_id, last_event_id)
+                 VALUES (?1, 'active', 'docs/x.md', ?2, 'kimi', ?3, 0)",
+                rusqlite::params![name, now, session_id],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![process_id, session_id, name, now],
+            )
+            .unwrap();
+        db.rebind_session(session_id, name).unwrap();
+    }
+
+    fn insert_unread_message(db: &HcomDb, from: &str, text: &str) -> i64 {
+        let data = serde_json::json!({
+            "from": from,
+            "text": text,
+            "scope": "broadcast",
+        })
+        .to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data) VALUES ('message', '2026-01-01T00:00:01Z', ?1, ?2)",
+                rusqlite::params![from, data],
+            )
+            .unwrap();
+        db.conn().last_insert_rowid()
+    }
+
+    fn instance_last_event_id(db: &HcomDb, name: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn stopped_event_count(db: &HcomDb, name: &str) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life' AND instance = ?1
+                   AND json_extract(data, '$.action') = 'stopped'",
+                [name],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn assert_allow_no_delivery(result: HookResult) {
+        match result {
+            HookResult::Allow {
+                additional_context,
+                delivery_ack,
+                ..
+            } => {
+                assert!(additional_context.is_none());
+                assert!(delivery_ack.is_none());
+            }
+            _ => panic!("expected Allow with no delivery"),
+        }
+    }
+
+    #[test]
+    fn posttooluse_with_pending_does_not_ack_or_advance_cursor() {
+        let (_dir, db) = make_test_db();
+        seed_bound_kimi_instance(&db, "kima", "sess-post", "pid-post");
+        let message_id = insert_unread_message(&db, "homo", "secret body");
+
+        let handler = get_handler("kimi-posttooluse").expect("kimi-posttooluse handler");
+        let result = handler(
+            &db,
+            &ctx_with_process("pid-post"),
+            &kimi_payload("sess-post", "kimi-posttooluse"),
+        );
+        assert_allow_no_delivery(result);
+
+        assert_eq!(instance_last_event_id(&db, "kima"), 0);
+        let unread = db.get_unread_messages("kima");
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].event_id, Some(message_id));
+    }
+
+    #[test]
+    fn notification_with_pending_does_not_ack_or_advance_cursor() {
+        let (_dir, db) = make_test_db();
+        seed_bound_kimi_instance(&db, "kima", "sess-notify", "pid-notify");
+        let message_id = insert_unread_message(&db, "homo", "secret body");
+
+        let handler = get_handler("kimi-notification").expect("kimi-notification handler");
+        let result = handler(
+            &db,
+            &ctx_with_process("pid-notify"),
+            &kimi_payload("sess-notify", "kimi-notification"),
+        );
+        assert_allow_no_delivery(result);
+
+        assert_eq!(instance_last_event_id(&db, "kima"), 0);
+        let unread = db.get_unread_messages("kima");
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].event_id, Some(message_id));
+    }
+
+    #[test]
+    fn userpromptsubmit_with_pending_delivers_and_acks() {
+        let (_dir, db) = make_test_db();
+        seed_bound_kimi_instance(&db, "kima", "sess-prompt", "pid-prompt");
+        let message_id = insert_unread_message(&db, "homo", "deliver me");
+
+        let handler = get_handler("kimi-userpromptsubmit").expect("kimi-userpromptsubmit handler");
+        let result = handler(
+            &db,
+            &ctx_with_process("pid-prompt"),
+            &kimi_payload("sess-prompt", "kimi-userpromptsubmit"),
+        );
+
+        let ack = match result {
+            HookResult::Allow {
+                additional_context,
+                delivery_ack,
+                ..
+            } => {
+                let context = additional_context.expect("expected formatted delivery context");
+                assert!(context.contains("deliver me"));
+                delivery_ack.expect("expected deferred delivery ack")
+            }
+            _ => panic!("expected Allow with delivery"),
+        };
+
+        assert_eq!(instance_last_event_id(&db, "kima"), 0);
+
+        // Simulates dispatch writing stdout then committing the deferred ack.
+        common::commit_delivery_ack(&db, &ack);
+
+        assert_eq!(instance_last_event_id(&db, "kima"), message_id);
+        let inst = db.get_instance_full("kima").unwrap().unwrap();
+        assert_eq!(inst.status, ST_ACTIVE);
+        assert!(inst.status_context.starts_with("deliver:"));
+    }
+
+    #[test]
+    fn stop_with_pending_defers_ack_stays_active() {
+        let (_dir, db) = make_test_db();
+        seed_bound_kimi_instance(&db, "gire", "sess-stop-pending", "pid-stop-pending");
+        let message_id = insert_unread_message(&db, "homo", "stop deliver");
+
+        let result = handle_stop(
+            &db,
+            &ctx_with_process("pid-stop-pending"),
+            &kimi_payload("sess-stop-pending", "kimi-stop"),
+        );
+
+        let ack = match result {
+            HookResult::Block {
+                reason,
+                delivery_ack,
+            } => {
+                assert!(reason.contains("stop deliver"));
+                delivery_ack.expect("expected deferred delivery ack on pending stop")
+            }
+            _ => panic!("expected Block with deferred delivery"),
+        };
+
+        assert_eq!(instance_last_event_id(&db, "gire"), 0);
+        let inst = db.get_instance_full("gire").unwrap().unwrap();
+        assert_eq!(inst.status, ST_ACTIVE);
+        assert_ne!(inst.status, ST_LISTENING);
+
+        // Simulates dispatch writing the Block stdout then committing the ack.
+        common::commit_delivery_ack(&db, &ack);
+
+        assert_eq!(instance_last_event_id(&db, "gire"), message_id);
+        let inst = db.get_instance_full("gire").unwrap().unwrap();
+        assert_eq!(inst.status, ST_ACTIVE);
+        assert_ne!(inst.status, ST_LISTENING);
+    }
+
+    #[test]
+    fn stop_without_pending_sets_listening() {
+        let (_dir, db) = make_test_db();
+        seed_bound_kimi_instance(&db, "gire", "sess-stop", "pid-stop");
+
+        let result = handle_stop(
+            &db,
+            &ctx_with_process("pid-stop"),
+            &kimi_payload("sess-stop", "kimi-stop"),
+        );
+        assert_eq!(result.exit_code(), 0);
+        let inst = db.get_instance_full("gire").unwrap().unwrap();
+        assert_eq!(inst.status, ST_LISTENING);
+    }
+
+    #[test]
+    fn stop_block_ack_commits_only_after_successful_write_and_flush() {
+        let (_dir, db) = make_test_db();
+        seed_bound_kimi_instance(&db, "gire", "sess-flush", "pid-flush");
+        let message_id = insert_unread_message(&db, "homo", "flush me");
+        let prepared = common::prepare_pending_messages(&db, "gire").expect("pending delivery");
+        let output = json!({
+            "hookSpecificOutput": {"permissionDecision": "deny"}
+        });
+
+        struct BrokenWriter;
+        impl std::io::Write for BrokenWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("broken pipe"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        commit_ack_after_write(&db, &mut BrokenWriter, &output, Some(&prepared.ack));
+        assert_eq!(
+            instance_last_event_id(&db, "gire"),
+            0,
+            "failed write must preserve the unread message"
+        );
+        assert_eq!(db.get_unread_messages("gire").len(), 1);
+
+        struct BrokenFlush(Vec<u8>);
+        impl std::io::Write for BrokenFlush {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("flush failed"))
+            }
+        }
+        commit_ack_after_write(
+            &db,
+            &mut BrokenFlush(Vec::new()),
+            &output,
+            Some(&prepared.ack),
+        );
+        assert_eq!(
+            instance_last_event_id(&db, "gire"),
+            0,
+            "failed flush must preserve the unread message"
+        );
+        assert_eq!(db.get_unread_messages("gire").len(), 1);
+
+        let mut ok_writer = std::io::Cursor::new(Vec::new());
+        commit_ack_after_write(&db, &mut ok_writer, &output, Some(&prepared.ack));
+        assert_eq!(instance_last_event_id(&db, "gire"), message_id);
+        assert_eq!(db.get_unread_messages("gire").len(), 0);
+        let written = String::from_utf8(ok_writer.into_inner()).unwrap();
+        assert!(written.ends_with('\n'));
+        assert!(written.contains("permissionDecision"));
+    }
+
+    // ── Lifecycle ownership regressions ────────────────────────────────────
+
+    #[test]
+    fn sessionstart_rejects_foreign_process_owner_without_mutation() {
+        let (_dir, db) = make_test_db();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at, tool, session_id)
+                 VALUES ('movi', 'active', 'foreign-work', ?1, 'omp', 'sess-old')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-foreign', 'sess-old', 'movi', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.rebind_session("sess-old", "movi").unwrap();
+
+        assert_allow_no_delivery(handle_sessionstart(
+            &db,
+            &ctx_with_process("pid-foreign"),
+            &kimi_payload("sess-new", "kimi-sessionstart"),
+        ));
+
+        let owner = db.get_instance_full("movi").unwrap().unwrap();
+        assert_eq!(owner.tool, "omp");
+        assert_eq!(owner.session_id.as_deref(), Some("sess-old"));
+        assert_eq!(owner.status, ST_ACTIVE);
+        assert_eq!(owner.status_context, "foreign-work");
+        assert_eq!(db.get_session_binding("sess-new").unwrap(), None);
+        assert_eq!(
+            db.get_process_binding("pid-foreign").unwrap().as_deref(),
+            Some("movi")
+        );
+    }
+
+    #[test]
+    fn sessionstart_rejects_foreign_canonical_owner_without_mutation() {
+        let (_dir, db) = make_test_db();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at, tool)
+                 VALUES ('kima', 'listening', 'ready_observed', ?1, 'kimi')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-kimi', '', 'kima', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at, tool, session_id)
+                 VALUES ('movi', 'inactive', 'exit:closed', ?1, 'omp', 'sess-foreign')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.rebind_session("sess-foreign", "movi").unwrap();
+
+        assert_allow_no_delivery(handle_sessionstart(
+            &db,
+            &ctx_with_process("pid-kimi"),
+            &kimi_payload("sess-foreign", "kimi-sessionstart"),
+        ));
+
+        let placeholder = db.get_instance_full("kima").unwrap().unwrap();
+        assert_eq!(placeholder.session_id, None);
+        assert_eq!(placeholder.status, ST_LISTENING);
+        let canonical = db.get_instance_full("movi").unwrap().unwrap();
+        assert_eq!(canonical.tool, "omp");
+        assert_eq!(canonical.session_id.as_deref(), Some("sess-foreign"));
+        assert_eq!(
+            db.get_session_binding("sess-foreign").unwrap().as_deref(),
+            Some("movi")
+        );
+        assert_eq!(
+            db.get_process_binding("pid-kimi").unwrap().as_deref(),
+            Some("kima")
+        );
+    }
+
+    #[test]
+    fn sessionstart_rejects_foreign_stopped_owner_without_mutation() {
+        let (_dir, db) = make_test_db();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at, tool)
+                 VALUES ('kima', 'listening', 'ready_observed', ?1, 'kimi')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-kimi', '', 'kima', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        let stopped = serde_json::json!({
+            "action": "stopped",
+            "by": "session",
+            "reason": "exit:closed",
+            "snapshot": {
+                "name": "movi",
+                "session_id": "sess-stopped-foreign",
+                "tool": "omp"
+            }
+        });
+        db.log_event("life", "movi", &stopped).unwrap();
+
+        assert_allow_no_delivery(handle_sessionstart(
+            &db,
+            &ctx_with_process("pid-kimi"),
+            &kimi_payload("sess-stopped-foreign", "kimi-sessionstart"),
+        ));
+
+        let placeholder = db.get_instance_full("kima").unwrap().unwrap();
+        assert_eq!(placeholder.session_id, None);
+        assert_eq!(placeholder.status, ST_LISTENING);
+        assert_eq!(
+            db.get_session_binding("sess-stopped-foreign").unwrap(),
+            None
+        );
+        assert_eq!(
+            db.get_process_binding("pid-kimi").unwrap().as_deref(),
+            Some("kima")
+        );
+        assert!(db.get_instance_full("movi").unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn sessionstart_accepts_kimi_canonical_owner_and_migrates_placeholder() {
+        // isolated_test_env: the accepted-bind path runs
+        // ensure_worker/set_terminal_title, which must not touch the real
+        // ~/.hcom (relay auto-spawn) during tests.
+        let _isolated = isolated_test_env();
+        let (_dir, db) = make_test_db();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at, tool)
+                 VALUES ('temp', 'listening', 'ready_observed', ?1, 'kimi')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-kimi', '', 'temp', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.upsert_notify_endpoint("temp", "pty", 51_234).unwrap();
+        seed_bound_kimi_instance(&db, "kima", "sess-kimi", "pid-old");
+
+        assert_allow_no_delivery(handle_sessionstart(
+            &db,
+            &ctx_with_process("pid-kimi"),
+            &kimi_payload("sess-kimi", "kimi-sessionstart"),
+        ));
+
+        assert!(db.get_instance_full("temp").unwrap().is_none());
+        let canonical = db.get_instance_full("kima").unwrap().unwrap();
+        assert_eq!(canonical.tool, "kimi");
+        assert_eq!(canonical.session_id.as_deref(), Some("sess-kimi"));
+        assert_eq!(canonical.status, ST_LISTENING);
+        assert_eq!(
+            db.get_process_binding("pid-kimi").unwrap().as_deref(),
+            Some("kima")
+        );
+        assert!(db.has_notify_endpoint_kind("kima", "pty"));
+    }
+
+    #[test]
+    fn sessionend_ignores_non_kimi_tool() {
+        let (_dir, db) = make_test_db();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id)
+                 VALUES ('movi', 'listening', ?1, 'omp', 'sess-omp')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-omp', 'sess-omp', 'movi', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.rebind_session("sess-omp", "movi").unwrap();
+
+        let result = handle_sessionend(
+            &db,
+            &ctx_with_process("pid-omp"),
+            &kimi_payload("sess-omp", "kimi-sessionend"),
+        );
+        assert_eq!(result.exit_code(), 0);
+        let inst = db.get_instance_full("movi").unwrap().unwrap();
+        assert_eq!(inst.status, "listening");
+        assert_eq!(inst.tool, "omp");
+        assert_eq!(
+            db.get_process_binding("pid-omp").unwrap().as_deref(),
+            Some("movi")
+        );
+    }
+
+    #[test]
+    fn sessionend_ignores_historical_session_id() {
+        let (_dir, db) = make_test_db();
+        seed_bound_kimi_instance(&db, "kima", "sess-primary", "pid-hist");
+
+        // A SessionEnd for a session the process already switched away from
+        // must not finalize the current identity.
+        let result = handle_sessionend(
+            &db,
+            &ctx_with_process("pid-hist"),
+            &kimi_payload("sess-old", "kimi-sessionend"),
+        );
+        assert_eq!(result.exit_code(), 0);
+        let inst = db.get_instance_full("kima").unwrap().unwrap();
+        assert_eq!(inst.status, "active");
+        assert_eq!(
+            db.get_process_binding("pid-hist").unwrap().as_deref(),
+            Some("kima")
+        );
+    }
+
+    #[test]
+    fn sessionend_finalizes_once_even_while_pid_is_alive() {
+        let (_dir, db) = make_test_db();
+        let now = chrono::Utc::now().timestamp() as f64;
+        let pid = std::process::id() as i64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, created_at, tool, session_id, pid)
+                 VALUES ('kima', 'active', ?1, 'kimi', 'sess-soft', ?2)",
+                rusqlite::params![now, pid],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO process_bindings (process_id, session_id, instance_name, updated_at)
+                 VALUES ('pid-soft', 'sess-soft', 'kima', ?1)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.rebind_session("sess-soft", "kima").unwrap();
+
+        let result = handle_sessionend(
+            &db,
+            &ctx_with_process("pid-soft"),
+            &kimi_payload("sess-soft", "kimi-sessionend"),
+        );
+        assert_eq!(result.exit_code(), 0);
+        assert!(db.get_instance_full("kima").unwrap().is_none());
+        assert_eq!(db.get_process_binding("pid-soft").unwrap(), None);
+        assert_eq!(db.get_session_binding("sess-soft").unwrap(), None);
+        assert_eq!(stopped_event_count(&db, "kima"), 1);
     }
 }

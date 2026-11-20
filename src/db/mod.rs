@@ -34,7 +34,8 @@ pub(crate) mod subscriptions;
 pub use events::Message;
 #[allow(unused_imports)]
 pub use instances::InstanceStatus;
-pub use instances::{ApprovalToken, InstanceRow};
+pub use instances::observe_pid_identity;
+pub use instances::{ApprovalToken, InstanceRow, PidOwnership};
 
 /// Schema version - bump on any schema change.
 const SCHEMA_VERSION: i32 = 19;
@@ -163,6 +164,31 @@ impl HcomDb {
         Ok(result)
     }
 
+    /// Run `f` atomically on this connection: in its own `BEGIN IMMEDIATE`
+    /// transaction when none is open, or in a savepoint nested inside the
+    /// caller's transaction. Any error rolls back every write made by `f`.
+    pub fn with_write_scope<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let own_transaction = self.conn.is_autocommit();
+        let (begin, commit, rollback) = if own_transaction {
+            ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK")
+        } else {
+            (
+                "SAVEPOINT hcom_write_scope",
+                "RELEASE hcom_write_scope",
+                "ROLLBACK TO hcom_write_scope; RELEASE hcom_write_scope",
+            )
+        };
+        self.conn.execute_batch(begin)?;
+        let result = f().and_then(|value| {
+            self.conn.execute_batch(commit)?;
+            Ok(value)
+        });
+        if result.is_err() {
+            let _ = self.conn.execute_batch(rollback);
+        }
+        result
+    }
+
     /// Access the filesystem path backing this DB handle.
     pub fn path(&self) -> &std::path::Path {
         &self.db_path
@@ -267,7 +293,15 @@ impl HcomDb {
             return Ok(());
         }
 
-        self.conn.execute_batch(
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        // A concurrent initializer may have finished while we acquired the
+        // write lock. Avoid rebuilding its view after it published the schema.
+        let current: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if current == SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        tx.execute_batch(
             "
             -- Events table
             CREATE TABLE IF NOT EXISTS events (
@@ -433,8 +467,8 @@ impl HcomDb {
         )?;
 
         // Set schema version
-        self.conn
-            .execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
+        tx.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
+        tx.commit()?;
 
         Ok(())
     }
@@ -831,7 +865,9 @@ impl HcomDb {
     fn snapshot_running_to_pidtrack(&self) {
         let Ok(mut stmt) = self.conn.prepare(
             "SELECT i.name, i.pid, i.tool, i.directory, i.session_id, p.process_id, \
-                    n_pty.port AS notify_port, n_inj.port AS inject_port \
+                    n_pty.port AS notify_port, n_inj.port AS inject_port, \
+                    CASE WHEN json_valid(i.launch_context) \
+                         THEN json_extract(i.launch_context, '$.pid_identity') END AS pid_identity \
              FROM instances i \
              LEFT JOIN process_bindings p ON i.name = p.instance_name \
              LEFT JOIN notify_endpoints n_pty ON i.name = n_pty.instance AND n_pty.kind = 'pty' \
@@ -851,6 +887,7 @@ impl HcomDb {
                 row.get::<_, Option<String>>(5)?, // process_id
                 row.get::<_, Option<i64>>(6)?,    // notify_port
                 row.get::<_, Option<i64>>(7)?,    // inject_port
+                row.get::<_, Option<String>>(8)?, // pid_identity
             ))
         }) else {
             return;
@@ -871,8 +908,17 @@ impl HcomDb {
                 .unwrap_or_default();
 
         for row in rows.flatten() {
-            let (name, pid, tool, directory, session_id, process_id, notify_port, inject_port) =
-                row;
+            let (
+                name,
+                pid,
+                tool,
+                directory,
+                session_id,
+                process_id,
+                notify_port,
+                inject_port,
+                pid_identity,
+            ) = row;
             let alive = crate::pidtrack::is_alive(pid as u32);
             if !alive {
                 continue;
@@ -888,6 +934,7 @@ impl HcomDb {
                     "session_id": session_id.unwrap_or_default(),
                     "notify_port": notify_port.unwrap_or(0),
                     "inject_port": inject_port.unwrap_or(0),
+                    "pid_identity": pid_identity.unwrap_or_default(),
                     "launched_at": now_epoch_f64(),
                 }),
             );
@@ -1177,6 +1224,65 @@ pub(super) mod tests {
 
         let db = HcomDb::open_at(&db_path).unwrap();
         (db, db_path)
+    }
+
+    #[test]
+    fn schema_initialization_failure_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("broken.db")).unwrap();
+        db.conn()
+            .execute_batch("CREATE TABLE instances (name TEXT PRIMARY KEY);")
+            .unwrap();
+        assert!(db.init_db().is_err());
+        let mut statement = db.conn().prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        ).unwrap();
+        let tables: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(tables, vec!["instances"]);
+        let version: i32 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0);
+        db.conn().execute_batch("DROP TABLE instances;").unwrap();
+        db.init_db().unwrap();
+    }
+
+    #[test]
+    fn concurrent_schema_initializers_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        // Open connections before spawning: a failed open must fail the test,
+        // rather than leave other workers stuck at a barrier forever.
+        let connections: Vec<_> = (0..4).map(|_| HcomDb::open_raw(&path).unwrap()).collect();
+        let workers: Vec<_> = connections
+            .into_iter()
+            .map(|db| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.init_db().unwrap();
+                    db.conn().execute(
+                        "INSERT INTO events(timestamp,type,instance,data) VALUES ('now','test','probe','{}')",
+                        [],
+                    ).unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let db = HcomDb::open_raw(&path).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 4);
     }
 
     #[test]

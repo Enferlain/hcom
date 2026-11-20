@@ -334,6 +334,14 @@ fn handle_status(db: &HcomDb, argv: &[String]) -> (i32, String) {
         Some(n) => n,
         None => return (0, r#"{"error":"Missing --name or --status"}"#.to_string()),
     };
+    if let Some(tool_name) = parse_flag(argv, "--tool").filter(|t| !t.is_empty()) {
+        let input = parse_flag(argv, "--input-json")
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let tool = instance_tool(db, &name);
+        common::update_tool_status_unless_approval(db, &name, &tool, &tool_name, &input);
+        return (0, r#"{"ok":true}"#.to_string());
+    }
     let status = match parse_flag(argv, "--status") {
         Some(s) => s,
         None => return (0, r#"{"error":"Missing --name or --status"}"#.to_string()),
@@ -1351,5 +1359,63 @@ mod tests {
         let (code, output) = handle_stop(&db, &sv(&[]));
         assert_eq!(code, 0);
         assert!(output.contains("Missing --name"));
+    }
+
+    #[test]
+    fn test_handle_status_tool_derives_detail_from_spec() {
+        crate::config::Config::init();
+        let (_dir, db) = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at) VALUES ('kiki', 'kilo', 'listening', 'idle', 0, 0)",
+                [],
+            )
+            .unwrap();
+        let input = serde_json::json!({"filePath": "/src/main.rs", "oldString": "a"});
+        let argv = sv(&[
+            "--name",
+            "kiki",
+            "--status",
+            "active",
+            "--tool",
+            "edit",
+            "--input-json",
+            &input.to_string(),
+        ]);
+        let (code, output) = handle_status(&db, &argv);
+        assert_eq!(code, 0, "{output}");
+        let inst = db.get_instance_full("kiki").unwrap().unwrap();
+        assert_eq!(inst.status, "active");
+        assert_eq!(inst.status_context, "tool:edit");
+        assert_eq!(inst.status_detail, "/src/main.rs");
+    }
+
+    #[test]
+    fn test_handle_status_tool_preserves_blocked_approval() {
+        crate::config::Config::init();
+        let (_dir, db) = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_detail, status_time, created_at) VALUES ('kiki', 'opencode', 'blocked', 'approval', 'bash', 0, 0)",
+                [],
+            )
+            .unwrap();
+        let input = serde_json::json!({"filePath": "/src/main.rs", "oldString": "a"});
+        let argv = sv(&[
+            "--name",
+            "kiki",
+            "--status",
+            "active",
+            "--tool",
+            "edit",
+            "--input-json",
+            &input.to_string(),
+        ]);
+        let (code, output) = handle_status(&db, &argv);
+        assert_eq!(code, 0, "{output}");
+        let inst = db.get_instance_full("kiki").unwrap().unwrap();
+        assert_eq!(inst.status, "blocked");
+        assert_eq!(inst.status_context, "approval");
+        assert_eq!(inst.status_detail, "bash");
     }
 }

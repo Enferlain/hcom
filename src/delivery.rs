@@ -1097,6 +1097,10 @@ pub struct ScreenState {
     /// set. Only ever true for Claude (see `ScreenTracker::is_claude_subagent_nav_visible`
     /// / `is_claude_session_switcher_visible`).
     pub nav_overlay: bool,
+    /// Codex is still starting with nothing to answer (see
+    /// `ScreenTracker::is_codex_startup_loading`); the launch-blocked heuristic
+    /// waits it out rather than reading a quiet loading screen as settled.
+    pub startup_loading: bool,
 }
 
 impl Default for ScreenState {
@@ -1114,6 +1118,7 @@ impl Default for ScreenState {
             approval_scrape_latched: false,
             approval_response_at: None,
             nav_overlay: false,
+            startup_loading: false,
         }
     }
 }
@@ -1360,11 +1365,11 @@ fn launch_ready_observed(
         return true;
     }
     if config.launch_ready_on_plugin_bind {
-        // Authoritative readiness for plugin-driven tools (OMP): the extension's
+        // Authoritative readiness for plugin-driven tools (Pi, OMP): the extension's
         // bind (a kind='plugin' notify endpoint) proves both TUI construction
         // and extension load. It deliberately REPLACES on-screen scraping rather
-        // than OR-ing with it — OMP's visible chrome is theme/preset dependent
-        // (status-line presets omit the pi glyph), and a syntactically broken /
+        // than OR-ing with it — their visible chrome is configurable (Pi's
+        // header, OMP's status-line presets), and a syntactically broken /
         // non-running extension could still render default chrome and be falsely
         // declared ready. Requiring the bind makes a dead extension block.
         return db.has_notify_endpoint_kind(name, "plugin");
@@ -1698,6 +1703,9 @@ fn maybe_emit_launch_blocked(
     }
 
     let screen = state.screen.read().unwrap();
+    if screen.startup_loading {
+        return;
+    }
     let tail_text = screen.visible_tail.as_deref().unwrap_or("");
     let classification = classify_launch_blocker(tail_text, screen.approval);
     // Gemini's animated startup banner keeps emitting output for ~60s, defeating
@@ -1852,6 +1860,28 @@ const IDLE_WAIT: Duration = Duration::from_secs(30);
 
 /// Maximum number of Enter-key retries during phase 2 (text clear).
 const MAX_ENTER_ATTEMPTS: u32 = 3;
+
+/// Refresh every liveness signal a long-lived delivery loop owes the rest of the
+/// system, from any path that would otherwise only touch the heartbeat.
+///
+/// Two signals, same meaning ("this loop is alive and current"), different
+/// audiences: the instance heartbeat, and the wake beacon/window that
+/// short-lived processes read. A one-shot like `hcom list` reaps stale
+/// instances but cannot detect a sleep on its own — it has no earlier monotonic
+/// sample to compare against — so a poll path that heartbeats without
+/// publishing leaves a window where `hcom list` runs after wake, sees an
+/// hours-old status clock, and unlinks a live agent. Keeping both writes in one
+/// place is what stops the paths from drifting apart again.
+fn refresh_liveness(db: &HcomDb, current_name: &str) {
+    crate::instance_lifecycle::is_in_wake_grace_publishing(db);
+    if let Err(e) = db.update_heartbeat(current_name) {
+        log_warn(
+            "native",
+            "delivery.heartbeat_fail",
+            &format!("Failed to update heartbeat: {}", e),
+        );
+    }
+}
 
 /// Delivery state machine for the native PTY path (Claude/Gemini/Codex/Antigravity).
 ///
@@ -2077,9 +2107,7 @@ pub fn run_delivery_loop(
             db.reconnect_if_stale();
 
             // Heartbeat + port re-registration
-            if let Err(e) = db.update_heartbeat(&current_name) {
-                log_warn("native", "delivery.heartbeat_fail", &format!("{}", e));
-            }
+            refresh_liveness(db, &current_name);
             if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
                 log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
             }
@@ -2171,14 +2199,8 @@ pub fn run_delivery_loop(
                     // Detect DB file replacement (hcom reset / schema bump) and reconnect
                     db.reconnect_if_stale();
 
-                    // Update heartbeat to prove we're alive (also re-asserts tcp_mode=true)
-                    if let Err(e) = db.update_heartbeat(&current_name) {
-                        log_warn(
-                            "native",
-                            "delivery.heartbeat_fail",
-                            &format!("Failed to update heartbeat: {}", e),
-                        );
-                    }
+                    // Heartbeat (also re-asserts tcp_mode=true) + wake state.
+                    refresh_liveness(db, &current_name);
                     // Re-register endpoints (self-heals after DB reset/instance recreation)
                     if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
                         log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
@@ -2289,11 +2311,11 @@ pub fn run_delivery_loop(
                             attempt += 1;
                         }
                     } else {
-                        // Gate blocked - refresh heartbeat so we don't go stale while waiting
-                        // (DB status is still "listening" until message is delivered and hooks fire)
-                        if let Err(e) = db.update_heartbeat(&current_name) {
-                            log_warn("native", "delivery.heartbeat_fail", &format!("{}", e));
-                        }
+                        // Gate blocked - refresh liveness so we don't go stale while
+                        // waiting (DB status is still "listening" until the message is
+                        // delivered and hooks fire). This path can hold for a long time
+                        // behind an approval prompt, so it publishes wake state too.
+                        refresh_liveness(db, &current_name);
 
                         // Log gate failure
                         if attempt == 0 || attempt.is_multiple_of(5) {
@@ -2733,13 +2755,7 @@ pub fn run_delivery_loop(
                     }
 
                     db.reconnect_if_stale();
-                    if let Err(e) = db.update_heartbeat(&current_name) {
-                        log_warn(
-                            "native",
-                            "delivery.heartbeat_fail",
-                            &format!("Failed to update heartbeat: {}", e),
-                        );
-                    }
+                    refresh_liveness(db, &current_name);
                     if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
                         log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
                     }
@@ -2853,13 +2869,23 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
         }
     };
 
-    let was_killed = EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
+    // `hcom kill` records exit:killed + its initiator in the row before it
+    // signals; this cleanup can win the race without having observed the
+    // signal itself. Keep the recorded reason and initiator for the stop
+    // event instead of collapsing the explicit kill into a plain PTY exit.
+    let kill_recorded = instance.status_context == "exit:killed";
+    let was_killed = kill_recorded || EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
     let (exit_context, exit_reason) = if was_killed {
         ("exit:killed", "killed")
     } else {
         ("exit:closed", "closed")
     };
-    if let Err(e) = db.set_status(current_name, "inactive", exit_context) {
+    let by = if kill_recorded && !instance.status_detail.is_empty() {
+        instance.status_detail.clone()
+    } else {
+        "pty".to_string()
+    };
+    if !kill_recorded && let Err(e) = db.set_status(current_name, "inactive", exit_context) {
         log_warn(
             "native",
             "delivery.set_status_fail",
@@ -2869,7 +2895,7 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
 
     let mut event_data = serde_json::json!({
         "action": "stopped",
-        "by": "pty",
+        "by": by,
         "reason": exit_reason,
     });
     if let Some(snapshot) = snapshot {
@@ -2963,6 +2989,7 @@ mod tests {
             approval_scrape_latched: false,
             approval_response_at: None,
             nav_overlay: false,
+            startup_loading: false,
         }
     }
 
@@ -3054,6 +3081,78 @@ mod tests {
             .collect();
 
         assert_eq!(events, vec![("samu".to_string(), "killed".to_string())]);
+    }
+
+    #[test]
+    fn pty_cleanup_keeps_kill_reason_and_initiator_recorded_by_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('kiro', 'codex', 'active', 'running', 0, 0)",
+                [],
+            )
+            .unwrap();
+        // `hcom kill` records the reason before signalling; the PTY cleanup
+        // can then win the race without having seen the signal itself.
+        crate::hooks::common::mark_kill_recorded(&db, "kiro", "samu", 0.0).unwrap();
+
+        cleanup_deleted_instance(&mut db, "kiro");
+        // The kill path's own finalize loses the delete gate and logs nothing.
+        crate::hooks::common::stop_instance(&db, "kiro", "samu", "killed");
+
+        let stops: Vec<(String, String)> = db
+            .conn()
+            .prepare(
+                "SELECT json_extract(data, '$.by'), json_extract(data, '$.reason') FROM events
+                 WHERE type = 'life' AND instance = 'kiro'
+                   AND json_extract(data, '$.action') = 'stopped'",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(stops, vec![("samu".to_string(), "killed".to_string())]);
+        assert!(db.get_instance_full("kiro").unwrap().is_none());
+    }
+
+    #[test]
+    fn pty_cleanup_records_ordinary_exit_as_closed_by_pty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('zuvi', 'codex', 'active', 'running', 0, 0)",
+                [],
+            )
+            .unwrap();
+        // No recorded kill and no PTY-side kill signal: a plain process exit
+        // must not be fabricated into a kill, whoever's PID used to sit there.
+        EXIT_WAS_KILLED.store(false, Ordering::Release);
+
+        cleanup_deleted_instance(&mut db, "zuvi");
+
+        let stops: Vec<(String, String)> = db
+            .conn()
+            .prepare(
+                "SELECT json_extract(data, '$.by'), json_extract(data, '$.reason') FROM events
+                 WHERE type = 'life' AND instance = 'zuvi'
+                   AND json_extract(data, '$.action') = 'stopped'",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(stops, vec![("pty".to_string(), "closed".to_string())]);
+        assert!(db.get_instance_full("zuvi").unwrap().is_none());
     }
 
     #[test]
@@ -3523,13 +3622,20 @@ mod tests {
     }
 
     #[test]
-    fn omp_launch_ready_requires_plugin_bind_not_screen() {
-        // OMP readiness is bind-driven: a rendered/ready screen must NOT be
+    fn pi_family_launch_ready_requires_plugin_bind_not_screen() {
+        // Pi/OMP readiness is bind-driven: a rendered/ready screen must NOT be
         // enough, and a kind='plugin' notify endpoint must flip it ready even
         // with no on-screen marker.
+        for tool in [crate::tool::Tool::Pi, crate::tool::Tool::Omp] {
+            assert_plugin_bind_readiness(tool);
+        }
+    }
+
+    fn assert_plugin_bind_readiness(tool: crate::tool::Tool) {
         let (_dir, db) = open_ready_test_db();
-        let config = ToolConfig::for_tool(crate::tool::Tool::Omp);
-        assert!(config.launch_ready_on_plugin_bind);
+        let config = ToolConfig::for_tool(tool);
+        assert!(config.launch_ready_on_plugin_bind, "{tool:?}");
+        assert!(tool.ready_pattern().is_empty(), "{tool:?}");
 
         let mut screen = safe_screen();
         screen.ready = true; // empty pattern => is_ready() always true
@@ -4413,5 +4519,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(blocked_kind, "unknown");
+    }
+
+    #[test]
+    fn codex_quiet_startup_loading_does_not_emit_launch_blocked() {
+        let (_dir, db) = open_ready_test_db();
+        let mut screen = safe_screen();
+        screen.ready = false;
+        screen.prompt_empty = false;
+        screen.startup_loading = true;
+        screen.visible_tail = Some("│ model: loading /model to change │".to_string());
+        let state = make_state(screen, 500);
+        let mut outcome = LaunchOutcome::Pending;
+        drive_launch_outcome(
+            &db,
+            &state,
+            "codi",
+            ST_LISTENING,
+            &LaunchActivityScope::new(db.get_last_event_id(), "codi"),
+            &ToolConfig::for_tool(crate::tool::Tool::Codex),
+            &mut outcome,
+        );
+        assert_eq!(outcome, LaunchOutcome::Pending);
+        let blocked_events: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE type = 'life'
+                   AND json_extract(data, '$.action') = 'launch_blocked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_events, 0);
     }
 }

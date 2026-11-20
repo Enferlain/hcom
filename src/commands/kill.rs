@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::db::HcomDb;
-use crate::hooks::common::stop_instance;
+use crate::hooks::common::{mark_kill_recorded, stop_instance};
 use crate::identity;
 use crate::log::log_info;
 use crate::paths;
@@ -23,6 +23,7 @@ pub struct KillArgs {
     pub targets: Vec<String>,
 }
 
+#[derive(Debug)]
 pub struct KillTrackedResult {
     pub target: String,
     pub pid: u32,
@@ -34,6 +35,13 @@ pub struct KillTrackedResult {
 }
 
 const EPERM_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+fn checked_tracked_pid(pid_i64: i64, name: &str) -> Result<u32, String> {
+    u32::try_from(pid_i64)
+        .ok()
+        .filter(|pid| *pid > 0 && i32::try_from(*pid).is_ok())
+        .ok_or_else(|| format!("Invalid tracked PID {pid_i64} for '{name}'"))
+}
 
 #[derive(Clone, Copy)]
 enum PaneCleanupProcessState {
@@ -136,12 +144,42 @@ pub fn kill_tracked_instance(
         .get_instance_full(name)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Agent '{}' not found", name))?;
-    let pid = inst
+    let pid_i64 = inst
         .pid
-        .ok_or_else(|| format!("No tracked PID for '{}'", name))? as u32;
+        .ok_or_else(|| format!("No tracked PID for '{}'", name))?;
+    let pid = checked_tracked_pid(pid_i64, name)?;
+    if matches!(inst.pid_ownership(pid), crate::db::PidOwnership::Unknown) {
+        return Err(format!(
+            "Cannot verify the tracked process incarnation for '{name}' (pid {pid}); retry later"
+        ));
+    }
     let is_headless = inst.background != 0;
+    // A refusal means nothing was signalled; leave the row (which may have
+    // been replaced under this name) for a retried decision.
     let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
-        kill_instance(db, name, pid, &inst, is_headless);
+        kill_instance(db, name, pid, &inst, is_headless, initiator)?;
+
+    // The process can disappear or become unobservable between the initial
+    // ownership check and kill_instance's liveness probe. Re-read the row
+    // before retiring it: an unknown-live incarnation must remain tracked so
+    // a later retry can make an ownership decision with better evidence.
+    if let Some(current) = db.get_instance_full(name).map_err(|e| e.to_string())? {
+        if current.pid != Some(pid as i64) {
+            return Err(format!(
+                "tracked PID for '{name}' changed while killing; retry later"
+            ));
+        }
+        if current.pid_identity() != inst.pid_identity() {
+            return Err(format!(
+                "tracked process identity for '{name}' changed while killing; retry later"
+            ));
+        }
+        if matches!(current.pid_ownership(pid), crate::db::PidOwnership::Unknown) {
+            return Err(format!(
+                "Cannot verify the tracked process incarnation for '{name}' (pid {pid}); retry later"
+            ));
+        }
+    }
     stop_instance(db, name, initiator, "killed");
 
     Ok(KillTrackedResult {
@@ -332,11 +370,36 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
             continue;
         }
 
-        if let Some(pid) = inst.pid {
-            active_pids.insert(pid as u32);
+        if let Some(pid_i64) = inst.pid {
+            let pid = match checked_tracked_pid(pid_i64, &inst.name) {
+                Ok(pid) => pid,
+                Err(error) => {
+                    eprintln!("{error}");
+                    failed += 1;
+                    continue;
+                }
+            };
+            active_pids.insert(pid);
+            if matches!(inst.pid_ownership(pid), crate::db::PidOwnership::Unknown) {
+                eprintln!(
+                    "Cannot verify the tracked process incarnation for '{}' (pid {}); retry later",
+                    inst.name, pid
+                );
+                failed += 1;
+                continue;
+            }
             let is_headless = inst.background != 0;
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
-                kill_instance(db, &inst.name, pid as u32, inst, is_headless);
+                match kill_instance(db, &inst.name, pid, inst, is_headless, initiator) {
+                    Ok(outcome) => outcome,
+                    // Nothing was signalled: report the failure and keep the
+                    // row instead of retiring an incarnation we refused to kill.
+                    Err(err) => {
+                        eprintln!("{err}");
+                        failed += 1;
+                        continue;
+                    }
+                };
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
             match result {
                 terminal::KillResult::Sent => {
@@ -444,10 +507,35 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
 
     // Kill active instances with this tag
     for inst in &tagged {
-        if let Some(pid) = inst.pid {
+        if let Some(pid_i64) = inst.pid {
+            let pid = match checked_tracked_pid(pid_i64, &inst.name) {
+                Ok(pid) => pid,
+                Err(error) => {
+                    eprintln!("{error}");
+                    failed += 1;
+                    continue;
+                }
+            };
+            if matches!(inst.pid_ownership(pid), crate::db::PidOwnership::Unknown) {
+                eprintln!(
+                    "Cannot verify the tracked process incarnation for '{}' (pid {}); retry later",
+                    inst.name, pid
+                );
+                failed += 1;
+                continue;
+            }
             let is_headless = inst.background != 0;
             let (result, pane_closed, pane_retry_command, preset_name, pane_id) =
-                kill_instance(db, &inst.name, pid as u32, inst, is_headless);
+                match kill_instance(db, &inst.name, pid, inst, is_headless, initiator) {
+                    Ok(outcome) => outcome,
+                    // Nothing was signalled: report the failure and keep the
+                    // row instead of retiring an incarnation we refused to kill.
+                    Err(err) => {
+                        eprintln!("{err}");
+                        failed += 1;
+                        continue;
+                    }
+                };
             let pane_info = pane_info_str(pane_closed, &preset_name, &pane_id);
             match result {
                 terminal::KillResult::Sent => {
@@ -485,7 +573,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
     // Also kill orphan processes with this tag (stopped but still running)
     let active_pids: HashSet<u32> = tagged
         .iter()
-        .filter_map(|i| i.pid.map(|p| p as u32))
+        .filter_map(|i| i.pid.and_then(|pid| checked_tracked_pid(pid, &i.name).ok()))
         .collect();
     let orphans = pidtrack::get_orphan_processes(hcom_dir, Some(&active_pids));
     let tagged_orphans: Vec<_> = orphans.iter().filter(|o| o.tag == tag).collect();
@@ -671,13 +759,65 @@ fn kill_single(
 
 /// Kill a process and close its terminal pane.
 /// Returns (KillResult, pane_closed, pane_retry_command, preset_name, pane_id).
+///
+/// Errors when the kill could not be recorded safely (row incarnation
+/// changed, or the marker write failed): nothing is signalled and the caller
+/// must leave the row for a retry instead of retiring it.
 fn kill_instance(
-    _db: &HcomDb,
+    db: &HcomDb,
     name: &str,
     pid: u32,
     instance: &crate::db::InstanceRow,
     is_headless: bool,
-) -> (terminal::KillResult, bool, Option<String>, String, String) {
+    initiator: &str,
+) -> Result<(terminal::KillResult, bool, Option<String>, String, String), String> {
+    // The PID now belongs to an unrelated process (reboot, crash): don't
+    // signal it or resolve a pane through it. A merely dead PID falls through
+    // so its group and pane are still cleaned up.
+    if instance.pid_reused(pid) {
+        log_info(
+            "kill",
+            "lifecycle.kill_pid_reused",
+            &format!("name={name} pid={pid} now belongs to another process; not signalling"),
+        );
+        return Ok((
+            terminal::KillResult::AlreadyDead,
+            false,
+            None,
+            String::new(),
+            String::new(),
+        ));
+    }
+
+    // The PTY cleanup thread may run as soon as the signal lands. Record the
+    // requested reason and initiator first so it cannot turn an explicit kill
+    // into a stopped snapshot with reason "closed" or by "pty". Both refusal
+    // paths fail closed — no signal, no pane close, no row retirement —
+    // because the PID we hold belongs to the snapshotted incarnation only.
+    match mark_kill_recorded(db, name, initiator, instance.created_at) {
+        Ok(true) => {}
+        Ok(false) => {
+            log_info(
+                "kill",
+                "lifecycle.kill_row_replaced",
+                &format!(
+                    "name={name} pid={pid} instance row was replaced; not signalling the old incarnation"
+                ),
+            );
+            return Err(format!(
+                "instance row for '{name}' changed while killing; retry later"
+            ));
+        }
+        Err(e) => {
+            log_info(
+                "kill",
+                "lifecycle.kill_status",
+                &format!("name={name} err={e}"),
+            );
+            return Err(format!("could not record kill for '{name}': {e}"));
+        }
+    }
+
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
         let (result, pane_closed, pane_retry_command) =
@@ -691,13 +831,13 @@ fn kill_instance(
                 name, pid, result, pane_closed
             ),
         );
-        return (
+        return Ok((
             result,
             pane_closed,
             pane_retry_command,
             String::new(),
             String::new(),
-        );
+        ));
     }
 
     let ti = terminal::resolve_terminal_info(
@@ -725,13 +865,13 @@ fn kill_instance(
         ),
     );
 
-    (
+    Ok((
         result,
         pane_closed,
         pane_retry_command,
         ti.preset_name.clone(),
         ti.pane_id.clone(),
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -767,6 +907,318 @@ mod tests {
         use clap::Parser;
         let args = KillArgs::try_parse_from(["kill"]).unwrap();
         assert!(args.targets.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_kill_rejects_out_of_range_tracked_pid_before_signalling() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, pid) VALUES ('luna', 1.0, ?)",
+                rusqlite::params![u32::MAX as i64],
+            )
+            .unwrap();
+
+        let result = kill_tracked_instance(&db, "luna", "test");
+        assert!(result.is_err());
+        assert!(db.get_instance_full("luna").unwrap().is_some());
+    }
+
+    /// A PID far beyond any live process: group signals report NotFound, so
+    /// the kill path runs end-to-end without touching a real process.
+    const DEAD_PID: u32 = 4_000_000;
+
+    fn stopped_events(db: &HcomDb, name: &str) -> Vec<(String, String)> {
+        db.conn()
+            .prepare(
+                "SELECT json_extract(data, '$.by'), json_extract(data, '$.reason') FROM events
+                 WHERE type = 'life' AND instance = ?1
+                   AND json_extract(data, '$.action') = 'stopped'
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([name], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn kill_instance_marks_kill_initiator_before_signalling() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, pid, background)
+                 VALUES ('luna', 1.0, 4000000, 1)",
+                [],
+            )
+            .unwrap();
+        let inst = db.get_instance_full("luna").unwrap().unwrap();
+
+        let (result, pane_closed, ..) =
+            kill_instance(&db, "luna", DEAD_PID, &inst, true, "boss").unwrap();
+
+        // The process is gone, but the recorded reason survived ahead of the
+        // signal, so a racing PTY cleanup or SessionEnd reads the kill back.
+        assert_eq!(result, terminal::KillResult::AlreadyDead);
+        assert!(!pane_closed);
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_eq!(row.status, "inactive");
+        assert_eq!(row.status_context, "exit:killed");
+        assert_eq!(row.status_detail, "boss");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn kill_instance_does_not_mark_reused_pid_as_killed() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        // The test process is alive under its real incarnation; a stored
+        // mismatching identity makes the PID read as reused by an unrelated
+        // process, so the kill must refuse to signal — and never record one.
+        let launch_context = json!({ "pid_identity": "not-the-real-incarnation" }).to_string();
+        let pid = std::process::id();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, pid, background, launch_context)
+                 VALUES ('luna', 1.0, ?1, 1, ?2)",
+                rusqlite::params![pid as i64, launch_context],
+            )
+            .unwrap();
+        let inst = db.get_instance_full("luna").unwrap().unwrap();
+
+        let (result, pane_closed, ..) =
+            kill_instance(&db, "luna", pid, &inst, true, "boss").unwrap();
+
+        assert_eq!(result, terminal::KillResult::AlreadyDead);
+        assert!(!pane_closed);
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_ne!(row.status_context, "exit:killed");
+        assert_eq!(row.status_detail, "");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn kill_instance_refuses_when_row_incarnation_changed() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        // Two incarnations of the same name with an identical PID and no
+        // stored identity — only created_at differs, exactly the replacement
+        // the PID and identity re-checks cannot see.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, pid, background)
+                 VALUES ('luna', 1.0, 4000000, 1)",
+                [],
+            )
+            .unwrap();
+        let snapshot = db.get_instance_full("luna").unwrap().unwrap();
+        db.delete_instance("luna").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, pid, background)
+                 VALUES ('luna', 2.0, 4000000, 1)",
+                [],
+            )
+            .unwrap();
+
+        let refusal = kill_instance(&db, "luna", DEAD_PID, &snapshot, true, "boss").unwrap_err();
+
+        assert!(refusal.contains("changed while killing"));
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_ne!(
+            row.status_context, "exit:killed",
+            "a replacement row must not be labeled as killed"
+        );
+        assert_eq!(row.status_detail, "");
+        assert!(stopped_events(&db, "luna").is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn kill_tracked_instance_fails_closed_when_marker_write_fails() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, pid, background)
+                 VALUES ('luna', 1.0, 4000000, 1)",
+                [],
+            )
+            .unwrap();
+        // Fail only the kill-marker write; reads and other updates still work.
+        db.conn()
+            .execute(
+                "CREATE TRIGGER refuse_kill_marker BEFORE UPDATE ON instances
+                 WHEN NEW.status_context = 'exit:killed'
+                 BEGIN SELECT RAISE(ABORT, 'marker refused'); END",
+                [],
+            )
+            .unwrap();
+
+        let refusal = kill_tracked_instance(&db, "luna", "boss").unwrap_err();
+
+        assert!(refusal.contains("could not record kill"));
+        // No retirement: the row survives without the kill label, and no stop
+        // event exists — the refusal propagates before stop_instance.
+        let row = db.get_instance_full("luna").unwrap().unwrap();
+        assert_ne!(row.status_context, "exit:killed");
+        assert!(stopped_events(&db, "luna").is_empty());
+    }
+
+    #[cfg(unix)]
+    struct ChildCleanup(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for ChildCleanup {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn kill_tracked_instance_does_not_signal_when_marker_write_fails() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let _child = ChildCleanup(child);
+        let launch_context = json!({
+            "pid_identity": crate::db::observe_pid_identity(pid).ok().flatten()
+        })
+        .to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, pid, background, launch_context)
+                 VALUES ('luna', 1.0, ?1, 1, ?2)",
+                rusqlite::params![pid as i64, launch_context],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "CREATE TRIGGER refuse_kill_marker BEFORE UPDATE ON instances
+                 WHEN NEW.status_context = 'exit:killed'
+                 BEGIN SELECT RAISE(ABORT, 'marker refused'); END",
+                [],
+            )
+            .unwrap();
+
+        let refusal = kill_tracked_instance(&db, "luna", "boss").unwrap_err();
+
+        assert!(refusal.contains("could not record kill"));
+        // No signal: the live process must still be alive.
+        assert!(
+            pidtrack::is_alive(pid),
+            "a refused marker must fail closed without signalling"
+        );
+        assert!(stopped_events(&db, "luna").is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn kill_tracked_instance_retires_row_with_initiator() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, pid, background)
+                 VALUES ('luna', 1.0, 4000000, 1)",
+                [],
+            )
+            .unwrap();
+
+        let outcome = kill_tracked_instance(&db, "luna", "boss").unwrap();
+
+        assert_eq!(outcome.kill_result, terminal::KillResult::AlreadyDead);
+        assert_eq!(outcome.pid, DEAD_PID);
+        assert!(db.get_instance_full("luna").unwrap().is_none());
+        assert_eq!(
+            stopped_events(&db, "luna"),
+            vec![("boss".to_string(), "killed".to_string())]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn kill_all_skips_retirement_when_marker_fails_and_continues() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, pid, background)
+                 VALUES ('luna', 1.0, 4000000, 1), ('mila', 1.0, 4000001, 1)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "CREATE TRIGGER refuse_kill_marker BEFORE UPDATE ON instances
+                 WHEN NEW.status_context = 'exit:killed' AND OLD.name = 'luna'
+                 BEGIN SELECT RAISE(ABORT, 'marker refused'); END",
+                [],
+            )
+            .unwrap();
+
+        let exit = kill_all(&db, &hcom_dir, "boss").unwrap();
+
+        assert_eq!(exit, 1, "the refused kill must be reported as a failure");
+        // Refused: row kept, not labeled, no stop event.
+        let luna = db.get_instance_full("luna").unwrap().unwrap();
+        assert_ne!(luna.status_context, "exit:killed");
+        assert!(stopped_events(&db, "luna").is_empty());
+        // The loop continued past the refusal and retired the next target.
+        assert!(db.get_instance_full("mila").unwrap().is_none());
+        assert_eq!(
+            stopped_events(&db, "mila"),
+            vec![("boss".to_string(), "killed".to_string())]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn kill_by_tag_skips_retirement_when_marker_fails_and_continues() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tag, created_at, pid, background)
+                 VALUES ('luna', 'night', 1.0, 4000000, 1),
+                        ('mila', 'night', 1.0, 4000001, 1),
+                        ('zuvi', 'other', 1.0, 4000002, 1)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "CREATE TRIGGER refuse_kill_marker BEFORE UPDATE ON instances
+                 WHEN NEW.status_context = 'exit:killed' AND OLD.name = 'luna'
+                 BEGIN SELECT RAISE(ABORT, 'marker refused'); END",
+                [],
+            )
+            .unwrap();
+
+        let exit = kill_by_tag(&db, &hcom_dir, "night", "boss").unwrap();
+
+        assert_eq!(exit, 1, "the refused kill must be reported as a failure");
+        assert!(db.get_instance_full("luna").unwrap().is_some());
+        assert!(stopped_events(&db, "luna").is_empty());
+        assert!(db.get_instance_full("mila").unwrap().is_none());
+        assert_eq!(
+            stopped_events(&db, "mila"),
+            vec![("boss".to_string(), "killed".to_string())]
+        );
+        // Untagged instances are never touched by a tag kill.
+        assert!(db.get_instance_full("zuvi").unwrap().is_some());
     }
 
     #[test]

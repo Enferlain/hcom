@@ -162,7 +162,6 @@ fn apply_isolated_env_ctx(
     command.env("CI", "1");
 
     command.env("HOME", &ctx.home);
-    command.env("HCOM_DEV_ROOT", env!("CARGO_MANIFEST_DIR"));
     #[cfg(windows)]
     {
         // Windows PowerShell and cmd are OS components, not user state.

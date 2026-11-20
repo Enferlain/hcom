@@ -104,6 +104,9 @@ pub(super) fn update_delivery_state(
         state.nav_overlay = matches!(target.known_tool(), Some(Tool::Claude))
             && (screen.is_claude_subagent_nav_visible()
                 || screen.is_claude_session_switcher_visible());
+        state.startup_loading = matches!(target.known_tool(), Some(Tool::Codex))
+            && launch_phase_active.load(Ordering::Acquire)
+            && screen.is_codex_startup_loading();
         // Claude Code v2.1.252 can omit PermissionDenied for the interactive
         // "No" choice. Its settled denial follow-up is a narrow, observable
         // falling edge for the hook-owned approval block.
@@ -845,7 +848,7 @@ pub(super) enum DeliveryStart {
     Pending(JoinHandle<()>, mpsc::Receiver<Result<()>>),
 }
 
-/// Start the delivery thread (and transcript watcher for Codex).
+/// Start the delivery thread.
 ///
 /// Returns [`DeliveryStart::Started`] when the delivery thread initialized
 /// successfully (DB opened, notify server created), [`DeliveryStart::Disabled`]
@@ -926,22 +929,6 @@ pub(super) fn start_delivery_thread(
                 // Signal successful initialization to parent
                 let _ = init_tx.send(Ok(()));
 
-                // For Codex: spawn the transcript watcher only after delivery
-                // init has succeeded (#5). Spawning it before init meant a failed
-                // or timed-out init still left an orphan watcher running against a
-                // session that never came up. Init success is reached exactly once
-                // per live delivery thread, so the watcher starts exactly once.
-                if matches!(target.known_tool(), Some(Tool::Codex)) {
-                    let watcher_running = running.clone();
-                    let watcher_name = instance_name.clone();
-                    std::thread::spawn(move || {
-                        crate::hooks::codex_file_edits::run_transcript_watcher(
-                            watcher_running,
-                            watcher_name,
-                            Duration::from_secs(5),
-                        );
-                    });
-                }
                 (db, notify)
             }
             Err(e) => {

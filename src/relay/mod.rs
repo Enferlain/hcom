@@ -6,6 +6,7 @@
 //!   {relay_id}/{device_uuid}  — retained state per device
 //!   {relay_id}/control        — non-retained control events (stop/kill)
 
+pub mod backfill;
 pub mod broker;
 pub mod client;
 pub mod control;
@@ -281,9 +282,11 @@ pub(crate) fn safe_kv_set(db: &HcomDb, key: &str, value: Option<&str>) {
 
 /// Record a fresh worker heartbeat. Called by the worker's main loop ~once per second
 /// and once at pidfile-write so the startup window doesn't look stale.
-pub(crate) fn write_worker_heartbeat(db: &HcomDb) {
+/// Returns whether the write landed: a long-lived worker whose DB was replaced
+/// (reset, schema recovery) keeps failing silently unless the caller checks.
+pub(crate) fn write_worker_heartbeat(db: &HcomDb) -> bool {
     let now = crate::shared::time::now_epoch_f64();
-    safe_kv_set(db, HEARTBEAT_KEY, Some(&format!("{now}")));
+    db.kv_set(HEARTBEAT_KEY, Some(&format!("{now}"))).is_ok()
 }
 
 /// Clear the heartbeat on clean worker shutdown so readers see "no worker" immediately
@@ -317,6 +320,7 @@ pub fn clear_relay_device_state(db: &HcomDb) {
         "relay_sync_time_",
         "relay_state_ts_",
         "relay_ctrl_",
+        backfill::GAP_KEY_PREFIX,
     ];
     for prefix in &prefixes {
         if let Ok(entries) = db.kv_prefix(prefix) {
@@ -1264,5 +1268,22 @@ mod tests {
             Some("1700000001.0")
         );
         assert!(safe_kv_get(&db, "relay_status").is_none());
+    }
+
+    #[test]
+    fn clear_relay_device_state_clears_backfill_gaps_at_group_reset() {
+        let db = test_db();
+        safe_kv_set(
+            &db,
+            "relay_gap_device-1234",
+            Some(r#"[{"after":10,"before":20}]"#),
+        );
+
+        clear_relay_device_state(&db);
+
+        assert!(
+            safe_kv_get(&db, "relay_gap_device-1234").is_none(),
+            "group rotation must not carry backfill gaps into the new relay"
+        );
     }
 }

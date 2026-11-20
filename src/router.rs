@@ -876,9 +876,21 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             &cmd_argv,
             |args| crate::commands::archive::cmd_archive(&db, &args, Some(&ctx))
         ),
-        "reset" => clap_dispatch!(crate::commands::reset::ResetArgs, cmd, &cmd_argv, |args| {
-            crate::commands::reset::cmd_reset(&db, &args, Some(&ctx))
-        }),
+        "reset" => match clap_parse!(crate::commands::reset::ResetArgs, cmd, &cmd_argv) {
+            Ok(args) => {
+                if let Some(exit_code) =
+                    crate::commands::reset::try_cmd_reset_preserving_db(&db, &args, Some(&ctx))
+                {
+                    exit_code
+                } else {
+                    return crate::commands::reset::cmd_reset(db, &args, Some(&ctx));
+                }
+            }
+            Err(e) => {
+                e.print().ok();
+                if e.use_stderr() { 1 } else { 0 }
+            }
+        },
         "hooks" => clap_dispatch!(crate::commands::hooks::HooksArgs, cmd, &cmd_argv, |args| {
             crate::commands::hooks::cmd_hooks(&db, &args, Some(&ctx))
         }),
@@ -904,21 +916,15 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         }
     };
 
-    // Deliver pending messages AFTER command.
-    // Deliver pending messages AFTER command for hookless codex/adhoc instances.
-    // This appends unread hcom messages to the command's stdout — keep in mind
-    // when changing output contracts or adding machine-readable modes.
-    if let Some(output) = crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json) {
-        use std::io::Write;
-        let mut stdout = std::io::stdout().lock();
-        if let Err(error) = stdout
-            .write_all(output.as_bytes())
-            .and_then(|_| stdout.flush())
-            && error.kind() != std::io::ErrorKind::BrokenPipe
-        {
-            eprintln!("Error: Failed writing pending messages to stdout: {error}");
-        }
+    // Deliver pending messages AFTER command for adhoc instances. `send` and
+    // `listen` claim delivery themselves once they have persisted/read the
+    // inbox, so quiet sends and failed writes cannot be drained a second time.
+    if let Err(e) = crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json) {
+        eprintln!("hcom: {e}");
+        return if result == 0 { 1 } else { result };
     }
+
+    crate::instance_lifecycle::reap_dead_processes_throttled(&db);
 
     result
 }

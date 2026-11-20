@@ -279,7 +279,14 @@ fn start_from_orphan(
     };
 
     // Core DB registration
-    let _ = pidtrack::recover_single_orphan_to_db(db, orphan, &name);
+    if let Err(e) = pidtrack::recover_single_orphan_to_db(db, orphan, &name) {
+        // Release a generated name's reservation row so retries don't strand
+        // one pending placeholder per attempt.
+        if !can_reuse {
+            let _ = db.delete_instance(&name);
+        }
+        bail!("Failed to recover orphan PID {pid}: {e}");
+    }
 
     db.log_event(
         "life",
@@ -2180,14 +2187,15 @@ mod tests {
         let ctx = make_hermes_ctx(Some("audit-session-1"), "/tmp/project");
         assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
         let name = db.get_session_binding("audit-session-1").unwrap().unwrap();
+        let target = if name == "nova" { "luna" } else { "nova" };
 
-        let err = start_rebind(&db, "nova", &ctx, None).unwrap_err();
+        let err = start_rebind(&db, target, &ctx, None).unwrap_err();
         assert!(
             err.to_string().contains("already has hcom identity"),
             "unexpected error: {err}"
         );
         // Refused before any mutation: no target row, no binding change.
-        assert!(db.get_instance_full("nova").unwrap().is_none());
+        assert!(db.get_instance_full(target).unwrap().is_none());
         assert_eq!(
             db.get_session_binding("audit-session-1")
                 .unwrap()
@@ -2207,14 +2215,15 @@ mod tests {
         // Soft finalize: binding dropped, retained row keeps the session id.
         crate::hooks::common::soft_finalize_session(&db, &name, "session end", None, true);
 
-        let err = start_rebind(&db, "nova", &ctx, None).unwrap_err();
+        let target = if name == "nova" { "luna" } else { "nova" };
+        let err = start_rebind(&db, target, &ctx, None).unwrap_err();
         assert!(
             err.to_string().contains("already has hcom identity"),
             "unexpected error: {err}"
         );
         // Refused before any mutation: no orphan row, retained row intact.
         assert!(
-            db.get_instance_full("nova").unwrap().is_none(),
+            db.get_instance_full(target).unwrap().is_none(),
             "no target row may be created for a session with a retained identity"
         );
         let row = db.get_instance_full(&name).unwrap().unwrap();
@@ -2269,14 +2278,15 @@ mod tests {
         let ctx = make_hermes_ctx(Some("audit-session-1"), "/tmp/project");
         assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
         let name = db.get_session_binding("audit-session-1").unwrap().unwrap();
+        let target = if name == "nova" { "luna" } else { "nova" };
 
-        let err = start_bare(&db, &hcom_dir, &ctx, Some("nova")).unwrap_err();
+        let err = start_bare(&db, &hcom_dir, &ctx, Some(target)).unwrap_err();
         assert!(
             err.to_string().contains("already has hcom identity"),
             "unexpected error: {err}"
         );
         assert!(
-            db.get_instance_full("nova").unwrap().is_none(),
+            db.get_instance_full(target).unwrap().is_none(),
             "refusal must happen before any row or position is created"
         );
         assert_eq!(
@@ -3142,6 +3152,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_vanilla_claude_rebind_binds_session_and_drops_old_identity() {
+        // Generated names are four letters; this target cannot collide with start_bare.
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
         assert!(crate::hooks::claude::setup_claude_hooks(false));
@@ -3153,10 +3164,10 @@ mod tests {
         assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
         let first = db.get_session_binding("sess-rebind").unwrap().unwrap();
 
-        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
+        assert_eq!(start_rebind(&db, "rebound", &ctx, None).unwrap(), 0);
         assert_eq!(
             db.get_session_binding("sess-rebind").unwrap().as_deref(),
-            Some("nova"),
+            Some("rebound"),
             "a reclaimed name must own the session that reclaimed it"
         );
         assert!(
@@ -3167,14 +3178,14 @@ mod tests {
             db.get_validated_claude_session_owner("sess-rebind")
                 .unwrap()
                 .as_deref(),
-            Some("nova"),
+            Some("rebound"),
             "hooks must resolve the reclaimed name, not reject the session"
         );
 
         assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
         assert_eq!(
             db.get_session_binding("sess-rebind").unwrap().as_deref(),
-            Some("nova"),
+            Some("rebound"),
             "a start after the rebind returns the reclaimed identity"
         );
     }

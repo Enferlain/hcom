@@ -3,7 +3,6 @@
 pub mod antigravity;
 pub mod claude;
 pub mod codex;
-pub mod codex_file_edits;
 pub mod common;
 pub mod copilot;
 pub mod cursor;
@@ -185,6 +184,9 @@ pub mod test_helpers {
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
+            // CODEX_HOME overrides HOME; inheriting it would write test hooks
+            // into the user's real Codex configuration.
+            std::env::remove_var("CODEX_HOME");
             std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
         }
         crate::config::Config::reset();
@@ -526,6 +528,8 @@ pub enum HookResult {
     Block {
         /// Reason text (formatted messages for delivery).
         reason: String,
+        /// Delivery ack to commit after stdout is successfully written.
+        delivery_ack: Option<DeliveryAck>,
     },
 
     /// Update the tool input before execution (exit 0, updatedInput field).
@@ -549,7 +553,59 @@ impl HookResult {
 
 #[cfg(test)]
 mod tests {
+    use super::test_helpers::isolated_test_env;
     use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn isolated_test_env_clears_inherited_codex_home_and_restores_it() {
+        const MARKER_VAR: &str = "HCOM_TEST_CODEX_HOME_ISOLATION";
+
+        // Child branch: run the actual test inside an isolated child process
+        // that inherited an explicit CODEX_HOME from the parent.
+        if std::env::var(MARKER_VAR).as_deref() == Ok("1") {
+            let expected_home =
+                std::env::var("CODEX_HOME").expect("child process expects inherited CODEX_HOME");
+            let (_dir, _hcom_dir, _test_home, guard) = isolated_test_env();
+            assert_eq!(
+                std::env::var("CODEX_HOME").ok(),
+                None,
+                "inherited CODEX_HOME must be cleared inside the isolated env"
+            );
+            drop(guard);
+            assert_eq!(
+                std::env::var("CODEX_HOME").ok().as_deref(),
+                Some(expected_home.as_str()),
+                "guard must restore inherited CODEX_HOME on drop"
+            );
+            return;
+        }
+
+        // Parent branch: spawn the self-test subprocess with an inherited CODEX_HOME.
+        // This avoids recursive or nested mutex acquisitions in EnvGuard::new.
+        let caller_home = tempfile::tempdir().unwrap();
+        let caller_codex_home = caller_home.path().join("codex");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hooks::tests::isolated_test_env_clears_inherited_codex_home_and_restores_it",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(MARKER_VAR, "1")
+            .env("CODEX_HOME", &caller_codex_home)
+            .output()
+            .expect("failed to spawn child test process");
+
+        assert!(
+            output.status.success(),
+            "child test process failed (status: {:?}):\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn test_hook_payload_from_claude() {
@@ -762,11 +818,16 @@ mod tests {
     fn test_hook_result_block() {
         let result = HookResult::Block {
             reason: "<hcom>message here</hcom>".into(),
+            delivery_ack: None,
         };
         assert_eq!(result.exit_code(), 2);
         match &result {
-            HookResult::Block { reason } => {
+            HookResult::Block {
+                reason,
+                delivery_ack,
+            } => {
                 assert_eq!(reason, "<hcom>message here</hcom>");
+                assert!(delivery_ack.is_none());
             }
             _ => panic!("expected Block"),
         }

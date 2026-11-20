@@ -164,6 +164,93 @@ pub(super) const INSTANCE_COLUMNS: &str =
      terminal_preset_requested, terminal_preset_effective,
      idle_since, pid, launch_context, pending_tool_use_id";
 
+impl InstanceRow {
+    /// Process identity recorded with this snapshot's PID, if any.
+    pub fn pid_identity(&self) -> Option<String> {
+        let ctx: serde_json::Value = serde_json::from_str(self.launch_context.as_deref()?).ok()?;
+        ctx.get("pid_identity")?.as_str().map(str::to_string)
+    }
+
+    /// Whether a *different* live process now holds `pid` (the identity in
+    /// this snapshot no longer matches), so it must not be signalled on this
+    /// instance's behalf. Checked against the snapshot, not a fresh read, so
+    /// a concurrent delete of the row can't turn a reused PID into "unknown".
+    /// A PID that is simply gone is not "reused": its process group can
+    /// outlive the leader, and a PID isn't recycled while that group exists,
+    /// so group signals and pane cleanup stay safe there. Rows without a
+    /// stored identity retain the legacy liveness behavior and report `false`.
+    pub fn pid_reused(&self, pid: u32) -> bool {
+        matches!(
+            self.pid_ownership(pid),
+            PidOwnership::Reused | PidOwnership::Unknown | PidOwnership::Invalid
+        )
+    }
+
+    /// Classify the current occupant of a stored PID without treating an
+    /// unreadable live identity as a confirmed mismatch or death.
+    pub fn pid_ownership(&self, pid: u32) -> PidOwnership {
+        if pid == 0 || i32::try_from(pid).is_err() {
+            return PidOwnership::Invalid;
+        }
+        let Some(expected) = self.pid_identity() else {
+            return PidOwnership::Legacy;
+        };
+        match crate::sys::process::identity(pid) {
+            Some(current) if current != expected => PidOwnership::Reused,
+            Some(_) if crate::sys::process::is_alive(pid) => PidOwnership::Matching,
+            Some(_) => PidOwnership::Dead,
+            // A live PID whose incarnation cannot be observed is unknown, so
+            // callers must not signal it as this row's process. A dead PID is
+            // safe for the existing process-group cleanup path.
+            None if crate::sys::process::is_alive(pid) => PidOwnership::Unknown,
+            None => PidOwnership::Dead,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidOwnership {
+    Matching,
+    Reused,
+    Dead,
+    Unknown,
+    Legacy,
+    Invalid,
+}
+
+/// Observe a live PID's process incarnation for storage.
+///
+/// Returns `Ok(None)` when the process is running but the platform can't report
+/// an identity (e.g. a sandbox hiding `/proc/sys/kernel/random/boot_id`): the
+/// PID is still tracked, just without PID-reuse protection, and cleanup falls
+/// back to plain liveness for that row. Only a PID that is already gone errors.
+pub fn observe_pid_identity(pid: u32) -> Result<Option<String>> {
+    // 0 and values that wrap negative as pid_t address process groups (or
+    // every process) in kill(), so liveness would be meaningless.
+    if pid == 0 || i32::try_from(pid).is_err() {
+        anyhow::bail!("invalid pid {pid}");
+    }
+    if let Some(identity) = crate::sys::process::identity(pid) {
+        return Ok(Some(identity));
+    }
+    if !crate::sys::process::is_alive(pid) {
+        anyhow::bail!("process {pid} is not running");
+    }
+    crate::log::log_warn(
+        "db",
+        "pid_identity.unavailable",
+        &format!("pid={pid} tracked without process identity"),
+    );
+    Ok(None)
+}
+
+fn validate_pid(pid: u32) -> Result<()> {
+    if pid == 0 || i32::try_from(pid).is_err() {
+        anyhow::bail!("invalid pid {pid}");
+    }
+    Ok(())
+}
+
 impl HcomDb {
     /// Get instance status by name
     ///
@@ -379,11 +466,109 @@ impl HcomDb {
         Ok(())
     }
 
-    /// Update instance PID after spawn
+    /// Update instance PID after spawn, recording the exact process incarnation
+    /// when the platform can observe it (see [`observe_pid_identity`]).
     pub fn update_instance_pid(&self, name: &str, pid: u32) -> Result<()> {
+        let pid_identity = observe_pid_identity(pid)?;
+        self.update_instance_pid_with_identity(name, pid, pid_identity.as_deref())
+    }
+
+    /// Update an instance PID with an already-observed process incarnation.
+    /// `None` stores the PID without reuse protection and drops any stale
+    /// identity so it can't be mistaken for this process.
+    pub fn update_instance_pid_with_identity(
+        &self,
+        name: &str,
+        pid: u32,
+        pid_identity: Option<&str>,
+    ) -> Result<()> {
+        validate_pid(pid)?;
+        let updated = match pid_identity {
+            Some(pid_identity) => self.conn.execute(
+                "UPDATE instances
+                 SET pid = ?,
+                     launch_context = json_set(
+                         CASE WHEN json_valid(launch_context) THEN launch_context ELSE '{}' END,
+                         '$.pid_identity', ?
+                     )
+                 WHERE name = ?",
+                params![pid as i64, pid_identity, name],
+            )?,
+            None => self.conn.execute(
+                "UPDATE instances
+                 SET pid = ?,
+                     launch_context = CASE
+                         WHEN json_valid(launch_context)
+                         THEN json_remove(launch_context, '$.pid_identity')
+                         ELSE launch_context
+                     END
+                 WHERE name = ?",
+                params![pid as i64, name],
+            )?,
+        };
+        if updated != 1 {
+            anyhow::bail!("instance {name} disappeared while storing pid {pid}");
+        }
+        Ok(())
+    }
+
+    /// Atomically persist PID ownership together with related instance fields.
+    pub fn update_instance_pid_with_fields(
+        &self,
+        name: &str,
+        pid: u32,
+        updates: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
+        let pid_identity = observe_pid_identity(pid)?;
+        self.update_instance_pid_with_identity_and_fields(
+            name,
+            pid,
+            pid_identity.as_deref(),
+            updates,
+        )
+    }
+
+    /// Atomically persist an already-observed PID incarnation with related fields.
+    pub fn update_instance_pid_with_identity_and_fields(
+        &self,
+        name: &str,
+        pid: u32,
+        pid_identity: Option<&str>,
+        updates: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<()> {
+        self.with_write_scope(|| {
+            self.update_instance_fields(name, updates)?;
+            self.update_instance_pid_with_identity(name, pid, pid_identity)
+        })
+    }
+
+    /// Stored process incarnation for an instance PID.
+    pub fn get_instance_pid_identity(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN json_valid(launch_context)
+                        THEN json_extract(launch_context, '$.pid_identity') END
+                 FROM instances WHERE name = ?",
+                params![name],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Clear a PID and its stored process identity.
+    pub fn clear_instance_pid(&self, name: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE instances SET pid = ? WHERE name = ?",
-            params![pid as i64, name],
+            "UPDATE instances
+             SET pid = NULL,
+                 launch_context = CASE
+                     WHEN json_valid(launch_context)
+                     THEN json_remove(launch_context, '$.pid_identity')
+                     ELSE launch_context
+                 END
+             WHERE name = ?",
+            params![name],
         )?;
         Ok(())
     }
@@ -393,8 +578,9 @@ impl HcomDb {
     /// currently missing or empty so late-bound PTY metadata can be persisted
     /// without clobbering richer hook-captured context.
     pub fn store_launch_context(&self, name: &str, context_json: &str) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
+        // A write scope rather than BEGIN IMMEDIATE so this also works inside a
+        // caller's transaction (e.g. placeholder migration during a tool bind).
+        self.with_write_scope(|| {
             let existing_json: Option<String> = self
                 .conn
                 .query_row(
@@ -448,18 +634,7 @@ impl HcomDb {
                 )?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Get instance tag (for display name computation).
@@ -580,17 +755,84 @@ impl HcomDb {
         agent_id: Option<&str>,
         event_data: &serde_json::Value,
     ) -> Result<bool> {
-        let timestamp = chrono_now_iso();
+        self.finalize_instance_stop_inner(name, created_at, session_id, agent_id, None, event_data)
+    }
+
+    /// Finalize a stop only while the row still owns the inspected PID incarnation.
+    pub fn finalize_instance_stop_if_pid_identity(
+        &self,
+        name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        pid_guard: (u32, &str),
+        event_data: &serde_json::Value,
+    ) -> Result<bool> {
+        self.finalize_instance_stop_inner(
+            name,
+            created_at,
+            session_id,
+            agent_id,
+            Some(pid_guard),
+            event_data,
+        )
+    }
+
+    fn finalize_instance_stop_inner(
+        &self,
+        name: &str,
+        created_at: f64,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+        pid_guard: Option<(u32, &str)>,
+        event_data: &serde_json::Value,
+    ) -> Result<bool> {
         let data = serde_json::to_string(event_data)?;
         let mut event_id = None;
 
         let won = self.with_immediate_transaction(|tx| {
-            let deleted = tx.execute(
-                "DELETE FROM instances
-                 WHERE name = ? AND created_at = ?
-                   AND session_id IS ? AND agent_id IS ?",
-                params![name, created_at, session_id, agent_id],
-            )?;
+            // Stamp after taking the write lock so timestamp order matches id order.
+            let timestamp = chrono_now_iso();
+            let deleted = if let Some((pid, pid_identity)) = pid_guard {
+                tx.execute(
+                    "DELETE FROM instances
+                     WHERE name = ? AND created_at = ?
+                       AND session_id IS ? AND agent_id IS ?
+                       AND pid = ?
+                       AND json_valid(launch_context)
+                       AND json_extract(launch_context, '$.pid_identity') = ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM instances child
+                           WHERE (? IS NOT NULL AND child.parent_session_id = ?)
+                              OR child.parent_name = ?
+                       )",
+                    params![
+                        name,
+                        created_at,
+                        session_id,
+                        agent_id,
+                        pid as i64,
+                        pid_identity,
+                        session_id,
+                        session_id,
+                        name
+                    ],
+                )?
+            } else {
+                tx.execute(
+                    "DELETE FROM instances
+                     WHERE name = ? AND created_at = ?
+                       AND session_id IS ? AND agent_id IS ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM instances child
+                           WHERE (? IS NOT NULL AND child.parent_session_id = ?)
+                              OR child.parent_name = ?
+                       )",
+                    params![
+                        name, created_at, session_id, agent_id, session_id, session_id, name
+                    ],
+                )?
+            };
             if deleted == 0 {
                 return Ok(false);
             }
@@ -1010,6 +1252,30 @@ impl HcomDb {
         let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|b| b.as_ref()).collect();
         let rows = self.conn.execute(&sql, refs.as_slice())?;
         Ok(rows > 0)
+    }
+
+    /// Advance a receive cursor without ever rewinding a newer delivery.
+    ///
+    /// The comparison and update are one SQLite operation, so a delayed
+    /// writer cannot acknowledge an older batch over a concurrent newer one.
+    pub fn advance_instance_cursor(&self, name: &str, event_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET last_event_id = MAX(COALESCE(last_event_id, 0), ?) WHERE name = ?",
+            params![event_id, name],
+        )?;
+        Ok(())
+    }
+
+    /// Commit a hook delivery cursor and optional one-shot announcement
+    /// atomically, while keeping the cursor forward-only.
+    pub fn ack_hook_delivery(&self, name: &str, event_id: i64, announce: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET last_event_id = MAX(COALESCE(last_event_id, 0), ?),
+             name_announced = CASE WHEN ? THEN 1 ELSE name_announced END
+             WHERE name = ?",
+            params![event_id, announce, name],
+        )?;
+        Ok(())
     }
 
     /// Update specific fields on an instance row.
@@ -1493,6 +1759,349 @@ mod tests {
             )
             .unwrap();
         assert_eq!(db.get_thread_members("debate-1"), vec!["nova".to_string()]);
+
+        cleanup_test_db(db_path);
+    }
+
+    // ── PID identity regression tests ──────────────────────────────────
+
+    #[test]
+    fn pid_identity_roundtrip_with_identity() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('echo', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        db.update_instance_pid_with_identity("echo", 42, Some("boot-abc:42:1000"))
+            .unwrap();
+
+        let row = db.get_instance_full("echo").unwrap().unwrap();
+        assert_eq!(row.pid, Some(42));
+        assert_eq!(row.pid_identity(), Some("boot-abc:42:1000".to_string()));
+
+        let stored = db.get_instance_pid_identity("echo").unwrap();
+        assert_eq!(stored, Some("boot-abc:42:1000".to_string()));
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn pid_identity_roundtrip_without_identity() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('echo', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        // Store PID with identity, then clear
+        db.update_instance_pid_with_identity("echo", 42, Some("boot-abc:42:1000"))
+            .unwrap();
+        db.update_instance_pid_with_identity("echo", 42, None)
+            .unwrap();
+
+        let row = db.get_instance_full("echo").unwrap().unwrap();
+        assert_eq!(row.pid, Some(42));
+        assert_eq!(
+            row.pid_identity(),
+            None,
+            "identity must be cleared when None is passed"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn clear_instance_pid_drops_identity() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('echo', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        db.update_instance_pid_with_identity("echo", 42, Some("boot:42:1000"))
+            .unwrap();
+        db.clear_instance_pid("echo").unwrap();
+
+        let row = db.get_instance_full("echo").unwrap().unwrap();
+        assert_eq!(row.pid, None);
+        assert_eq!(row.pid_identity(), None);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn pid_reused_detects_mismatch() {
+        // Build an InstanceRow that carries a known pid_identity
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('echo', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.update_instance_pid_with_identity("echo", 1, Some("identity-A"))
+            .unwrap();
+
+        let row = db.get_instance_full("echo").unwrap().unwrap();
+        // PID 1 (init) is alive and has identity != "identity-A"
+        assert!(
+            row.pid_reused(1),
+            "PID 1 should be detected as reused (different identity)"
+        );
+
+        // A row without stored identity always reports false
+        db.update_instance_pid_with_identity("echo", 1, None)
+            .unwrap();
+        let row2 = db.get_instance_full("echo").unwrap().unwrap();
+        assert!(!row2.pid_reused(1), "no identity = can't detect reuse");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn finalize_instance_stop_if_pid_identity_guard_cas() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, session_id) VALUES ('echo', 1000.0, 'sess1')",
+                [],
+            )
+            .unwrap();
+        db.update_instance_pid_with_identity("echo", 42, Some("boot:42:1000"))
+            .unwrap();
+
+        let event_data = serde_json::json!({"action": "stopped"});
+
+        // Wrong identity → CAS fails
+        let won = db
+            .finalize_instance_stop_if_pid_identity(
+                "echo",
+                1000.0,
+                Some("sess1"),
+                None,
+                (42, "boot:42:WRONG"),
+                &event_data,
+            )
+            .unwrap();
+        assert!(!won, "wrong identity must not win");
+        assert!(
+            db.get_instance_full("echo").unwrap().is_some(),
+            "row must survive wrong-identity stop"
+        );
+
+        // Correct identity → CAS wins
+        let won = db
+            .finalize_instance_stop_if_pid_identity(
+                "echo",
+                1000.0,
+                Some("sess1"),
+                None,
+                (42, "boot:42:1000"),
+                &event_data,
+            )
+            .unwrap();
+        assert!(won, "correct identity must win");
+        assert!(
+            db.get_instance_full("echo").unwrap().is_none(),
+            "row must be deleted after correct-identity stop"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn finalize_instance_stop_rechecks_both_child_relationships() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, session_id) VALUES ('parent', 1000.0, 'sess-parent')",
+                [],
+            )
+            .unwrap();
+        db.update_instance_pid_with_identity("parent", 42, Some("guard:42:1"))
+            .unwrap();
+
+        let event_data = serde_json::json!({"action": "stopped"});
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, parent_session_id) VALUES ('session-child', 1001.0, 'sess-parent')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !db.finalize_instance_stop_if_pid_identity(
+                "parent",
+                1000.0,
+                Some("sess-parent"),
+                None,
+                (42, "guard:42:1"),
+                &event_data,
+            )
+            .unwrap()
+        );
+        assert!(db.get_instance_full("parent").unwrap().is_some());
+
+        db.delete_instance("session-child").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, parent_name) VALUES ('native-child', 1002.0, 'parent')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            !db.finalize_instance_stop_if_pid_identity(
+                "parent",
+                1000.0,
+                Some("sess-parent"),
+                None,
+                (42, "guard:42:1"),
+                &event_data,
+            )
+            .unwrap()
+        );
+        assert!(db.get_instance_full("parent").unwrap().is_some());
+
+        db.delete_instance("native-child").unwrap();
+        assert!(
+            db.finalize_instance_stop_if_pid_identity(
+                "parent",
+                1000.0,
+                Some("sess-parent"),
+                None,
+                (42, "guard:42:1"),
+                &event_data,
+            )
+            .unwrap()
+        );
+        assert!(db.get_instance_full("parent").unwrap().is_none());
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn update_instance_pid_requires_existing_row_and_valid_pid() {
+        let (db, db_path) = setup_full_test_db();
+
+        let missing = db.update_instance_pid_with_identity("missing", 42, Some("guard:42:1"));
+        assert!(missing.is_err(), "a zero-row PID update must be reported");
+
+        let invalid_zero = db.update_instance_pid_with_identity("missing", 0, None);
+        assert!(
+            invalid_zero.is_err(),
+            "PID zero must be rejected before SQL"
+        );
+
+        let invalid_high = db.update_instance_pid_with_identity("missing", u32::MAX, None);
+        assert!(
+            invalid_high.is_err(),
+            "out-of-range PID must be rejected before SQL"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn with_write_scope_savepoint_nests_inside_transaction() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('alpha', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        // Inner write_scope inside an explicit transaction
+        db.with_immediate_transaction(|_tx| {
+            db.with_write_scope(|| {
+                db.conn().execute(
+                    "UPDATE instances SET status = 'testing' WHERE name = 'alpha'",
+                    [],
+                )?;
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .unwrap();
+
+        let row = db.get_instance_full("alpha").unwrap().unwrap();
+        assert_eq!(row.status, "testing", "nested savepoint must commit");
+
+        // Inner write_scope error → rollback savepoint only
+        let result: anyhow::Result<()> = db.with_immediate_transaction(|_tx| {
+            db.with_write_scope(|| {
+                db.conn().execute(
+                    "UPDATE instances SET status = 'will-rollback' WHERE name = 'alpha'",
+                    [],
+                )?;
+                anyhow::bail!("intentional failure");
+            })?;
+            Ok(())
+        });
+        assert!(result.is_err());
+        let row = db.get_instance_full("alpha").unwrap().unwrap();
+        assert_eq!(
+            row.status, "testing",
+            "failed savepoint must roll back to pre-savepoint state"
+        );
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn store_launch_context_cooperative_inside_transaction() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('alpha', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        // store_launch_context should work inside an existing transaction
+        db.with_immediate_transaction(|_tx| {
+            db.store_launch_context("alpha", r#"{"pane_id":"p1"}"#)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let row = db.get_instance_full("alpha").unwrap().unwrap();
+        let ctx: serde_json::Value =
+            serde_json::from_str(row.launch_context.as_deref().unwrap()).unwrap();
+        assert_eq!(ctx["pane_id"], "p1");
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn update_instance_pid_with_identity_and_fields_atomic() {
+        let (db, db_path) = setup_full_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('echo', 1000.0)",
+                [],
+            )
+            .unwrap();
+
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "background_log_file".into(),
+            serde_json::json!("/tmp/bg.log"),
+        );
+
+        db.update_instance_pid_with_identity_and_fields("echo", 99, Some("boot:99:2000"), &fields)
+            .unwrap();
+
+        let row = db.get_instance_full("echo").unwrap().unwrap();
+        assert_eq!(row.pid, Some(99));
+        assert_eq!(row.pid_identity(), Some("boot:99:2000".to_string()));
+        assert_eq!(row.background_log_file, "/tmp/bg.log");
 
         cleanup_test_db(db_path);
     }

@@ -62,9 +62,9 @@ pub struct GatesSpec {
     pub launch_requires_ready: bool,
     /// Treat the plugin's extension bind (a `kind='plugin'` notify endpoint) as
     /// launch readiness, in addition to the on-screen `ready_pattern`. For
-    /// plugin-driven tools whose visible chrome is theme/preset configurable
-    /// (OMP: status-line presets omit the pi glyph), the bind is the only
-    /// rendering-independent proof the interactive TUI is up.
+    /// plugin-driven tools whose visible chrome is configurable (Pi: quiet or
+    /// expanded header; OMP: status-line presets omit the pi glyph), the bind
+    /// is the only rendering-independent proof the interactive TUI is up.
     pub launch_ready_on_plugin_bind: bool,
 }
 
@@ -259,8 +259,10 @@ const CODEX_HOOKS: &[&str] = &[
     "codex-sessionstart",
     "codex-userpromptsubmit",
     "codex-pretooluse",
+    "codex-permissionrequest",
     "codex-posttooluse",
     "codex-stop",
+    "codex-interrupt",
 ];
 
 const OPENCODE_HOOKS: &[&str] = &[
@@ -315,6 +317,7 @@ const COPILOT_HOOKS: &[&str] = &[
     "copilot-pretooluse",
     "copilot-permissionrequest",
     "copilot-posttooluse",
+    "copilot-erroroccurred",
     "copilot-posttoolusefailure",
     "copilot-notification",
     "copilot-agentstop",
@@ -424,7 +427,7 @@ const CODEX_HELP_EXTRA_ENV: &[HelpEntry] = &[
     ),
     (
         "HCOM_CODEX_SANDBOX_MODE",
-        "workspace | untrusted | danger-full-access | none",
+        "workspace | danger-full-access | none",
     ),
 ];
 
@@ -579,7 +582,7 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
     status_detail: StatusDetailSpec {
         bash: &["run_shell_command"],
         file: &["write_file", "replace"],
-        delegate: &["delegate_to_agent"],
+        delegate: &["invoke_agent"],
     },
 };
 
@@ -603,7 +606,7 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
         invocation: HookInvocation::JsonStdin,
     },
     // - require_ready_prompt=false: "? for shortcuts" hides in narrow terminals.
-    // - require_prompt_empty=true: VT100 dim detection on the `›` prompt char.
+    // - require_prompt_empty=true: VT100 dim detection after `›` or `»`.
     gates: GatesSpec {
         require_idle: true,
         require_ready_prompt: false,
@@ -629,10 +632,11 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
         unique_examples: CODEX_HELP_EXAMPLES,
         extra_env: CODEX_HELP_EXTRA_ENV,
     },
+    // Codex hooks report every shell/exec tool as `Bash` (HookToolName::bash).
     status_detail: StatusDetailSpec {
-        bash: &["Bash", "execute_command", "shell", "shell_command"],
+        bash: &["Bash"],
         file: &["apply_patch"],
-        delegate: &[],
+        delegate: &["spawn_agent"],
     },
 };
 
@@ -688,9 +692,9 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
         extra_env: &[],
     },
     status_detail: StatusDetailSpec {
-        bash: &[],
-        file: &[],
-        delegate: &[],
+        bash: &["bash", "shell"],
+        file: &["edit", "write", "apply_patch", "patch"],
+        delegate: &["task", "subagent"],
     },
 };
 
@@ -747,9 +751,9 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
         extra_env: &[],
     },
     status_detail: StatusDetailSpec {
-        bash: &[],
-        file: &[],
-        delegate: &[],
+        bash: &["bash", "shell"],
+        file: &["edit", "write", "apply_patch", "patch"],
+        delegate: &["task", "subagent"],
     },
 };
 
@@ -936,7 +940,7 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
     status_detail: StatusDetailSpec {
         bash: &["Bash"],
         file: &["Write", "Edit"],
-        delegate: &["Agent"],
+        delegate: &["Agent", "AgentSwarm"],
     },
 };
 
@@ -949,7 +953,13 @@ pub static PI: IntegrationSpec = IntegrationSpec {
     tui_prefix: "pi  ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"/ commands",
+    // Readiness comes from the hcom extension's bind, not on-screen text.
+    // Pi's header hint differs between the compact ("/ commands"), expanded
+    // ("/ for commands") and quiet-startup (none) headers, and it is drawn
+    // before Pi enables its key/submit handlers. Pi fires session_start (our
+    // bind) from rebindCurrentSession() after those handlers are set up, so
+    // the bind is the earliest point at which the TUI reliably accepts input.
+    ready_pattern: b"",
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -967,7 +977,7 @@ pub static PI: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: false,
         block_on_approval: true,
         launch_requires_ready: true,
-        launch_ready_on_plugin_bind: false,
+        launch_ready_on_plugin_bind: true,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_PI_ARGS"),
@@ -1069,7 +1079,7 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
     status_detail: StatusDetailSpec {
         bash: &["bash"],
         file: &["edit", "write"],
-        delegate: &[],
+        delegate: &["task"],
     },
 };
 

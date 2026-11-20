@@ -26,7 +26,19 @@ pub struct Message {
     pub timestamp: Option<String>,
     pub delivered_to: Option<Vec<String>>,
     pub bundle_id: Option<String>,
-    pub relay: bool,
+    /// `<origin_id>:<SHORT>` for relay-imported messages, None for local ones.
+    pub relay_ref: Option<String>,
+}
+
+impl Message {
+    /// The id a reader passes to `hcom send --reply-to`: the origin reference
+    /// for relayed messages (the local id means nothing on the sender's
+    /// device), the local event id otherwise.
+    pub fn reply_id(&self) -> Option<String> {
+        self.relay_ref
+            .clone()
+            .or_else(|| self.event_id.map(|id| id.to_string()))
+    }
 }
 
 impl HcomDb {
@@ -195,10 +207,11 @@ impl HcomDb {
                     .get("bundle_id")
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let relay = json
-                    .get("_relay")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+                let relay_ref = json.get("_relay").and_then(|relay| {
+                    let id = relay.get("id")?.as_i64()?;
+                    let short = relay.get("short")?.as_str().filter(|s| !s.is_empty())?;
+                    Some(format!("{id}:{short}"))
+                });
 
                 messages.push(Message {
                     from,
@@ -209,7 +222,7 @@ impl HcomDb {
                     timestamp: Some(timestamp.clone()),
                     delivered_to,
                     bundle_id,
-                    relay,
+                    relay_ref,
                 });
             }
         }
@@ -599,9 +612,8 @@ impl HcomDb {
             .unwrap_or(0)
     }
 
-    /// Log a status event to the events table
-    ///
-    /// Used by TranscriptWatcher to log tool:apply_patch, tool:shell, and prompt events.
+    /// Log a bare status event (test fixture for status-driven subscriptions).
+    #[cfg(test)]
     pub fn log_status_event(
         &self,
         instance: &str,

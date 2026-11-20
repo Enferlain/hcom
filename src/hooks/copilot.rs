@@ -23,6 +23,7 @@ const COPILOT_HOOK_COMMANDS: &[(&str, &str, bool, Option<&str>)] = &[
     ("PreToolUse", "copilot-pretooluse", false, None),
     ("PermissionRequest", "copilot-permissionrequest", true, None),
     ("PostToolUse", "copilot-posttooluse", false, None),
+    ("ErrorOccurred", "copilot-erroroccurred", false, None),
     (
         "PostToolUseFailure",
         "copilot-posttoolusefailure",
@@ -440,20 +441,35 @@ fn handle_notification(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     }
 }
 
+fn handle_erroroccurred(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Value {
+    let Some(instance) = resolved_instance(db, ctx, payload) else {
+        return json!({});
+    };
+    let context = payload
+        .raw
+        .get("error_context")
+        .or_else(|| payload.raw.get("errorContext"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let recoverable = payload.raw.get("recoverable").and_then(Value::as_bool);
+    let error_name = payload
+        .raw
+        .pointer("/error/name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    log::log_warn(
+        "hooks",
+        "copilot.error_occurred",
+        &format!(
+            "instance={} context={context} error={error_name} recoverable={recoverable:?}",
+            instance.name
+        ),
+    );
+    json!({})
+}
+
 fn command_looks_safe_hcom(command: &str) -> bool {
-    let trimmed = command.trim();
-    for prefix in ["hcom", "uvx hcom"] {
-        if trimmed == prefix {
-            return true;
-        }
-        for safe in common::SAFE_HCOM_COMMANDS {
-            let expected = format!("{prefix} {safe}");
-            if trimmed == expected || trimmed.starts_with(&format!("{expected} ")) {
-                return true;
-            }
-        }
-    }
-    false
+    common::is_safe_hcom_command(command)
 }
 
 fn handle_permissionrequest(_db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> Value {
@@ -464,7 +480,9 @@ fn handle_permissionrequest(_db: &HcomDb, _ctx: &HcomContext, payload: &HookPayl
         .or_else(|| payload.tool_input.get("script"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    if matches!(payload.tool_name.as_str(), "bash" | "powershell" | "shell")
+    // POSIX shells only: the check parses POSIX quoting, and PowerShell
+    // reads a backslash-escaped `;` as a statement separator.
+    if (payload.tool_name == "bash" || (payload.tool_name == "shell" && !cfg!(windows)))
         && command_looks_safe_hcom(command)
     {
         json!({ "behavior": "allow", "message": "hcom coordination command" })
@@ -489,16 +507,39 @@ fn handle_subagentstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -
     }
 }
 
+/// Only the instance's own session ends it (as in Claude's SessionEnd).
+/// Resolution prefers the process binding, so without this check any session
+/// the Copilot process ends would stop the instance. After `hcom r`, the new,
+/// still-running process sent SessionEnd `user_exit` ~15s in and the resumed
+/// instance was stopped. A PTY-launched instance whose session is not bound
+/// yet is still cleaned up by the PTY wrapper when Copilot exits.
 fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Value {
-    if let Some(instance) = resolved_instance(db, ctx, payload) {
-        let reason = payload
-            .raw
-            .get("reason")
-            .or_else(|| payload.raw.get("stop_reason"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        common::finalize_session(db, &instance.name, reason, None);
+    let Some(instance) = resolve_instance(db, ctx, payload) else {
+        return json!({});
+    };
+    let reason = payload
+        .raw
+        .get("reason")
+        .or_else(|| payload.raw.get("stop_reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let incoming = payload.session_id.as_deref().filter(|sid| !sid.is_empty());
+    if incoming.is_some() && incoming != instance.session_id.as_deref() {
+        log::log_warn(
+            "hooks",
+            "copilot.sessionend_ignored",
+            &format!(
+                "instance={} incoming_session_id={} bound_session_id={} reason={}",
+                instance.name,
+                incoming.unwrap_or(""),
+                instance.session_id.as_deref().unwrap_or(""),
+                reason
+            ),
+        );
+        return json!({});
     }
+    update_position(db, ctx, payload, &instance.name);
+    common::finalize_session(db, &instance.name, reason, None);
     json!({})
 }
 
@@ -554,6 +595,7 @@ pub fn dispatch_copilot_hook_native(hook_name: &str) -> i32 {
                     handle_agentstop(&db, &ctx, &payload)
                 }
                 "copilot-notification" => (handle_notification(&db, &ctx, &payload), None),
+                "copilot-erroroccurred" => (handle_erroroccurred(&db, &ctx, &payload), None),
                 "copilot-subagentstart" => (handle_subagentstart(&db, &ctx, &payload), None),
                 "copilot-sessionend" => (handle_sessionend(&db, &ctx, &payload), None),
                 _ => (json!({}), None),
@@ -631,6 +673,13 @@ mod tests {
                 .any(|hook| hook["command"]
                     == build_copilot_hook_command("copilot-permissionrequest"))
         );
+        assert!(
+            root["hooks"]["ErrorOccurred"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hook| hook["command"] == build_copilot_hook_command("copilot-erroroccurred"))
+        );
     }
 
     #[test]
@@ -639,5 +688,98 @@ mod tests {
         assert!(command_looks_safe_hcom("uvx hcom list --json"));
         assert!(!command_looks_safe_hcom("hcom kill luna"));
         assert!(!command_looks_safe_hcom("echo hcom send @luna"));
+        assert!(command_looks_safe_hcom("hcom"));
+        assert!(command_looks_safe_hcom(
+            "hcom send @luna --name nova -- 'costs $5; fine (really)'"
+        ));
+        assert!(command_looks_safe_hcom(r#"hcom send @luna -- "a; b | c""#));
+        for chained in [
+            "hcom send @luna -- hi; rm -rf ~",
+            "hcom send @luna -- hi && rm -rf ~",
+            "hcom list | sh",
+            "hcom send @luna -- $(cat ~/.ssh/id_rsa)",
+            r#"hcom send @luna -- "$(whoami)""#,
+            "hcom send @luna -- `id`",
+            "hcom list > /tmp/x",
+            "hcom list\nrm -rf ~",
+            "hcom send @luna -- 'unterminated",
+            "hcomx list",
+        ] {
+            assert!(!command_looks_safe_hcom(chained), "{chained}");
+        }
+    }
+
+    #[test]
+    fn permissionrequest_autoapprove_is_posix_shell_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        let env = [("HCOM_PROCESS_ID".to_string(), "proc-x".to_string())]
+            .into_iter()
+            .collect();
+        let ctx = HcomContext::from_env(&env, dir.path().to_path_buf());
+        let request = |tool: &str, command: &str| {
+            handle_permissionrequest(
+                &db,
+                &ctx,
+                &HookPayload::from_copilot_native(
+                    "PermissionRequest",
+                    json!({"toolName": tool, "toolInput": {"command": command}}),
+                ),
+            )
+        };
+        // POSIX bash running one safe hcom command is auto-approved.
+        assert_eq!(
+            request("bash", "hcom send @luna -- hi"),
+            json!({ "behavior": "allow", "message": "hcom coordination command" })
+        );
+        // PowerShell is never POSIX-auto-approved: its quoting and statement
+        // separators are not what the POSIX checker parses, so a safe-looking
+        // script could hide a second command.
+        assert_eq!(request("powershell", "hcom send @luna -- hi"), json!({}));
+        // A chained POSIX command is refused even under bash.
+        assert_eq!(
+            request("bash", "hcom send @luna -- hi; rm -rf ~"),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn sessionend_only_stops_the_instances_own_session() {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        // A resumed instance: launched with the resumed session id and bound
+        // to the new Copilot process.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, session_id)
+                 VALUES ('memo', 'copilot', 'listening', 'ready', 0, 0, 'resumed-sid')",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("proc-new", "resumed-sid", "memo")
+            .unwrap();
+        let env = [("HCOM_PROCESS_ID".to_string(), "proc-new".to_string())]
+            .into_iter()
+            .collect();
+        let ctx = HcomContext::from_env(&env, dir.path().to_path_buf());
+        let end = |sid: &str| {
+            let raw = json!({"sessionId": sid, "reason": "user_exit"});
+            handle_sessionend(
+                &db,
+                &ctx,
+                &HookPayload::from_copilot_native("SessionEnd", raw),
+            )
+        };
+
+        end("startup-sid");
+        let inst = db.get_instance_full("memo").unwrap().unwrap();
+        assert_eq!(inst.session_id.as_deref(), Some("resumed-sid"));
+        assert_eq!(inst.status, "listening");
+
+        end("resumed-sid");
+        assert!(db.get_instance_full("memo").unwrap().is_none());
     }
 }

@@ -165,23 +165,26 @@ impl HcomDb {
             return Err(anyhow::anyhow!("test_injected_migrate_notify_fail"));
         }
 
-        let tx = self.conn.unchecked_transaction()?;
-        // Drop target rows for kinds the source will bring (source wins), keeping
-        // target-only kinds like `plugin`.
-        tx.execute(
-            "DELETE FROM notify_endpoints
-             WHERE instance = ?2
-               AND kind IN (SELECT kind FROM notify_endpoints WHERE instance = ?1)",
-            params![old_name, new_name],
-        )?;
-        // Move the source's (now conflict-free) rows onto the target.
-        tx.execute(
-            "UPDATE notify_endpoints SET instance = ?2 WHERE instance = ?1",
-            params![old_name, new_name],
-        )?;
-        tx.commit()?;
-
-        Ok(())
+        // Use the shared write scope so this helper is safe both as a standalone
+        // operation and while a placeholder/session transfer already owns the
+        // connection transaction. A nested call becomes a savepoint, keeping the
+        // endpoint move in the caller's all-or-nothing ownership transfer.
+        self.with_write_scope(|| {
+            // Drop target rows for kinds the source will bring (source wins), keeping
+            // target-only kinds like `plugin`.
+            self.conn.execute(
+                "DELETE FROM notify_endpoints
+                 WHERE instance = ?2
+                   AND kind IN (SELECT kind FROM notify_endpoints WHERE instance = ?1)",
+                params![old_name, new_name],
+            )?;
+            // Move the source's (now conflict-free) rows onto the target.
+            self.conn.execute(
+                "UPDATE notify_endpoints SET instance = ?2 WHERE instance = ?1",
+                params![old_name, new_name],
+            )?;
+            Ok(())
+        })
     }
 
     /// Get last_event_id for an instance (cursor position for message delivery).
@@ -1251,6 +1254,28 @@ mod tests {
         db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
 
         db.migrate_notify_endpoints("mozi", "fano").unwrap();
+
+        assert_eq!(endpoint_port(&db, "fano", "plugin"), Some(58_898));
+        assert_eq!(endpoint_port(&db, "fano", "pty"), Some(55_568));
+        assert_eq!(endpoint_count_for(&db, "mozi"), 0);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_migrate_notify_endpoints_can_join_outer_transaction() {
+        let (db, db_path) = setup_full_test_db();
+        HcomDb::set_test_migrate_notify_fail(false);
+        db.upsert_notify_endpoint("fano", "plugin", 58_898).unwrap();
+        db.upsert_notify_endpoint("mozi", "pty", 55_568).unwrap();
+
+        // The savepoint-nested merge must join a caller-owned transaction
+        // (the tool-checked identity binding) instead of failing to open its
+        // own transaction inside one.
+        let outer = db.conn().unchecked_transaction().unwrap();
+        db.migrate_notify_endpoints("mozi", "fano").unwrap();
+        outer.commit().unwrap();
 
         assert_eq!(endpoint_port(&db, "fano", "plugin"), Some(58_898));
         assert_eq!(endpoint_port(&db, "fano", "pty"), Some(55_568));

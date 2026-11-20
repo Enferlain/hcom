@@ -293,30 +293,32 @@ fn attribute_disk_match(
     owner
 }
 
-/// Get transcript path for an instance from DB.
-fn get_transcript_path(db: &HcomDb, name: &str) -> Option<String> {
-    db.conn()
-        .query_row(
-            "SELECT transcript_path FROM instances WHERE name = ?",
-            rusqlite::params![name],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten()
-        .filter(|p| !p.is_empty())
-}
-
 /// Build an appropriate error message when transcript resolution fails.
 /// Uses resolve_display_name_or_stopped (which handles exact base and tag-name
 /// resolution) to check if the instance exists without a transcript.
-fn no_transcript_error(db: &HcomDb, name: &str) -> String {
+fn no_transcript_error(
+    db: &HcomDb,
+    name: &str,
+    display_name: &str,
+    device: Option<&str>,
+) -> String {
     if let Some(resolved) = crate::identity::resolve_display_name_or_stopped(db, name) {
+        let display_name = if display_name.is_empty() {
+            &resolved
+        } else {
+            display_name
+        };
+        let command = match device {
+            Some(device) => format!(
+                "hcom events --remote-fetch --device {device} --participant {resolved} --type message"
+            ),
+            None => format!("hcom events --participant {resolved} --type message"),
+        };
         format!(
-            "Agent '{}' has no transcript yet — no messages have been exchanged",
-            resolved
+            "No model transcript is registered for {display_name}.\nView transport messages with: {command}"
         )
     } else {
-        format!("Agent '{name}' not found")
+        format!("Agent '{display_name}' not found")
     }
 }
 
@@ -1149,6 +1151,8 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
                 crate::relay::control::rpc_action::TRANSCRIPT,
                 &json!({
                     "target": base_name,
+                    "display_target": resolved,
+                    "origin_device": device,
                     "last": last_n,
                     "range": args.range_flag.as_ref().or(args.range_positional.as_ref()),
                     "json": json_mode,
@@ -1193,7 +1197,7 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
         match resolved {
             Some(r) => r,
             None => {
-                eprintln!("Error: {}", no_transcript_error(db, name));
+                eprintln!("Error: {}", no_transcript_error(db, name, name, None));
                 return 1;
             }
         }
@@ -1353,6 +1357,8 @@ pub fn render_instance_transcript(
             last_n,
             ..Default::default()
         },
+        name,
+        None,
     )
 }
 
@@ -1376,7 +1382,21 @@ pub fn render_instance_transcript_with_options_no_retry(
             detailed,
             retry_codex: false,
         },
+        name,
+        None,
     )
+}
+
+/// Render a remote transcript while retaining the caller's device-qualified
+/// name in diagnostics.
+pub fn render_remote_instance_transcript_with_options_no_retry(
+    db: &HcomDb,
+    name: &str,
+    display_name: &str,
+    device: &str,
+    opts: &TranscriptRenderOpts<'_>,
+) -> Result<String, String> {
+    render_instance_transcript_impl(db, name, opts, display_name, Some(device))
 }
 
 pub fn render_instance_transcript_with_options(
@@ -1399,6 +1419,8 @@ pub fn render_instance_transcript_with_options(
             detailed,
             retry_codex: true,
         },
+        name,
+        None,
     )
 }
 
@@ -1406,9 +1428,12 @@ fn render_instance_transcript_impl(
     db: &HcomDb,
     name: &str,
     opts: &TranscriptRenderOpts<'_>,
+    display_name: &str,
+    device: Option<&str>,
 ) -> Result<String, String> {
     let (instance_name, transcript_path, agent_type, session_id) =
-        resolve_instance_transcript(db, name).ok_or_else(|| no_transcript_error(db, name))?;
+        resolve_instance_transcript(db, name)
+            .ok_or_else(|| no_transcript_error(db, name, display_name, device))?;
     let (range_start, range_end) = if let Some(r) = opts.range {
         parse_range(r)
     } else {
@@ -1503,48 +1528,86 @@ fn resolve_instance_transcript(
     db: &HcomDb,
     name: &str,
 ) -> Option<(String, String, String, Option<String>)> {
-    let name = crate::identity::resolve_display_name_or_stopped(db, name)
-        .unwrap_or_else(|| name.to_string());
+    // An exact live or stopped identity is authoritative even when it has no
+    // transcript. Only infer a prefix when no exact identity exists; otherwise
+    // a transcript-bearing longer name could disclose the wrong conversation.
+    if let Some(exact_name) = crate::identity::resolve_display_name_or_stopped(db, name) {
+        match db.get_instance_full(&exact_name) {
+            Ok(Some(instance)) => {
+                if !instance.transcript_path.is_empty() {
+                    return Some((
+                        exact_name,
+                        instance.transcript_path,
+                        instance.tool,
+                        instance.session_id,
+                    ));
+                }
 
-    // Direct match
-    if let Some(path) = get_transcript_path(db, &name) {
-        let (tool, sid) = db
-            .conn()
-            .query_row(
-                "SELECT tool, session_id FROM instances WHERE name = ?",
-                rusqlite::params![&name],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
-            .unwrap_or_else(|_| (detect_agent_type(&path).to_string(), None));
-        return Some((name, path, tool, sid));
-    } else if let Ok((tool, sid)) = db.conn().query_row(
-        "SELECT tool, session_id FROM instances WHERE name = ?",
-        rusqlite::params![&name],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-    ) && let Ok(t) = tool.parse::<Tool>()
-        && t != Tool::Hermes
-        && let Some(db_path) = transcript::database_search_path(t)
-    {
-        return Some((name, db_path.to_string_lossy().to_string(), tool, sid));
+                // Preserve the database-backed fallback for OpenCode and Kilo
+                // (and other non-Hermes tools), while Hermes always uses its
+                // tracked profile path to avoid reading an unrelated ambient DB.
+                if let Ok(tool) = instance.tool.parse::<Tool>()
+                    && tool != Tool::Hermes
+                    && let Some(db_path) = transcript::database_search_path(tool)
+                {
+                    return Some((
+                        exact_name,
+                        db_path.to_string_lossy().to_string(),
+                        instance.tool,
+                        instance.session_id,
+                    ));
+                }
+
+                // An exact current identity without a transcript blocks stale
+                // stopped data and all prefix candidates.
+                return None;
+            }
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+
+        // The exact name may be represented only by a stopped life snapshot.
+        // Keep its recorded tool so database-backed stopped sessions select the
+        // correct parser; fall back to path detection for older snapshots.
+        if let Ok((path, sid, tool)) = db.conn().query_row(
+            "SELECT json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.session_id'), json_extract(data, '$.snapshot.tool') FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped' ORDER BY id DESC LIMIT 1",
+            rusqlite::params![&exact_name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)),
+        ) {
+            let agent = tool.unwrap_or_else(|| detect_agent_type(&path).to_string());
+            return Some((exact_name, path, agent, sid));
+        }
+
+        return None;
     }
 
-    // Prefix match
-    if let Ok((matched_name, path, tool, sid)) = db.conn().query_row(
-        "SELECT name, transcript_path, tool, session_id FROM instances WHERE name LIKE ? AND transcript_path IS NOT NULL AND transcript_path != '' LIMIT 1",
-        rusqlite::params![format!("{}%", name)],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?)),
-    ) {
-        return Some((matched_name, path, tool, sid));
-    }
+    // Prefix match is literal and must be unambiguous. Escaping all LIKE
+    // metacharacters prevents '_'/'%'/'\\' in a user prefix from broadening it.
+    let escaped = name
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("{escaped}%");
 
-    // Check stopped events (session_id and tool from snapshot)
-    if let Ok((path, sid, tool)) = db.conn().query_row(
-        "SELECT json_extract(data, '$.snapshot.transcript_path'), json_extract(data, '$.snapshot.session_id'), json_extract(data, '$.snapshot.tool') FROM events WHERE type = 'life' AND instance = ? AND json_extract(data, '$.action') = 'stopped' ORDER BY id DESC LIMIT 1",
-        rusqlite::params![&name],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)),
+    if let Ok(mut stmt) = db.conn().prepare(
+        "SELECT name, transcript_path, tool, session_id FROM instances WHERE name LIKE ?1 ESCAPE '\\' AND transcript_path IS NOT NULL AND transcript_path != '' LIMIT 2",
     ) {
-        let agent = tool.unwrap_or_else(|| detect_agent_type(&path).to_string());
-        return Some((name, path, agent, sid));
+        let rows_res = stmt
+            .query_map(rusqlite::params![pattern], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .and_then(|mapped| mapped.collect::<rusqlite::Result<Vec<_>>>());
+
+        if let Ok(matches) = rows_res
+            && matches.len() == 1
+        {
+            return Some(matches.into_iter().next().unwrap());
+        }
     }
 
     None
@@ -1585,6 +1648,247 @@ mod tests {
         db.init_db().unwrap();
         std::mem::forget(dir);
         db
+    }
+
+    fn insert_test_instance(db: &HcomDb, name: &str, transcript_path: &str, tool: &str) {
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "created_at".into(),
+            json!(crate::shared::time::now_epoch_f64()),
+        );
+        data.insert("tool".into(), json!(tool));
+        data.insert("transcript_path".into(), json!(transcript_path));
+        db.save_instance_named(name, &data).unwrap();
+    }
+
+    #[test]
+    fn known_agent_without_transcript_points_to_transport_history() {
+        let db = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) \
+                 VALUES ('pita', 100.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+
+        let error = no_transcript_error(&db, "pita", "pita", None);
+        assert_eq!(
+            error,
+            "No model transcript is registered for pita.\n\
+View transport messages with: hcom events --participant pita --type message"
+        );
+        assert!(!error.contains("no messages have been exchanged"));
+    }
+
+    #[test]
+    fn remote_agent_without_transcript_queries_its_origin_device() {
+        let db = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) \
+                 VALUES ('pita', 100.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+
+        let error = no_transcript_error(&db, "pita", "pita:ABCD", Some("ABCD"));
+        assert_eq!(
+            error,
+            "No model transcript is registered for pita:ABCD.\n\
+View transport messages with: hcom events --remote-fetch --device ABCD --participant pita --type message"
+        );
+    }
+
+    #[test]
+    fn resolve_instance_transcript_literal_wildcards_and_backslash() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+
+        let testa = dir.path().join("testa1.jsonl");
+        let fooa = dir.path().join("fooa1.jsonl");
+        let slash = dir.path().join("esc_slash.jsonl");
+        fs::write(&testa, "").unwrap();
+        fs::write(&fooa, "").unwrap();
+        fs::write(&slash, "").unwrap();
+        insert_test_instance(&db, "testa1", testa.to_str().unwrap(), "codex");
+        insert_test_instance(&db, "fooa1", fooa.to_str().unwrap(), "codex");
+        insert_test_instance(&db, "esc\\1", slash.to_str().unwrap(), "codex");
+
+        assert_eq!(
+            resolve_instance_transcript(&db, "test_"),
+            None,
+            "literal '_' must not match 'testa1' via SQL LIKE wildcard"
+        );
+        assert_eq!(
+            resolve_instance_transcript(&db, "foo%"),
+            None,
+            "literal '%' must not match 'fooa1' via SQL LIKE wildcard"
+        );
+        assert_eq!(
+            resolve_instance_transcript(&db, "esc\\")
+                .as_ref()
+                .map(|(name, _, _, _)| name.as_str()),
+            Some("esc\\1"),
+            "literal backslash prefix must resolve its literal instance"
+        );
+    }
+
+    #[test]
+    fn resolve_instance_transcript_rejects_ambiguous_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+        let p1 = dir.path().join("ambig_one.jsonl");
+        let p2 = dir.path().join("ambig_two.jsonl");
+        fs::write(&p1, "").unwrap();
+        fs::write(&p2, "").unwrap();
+        insert_test_instance(&db, "ambig_one", p1.to_str().unwrap(), "codex");
+        insert_test_instance(&db, "ambig_two", p2.to_str().unwrap(), "codex");
+
+        assert_eq!(
+            resolve_instance_transcript(&db, "ambig_"),
+            None,
+            "multiple prefix candidates must fail closed"
+        );
+    }
+
+    #[test]
+    fn resolve_instance_transcript_exact_live_identity_blocks_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) \
+                 VALUES ('pico', 1.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+        let longer = dir.path().join("pico_worker.jsonl");
+        fs::write(&longer, "").unwrap();
+        insert_test_instance(&db, "pico_worker", longer.to_str().unwrap(), "codex");
+
+        assert_eq!(
+            resolve_instance_transcript(&db, "pico"),
+            None,
+            "an exact live identity without a transcript must not borrow a prefix match"
+        );
+    }
+
+    #[test]
+    fn resolve_instance_transcript_exact_match_precedes_prefix_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+        let exact = dir.path().join("exact.jsonl");
+        let longer = dir.path().join("exact_one.jsonl");
+        fs::write(&exact, "").unwrap();
+        fs::write(&longer, "").unwrap();
+        insert_test_instance(&db, "exact", exact.to_str().unwrap(), "codex");
+        insert_test_instance(&db, "exact_one", longer.to_str().unwrap(), "codex");
+
+        let resolved = resolve_instance_transcript(&db, "exact").unwrap();
+        assert_eq!(resolved.0, "exact");
+        assert_eq!(resolved.1, exact.to_str().unwrap());
+    }
+
+    #[test]
+    fn resolve_instance_transcript_exact_stopped_precedes_prefix_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+        let active_one = dir.path().join("pico_one.jsonl");
+        let active_two = dir.path().join("pico_two.jsonl");
+        let stopped = dir.path().join("pico_stopped.jsonl");
+        fs::write(&active_one, "").unwrap();
+        fs::write(&active_two, "").unwrap();
+        fs::write(&stopped, "").unwrap();
+        insert_test_instance(&db, "pico_one", active_one.to_str().unwrap(), "codex");
+        insert_test_instance(&db, "pico_two", active_two.to_str().unwrap(), "codex");
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', 'pico', ?2)",
+                rusqlite::params![
+                    "2026-03-27T10:00:00Z",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "transcript_path": stopped.to_str().unwrap(),
+                            "session_id": "sess-pico-stopped",
+                            "tool": "codex"
+                        }
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        let resolved = resolve_instance_transcript(&db, "pico").unwrap();
+        assert_eq!(resolved.0, "pico");
+        assert_eq!(resolved.1, stopped.to_str().unwrap());
+        assert_eq!(resolved.3.as_deref(), Some("sess-pico-stopped"));
+    }
+
+    #[test]
+    fn resolve_instance_transcript_stale_stopped_incarnation_does_not_override_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, transcript_path, tool) \
+                 VALUES ('pico', 1.0, '', 'adhoc')",
+                [],
+            )
+            .unwrap();
+        let stopped = dir.path().join("pico_stopped.jsonl");
+        fs::write(&stopped, "").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', 'pico', ?2)",
+                rusqlite::params![
+                    "2026-03-27T10:00:00Z",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {"transcript_path": stopped.to_str().unwrap()}
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            resolve_instance_transcript(&db, "pico"),
+            None,
+            "a current exact identity must not inherit an older incarnation's transcript"
+        );
+    }
+
+    #[test]
+    fn resolve_instance_transcript_stopped_snapshot_uses_recorded_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+        let stopped = dir.path().join("session.db");
+        fs::write(&stopped, "").unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?1, 'life', 'miso', ?2)",
+                rusqlite::params![
+                    "2026-03-27T10:00:00Z",
+                    json!({
+                        "action": "stopped",
+                        "snapshot": {
+                            "transcript_path": stopped.to_str().unwrap(),
+                            "session_id": "sess-stopped-123",
+                            "tool": "opencode"
+                        }
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        let resolved = resolve_instance_transcript(&db, "miso").unwrap();
+        assert_eq!(resolved.0, "miso");
+        assert_eq!(resolved.1, stopped.to_str().unwrap());
+        assert_eq!(resolved.2, "opencode");
+        assert_eq!(resolved.3.as_deref(), Some("sess-stopped-123"));
     }
 
     #[test]
@@ -2580,7 +2884,7 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(err_empty.contains("no transcript yet"));
+        assert!(err_empty.contains("No model transcript is registered"));
         assert!(!err_empty.contains("Ambient"));
     }
 

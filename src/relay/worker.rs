@@ -9,14 +9,33 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::config::HcomConfig;
 use crate::db::HcomDb;
 use crate::log;
 use crate::relay::client::RelayCommand;
+
+/// Set when the worker exits because a new build was installed: the exiting worker spawns its
+/// successor after its pidfile is gone. Leaving the restart to the next hook left an idle device
+/// without a relay worker.
+static HANDOFF_ON_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// The executable path this worker was started from, captured once before an upgrade can move
+/// or replace the file.
+static INSTALL_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+fn install_path() -> Option<PathBuf> {
+    INSTALL_PATH
+        .get_or_init(|| std::env::current_exe().ok())
+        .clone()
+}
+
+fn request_handoff() {
+    HANDOFF_ON_EXIT.store(true, Ordering::SeqCst);
+}
 
 // ── PID file helpers ────────────────────────────────────────────────
 
@@ -117,7 +136,9 @@ pub fn run() -> i32 {
 
     // Write PID file (guard removes on exit)
     write_pid_file();
-    let _pid_guard = PidFileGuard;
+    let pid_guard = PidFileGuard;
+    // Capture the install path before an upgrade can replace the executable.
+    let _ = install_path();
 
     log::log_info(
         "relay",
@@ -175,6 +196,16 @@ pub fn run() -> i32 {
     }
 
     log::log_info("relay", "relay_worker.stop", "exited cleanly");
+    if HANDOFF_ON_EXIT.load(Ordering::SeqCst) {
+        // The successor refuses to start while this worker's pidfile names a live PID.
+        drop(pid_guard);
+        let spawned = do_spawn_with(install_path());
+        log::log_info(
+            "relay",
+            "relay_worker.handoff",
+            &format!("successor spawned={spawned}"),
+        );
+    }
     0
 }
 
@@ -224,11 +255,28 @@ fn setup_notify_listener(cmd_tx: &std::sync::mpsc::Sender<RelayCommand>) -> Opti
 fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: Arc<AtomicBool>) {
     let mut consecutive_empty = 0u32;
     let mut db = HcomDb::open().ok();
+    // An install replaces the executable file under a running worker. Exit when
+    // that happens so a worker from the new build takes over.
+    let exe_path = install_path();
+    let started_with = exe_path.as_deref().and_then(exe_fingerprint);
 
     loop {
         std::thread::sleep(Duration::from_secs(30));
 
         if shutdown.load(Ordering::Relaxed) {
+            let _ = cmd_tx.send(RelayCommand::Shutdown);
+            return;
+        }
+
+        if let (Some(path), Some(start)) = (exe_path.as_deref(), started_with)
+            && binary_replaced(path, start)
+        {
+            log::log_info(
+                "relay",
+                "relay_worker.binary_changed",
+                "executable replaced; exiting so a worker from the new build takes over",
+            );
+            request_handoff();
             let _ = cmd_tx.send(RelayCommand::Shutdown);
             return;
         }
@@ -270,6 +318,19 @@ fn auto_exit_watchdog(cmd_tx: std::sync::mpsc::Sender<RelayCommand>, shutdown: A
     }
 }
 
+type ExeFingerprint = (u64, std::time::SystemTime);
+
+fn exe_fingerprint(path: &std::path::Path) -> Option<ExeFingerprint> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// True when the file at `path` is no longer the one the worker started from.
+/// A missing file during an atomic swap is not a replacement yet.
+fn binary_replaced(path: &std::path::Path, started_with: ExeFingerprint) -> bool {
+    exe_fingerprint(path).is_some_and(|now| now != started_with)
+}
+
 /// Check if relay is enabled in the current config (non-empty relay_id + relay_enabled flag).
 fn relay_enabled_in_config() -> bool {
     HcomConfig::load(None)
@@ -298,6 +359,11 @@ fn local_instance_count(db: &HcomDb) -> i64 {
 /// Detaches via setsid() so the worker survives terminal close.
 /// Returns true if spawned successfully, false if already running or spawn failed.
 fn do_spawn() -> bool {
+    do_spawn_with(std::env::current_exe().ok())
+}
+
+/// `do_spawn` for a given executable: handoff passes the path captured at start.
+fn do_spawn_with(binary: Option<PathBuf>) -> bool {
     let lock_path = spawn_lock_path();
     if let Some(parent) = lock_path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
@@ -347,9 +413,8 @@ fn do_spawn() -> bool {
         return false;
     }
 
-    let binary = match std::env::current_exe() {
-        Ok(b) => b,
-        Err(_) => return false,
+    let Some(binary) = binary else {
+        return false;
     };
 
     let mut cmd = Command::new(&binary);
@@ -541,6 +606,21 @@ pub fn stop_relay_worker_blocking() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replaced_executable_is_detected_and_a_missing_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("hcom.exe");
+        std::fs::write(&exe, b"old build").unwrap();
+        let start = exe_fingerprint(&exe).unwrap();
+        assert!(!binary_replaced(&exe, start));
+
+        std::fs::rename(&exe, dir.path().join("hcom.exe.pre-old")).unwrap();
+        assert!(!binary_replaced(&exe, start));
+
+        std::fs::write(&exe, b"the new, longer build").unwrap();
+        assert!(binary_replaced(&exe, start));
+    }
 
     #[test]
     fn test_pid_file_path() {

@@ -220,13 +220,60 @@ pub fn get_rpc_result(db: &HcomDb, request_id: &str) -> Option<Value> {
     serde_json::from_str(&data).ok()
 }
 
+/// Return an RPC answer carried by a particular remote device.
+///
+/// RPC control traffic is broadcast to every relay peer. The request id is
+/// normally unique, but it is not an authentication boundary: a stale or
+/// malicious answer from another peer must not shadow the answer for the
+/// device whose gap is being recovered.
+pub(crate) fn get_rpc_result_for_device(
+    db: &HcomDb,
+    request_id: &str,
+    device_id: &str,
+) -> Option<Value> {
+    let data: String = db
+        .conn()
+        .query_row(
+            "SELECT data FROM events
+             WHERE type = 'rpc_result'
+             AND json_extract(data, '$.request_id') = ?1
+             AND json_extract(data, '$._relay.device') = ?2
+             AND json_extract(data, '$.action') = 'events'
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![request_id, device_id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    serde_json::from_str(&data).ok()
+}
+
 fn delete_rpc_result(db: &HcomDb, request_id: &str) {
+    let _ = delete_rpc_result_checked(db, request_id);
+}
+
+pub(crate) fn delete_rpc_result_checked(db: &HcomDb, request_id: &str) -> anyhow::Result<()> {
     // rpc_result rows are single-use rendezvous points. Deleting on consume prevents
     // accumulation and keeps _rpc events out of the push loop entirely.
-    let _ = db.conn().execute(
+    db.conn().execute(
         "DELETE FROM events WHERE type = 'rpc_result' AND json_extract(data, '$.request_id') = ?",
         rusqlite::params![request_id],
-    );
+    )?;
+    Ok(())
+}
+
+pub(crate) fn delete_rpc_result_checked_for_device(
+    db: &HcomDb,
+    request_id: &str,
+    device_id: &str,
+) -> anyhow::Result<()> {
+    db.conn().execute(
+        "DELETE FROM events
+         WHERE type = 'rpc_result'
+           AND json_extract(data, '$.request_id') = ?1
+           AND json_extract(data, '$._relay.device') = ?2",
+        rusqlite::params![request_id, device_id],
+    )?;
+    Ok(())
 }
 
 pub fn wait_for_rpc_result_with_db(
@@ -572,6 +619,23 @@ fn check_remote_action_for_db(
     }
 }
 
+/// Whether a peer can take `action` right now, without waiting: `Some(true)`
+/// yes, `Some(false)` never (it advertises capabilities without the action),
+/// `None` not yet (offline, or its capabilities have not synced).
+pub(crate) fn peer_accepts_action(
+    db: &HcomDb,
+    target_device_short_id: &str,
+    action: &str,
+) -> Option<bool> {
+    match read_remote_capabilities(db, target_device_short_id) {
+        Ok(CachedCapabilities::Advertised(capabilities)) => {
+            Some(capabilities.iter().any(|cap| cap == action))
+        }
+        Ok(CachedCapabilities::Legacy) => Some(true),
+        Ok(CachedCapabilities::Stale(_)) | Ok(CachedCapabilities::NotSynced) | Err(_) => None,
+    }
+}
+
 fn ensure_remote_action_supported(
     db: &HcomDb,
     target_device_short_id: &str,
@@ -610,12 +674,18 @@ fn emit_rpc_result(
     ok: bool,
     result: &serde_json::Value,
 ) {
-    let data = json!({
+    let mut data = json!({
         "request_id": request_id,
         "action": action,
         "ok": ok,
         "result": result,
     });
+    // A bounded events answer may contain a cut copy of one event. Carry the
+    // marker on the rpc_result itself so the backfill importer can refuse the
+    // partial row before it is treated as recovered.
+    if let Some(marker) = result.get("_relay_truncated") {
+        data["_relay_truncated"] = marker.clone();
+    }
     let _ = db.log_event("rpc_result", "_rpc", &data);
 }
 
@@ -987,9 +1057,28 @@ fn handle_remote_transcript(
     let json_mode = bool_param(params, "json", false);
     let full_mode = bool_param(params, "full", false);
     let detailed = bool_param(params, "detailed", false);
-    let content = crate::commands::transcript::render_instance_transcript_with_options_no_retry(
-        db, target, range, last_n, json_mode, full_mode, detailed,
-    )?;
+    let display_target = optional_param(params, "display_target").unwrap_or(target);
+    let content = match optional_param(params, "origin_device") {
+        Some(device) => {
+            crate::commands::transcript::render_remote_instance_transcript_with_options_no_retry(
+                db,
+                target,
+                display_target,
+                device,
+                &crate::commands::transcript::TranscriptRenderOpts {
+                    range,
+                    last_n,
+                    json_mode,
+                    full_mode,
+                    detailed,
+                    retry_codex: false,
+                },
+            )?
+        }
+        None => crate::commands::transcript::render_instance_transcript_with_options_no_retry(
+            db, target, range, last_n, json_mode, full_mode, detailed,
+        )?,
+    };
     Ok(json!({"target": target, "content": content}))
 }
 
@@ -997,6 +1086,10 @@ const REMOTE_EVENTS_HARD_CAP: usize = 2000;
 // Cap RPC response below the rumqttc client's 128 KiB accept limit
 // (src/relay/client.rs), leaving room for envelope + AEAD overhead.
 const REMOTE_EVENTS_BYTE_CAP: usize = 98_304;
+// The backfill worker's one-event request uses this widest budget. At or above
+// it, an oversized event may be sent as an explicitly marked cut copy so the
+// requester can shrink its normal batch budget rather than dropping the event.
+const REMOTE_EVENTS_WIDEST_EVENT_BYTES: usize = 96 * 1024;
 
 fn handle_remote_events(
     db: &HcomDb,
@@ -1011,6 +1104,11 @@ fn handle_remote_events(
         _ => crate::core::filters::FilterMap::new(),
     };
     let sql = optional_param(params, "sql").map(|s| s.to_string());
+    // Catch-up callers request a smaller envelope so the answer can share the
+    // peer's retained state snapshot. Never allow a caller to exceed the hard
+    // cap used by the normal RPC path.
+    let byte_cap = usize_param(params, "max_bytes", REMOTE_EVENTS_BYTE_CAP)
+        .clamp(1024, REMOTE_EVENTS_BYTE_CAP);
     let mut last_n = usize_param(params, "last", 20);
     if last_n == 0 {
         last_n = 20;
@@ -1078,12 +1176,27 @@ fn handle_remote_events(
         }
         out
     };
+    let mut cut_marker: Option<Value> = None;
     let mut out = build_envelope(&events, truncated);
     let mut serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
-    while serialized_len > REMOTE_EVENTS_BYTE_CAP && !events.is_empty() {
-        events.pop();
+    while serialized_len > byte_cap && !events.is_empty() {
+        if events.len() == 1
+            && byte_cap >= REMOTE_EVENTS_WIDEST_EVENT_BYTES
+            && super::push::shrink_level(&events[0]) < super::push::SHRINK_LAST_LEVEL
+        {
+            // A single event larger than the widest budget cannot be returned
+            // intact. Send an explicitly marked cut copy so the requester can
+            // retry with its wide budget instead of silently abandoning it.
+            super::push::shrink_event(&mut events[0]);
+            cut_marker = events[0]["data"].get("_relay_truncated").cloned();
+        } else {
+            events.pop();
+        }
         truncated = true;
         out = build_envelope(&events, truncated);
+        if let Some(marker) = &cut_marker {
+            out["_relay_truncated"] = marker.clone();
+        }
         serialized_len = serde_json::to_string(&out).map(|s| s.len()).unwrap_or(0);
     }
     Ok(out)
@@ -1946,6 +2059,98 @@ mod tests {
             envelope_len <= REMOTE_EVENTS_BYTE_CAP,
             "envelope {envelope_len} bytes exceeds cap"
         );
+    }
+
+    #[test]
+    fn test_handle_remote_events_honours_a_smaller_byte_budget() {
+        let db = test_db();
+        let big = "x".repeat(8_000);
+        for _ in 0..20 {
+            db.log_event("message", "luna", &json!({"blob": big}))
+                .unwrap();
+        }
+        let out = handle_remote_events(
+            &db,
+            &json!({"last": 20, "max_bytes": 32 * 1024}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out["truncated"].as_bool(), Some(true));
+        let envelope_len = serde_json::to_string(&out).unwrap().len();
+        assert!(envelope_len <= 32 * 1024, "envelope {envelope_len} bytes");
+        let ids: Vec<i64> = out["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_i64().unwrap())
+            .collect();
+        assert!(ids.windows(2).all(|w| w[0] > w[1]), "{ids:?}");
+
+        let out = handle_remote_events(
+            &db,
+            &json!({"last": 20, "max_bytes": 10_000_000}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert!(serde_json::to_string(&out).unwrap().len() <= REMOTE_EVENTS_BYTE_CAP);
+    }
+
+    #[test]
+    fn test_handle_remote_events_sends_a_cut_copy_of_one_event_larger_than_the_budget() {
+        let db = test_db();
+        db.log_event(
+            "message",
+            "luna",
+            &json!({"from": "luna", "text": "x".repeat(100_000)}),
+        )
+        .unwrap();
+        let out = handle_remote_events(
+            &db,
+            &json!({"last": 1, "max_bytes": REMOTE_EVENTS_WIDEST_EVENT_BYTES}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        let events = out["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1, "a cut copy, not an empty answer");
+        assert_eq!(out["truncated"].as_bool(), Some(true));
+        assert_eq!(events[0]["data"]["from"], "luna");
+        assert_eq!(events[0]["data"]["_relay_truncated"]["level"], 1);
+        assert_eq!(out["_relay_truncated"]["level"], 1);
+        assert!(serde_json::to_string(&out).unwrap().len() <= REMOTE_EVENTS_BYTE_CAP);
+    }
+
+    #[test]
+    fn test_handle_remote_events_below_the_widest_budget_never_cuts_an_event() {
+        let db = test_db();
+        db.log_event(
+            "message",
+            "luna",
+            &json!({"from": "luna", "text": "y".repeat(50_000)}),
+        )
+        .unwrap();
+        let narrow = handle_remote_events(
+            &db,
+            &json!({"last": 1, "max_bytes": 32 * 1024}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(narrow["events"].as_array().unwrap().len(), 0);
+        assert_eq!(narrow["truncated"].as_bool(), Some(true));
+        let wide = handle_remote_events(
+            &db,
+            &json!({"last": 1, "max_bytes": REMOTE_EVENTS_BYTE_CAP}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        let events = wide["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0]["data"].get("_relay_truncated").is_none());
+        assert_eq!(events[0]["data"]["text"].as_str().unwrap().len(), 50_000);
     }
 
     #[test]

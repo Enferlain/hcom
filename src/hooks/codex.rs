@@ -27,20 +27,34 @@ use crate::instances;
 use crate::log;
 use crate::paths;
 use crate::shared::context::HcomContext;
-use crate::shared::{ST_ACTIVE, ST_LISTENING};
+use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_LISTENING};
 
 use super::common::SAFE_HCOM_COMMANDS;
 
+// `fork` is its own SessionStart source since Codex 0.155 (earlier releases
+// reported forks as `startup`); without it a forked session never binds hooks.
+//
+// PermissionRequest fires for every tool that asks for approval, so PostToolUse
+// must match every tool too, or an approved apply_patch/MCP call would leave the
+// row blocked until the next shell call. PreToolUse only feeds status detail.
+// A denied or aborted approval skips PostToolUse; Stop, Interrupt, and the next
+// PreToolUse clear it instead.
 const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     (
         "SessionStart",
         "codex-sessionstart",
-        Some("startup|resume|clear"),
+        Some("startup|resume|clear|fork"),
     ),
     ("UserPromptSubmit", "codex-userpromptsubmit", None),
-    ("PreToolUse", "codex-pretooluse", Some("Bash")),
-    ("PostToolUse", "codex-posttooluse", Some("Bash")),
+    (
+        "PreToolUse",
+        "codex-pretooluse",
+        Some("Bash|apply_patch|spawn_agent"),
+    ),
+    ("PermissionRequest", "codex-permissionrequest", None),
+    ("PostToolUse", "codex-posttooluse", None),
     ("Stop", "codex-stop", None),
+    ("Interrupt", "codex-interrupt", None),
 ];
 const HCOM_TOOL_NAMES: &[&str] = &[
     "claude",
@@ -81,6 +95,7 @@ const CODEX_ALL_HOOK_EVENTS: &[&str] = &[
     "SubagentStart",
     "SubagentStop",
     "Stop",
+    "Interrupt",
 ];
 /// Subdirectories of `$CODEX_HOME/plugins` that hold installed plugins
 /// (codex-rs/core-plugins/src/store.rs:21-22).
@@ -513,15 +528,13 @@ fn update_codex_position(
     }
 }
 
-/// Prepare pending messages for a Codex instance.
-///
-/// Only additionalContext — no systemMessage. Codex TUI renders both
-/// as separate visible lines ("warning:" + "hook context:"), causing
-/// double output for every delivered message.
+/// Show the delivery in the TUI while also giving it to the model.
+/// Codex renders systemMessage as hook output and keeps additionalContext
+/// out of the TUI; only additionalContext enters model context.
 fn prepare_codex_delivery(db: &HcomDb, instance_name: &str) -> Option<HookResult> {
     common::prepare_pending_messages(db, instance_name).map(|prepared| HookResult::Allow {
+        system_message: Some(prepared.formatted.clone()),
         additional_context: Some(prepared.formatted),
-        system_message: None,
         delivery_ack: Some(prepared.ack),
     })
 }
@@ -577,8 +590,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     crate::relay::worker::ensure_worker(true);
     common::notify_hook_instance_with_db(db, &instance_name);
 
-    // Bootstrap is injected at launch time via developer_instructions flag,
-    // not here — Codex TUI renders hook output visibly ("hook context:").
+    // Bootstrap is injected at launch time via developer_instructions flag.
     hook_noop()
 }
 
@@ -598,14 +610,142 @@ fn handle_pretooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> H
         None => return hook_noop(),
     };
 
-    common::update_tool_status(
-        db,
-        &instance.name,
-        "codex",
-        &payload.tool_name,
-        &payload.tool_input,
-    );
+    update_pretool_status(db, &instance, payload);
     hook_noop()
+}
+
+// Use the caller's snapshot when releasing an older approval. A request that
+// arrives after an active snapshot must remain blocked at write time.
+fn update_pretool_status(db: &HcomDb, instance: &InstanceRow, payload: &HookPayload) -> bool {
+    let applied = if is_approval_block(instance) {
+        let detail = family::extract_tool_detail("codex", &payload.tool_name, &payload.tool_input);
+        lifecycle::resolve_approval_status(
+            db,
+            instance,
+            ST_ACTIVE,
+            &format!("tool:{}", payload.tool_name),
+            lifecycle::StatusUpdate {
+                detail: &detail,
+                ..Default::default()
+            },
+        )
+    } else {
+        common::update_tool_status_unless_approval(
+            db,
+            &instance.name,
+            "codex",
+            &payload.tool_name,
+            &payload.tool_input,
+        )
+    };
+    // The row holds one detail (the first file); log the rest of a multi-file
+    // patch too so collision detection sees every file it writes.
+    if applied && payload.tool_name == "apply_patch" {
+        for file in family::patch_files(&payload.tool_input).iter().skip(1) {
+            lifecycle::emit_status_event(
+                db,
+                &instance.name,
+                Some(instance),
+                ST_ACTIVE,
+                "tool:apply_patch",
+                file,
+                "",
+                "apply_patch",
+                "",
+                std::panic::Location::caller(),
+            );
+        }
+    }
+    applied
+}
+
+/// Approval blocks set by PermissionRequest or by the PTY's approval scrape.
+fn is_approval_block(instance: &InstanceRow) -> bool {
+    instance.status == ST_BLOCKED
+        && matches!(
+            instance.status_context.as_str(),
+            "approval" | "pty:approval"
+        )
+}
+
+/// Observe an approval prompt without deciding it: no output means Codex falls
+/// through to its reviewer or the user.
+fn handle_permissionrequest(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+    let instance = match resolve_and_update_codex_instance(db, ctx, payload) {
+        Some(instance) => instance,
+        None => return hook_noop(),
+    };
+
+    // Record a unique owner plus tool parameters so unrelated completions cannot
+    // release this request. Read the PTY context under the same write lock.
+    let owner = format!(
+        "codex:{}",
+        serde_json::json!({
+            "tool": approval_tool_fingerprint(payload),
+            "request": uuid::Uuid::new_v4().to_string(),
+        })
+    );
+    let detail = family::extract_tool_detail("codex", &payload.tool_name, &payload.tool_input);
+    let result = db.with_write_scope(|| {
+        let current = db
+            .get_instance_full(&instance.name)?
+            .ok_or_else(|| anyhow::anyhow!("Codex instance disappeared"))?;
+        let context = if current.status == ST_BLOCKED && current.status_context == "pty:approval" {
+            "pty:approval"
+        } else {
+            "approval"
+        };
+        let updates = serde_json::Map::from_iter([(
+            "pending_tool_use_id".to_string(),
+            Value::String(owner.clone()),
+        )]);
+        db.update_instance_fields(&instance.name, &updates)?;
+        lifecycle::set_status_checked(
+            db,
+            &instance.name,
+            ST_BLOCKED,
+            context,
+            lifecycle::StatusUpdate {
+                detail: &detail,
+                tool_name: &payload.tool_name,
+                tool_use_id: &owner,
+                ..Default::default()
+            },
+        )
+    });
+    match result {
+        Ok(()) => crate::notify::wake(db, &instance.name, crate::notify::WakeKind::DELIVERY_LOOPS),
+        Err(error) => log::log_warn("hooks", "codex.permission_status", &format!("{error}")),
+    }
+    hook_noop()
+}
+
+fn approval_tool_fingerprint(payload: &HookPayload) -> String {
+    use sha2::{Digest, Sha256};
+    let tool = serde_json::json!({"name": payload.tool_name, "input": payload.tool_input});
+    // Keep approval owners bounded even for large patches; do not duplicate
+    // complete tool arguments in the persisted status-event owner field.
+    Sha256::digest(tool.to_string().as_bytes()).iter().fold(
+        String::with_capacity(64),
+        |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(&mut hex, "{byte:02x}");
+            hex
+        },
+    )
+}
+
+fn approval_matches_tool(instance: &InstanceRow, payload: &HookPayload) -> bool {
+    let Some(owner) = instance.pending_tool_use_id.strip_prefix("codex:") else {
+        // PTY-only and legacy approvals have no native tool attribution.
+        return instance.pending_tool_use_id.is_empty();
+    };
+    serde_json::from_str::<Value>(owner)
+        .ok()
+        .is_some_and(|owner| {
+            owner.get("tool").and_then(Value::as_str)
+                == Some(approval_tool_fingerprint(payload).as_str())
+        })
 }
 
 fn handle_posttooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
@@ -613,6 +753,19 @@ fn handle_posttooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
         Some(instance) => instance,
         None => return hook_noop(),
     };
+
+    if is_approval_block(&instance) && approval_matches_tool(&instance, payload) {
+        lifecycle::resolve_approval_status(
+            db,
+            &instance,
+            ST_ACTIVE,
+            &format!("approved:{}", payload.tool_name),
+            lifecycle::StatusUpdate {
+                tool_name: &payload.tool_name,
+                ..Default::default()
+            },
+        );
+    }
 
     prepare_codex_delivery(db, &instance.name).unwrap_or_else(hook_noop)
 }
@@ -628,13 +781,33 @@ fn handle_stop(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookRes
     hook_noop()
 }
 
+/// Esc (or an aborted approval) ends the turn without Stop.
+fn handle_interrupt(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+    let instance = match resolve_and_update_codex_instance(db, ctx, payload) {
+        Some(instance) => instance,
+        None => return hook_noop(),
+    };
+
+    lifecycle::set_status(
+        db,
+        &instance.name,
+        ST_LISTENING,
+        "interrupted",
+        Default::default(),
+    );
+    common::notify_hook_instance_with_db(db, &instance.name);
+    hook_noop()
+}
+
 fn get_codex_handler(hook_name: &str) -> Option<CodexHookHandler> {
     match hook_name {
         "codex-sessionstart" => Some(handle_sessionstart),
         "codex-userpromptsubmit" => Some(handle_userpromptsubmit),
         "codex-pretooluse" => Some(handle_pretooluse),
+        "codex-permissionrequest" => Some(handle_permissionrequest),
         "codex-posttooluse" => Some(handle_posttooluse),
         "codex-stop" => Some(handle_stop),
+        "codex-interrupt" => Some(handle_interrupt),
         _ => None,
     }
 }
@@ -676,7 +849,7 @@ fn dispatch_result_to_stdout(db: &HcomDb, hook_name: &str, result: HookResult) -
             }
             0
         }
-        HookResult::Block { reason } => {
+        HookResult::Block { reason, .. } => {
             // Codex hooks on exit 2 read the reason from stderr, not stdout.
             let _ = std::io::stderr().lock().write_all(reason.as_bytes());
             2
@@ -763,17 +936,29 @@ fn codex_config_dir() -> PathBuf {
 
 /// Get path to Codex config.toml.
 pub fn get_codex_config_path() -> PathBuf {
-    codex_config_dir().join("config.toml")
+    codex_config_path_at(&codex_config_dir())
 }
 
 /// Get path to Codex hooks.json.
 pub fn get_codex_hooks_path() -> PathBuf {
-    codex_config_dir().join("hooks.json")
+    codex_hooks_path_at(&codex_config_dir())
 }
 
 /// Get path to Codex execpolicy rules directory.
 pub fn get_codex_rules_path() -> PathBuf {
-    codex_config_dir().join("rules")
+    codex_rules_path_at(&codex_config_dir())
+}
+
+fn codex_config_path_at(codex_home: &Path) -> PathBuf {
+    codex_home.join("config.toml")
+}
+
+fn codex_hooks_path_at(codex_home: &Path) -> PathBuf {
+    codex_home.join("hooks.json")
+}
+
+fn codex_rules_path_at(codex_home: &Path) -> PathBuf {
+    codex_home.join("rules")
 }
 
 /// Strip a Windows verbatim prefix and collapse `.`/`..` components.
@@ -1046,6 +1231,7 @@ fn codex_hook_event_state_label(event: &str) -> &'static str {
         "SessionStart" => "session_start",
         "UserPromptSubmit" => "user_prompt_submit",
         "Stop" => "stop",
+        "Interrupt" => "interrupt",
         _ => "unknown",
     }
 }
@@ -1377,7 +1563,7 @@ fn test_hook_list_from_hooks_json(hooks_path: &Path) -> Result<Vec<CodexHookList
         .collect())
 }
 
-fn fetch_codex_hook_list(cwd: &Path) -> Result<Vec<CodexHookListEntry>, String> {
+fn fetch_codex_hook_list(cwd: &Path, codex_home: &Path) -> Result<Vec<CodexHookListEntry>, String> {
     #[cfg(test)]
     {
         let _ = cwd;
@@ -1388,13 +1574,14 @@ fn fetch_codex_hook_list(cwd: &Path) -> Result<Vec<CodexHookListEntry>, String> 
             let json: Value = serde_json::from_str(&value).map_err(|e| e.to_string())?;
             return parse_codex_hook_list_entries(&json);
         }
-        test_hook_list_from_hooks_json(&get_codex_hooks_path())
+        test_hook_list_from_hooks_json(&codex_hooks_path_at(codex_home))
     }
 
     #[cfg(not(test))]
     {
         let mut child = crate::terminal::executable_command("codex")
             .args(["app-server", "--listen", "stdio://"])
+            .env("CODEX_HOME", codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1461,9 +1648,12 @@ fn fetch_codex_hook_list(cwd: &Path) -> Result<Vec<CodexHookListEntry>, String> 
     }
 }
 
-fn fetch_codex_hcom_hook_entries(cwd: &Path) -> Result<Vec<CodexHookTrustEntry>, String> {
-    let entries = fetch_codex_hook_list(cwd)?;
-    hcom_trust_entries_from_hook_list(&entries, &get_codex_hooks_path())
+fn fetch_codex_hcom_hook_entries(
+    cwd: &Path,
+    codex_home: &Path,
+) -> Result<Vec<CodexHookTrustEntry>, String> {
+    let entries = fetch_codex_hook_list(cwd, codex_home)?;
+    hcom_trust_entries_from_hook_list(&entries, &codex_hooks_path_at(codex_home))
 }
 
 #[cfg(not(test))]
@@ -1729,13 +1919,14 @@ fn write_hcom_hook_trust_state(
 fn write_hcom_trust_state_from_hook_list(
     hook_list: &[CodexHookListEntry],
     codex_cli_version: &str,
+    codex_home: &Path,
 ) -> Result<(), String> {
-    let hooks_path = get_codex_hooks_path();
+    let hooks_path = codex_hooks_path_at(codex_home);
     let entries = hcom_trust_entries_from_hook_list(hook_list, &hooks_path)?;
     let definition_hashes =
         hcom_hook_definition_hashes_from_hooks_path(&hooks_path).map_err(|e| e.to_string())?;
     write_hcom_hook_trust_state(
-        &get_codex_config_path(),
+        &codex_config_path_at(codex_home),
         &hooks_path,
         &entries,
         &HashSet::new(),
@@ -1750,7 +1941,15 @@ fn write_hcom_trust_state_from_hook_list(
 /// Exact trust state is always preferred; the invocation-wide bypass flag is a
 /// last resort and is only permitted when hcom can show that nothing but its own
 /// hooks would be unlocked by it.
+#[allow(dead_code)]
 pub(crate) fn resolve_codex_hook_trust_state(launch_dir: &Path) -> CodexHookTrustState {
+    resolve_codex_hook_trust_state_at(launch_dir, &codex_config_dir())
+}
+
+pub(crate) fn resolve_codex_hook_trust_state_at(
+    launch_dir: &Path,
+    codex_home: &Path,
+) -> CodexHookTrustState {
     let codex_cli_version = match codex_hook_trust_version() {
         // Codex predates the trust gate — nothing is holding hcom's hooks back.
         Ok(None) => return CodexHookTrustState::Trusted,
@@ -1771,10 +1970,19 @@ pub(crate) fn resolve_codex_hook_trust_state(launch_dir: &Path) -> CodexHookTrus
         // This is the launch-time guardrail. Cheap status/verify paths only
         // inspect local metadata, but before opening Codex we ask Codex for
         // authoritative currentHash values and rewrite hcom's trust entries.
-        match fetch_codex_hook_list(launch_dir) {
+        match fetch_codex_hook_list(launch_dir, codex_home) {
             Ok(hook_list) => {
-                match write_hcom_trust_state_from_hook_list(&hook_list, &codex_cli_version) {
-                    Ok(()) if codex_hcom_hooks_trusted_locally_for_version(&codex_cli_version) => {
+                match write_hcom_trust_state_from_hook_list(
+                    &hook_list,
+                    &codex_cli_version,
+                    codex_home,
+                ) {
+                    Ok(())
+                        if codex_hcom_hooks_trusted_locally_for_version(
+                            &codex_cli_version,
+                            codex_home,
+                        ) =>
+                    {
                         return CodexHookTrustState::Trusted;
                     }
                     Ok(()) => log::log_warn(
@@ -1792,7 +2000,8 @@ pub(crate) fn resolve_codex_hook_trust_state(launch_dir: &Path) -> CodexHookTrus
                 // Self-heal did not land, but Codex just reported every hook it
                 // can see along with its trust status, so the bypass can be
                 // judged precisely instead of guessed at.
-                let foreign = foreign_hooks_unlocked_by_bypass(&hook_list, &get_codex_hooks_path());
+                let foreign =
+                    foreign_hooks_unlocked_by_bypass(&hook_list, &codex_hooks_path_at(codex_home));
                 return if foreign.is_empty() {
                     CodexHookTrustState::BypassSafeFromHooksList
                 } else {
@@ -1813,7 +2022,7 @@ pub(crate) fn resolve_codex_hook_trust_state(launch_dir: &Path) -> CodexHookTrus
                 // Worth its own step because a flaky or slow app-server is the
                 // ordinary failure here, and it must not turn every launch into
                 // a false alarm.
-                if codex_hcom_hooks_trusted_locally_for_version(&codex_cli_version) {
+                if codex_hcom_hooks_trusted_locally_for_version(&codex_cli_version, codex_home) {
                     log::log_warn(
                         "codex",
                         "codex.hook_list_unavailable_state_exact",
@@ -1836,7 +2045,7 @@ pub(crate) fn resolve_codex_hook_trust_state(launch_dir: &Path) -> CodexHookTrus
 
     // Blind mode: no authoritative inventory. Only bypass when a purely local
     // scan proves that nothing but hcom's own hooks could be in scope.
-    match scan_local_codex_hook_definitions(launch_dir) {
+    match scan_local_codex_hook_definitions(launch_dir, codex_home) {
         Ok(foreign) if foreign.is_empty() => CodexHookTrustState::BypassSafeFromLocalScan,
         Ok(foreign) => CodexHookTrustState::BypassUnsafe {
             reason: format!(
@@ -1865,27 +2074,29 @@ pub(crate) fn resolve_codex_hook_trust_state(launch_dir: &Path) -> CodexHookTrus
 /// hcom writes exactly one hooks file, so only handlers in that file with a
 /// command hcom installs are hcom's; everything found anywhere else is foreign.
 /// `Err` means the scan could not be completed and the caller must fail closed.
-fn scan_local_codex_hook_definitions(launch_dir: &Path) -> Result<Vec<String>, String> {
-    let codex_home = codex_config_dir();
-    let hcom_hooks_path = get_codex_hooks_path();
+fn scan_local_codex_hook_definitions(
+    launch_dir: &Path,
+    codex_home: &Path,
+) -> Result<Vec<String>, String> {
+    let hcom_hooks_path = codex_hooks_path_at(codex_home);
     let expected = expected_hcom_hook_commands();
     let mut foreign = Vec::new();
 
     collect_foreign_hooks_from_hooks_json(&hcom_hooks_path, &expected, true, &mut foreign)?;
-    let user_config_path = codex_home.join("config.toml");
+    let user_config_path = codex_config_path_at(codex_home);
     let user_config = read_toml_value_if_present(&user_config_path)?;
     if let Some(config) = user_config.as_ref() {
         collect_foreign_hooks_from_config_toml(&user_config_path, config, &expected, &mut foreign)?;
         note_declared_plugins(&user_config_path, config, &mut foreign);
     }
-    note_possible_plugin_hooks(&codex_home, &mut foreign);
+    note_possible_plugin_hooks(codex_home, &mut foreign);
 
     let markers = codex_project_root_markers(user_config.as_ref())?;
     for dir in codex_project_layer_dirs(launch_dir, &markers)? {
         let dot_codex = dir.join(".codex");
         // Codex skips a project `.codex` that resolves to CODEX_HOME itself
         // (codex-rs/config/src/loader/mod.rs:1256-1259).
-        if paths_equivalent(&dot_codex, &codex_home) || !dot_codex.is_dir() {
+        if paths_equivalent(&dot_codex, codex_home) || !dot_codex.is_dir() {
             continue;
         }
         collect_foreign_hooks_from_hooks_json(
@@ -2084,8 +2295,11 @@ fn note_possible_plugin_hooks(codex_home: &Path, out: &mut Vec<String>) {
     }
 }
 
-fn codex_hcom_hooks_trusted_locally_for_version(codex_cli_version: &str) -> bool {
-    let hooks_path = get_codex_hooks_path();
+fn codex_hcom_hooks_trusted_locally_for_version(
+    codex_cli_version: &str,
+    codex_home: &Path,
+) -> bool {
+    let hooks_path = codex_hooks_path_at(codex_home);
     let hooks_content = match std::fs::read_to_string(&hooks_path) {
         Ok(content) => content,
         Err(_) => return false,
@@ -2108,7 +2322,7 @@ fn codex_hcom_hooks_trusted_locally_for_version(codex_cli_version: &str) -> bool
     let keys: HashSet<String> = entries.into_iter().map(|entry| entry.key).collect();
 
     codex_hcom_hook_keys_trusted_for_version(
-        &get_codex_config_path(),
+        &codex_config_path_at(codex_home),
         &keys,
         codex_cli_version,
         &definition_hashes,
@@ -2380,7 +2594,11 @@ fn codex_feature_enabled(config_path: &Path, feature_key: CodexHooksFeatureKey) 
 /// Codex warns if the deprecated key is present at all, even when `hooks` is
 /// also enabled, so treat that mixed state as not current.
 pub(crate) fn codex_current_feature_enabled() -> bool {
-    let config_path = get_codex_config_path();
+    codex_current_feature_enabled_at(&codex_config_dir())
+}
+
+pub(crate) fn codex_current_feature_enabled_at(codex_home: &Path) -> bool {
+    let config_path = codex_config_path_at(codex_home);
     let feature_key = detect_codex_hooks_feature_key();
     codex_selected_feature_enabled(&config_path, feature_key)
         && !codex_deprecated_feature_present(&config_path, feature_key)
@@ -2534,7 +2752,11 @@ fn build_codex_rules() -> String {
 
 /// Set up Codex execpolicy rules for auto-approval.
 pub fn setup_codex_execpolicy() -> bool {
-    let rules_dir = get_codex_rules_path();
+    setup_codex_execpolicy_at(&codex_config_dir())
+}
+
+fn setup_codex_execpolicy_at(codex_home: &Path) -> bool {
+    let rules_dir = codex_rules_path_at(codex_home);
     let rules_file = rules_dir.join("hcom.rules");
     let rule_content = build_codex_rules();
 
@@ -2550,7 +2772,11 @@ pub fn setup_codex_execpolicy() -> bool {
 
 /// Remove hcom execpolicy rule.
 pub fn remove_codex_execpolicy() -> bool {
-    let rules_file = get_codex_rules_path().join("hcom.rules");
+    remove_codex_execpolicy_at(&codex_config_dir())
+}
+
+fn remove_codex_execpolicy_at(codex_home: &Path) -> bool {
+    let rules_file = codex_rules_path_at(codex_home).join("hcom.rules");
     if rules_file.exists() {
         std::fs::remove_file(&rules_file).is_ok()
     } else {
@@ -2638,8 +2864,15 @@ pub enum SetupError {
 }
 
 pub fn try_setup_codex_hooks(include_permissions: bool) -> Result<(), SetupError> {
-    let config_path = get_codex_config_path();
-    let hooks_path = get_codex_hooks_path();
+    try_setup_codex_hooks_at(include_permissions, &codex_config_dir())
+}
+
+pub(crate) fn try_setup_codex_hooks_at(
+    include_permissions: bool,
+    codex_home: &Path,
+) -> Result<(), SetupError> {
+    let config_path = codex_config_path_at(codex_home);
+    let hooks_path = codex_hooks_path_at(codex_home);
     let feature_key = detect_codex_hooks_feature_key();
 
     ensure_codex_feature_enabled(&config_path, feature_key).map_err(|e| {
@@ -2693,7 +2926,7 @@ pub fn try_setup_codex_hooks(include_permissions: bool) -> Result<(), SetupError
             let definition_hashes =
                 hcom_hook_definition_hashes_from_hooks_json(&hooks_json, &hooks_path);
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            match fetch_codex_hcom_hook_entries(&cwd).and_then(|entries| {
+            match fetch_codex_hcom_hook_entries(&cwd, codex_home).and_then(|entries| {
                 let current_keys: HashSet<String> =
                     entries.iter().map(|entry| entry.key.clone()).collect();
                 let stale_keys: HashSet<String> = old_hcom_hook_keys
@@ -2724,9 +2957,9 @@ pub fn try_setup_codex_hooks(include_permissions: bool) -> Result<(), SetupError
     }
 
     let ep_ok = if include_permissions {
-        setup_codex_execpolicy()
+        setup_codex_execpolicy_at(codex_home)
     } else {
-        remove_codex_execpolicy()
+        remove_codex_execpolicy_at(codex_home)
     };
     if !ep_ok {
         log::log_warn(
@@ -2743,12 +2976,24 @@ pub fn setup_codex_hooks(include_permissions: bool) -> bool {
 }
 
 pub fn verify_codex_hooks_installed(check_permissions: bool) -> bool {
-    verify_codex_hooks_inner(check_permissions).is_ok()
+    verify_codex_hooks_installed_at(check_permissions, &codex_config_dir())
 }
 
+pub(crate) fn verify_codex_hooks_installed_at(check_permissions: bool, codex_home: &Path) -> bool {
+    verify_codex_hooks_inner_at(check_permissions, codex_home).is_ok()
+}
+
+#[allow(dead_code)]
 pub(crate) fn verify_codex_hooks_inner(check_permissions: bool) -> Result<(), VerifyFailReason> {
-    let config_path = get_codex_config_path();
-    let hooks_path = get_codex_hooks_path();
+    verify_codex_hooks_inner_at(check_permissions, &codex_config_dir())
+}
+
+fn verify_codex_hooks_inner_at(
+    check_permissions: bool,
+    codex_home: &Path,
+) -> Result<(), VerifyFailReason> {
+    let config_path = codex_config_path_at(codex_home);
+    let hooks_path = codex_hooks_path_at(codex_home);
 
     if !config_path.exists() {
         return Err(VerifyFailReason::ConfigPathMissing(config_path));
@@ -2762,7 +3007,7 @@ pub(crate) fn verify_codex_hooks_inner(check_permissions: bool) -> Result<(), Ve
     verify_hooks_json_at(&hooks_path)?;
     verify_hcom_hook_trust_state(&config_path, &hooks_path)?;
     if check_permissions {
-        let rules_file = get_codex_rules_path().join("hcom.rules");
+        let rules_file = codex_rules_path_at(codex_home).join("hcom.rules");
         if !rules_file.exists() {
             return Err(VerifyFailReason::PermissionsRulesMissing(rules_file));
         }
@@ -3091,6 +3336,56 @@ mod tests {
 
         assert!(remove_codex_hooks());
         assert!(!verify_codex_hooks_installed(false));
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_codex_hooks_targets_effective_child_home() {
+        let (tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.130.0") };
+        let ambient_config = get_codex_config_path();
+        let child_home = tmp.path().join("child-codex-home");
+
+        try_setup_codex_hooks_at(false, &child_home).unwrap();
+
+        assert!(child_home.join("config.toml").exists());
+        assert!(child_home.join("hooks.json").exists());
+        assert!(verify_codex_hooks_installed_at(false, &child_home));
+        assert!(!ambient_config.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_codex_hook_trust_state_at_fails_closed_on_foreign_hooks() {
+        let (tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.131.0") };
+        let child_home = tmp.path().join("child-codex-home");
+        std::fs::create_dir_all(&child_home).unwrap();
+
+        // Write a foreign hook in child_home/hooks.json
+        let foreign_hooks_json = serde_json::json!({
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": "",
+                    "hooks": [{
+                        "command": "evil-command",
+                        "type": "command"
+                    }]
+                }]
+            }
+        });
+        std::fs::write(
+            child_home.join("hooks.json"),
+            serde_json::to_string(&foreign_hooks_json).unwrap(),
+        )
+        .unwrap();
+
+        let state = resolve_codex_hook_trust_state_at(tmp.path(), &child_home);
+        assert!(
+            matches!(state, CodexHookTrustState::BypassUnsafe { .. }),
+            "foreign hooks in target codex_home must fail closed as BypassUnsafe, got: {:?}",
+            state
+        );
     }
 
     #[test]
@@ -3493,13 +3788,29 @@ mod tests {
             .iter()
             .filter_map(|h| h.get("command").and_then(|v| v.as_str()))
             .collect();
-        let hcom_count = hook_cmds
+        assert_eq!(hook_cmds, ["user-mixed-hook"]);
+        let hcom_count = posttool_groups
             .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .filter_map(|h| h.get("command").and_then(Value::as_str))
             .filter(|c| c.contains("codex-posttooluse"))
             .count();
         assert_eq!(
             hcom_count, 1,
             "expected exactly one hcom hook, got {hcom_count}"
+        );
+        let all_tools_group = posttool_groups
+            .iter()
+            .find(|g| g.get("matcher").is_none())
+            .expect("all-tools PostToolUse group missing");
+        assert!(
+            all_tools_group["hooks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("codex-posttooluse")))
         );
     }
 
@@ -4010,5 +4321,454 @@ mod tests {
             let content = std::fs::read_to_string(local_dir.join("hooks.json")).unwrap();
             assert!(!content.contains("codex-"));
         }
+    }
+
+    // ── native hook adaptation tests (e841958 + 8b99ab7 + ddc62f6) ──
+
+    #[test]
+    fn test_codex_hook_commands_matchers_and_events() {
+        // configfork + PermissionRequest + Interrupt + broad matchers
+        let commands_map: HashMap<&str, (Option<&str>, &str)> = CODEX_HOOK_COMMANDS
+            .iter()
+            .map(|(event, cmd, matcher)| (*event, (*matcher, *cmd)))
+            .collect();
+
+        // 1. SessionStart must match startup|resume|clear|fork
+        assert_eq!(
+            commands_map.get("SessionStart").unwrap().0,
+            Some("startup|resume|clear|fork")
+        );
+        // 2. PreToolUse must match Bash|apply_patch|spawn_agent
+        assert_eq!(
+            commands_map.get("PreToolUse").unwrap().0,
+            Some("Bash|apply_patch|spawn_agent")
+        );
+        let matcher = regex::Regex::new(commands_map["PreToolUse"].0.unwrap()).unwrap();
+        for name in crate::integration_spec::CODEX.status_detail.bash {
+            assert!(matcher.is_match(name), "shell hook matcher misses {name}");
+            assert!(
+                crate::core::filters::SHELL_TOOL_CONTEXT_LIST
+                    .contains(&format!("tool:{name}").as_str())
+            );
+            assert_eq!(
+                family::extract_tool_detail(
+                    "codex",
+                    name,
+                    &serde_json::json!({"command":"echo ready"})
+                ),
+                "echo ready"
+            );
+        }
+        // 3. PermissionRequest must match all tools (matcher None)
+        assert_eq!(commands_map.get("PermissionRequest").unwrap().0, None);
+        assert_eq!(
+            commands_map.get("PermissionRequest").unwrap().1,
+            "codex-permissionrequest"
+        );
+        // 4. PostToolUse must match all tools (matcher None)
+        assert_eq!(commands_map.get("PostToolUse").unwrap().0, None);
+        // 5. Interrupt must be present (matcher None)
+        assert_eq!(commands_map.get("Interrupt").unwrap().0, None);
+        assert_eq!(commands_map.get("Interrupt").unwrap().1, "codex-interrupt");
+
+        // State labels
+        assert_eq!(codex_hook_event_state_label("Interrupt"), "interrupt");
+        assert_eq!(
+            codex_hook_event_state_label("PermissionRequest"),
+            "permission_request"
+        );
+
+        // CODEX_ALL_HOOK_EVENTS contains Interrupt
+        assert!(CODEX_ALL_HOOK_EVENTS.contains(&"Interrupt"));
+
+        // Expected hooks JSON includes all 7 hooks
+        let expected = build_expected_hook_json();
+        let hooks = expected["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), 7);
+        assert!(hooks.contains_key("SessionStart"));
+        assert!(hooks.contains_key("PreToolUse"));
+        assert!(hooks.contains_key("PermissionRequest"));
+        assert!(hooks.contains_key("PostToolUse"));
+        assert!(hooks.contains_key("UserPromptSubmit"));
+        assert!(hooks.contains_key("Stop"));
+        assert!(hooks.contains_key("Interrupt"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_prepare_codex_delivery_both_json_fields_and_ack() {
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let transcript = home.join("rollout-sess-deliv.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let db = HcomDb::open().unwrap();
+        let ctx = unmanaged_codex_context(&home);
+        let payload =
+            unmanaged_codex_payload("SessionStart", "sess-deliv", &transcript, &home, None);
+        handle_sessionstart(&db, &ctx, &payload);
+        let inst = db.iter_instances_full().unwrap().pop().unwrap();
+
+        let data = serde_json::json!({
+            "from": "alice",
+            "text": "ping message",
+            "scope": "broadcast",
+        })
+        .to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-01-01T00:00:00Z', 'alice', ?1)",
+                rusqlite::params![data],
+            )
+            .unwrap();
+
+        let delivery = prepare_codex_delivery(&db, &inst.name).expect("must have pending delivery");
+        match delivery {
+            HookResult::Allow {
+                additional_context: Some(ctx_text),
+                system_message: Some(sys_text),
+                delivery_ack: Some(ack),
+            } => {
+                assert_eq!(ctx_text, sys_text, "both fields must be identical");
+                assert!(ctx_text.contains("ping message"));
+                assert_eq!(ack.instance_name, inst.name);
+                assert_eq!(
+                    db.get_unread_messages(&inst.name).len(),
+                    1,
+                    "preparing hook output must leave delivery pending"
+                );
+                common::commit_delivery_ack(&db, &ack);
+                assert!(
+                    db.get_unread_messages(&inst.name).is_empty(),
+                    "only the deferred acknowledgement consumes delivery"
+                );
+            }
+            other => panic!("expected Allow with both fields, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_permissionrequest_blocked_guard_and_detail() {
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let transcript = home.join("rollout-sess-perm.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let db = HcomDb::open().unwrap();
+        let ctx = unmanaged_codex_context(&home);
+        let start_payload =
+            unmanaged_codex_payload("SessionStart", "sess-perm", &transcript, &home, None);
+        handle_sessionstart(&db, &ctx, &start_payload);
+        let inst = db.iter_instances_full().unwrap().pop().unwrap();
+
+        // 1. PermissionRequest sets ST_BLOCKED with "approval" and tool detail
+        let perm_payload = HookPayload::from_codex_native(
+            "PermissionRequest",
+            serde_json::json!({
+                "session_id": "sess-perm",
+                "transcript_path": &transcript,
+                "cwd": &home,
+                "tool_name": "Bash",
+                "tool_input": { "command": "rm -rf target" }
+            }),
+        );
+        let res = handle_permissionrequest(&db, &ctx, &perm_payload);
+        assert!(matches!(res, HookResult::Allow { .. }));
+
+        let updated = db.get_instance_full(&inst.name).unwrap().unwrap();
+        assert_eq!(updated.status, ST_BLOCKED);
+        assert_eq!(updated.status_context, "approval");
+        assert_eq!(updated.status_detail, "rm -rf target");
+
+        // 2. If status was already pty:approval, keeps pty:approval context
+        lifecycle::set_status(
+            &db,
+            &inst.name,
+            ST_BLOCKED,
+            "pty:approval",
+            Default::default(),
+        );
+        handle_permissionrequest(&db, &ctx, &perm_payload);
+        let updated2 = db.get_instance_full(&inst.name).unwrap().unwrap();
+        assert_eq!(updated2.status, ST_BLOCKED);
+        assert_eq!(updated2.status_context, "pty:approval");
+    }
+
+    #[test]
+    #[serial]
+    fn test_delayed_pretooluse_preserves_new_permission_request() {
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let transcript = home.join("rollout-sess-pre-race.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let db = HcomDb::open().unwrap();
+        let ctx = unmanaged_codex_context(&home);
+        let start =
+            unmanaged_codex_payload("SessionStart", "sess-pre-race", &transcript, &home, None);
+        handle_sessionstart(&db, &ctx, &start);
+        let payload = HookPayload::from_codex_native(
+            "PreToolUse",
+            serde_json::json!({
+                "session_id": "sess-pre-race",
+                "transcript_path": &transcript,
+                "cwd": &home,
+                "tool_name": "Bash",
+                "tool_input": { "command": "echo ready" }
+            }),
+        );
+        let stale = resolve_and_update_codex_instance(&db, &ctx, &payload).unwrap();
+        handle_permissionrequest(&db, &ctx, &payload);
+        let pending = db.get_instance_full(&stale.name).unwrap().unwrap();
+        update_pretool_status(&db, &stale, &payload);
+        let still_pending = db.get_instance_full(&stale.name).unwrap().unwrap();
+        assert_eq!(still_pending.status, ST_BLOCKED);
+        assert_eq!(still_pending.status_context, pending.status_context);
+        assert_eq!(still_pending.status_detail, pending.status_detail);
+        assert_eq!(still_pending.status_time, pending.status_time);
+
+        // A subsequent hook which actually observed that approval can release it.
+        handle_pretooluse(&db, &ctx, &payload);
+        let next = db.get_instance_full(&stale.name).unwrap().unwrap();
+        assert_eq!(next.status, ST_ACTIVE);
+        assert_eq!(next.status_context, "tool:Bash");
+    }
+
+    #[test]
+    #[serial]
+    fn native_approval_ignores_unrelated_completion_and_replaced_owner() {
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let transcript = home.join("rollout-native-owner.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let db = HcomDb::open().unwrap();
+        let ctx = unmanaged_codex_context(&home);
+        let start =
+            unmanaged_codex_payload("SessionStart", "native-owner", &transcript, &home, None);
+        handle_sessionstart(&db, &ctx, &start);
+        let request = HookPayload::from_codex_native(
+            "PermissionRequest",
+            serde_json::json!({
+                "session_id": "native-owner", "transcript_path": &transcript, "cwd": &home,
+                "tool_name": "Bash", "tool_input": {"command":format!("echo {}", "x".repeat(8192))}
+            }),
+        );
+        handle_permissionrequest(&db, &ctx, &request);
+        let first = resolve_and_update_codex_instance(&db, &ctx, &request).unwrap();
+        assert!(
+            first.pending_tool_use_id.len() < 256,
+            "large arguments must not inflate approval owners"
+        );
+        let mut unrelated = request.clone();
+        unrelated.tool_name = "spawn_agent".into();
+        unrelated.tool_input = serde_json::json!({"message":"another task"});
+        handle_posttooluse(&db, &ctx, &unrelated);
+        assert_eq!(
+            db.get_instance_full(&first.name).unwrap().unwrap().status,
+            ST_BLOCKED
+        );
+
+        // Even the same tool and parameters are a distinct replacement request.
+        handle_permissionrequest(&db, &ctx, &request);
+        let replacement = db.get_instance_full(&first.name).unwrap().unwrap();
+        assert_ne!(first.pending_tool_use_id, replacement.pending_tool_use_id);
+        assert!(!update_pretool_status(&db, &first, &request));
+        assert_eq!(
+            db.get_instance_full(&first.name).unwrap().unwrap().status,
+            ST_BLOCKED
+        );
+        handle_posttooluse(&db, &ctx, &request);
+        let done = db.get_instance_full(&first.name).unwrap().unwrap();
+        assert_eq!(done.status, ST_ACTIVE);
+        assert!(done.pending_tool_use_id.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn guarded_patch_does_not_emit_partial_active_file_events() {
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let transcript = home.join("rollout-guarded-patch.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let db = HcomDb::open().unwrap();
+        let ctx = unmanaged_codex_context(&home);
+        let start =
+            unmanaged_codex_payload("SessionStart", "guarded-patch", &transcript, &home, None);
+        handle_sessionstart(&db, &ctx, &start);
+        let patch = HookPayload::from_codex_native(
+            "PreToolUse",
+            serde_json::json!({
+                "session_id":"guarded-patch", "transcript_path": &transcript, "cwd": &home,
+                "tool_name":"apply_patch", "tool_input":{"command":"*** Begin Patch\n*** Update File: a.rs\n*** Update File: b.rs\n*** End Patch"}
+            }),
+        );
+        let stale = resolve_and_update_codex_instance(&db, &ctx, &patch).unwrap();
+        handle_permissionrequest(&db, &ctx, &patch);
+        assert!(!update_pretool_status(&db, &stale, &patch));
+        let row = db.get_instance_full(&stale.name).unwrap().unwrap();
+        assert_eq!(row.status, ST_BLOCKED);
+        let count: i64 = db.conn().query_row(
+            "SELECT count(*) FROM events WHERE type = 'status' AND json_extract(data, '$.context') = 'tool:apply_patch'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn test_posttooluse_clears_approval_block_and_delivers() {
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let transcript = home.join("rollout-sess-post.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let db = HcomDb::open().unwrap();
+        let ctx = unmanaged_codex_context(&home);
+        let start_payload =
+            unmanaged_codex_payload("SessionStart", "sess-post", &transcript, &home, None);
+        handle_sessionstart(&db, &ctx, &start_payload);
+        let inst = db.iter_instances_full().unwrap().pop().unwrap();
+
+        // Set instance into approval block
+        lifecycle::set_status(&db, &inst.name, ST_BLOCKED, "approval", Default::default());
+
+        // Queue a message
+        let data = serde_json::json!({
+            "from": "bob",
+            "text": "post message",
+            "scope": "broadcast",
+        })
+        .to_string();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-01-01T00:00:00Z', 'bob', ?1)",
+                rusqlite::params![data],
+            )
+            .unwrap();
+
+        let post_payload = HookPayload::from_codex_native(
+            "PostToolUse",
+            serde_json::json!({
+                "session_id": "sess-post",
+                "transcript_path": &transcript,
+                "cwd": &home,
+                "tool_name": "apply_patch",
+                "tool_input": {}
+            }),
+        );
+        let res = handle_posttooluse(&db, &ctx, &post_payload);
+
+        // Instance block must be cleared to active with approved:apply_patch
+        let updated = db.get_instance_full(&inst.name).unwrap().unwrap();
+        assert_eq!(updated.status, ST_ACTIVE);
+        assert_eq!(updated.status_context, "approved:apply_patch");
+
+        // Pending delivery is delivered
+        match res {
+            HookResult::Allow {
+                additional_context: Some(ctx_text),
+                system_message: Some(sys_text),
+                delivery_ack: Some(_),
+            } => {
+                assert_eq!(ctx_text, sys_text);
+                assert!(ctx_text.contains("post message"));
+            }
+            other => panic!("expected Allow with delivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_interrupt_transitions_to_listening_and_wakes() {
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let transcript = home.join("rollout-sess-intr.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let db = HcomDb::open().unwrap();
+        let ctx = unmanaged_codex_context(&home);
+        let start_payload =
+            unmanaged_codex_payload("SessionStart", "sess-intr", &transcript, &home, None);
+        handle_sessionstart(&db, &ctx, &start_payload);
+        let inst = db.iter_instances_full().unwrap().pop().unwrap();
+
+        // Mark active
+        lifecycle::set_status(&db, &inst.name, ST_ACTIVE, "running", Default::default());
+
+        let intr_payload = HookPayload::from_codex_native(
+            "Interrupt",
+            serde_json::json!({
+                "session_id": "sess-intr",
+                "transcript_path": &transcript,
+                "cwd": &home,
+            }),
+        );
+        let res = handle_interrupt(&db, &ctx, &intr_payload);
+        assert!(matches!(res, HookResult::Allow { .. }));
+
+        let updated = db.get_instance_full(&inst.name).unwrap().unwrap();
+        assert_eq!(updated.status, ST_LISTENING);
+        assert_eq!(updated.status_context, "interrupted");
+    }
+
+    #[test]
+    #[serial]
+    fn test_pretooluse_multi_file_patch_and_spawn_agent() {
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let transcript = home.join("rollout-sess-patch.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        let db = HcomDb::open().unwrap();
+        let ctx = unmanaged_codex_context(&home);
+        let start_payload =
+            unmanaged_codex_payload("SessionStart", "sess-patch", &transcript, &home, None);
+        handle_sessionstart(&db, &ctx, &start_payload);
+        let inst = db.iter_instances_full().unwrap().pop().unwrap();
+
+        // 1. multi-file apply_patch
+        let patch_input = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: src/f1.rs\n@@\n*** Add File: src/f2.rs\n*** Delete File: src/f3.rs\n*** End Patch"
+        });
+        let pre_patch = HookPayload::from_codex_native(
+            "PreToolUse",
+            serde_json::json!({
+                "session_id": "sess-patch",
+                "transcript_path": &transcript,
+                "cwd": &home,
+                "tool_name": "apply_patch",
+                "tool_input": patch_input,
+            }),
+        );
+        handle_pretooluse(&db, &ctx, &pre_patch);
+
+        let updated = db.get_instance_full(&inst.name).unwrap().unwrap();
+        assert_eq!(updated.status_detail, "src/f1.rs");
+
+        // The row update logs the first file; explicit events cover the rest.
+        let events = db
+            .get_events_since(0, Some("status"), Some(&inst.name))
+            .unwrap();
+        let patch_events: Vec<_> = events
+            .iter()
+            .filter(|e| e["data"]["context"] == "tool:apply_patch")
+            .collect();
+        assert_eq!(patch_events.len(), 3);
+        assert_eq!(patch_events[0]["data"]["detail"], "src/f1.rs");
+        assert_eq!(patch_events[1]["data"]["detail"], "src/f2.rs");
+        assert_eq!(patch_events[2]["data"]["detail"], "src/f3.rs");
+        for event in patch_events {
+            assert_eq!(event["data"]["new_context"], "tool:apply_patch");
+            assert!(event["data"]["writer"].is_string());
+            assert!(event["data"]["position"].is_number());
+        }
+
+        // 2. spawn_agent
+        let spawn_input = serde_json::json!({
+            "message": "research codebase hooks"
+        });
+        let pre_spawn = HookPayload::from_codex_native(
+            "PreToolUse",
+            serde_json::json!({
+                "session_id": "sess-patch",
+                "transcript_path": &transcript,
+                "cwd": &home,
+                "tool_name": "spawn_agent",
+                "tool_input": spawn_input,
+            }),
+        );
+        handle_pretooluse(&db, &ctx, &pre_spawn);
+
+        let updated2 = db.get_instance_full(&inst.name).unwrap().unwrap();
+        assert_eq!(updated2.status_detail, "research codebase hooks");
     }
 }

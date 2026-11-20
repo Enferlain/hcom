@@ -343,6 +343,104 @@ fn filtered_listen_match_result_follows_versioned_schema() {
 }
 
 #[test]
+fn filtered_adhoc_listen_preserves_unrelated_inbox_for_plain_and_json_output() {
+    fn run_case(json: bool) {
+        let h = Hcom::new();
+        let receiver = h.start();
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        db.execute(
+            "UPDATE instances SET tool = 'adhoc', last_event_id = 0 WHERE name = ?",
+            [&receiver],
+        )
+        .unwrap();
+
+        let message = serde_json::json!({
+            "from": "sender",
+            "scope": "mentions",
+            "mentions": [&receiver],
+            "delivered_to": [&receiver],
+            "text": "unrelated inbox sentinel",
+        });
+        db.execute(
+            "INSERT INTO events (timestamp, type, instance, data) \
+             VALUES ('2026-10-02T00:00:01Z', 'message', 'sender', ?)",
+            [message.to_string()],
+        )
+        .unwrap();
+        let message_id = db.last_insert_rowid();
+
+        let life = serde_json::json!({
+            "action": "filtered-listen-match",
+            "status": "ready",
+        });
+        db.execute(
+            "INSERT INTO events (timestamp, type, instance, data) \
+             VALUES ('2026-10-02T00:00:02Z', 'life', 'other', ?)",
+            [life.to_string()],
+        )
+        .unwrap();
+        let life_id = db.last_insert_rowid();
+        assert!(message_id < life_id);
+
+        let before: i64 = db
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = ?",
+                [&receiver],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0);
+        drop(db);
+
+        let mut args = vec![
+            "listen",
+            "--name",
+            receiver.as_str(),
+            "--sql",
+            "type='life' AND instance='other'",
+            "--after-id",
+            "0",
+            "--timeout",
+            "1",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let (code, stdout, stderr) = h.run(args);
+        assert_eq!(code, 0, "stderr={stderr}; stdout={stdout}");
+        assert!(
+            !stdout.contains("unrelated inbox sentinel"),
+            "stdout={stdout}"
+        );
+        if json {
+            let matched: serde_json::Value = serde_json::from_str(stdout.trim())
+                .unwrap_or_else(|error| panic!("filtered listen JSON: {error}; stdout={stdout}"));
+            assert_eq!(matched["schema_version"].as_i64(), Some(1));
+            assert_eq!(matched["matched"].as_bool(), Some(true));
+            assert_eq!(matched["type"].as_str(), Some("life"));
+            assert_eq!(matched["instance"].as_str(), Some("other"));
+            assert_eq!(matched["event_id"].as_i64(), Some(life_id));
+        } else {
+            assert!(stdout.contains("life:other"), "stdout={stdout}");
+            assert!(stdout.contains(&format!("#{life_id}")), "stdout={stdout}");
+        }
+
+        let after: i64 = rusqlite::Connection::open(h.path().join("hcom.db"))
+            .unwrap()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = ?",
+                [&receiver],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 0, "filtered listen must preserve inbox cursor");
+    }
+
+    run_case(false);
+    run_case(true);
+}
+
+#[test]
 fn idle_wait_ignores_transport_listen_but_accepts_provider_idle() {
     let h = Hcom::new();
     let worker = h.start();
@@ -975,6 +1073,14 @@ fn events_stream_broken_pipe_terminates_cleanly_zero_and_cleans_up_endpoint() {
 
     let process_id = "stream-broken-pipe-proc";
     let name = h.start_with_process_id(process_id);
+    let receive_cursor_before: i64 = rusqlite::Connection::open(h.path().join("hcom.db"))
+        .unwrap()
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = ?",
+            [&name],
+            |row| row.get(0),
+        )
+        .unwrap();
 
     // Setup extra endpoints and observed worker in instances table
     {
@@ -1066,6 +1172,17 @@ fn events_stream_broken_pipe_terminates_cleanly_zero_and_cleans_up_endpoint() {
 
     // Direct DB assertions:
     let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+    let receive_cursor_after: i64 = db
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = ?",
+            [&name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        receive_cursor_after, receive_cursor_before,
+        "observing an event stream must leave the caller's inbox unread"
+    );
 
     // 1. events_stream endpoint for this listener must be removed
     let stream_count: i64 = db
@@ -2594,6 +2711,95 @@ fn result_from_returns_structured_launch_failure_exit_code() {
 }
 
 #[test]
+fn non_destructive_reset_paths_deliver_pending_messages() {
+    let h = Hcom::new();
+    let sender = h.start();
+    let process_id = "reset-pending-delivery-process";
+    let recipient = h.start_with_process_id(process_id);
+
+    let send_message = |text: &str| {
+        let (code, stdout, stderr) = h.run([
+            "send",
+            "--name",
+            &sender,
+            &format!("@{recipient}"),
+            "--",
+            text,
+        ]);
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    };
+
+    send_message("pending during reset preview");
+    let mut preview = h.cmd();
+    preview
+        .env("HCOM_PROCESS_ID", process_id)
+        .env("CODEX_SANDBOX", "1")
+        .arg("reset");
+    let output = preview.output().expect("run reset preview");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("RESET PREVIEW"), "stdout={stdout}");
+    assert!(
+        stdout.contains("pending during reset preview"),
+        "stdout={stdout}"
+    );
+
+    send_message("pending during reset hooks");
+    let mut hooks = h.cmd();
+    hooks
+        .env("HCOM_PROCESS_ID", process_id)
+        .env("CODEX_SANDBOX", "1")
+        .args(["--go", "reset", "hooks"]);
+    let output = hooks.output().expect("run reset hooks");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("pending during reset hooks"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn cli_destructive_reset_clears_db_and_creates_archive() {
+    let h = Hcom::new();
+    let sender = h.start();
+    let recipient = h.start();
+
+    let (s_code, _, _) = h.run([
+        "send",
+        "--name",
+        &sender,
+        &format!("@{recipient}"),
+        "--",
+        "hello before reset",
+    ]);
+    assert_eq!(s_code, 0);
+
+    // Destructive reset with --go
+    let (code, stdout, stderr) = h.run(["--go", "reset"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("Archived to"), "stdout={stdout}");
+    assert!(
+        stdout.contains("Started fresh HCOM conversation"),
+        "stdout={stdout}"
+    );
+
+    // Verify archive dir exists
+    let archive_dir = h.path().join("archive");
+    assert!(archive_dir.exists(), "archive directory must exist");
+
+    // Events in new DB should not contain old messages
+    let (ev_code, ev_stdout, _) = h.run(["events", "--type", "message"]);
+    assert_eq!(ev_code, 0);
+    assert!(
+        !ev_stdout.contains("hello before reset"),
+        "events={ev_stdout}"
+    );
+}
+
+#[test]
 fn start_send_events_roundtrip() {
     let h = Hcom::new();
     let sender = h.start();
@@ -2661,6 +2867,8 @@ fn start_send_events_roundtrip() {
     assert_eq!(delivered.len(), 1, "listen output={listen_out}");
     assert_eq!(delivered[0]["from"], sender.as_str());
     assert_eq!(delivered[0]["text"], "hello there");
+    let event_id = delivered[0]["event_id"].as_i64().expect("event_id");
+    assert_eq!(delivered[0]["reply_id"], event_id.to_string());
 
     let (c7, list_after_listen_out, _) = h.run(["list", "--json"]);
     assert_eq!(c7, 0);
@@ -2681,6 +2889,298 @@ fn start_send_events_roundtrip() {
         after_by_name.get(&recipient).copied(),
         Some(0),
         "listen should advance recipient cursor; list={list_after_listen_out}"
+    );
+}
+
+#[test]
+fn listen_json_local_and_relayed_canonical_metadata_roundtrip() {
+    let h = Hcom::new();
+    let receiver = h.start();
+    let sender = h.start();
+
+    // Send local message with intent and thread
+    let (s_code, _, s_err) = h.run([
+        "send",
+        &format!("@{receiver}"),
+        "--name",
+        &sender,
+        "--intent",
+        "request",
+        "--thread",
+        "work-1",
+        "--",
+        "local task",
+    ]);
+    assert_eq!(s_code, 0, "send failed: stderr={s_err}");
+
+    // Direct SQLite insertion to simulate relay import with origin 42:BOXE and dynamically derived local id
+    let relay_local_id: i64 = {
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let next_id: i64 = db
+            .query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM events", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let relay_data = serde_json::json!({
+            "from": "remo:BOXE",
+            "text": "remote task",
+            "intent": "request",
+            "thread": "work-2",
+            "scope": "mentions",
+            "mentions": [receiver.as_str()],
+            "_relay": {"id": 42, "short": "BOXE", "device": "dev-boxe"}
+        });
+        db.execute(
+            "INSERT INTO events (id, timestamp, type, instance, data) VALUES (?1, '2026-10-02T16:00:00Z', 'message', 'remo:BOXE', ?2)",
+            rusqlite::params![next_id, serde_json::to_string(&relay_data).unwrap()],
+        )
+        .unwrap();
+        next_id
+    };
+    assert_ne!(
+        relay_local_id, 42,
+        "local receiver id must not collide with foreign origin id 42"
+    );
+
+    // Capture cursor before listen to verify filtered output preservation
+    let (c_code, cursor_out, _) = h.run(["events", "--cursor"]);
+    assert_eq!(c_code, 0);
+    let _cursor = cursor_out.trim();
+
+    // Verify filtered listen preserves versioned listen_result matched/timeout contract
+    let (f_code, f_out, f_err) = h.run([
+        "listen",
+        "--name",
+        &receiver,
+        "--timeout",
+        "1",
+        "--timeout-ok",
+        "--json",
+        "--type",
+        "life",
+    ]);
+    assert_eq!(f_code, 0, "filtered stderr={f_err}");
+    let filter_res: serde_json::Value = serde_json::from_str(f_out.trim()).expect("filter json");
+    assert_eq!(filter_res["schema_version"], 1);
+    assert_eq!(filter_res["matched"], false);
+    assert_eq!(filter_res["reason"], "timeout");
+
+    // Run unfiltered listen --json on receiver
+    let (l_code, l_out, l_err) = h.run(["listen", "--name", &receiver, "--timeout", "1", "--json"]);
+    assert_eq!(l_code, 0, "listen failed: stderr={l_err}");
+    let lines: Vec<serde_json::Value> = l_out
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert_eq!(lines.len(), 2, "output={l_out}");
+
+    // First: local message
+    assert_eq!(lines[0]["from"], sender.as_str());
+    assert_eq!(lines[0]["text"], "local task");
+    assert_eq!(lines[0]["intent"], "request");
+    assert_eq!(lines[0]["thread"], "work-1");
+    let local_id = lines[0]["event_id"].as_i64().expect("local event_id");
+    assert_eq!(lines[0]["reply_id"], local_id.to_string());
+
+    // Second: relayed message with canonical origin 42:BOXE vs local event_id
+    assert_eq!(lines[1]["from"], "remo:BOXE");
+    assert_eq!(lines[1]["text"], "remote task");
+    assert_eq!(lines[1]["intent"], "request");
+    assert_eq!(lines[1]["thread"], "work-2");
+    assert_eq!(lines[1]["event_id"], relay_local_id);
+    assert_eq!(lines[1]["reply_id"], "42:BOXE");
+
+    // Reply using the reply_id values
+    for (line, expected_reply_to_local, expected_thread) in [
+        (&lines[0], local_id, "work-1"),
+        (&lines[1], relay_local_id, "work-2"),
+    ] {
+        let reply_id = line["reply_id"].as_str().unwrap();
+        let (rep_code, _, rep_err) = h.run([
+            "send",
+            &format!("@{sender}"),
+            "--name",
+            &receiver,
+            "--intent",
+            "ack",
+            "--reply-to",
+            reply_id,
+            "--",
+            "acknowledged",
+        ]);
+        assert_eq!(rep_code, 0, "reply send failed: stderr={rep_err}");
+        let db = rusqlite::Connection::open(h.path().join("hcom.db")).unwrap();
+        let (reply_to_local, thread): (i64, String) = db
+            .query_row(
+                "SELECT json_extract(data, '$.reply_to_local'), json_extract(data, '$.thread') \
+                 FROM events WHERE type = 'message' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reply_to_local, expected_reply_to_local);
+        assert_eq!(thread, expected_thread);
+    }
+
+    // Verify receiver's unread is now 0 (cursor advanced forward-only to 100+)
+    let (list_code, list_out, _) = h.run(["list", "--json"]);
+    assert_eq!(list_code, 0);
+    let list: serde_json::Value = serde_json::from_str(&list_out).expect("list json");
+    let receiver_item = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == receiver.as_str())
+        .expect("receiver in list");
+    assert_eq!(receiver_item["unread_count"], 0);
+}
+
+#[test]
+fn fixture_default_env_does_not_redirect_dev_root() {
+    let h = Hcom::new();
+    let (code, stdout, _) = h.run(["status", "--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("status json");
+    assert!(
+        v.get("dev_root").is_none() || v["dev_root"].is_null(),
+        "default fixture must not redirect dev_root: {stdout}"
+    );
+
+    // Explicit dev_root configuration still works
+    let (c_set, _, _) = h.run(["config", "dev_root", "/tmp/explicit-dev-root"]);
+    assert_eq!(c_set, 0);
+    let (c2, out2, _) = h.run(["status", "--json"]);
+    assert_eq!(c2, 0);
+    let v2: serde_json::Value = serde_json::from_str(&out2).expect("status json override");
+    assert_eq!(
+        v2["dev_root"]["path"].as_str(),
+        Some("/tmp/explicit-dev-root")
+    );
+}
+
+#[test]
+fn send_json_is_one_line_and_leaves_sender_inbox_unread() {
+    let h = Hcom::new();
+    let sender = h.start();
+    let recipient = h.start();
+
+    let (pending_code, _, pending_stderr) = h.run([
+        "send",
+        "--quiet",
+        "--name",
+        &recipient,
+        &format!("@{sender}"),
+        "--",
+        "pending unrelated inbox",
+    ]);
+    assert_eq!(
+        pending_code, 0,
+        "pending send failed: stderr={pending_stderr}"
+    );
+
+    let sender_unread = || {
+        rusqlite::Connection::open(h.path().join("hcom.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE id > (SELECT last_event_id FROM instances WHERE name = ?1)
+                   AND type = 'message'
+                   AND EXISTS (
+                       SELECT 1 FROM json_each(json_extract(events.data, '$.delivered_to'))
+                       WHERE value = ?1
+                   )",
+                [&sender],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        sender_unread(),
+        1,
+        "sender must have a pending unrelated inbox message"
+    );
+
+    let before: i64 = rusqlite::Connection::open(h.path().join("hcom.db"))
+        .unwrap()
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = ?",
+            [&sender],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let (code, stdout, stderr) = h.run([
+        "send",
+        "--json",
+        "--name",
+        &sender,
+        &format!("@{recipient}"),
+        "--",
+        "json payload",
+    ]);
+    assert_eq!(code, 0, "stderr={stderr}; stdout={stdout}");
+    assert_eq!(stdout.lines().count(), 1, "stdout={stdout}");
+    assert!(
+        stdout.trim().starts_with("{\"event_id\":")
+            && stdout.trim().contains(",\"delivered_to\":["),
+        "stdout={stdout}"
+    );
+    let result: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|error| panic!("send JSON: {error}; stdout={stdout}"));
+    let event_id = result["event_id"].as_i64().expect("event_id integer");
+    assert!(event_id > 0, "stdout={stdout}");
+    assert_eq!(result["delivered_to"], serde_json::json!([recipient]));
+    assert_eq!(result.as_object().unwrap().len(), 2, "stdout={stdout}");
+
+    let after: i64 = rusqlite::Connection::open(h.path().join("hcom.db"))
+        .unwrap()
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = ?",
+            [&sender],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(after, before, "--json must not drain the sender inbox");
+    assert_eq!(
+        sender_unread(),
+        1,
+        "--json must preserve the pending inbox message"
+    );
+
+    let (quiet_code, quiet_stdout, quiet_stderr) = h.run([
+        "send",
+        "--json",
+        "--quiet",
+        "--name",
+        &sender,
+        &format!("@{recipient}"),
+        "--",
+        "quiet JSON payload",
+    ]);
+    assert_eq!(
+        quiet_code, 0,
+        "stderr={quiet_stderr}; stdout={quiet_stdout}"
+    );
+    assert_eq!(quiet_stdout.lines().count(), 1, "stdout={quiet_stdout}");
+    serde_json::from_str::<serde_json::Value>(quiet_stdout.trim())
+        .unwrap_or_else(|error| panic!("quiet send JSON: {error}; stdout={quiet_stdout}"));
+
+    let after_quiet: i64 = rusqlite::Connection::open(h.path().join("hcom.db"))
+        .unwrap()
+        .query_row(
+            "SELECT last_event_id FROM instances WHERE name = ?",
+            [&sender],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        after_quiet, before,
+        "--json --quiet must not drain the sender inbox"
+    );
+    assert_eq!(
+        sender_unread(),
+        1,
+        "--json --quiet must preserve the pending inbox message"
     );
 }
 

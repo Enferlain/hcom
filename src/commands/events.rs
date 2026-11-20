@@ -2249,6 +2249,10 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
                     );
                     return 1;
                 }
+                // Streaming observes events without consuming the caller's inbox.
+                // Reserve stdout so router delivery cannot append messages or
+                // turn a clean broken-pipe exit into an output failure.
+                crate::cli_context::claim_inline_delivery();
                 return cmd_events_stream(db, stream_args, instance_name.as_deref());
             }
         }

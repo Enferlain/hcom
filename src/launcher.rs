@@ -388,7 +388,7 @@ where
     // HCOM_* settings from config.toml
     for (key, value) in hcom_config.to_env_dict() {
         if !value.is_empty() {
-            env.insert(key, value);
+            insert_effective_env(&mut env, key, value, cfg!(windows));
         }
     }
 
@@ -396,7 +396,7 @@ where
     let env_path = paths::hcom_path(&["env"]);
     for (key, value) in config::load_env_extras(&env_path) {
         if !value.is_empty() {
-            env.insert(key, value);
+            insert_effective_env(&mut env, key, value, cfg!(windows));
         }
     }
 
@@ -457,6 +457,65 @@ fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
         crate::tool::Tool::OpenCode | crate::tool::Tool::Adhoc => return None,
     };
     Some(root.join(dirname))
+}
+
+/// Insert an environment override using the target platform's key semantics.
+/// Windows environment names are case-insensitive, while `HashMap` keys are
+/// not; remove an earlier spelling so the child receives one authoritative
+/// value instead of an order-dependent pair.
+fn insert_effective_env(
+    env: &mut HashMap<String, String>,
+    key: String,
+    value: String,
+    case_insensitive: bool,
+) {
+    if case_insensitive {
+        env.retain(|existing, _| !existing.eq_ignore_ascii_case(&key));
+    }
+    env.insert(key, value);
+}
+
+fn effective_env_value<'a>(
+    env: &'a HashMap<String, String>,
+    key: &str,
+    case_insensitive: bool,
+) -> Option<&'a str> {
+    if case_insensitive {
+        env.iter()
+            .find(|(existing, _)| existing.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
+    } else {
+        env.get(key).map(String::as_str)
+    }
+}
+
+/// Make the tool config directory explicit in the child environment.
+///
+/// Some launch backends clear the inherited environment while others do not.
+/// Copying an ambient override into the effective launch map keeps preflight,
+/// hook setup, and the child process on the same directory in both cases.
+fn ensure_tool_config_env(tool: &LaunchTool, env: &mut HashMap<String, String>) {
+    let Some(env_var) = tool.spec().launch.config_dir_env else {
+        return;
+    };
+    let case_insensitive = cfg!(windows);
+    if let Some(value) = effective_env_value(env, env_var, case_insensitive).map(str::to_owned) {
+        insert_effective_env(env, env_var.to_string(), value, case_insensitive);
+        return;
+    }
+    if let Some(value) = std::env::var(env_var)
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        insert_effective_env(env, env_var.to_string(), value, case_insensitive);
+    } else if let Some(config_dir) = isolated_tool_config_dir(tool) {
+        insert_effective_env(
+            env,
+            env_var.to_string(),
+            config_dir.to_string_lossy().to_string(),
+            case_insensitive,
+        );
+    }
 }
 
 /// Get system prompt file path for Gemini/Codex.
@@ -556,7 +615,11 @@ fn format_plugin_install_error(
 ///
 /// Uses verify-first pattern: read-only check first, only write if needed.
 /// Strict gate: refuses to launch if hooks can't be installed.
-fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Result<()> {
+fn ensure_hooks_installed(
+    tool: &LaunchTool,
+    include_permissions: bool,
+    codex_home: Option<&std::path::Path>,
+) -> Result<()> {
     match tool {
         LaunchTool::Claude | LaunchTool::ClaudePty => {
             if crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions) {
@@ -611,12 +674,15 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             Ok(())
         }
         LaunchTool::Codex => {
-            if crate::hooks::codex::verify_codex_hooks_installed(include_permissions)
-                && crate::hooks::codex::codex_current_feature_enabled()
+            let codex_home = codex_home.expect("Codex launch must resolve CODEX_HOME");
+            if crate::hooks::codex::verify_codex_hooks_installed_at(include_permissions, codex_home)
+                && crate::hooks::codex::codex_current_feature_enabled_at(codex_home)
             {
                 return Ok(());
             }
-            if let Err(e) = crate::hooks::codex::try_setup_codex_hooks(include_permissions) {
+            if let Err(e) =
+                crate::hooks::codex::try_setup_codex_hooks_at(include_permissions, codex_home)
+            {
                 if matches!(e, crate::hooks::codex::SetupError::HookTrustFailed { .. }) {
                     crate::log::log_warn(
                         "codex",
@@ -629,8 +695,8 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
                     let diag = install_diag_context(
                         tool,
                         &[
-                            ("config_path", crate::hooks::codex::get_codex_config_path()),
-                            ("hooks_path", crate::hooks::codex::get_codex_hooks_path()),
+                            ("config_path", codex_home.join("config.toml")),
+                            ("hooks_path", codex_home.join("hooks.json")),
                         ],
                     );
                     bail!(
@@ -878,6 +944,59 @@ fn sidecar_ambient_env<'a>(
         .collect()
 }
 
+struct RunnerBinaries {
+    path_dirs: Vec<String>,
+    tool_path: Option<String>,
+}
+
+/// Resolve the executables needed by generated runners and order their directories.
+///
+/// The selected Node runtime must precede every other prepended directory: tool,
+/// hcom, and Python directories can all contain an older `node`/`npx`. The tool is
+/// resolved before PATH changes and passed explicitly to `hcom pty`, so moving its
+/// directory after Node does not change which tool executable is launched.
+fn resolve_runner_binaries(
+    initial_dirs: Vec<String>,
+    tool_bin: &str,
+    mut which_bin: impl FnMut(&str) -> Option<String>,
+) -> RunnerBinaries {
+    let tool_path = which_bin(tool_bin);
+    let hcom_path = which_bin("hcom");
+    let node_path = which_bin("node");
+    let python_path = which_bin("python3");
+    let mut path_dirs = Vec::new();
+
+    fn append_binary_dir(path_dirs: &mut Vec<String>, path: &str) {
+        if let Some(dir) = Path::new(path).parent() {
+            let dir = dir.to_string_lossy().into_owned();
+            if !path_dirs.contains(&dir) {
+                path_dirs.push(dir);
+            }
+        }
+    }
+
+    for path in node_path.iter() {
+        append_binary_dir(&mut path_dirs, path);
+    }
+    for dir in initial_dirs {
+        if !path_dirs.contains(&dir) {
+            path_dirs.push(dir);
+        }
+    }
+    for path in tool_path
+        .iter()
+        .chain(hcom_path.iter())
+        .chain(python_path.iter())
+    {
+        append_binary_dir(&mut path_dirs, path);
+    }
+
+    RunnerBinaries {
+        path_dirs,
+        tool_path,
+    }
+}
+
 /// Windows runner: a PowerShell script that launches the tool through the hcom
 /// ConPTY wrapper (`hcom pty <tool>`), mirroring the Unix bash runner. The
 /// wrapper runs the delivery loop so idle agents can be woken. Mirrors the bash
@@ -992,16 +1111,8 @@ fn create_runner_script_windows(
         .parse::<crate::tool::Tool>()
         .map(|t| t.spec().cli_binary)
         .unwrap_or(tool);
-    for bin_name in &[tool_bin, "hcom", "python3", "node"] {
-        if let Some(bin_path) = terminal::which_bin(bin_name)
-            && let Some(dir) = Path::new(&bin_path).parent()
-        {
-            let d = dir.to_string_lossy().to_string();
-            if !path_dirs.contains(&d) {
-                path_dirs.push(d);
-            }
-        }
-    }
+    let binaries = resolve_runner_binaries(path_dirs, tool_bin, terminal::which_bin);
+    let path_dirs = binaries.path_dirs;
     let path_line = if path_dirs.is_empty() {
         String::new()
     } else {
@@ -1026,8 +1137,18 @@ fn create_runner_script_windows(
     let hcom_bin = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "hcom".to_string());
+    let tool_path_arg = binaries
+        .tool_path
+        .as_deref()
+        .map(|path| format!(" --hcom-tool-path {}", terminal::ps_quote(path)))
+        .unwrap_or_default();
     let run_line = if tool_args.is_empty() {
-        format!("& {} pty {}", terminal::ps_quote(&hcom_bin), tool)
+        format!(
+            "& {} pty {}{}",
+            terminal::ps_quote(&hcom_bin),
+            tool,
+            tool_path_arg
+        )
     } else {
         let args_file = launch_dir.join(format!(
             "{}_{}_{}_{}.args.json",
@@ -1039,9 +1160,10 @@ fn create_runner_script_windows(
         let mut file = crate::sys::fs::create_private_new(&args_file)?;
         file.write_all(serde_json::to_string(tool_args)?.as_bytes())?;
         format!(
-            "& {} pty {} --hcom-args-file {}",
+            "& {} pty {}{} --hcom-args-file {}",
             terminal::ps_quote(&hcom_bin),
             tool,
+            tool_path_arg,
             terminal::ps_quote(&args_file.to_string_lossy())
         )
     };
@@ -1062,8 +1184,10 @@ fn create_runner_script_windows(
          Set-Location {cwd}\n\
          {unset_line}\n\
          {env_block}\n\
+         if ($env:HCOM_BACKGROUND) {{ Write-Host '[hcom runner] environment ready' }}\n\
          {sidecar_source}\n\
          {path_line}\n\
+         if ($env:HCOM_BACKGROUND) {{ Write-Host '[hcom runner] starting PTY wrapper' }}\n\
          \n\
          {run_line}\n",
         cwd = terminal::ps_quote(cwd),
@@ -1188,16 +1312,8 @@ pub fn create_runner_script(
         .parse::<crate::tool::Tool>()
         .map(|t| t.spec().cli_binary)
         .unwrap_or(tool);
-    for bin_name in &[tool_bin, "hcom", "python3", "node"] {
-        if let Some(bin_path) = terminal::which_bin(bin_name)
-            && let Some(dir) = Path::new(&bin_path).parent()
-        {
-            let d = dir.to_string_lossy().to_string();
-            if !path_dirs.contains(&d) {
-                path_dirs.push(d);
-            }
-        }
-    }
+    let binaries = resolve_runner_binaries(path_dirs, tool_bin, terminal::which_bin);
+    let path_dirs = binaries.path_dirs;
 
     let path_export = if !path_dirs.is_empty() {
         format!("export PATH=\"{}:$PATH\"", path_dirs.join(":"))
@@ -1206,6 +1322,16 @@ pub fn create_runner_script(
     };
 
     let use_exec = if run_here { "" } else { "exec " };
+    let tool_path_arg = binaries
+        .tool_path
+        .as_deref()
+        .map(|path| {
+            format!(
+                " --hcom-tool-path {}",
+                crate::tools::args_common::shell_quote(path)
+            )
+        })
+        .unwrap_or_default();
 
     let content = format!(
         "#!/bin/bash\n\
@@ -1220,7 +1346,7 @@ pub fn create_runner_script(
          {}\n\
          {}\n\
          \n\
-         {}{} pty {} {}\n",
+         {}{} pty {}{} {}\n",
         tool.chars()
             .next()
             .unwrap_or('?')
@@ -1239,6 +1365,7 @@ pub fn create_runner_script(
         use_exec,
         crate::tools::args_common::shell_quote(&native_bin_str),
         tool,
+        tool_path_arg,
         tool_args_str,
     );
 
@@ -1261,20 +1388,23 @@ pub fn create_runner_script(
 }
 
 /// Build the command that runs a generated runner script in the launched
-/// terminal: PowerShell on Windows, bash elsewhere.
-fn runner_invocation_command(script_file: &str) -> String {
-    if cfg!(windows) {
-        format!(
-            "powershell {} {}",
-            crate::terminal::POWERSHELL_SCRIPT_FLAGS.join(" "),
-            crate::terminal::ps_quote(script_file)
-        )
+/// terminal. On Windows the outer launcher is already PowerShell, so invoke
+/// the runner in that process instead of starting a second PowerShell host.
+/// Besides avoiding needless startup cost, this removes a launch stage that
+/// can intermittently stall before `hcom pty` is reached.
+fn runner_invocation_command_for_platform(script_file: &str, windows: bool) -> String {
+    if windows {
+        format!("& {}", crate::terminal::ps_quote(script_file))
     } else {
         format!(
             "bash {}",
             crate::tools::args_common::shell_quote(script_file)
         )
     }
+}
+
+fn runner_invocation_command(script_file: &str) -> String {
+    runner_invocation_command_for_platform(script_file, cfg!(windows))
 }
 
 /// Launch a tool via PTY wrapper in a terminal.
@@ -1362,7 +1492,7 @@ fn finalize_background_launch(
     log_file: String,
     pid: u32,
     effective_preset: String,
-) {
+) -> Result<()> {
     instance_binding::persist_terminal_launch_context(
         ctx.db,
         ctx.instance_name,
@@ -1370,25 +1500,68 @@ fn finalize_background_launch(
         &effective_preset,
         Some(ctx.process_id),
     );
-    instances::update_instance_position(
-        ctx.db,
-        ctx.instance_name,
-        &serde_json::Map::from_iter([
-            ("pid".to_string(), json!(pid)),
-            ("background_log_file".to_string(), json!(&log_file)),
-        ]),
-    );
+    let updates =
+        serde_json::Map::from_iter([("background_log_file".to_string(), json!(&log_file))]);
+    let pid_identity = crate::db::observe_pid_identity(pid);
+    let persist_result = pid_identity
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .and_then(|identity| {
+            ctx.db.update_instance_pid_with_identity_and_fields(
+                ctx.instance_name,
+                pid,
+                identity.as_deref(),
+                &updates,
+            )
+        });
+    if let Err(e) = persist_result {
+        // Keep the log path as diagnostics even though PID ownership was not
+        // established, and stop the untracked runner. Never kill by an
+        // unverified PID: it may already have exited and been reused. A runner
+        // that was alive but had no observable identity is still our unreaped
+        // child, so its PID can't have been recycled yet.
+        let _ = ctx.db.update_instance_fields(ctx.instance_name, &updates);
+        let still_ours = match pid_identity.as_ref() {
+            Ok(Some(expected)) => crate::sys::process::identity(pid).as_ref() == Some(expected),
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        if still_ours {
+            let _ = crate::sys::process::kill_group(pid);
+        }
+        crate::log::log_error(
+            "launcher",
+            "background.persist_pid",
+            &format!("instance={} pid={} err={}", ctx.instance_name, pid, e),
+        );
+        bail!(
+            "failed to persist background process for '{}': {}",
+            ctx.instance_name,
+            e
+        );
+    }
+    let hcom_dir = crate::paths::hcom_dir();
     crate::pidtrack::record_pid(&crate::pidtrack::PidRecord {
+        hcom_dir: &hcom_dir,
+        pid,
+        tool: ctx.tool,
+        name: ctx.instance_name,
+        directory: ctx.working_dir,
         process_id: ctx.process_id,
         terminal_preset: &effective_preset,
+        pane_id: "",
+        terminal_id: "",
+        kitty_listen_on: "",
+        zellij_session_name: "",
+        session_id: "",
+        notify_port: 0,
+        inject_port: 0,
         tag: ctx.tag,
-        ..crate::pidtrack::PidRecord::new(
-            &crate::paths::hcom_dir(),
-            pid,
-            ctx.tool,
-            ctx.instance_name,
-            ctx.working_dir,
-        )
+        pid_identity: pid_identity
+            .as_ref()
+            .ok()
+            .and_then(|v| v.as_deref())
+            .unwrap_or(""),
     });
     ctx.log_files.push(log_file.clone());
     ctx.handles.push(json!({
@@ -1397,6 +1570,7 @@ fn finalize_background_launch(
         "log_file": log_file,
         "pid": pid,
     }));
+    Ok(())
 }
 
 fn launch_background_runner(
@@ -1463,7 +1637,7 @@ fn launch_pty_or_background(
             ctx.terminal_mode,
             inside_ai_tool,
         )?;
-        finalize_background_launch(ctx, log_file, pid, effective_preset);
+        finalize_background_launch(ctx, log_file, pid, effective_preset)?;
         Ok(true)
     } else {
         let effective_run_here = will_run_in_current_terminal(
@@ -1742,14 +1916,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         c
     });
 
-    // For Codex: probe CODEX_HOME writability synchronously. Sandboxed parent
-    // codex would otherwise spawn a child that hangs on the readonly-state-DB
-    // repair prompt. Failing here lets the parent's sandbox-escalation flow
-    // surface the denial to the user.
-    if matches!(normalized, LaunchTool::Codex) {
-        crate::tools::codex_preprocessing::ensure_codex_home_writable()?;
-    }
-
     let inside_ai_tool = crate::shared::context::HcomContext::from_os().is_inside_ai_tool();
     let terminal_mode = params
         .terminal
@@ -1763,9 +1929,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         inside_ai_tool,
     );
 
-    // Ensure hooks are installed (strict: refuse to launch without hooks)
-    ensure_hooks_installed(&normalized, hcom_config.auto_approve)?;
-
     // Build base environment for the current launch regime, then overlay
     // config.toml + ~/.hcom/env which win.
     let mut base_env = build_launch_env(
@@ -1773,22 +1936,44 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         launch_env_regime(base_env_run_here, inside_ai_tool),
     );
     if let Some(ref caller_env) = params.env {
-        base_env.extend(caller_env.clone());
+        for (key, value) in caller_env {
+            insert_effective_env(&mut base_env, key.clone(), value.clone(), cfg!(windows));
+        }
     }
     base_env.remove("HCOM_TERMINAL");
-    if let Some(env_var) = normalized.spec().launch.config_dir_env
-        && !base_env.contains_key(env_var)
-        && std::env::var(env_var)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_none()
-        && let Some(config_dir) = isolated_tool_config_dir(&normalized)
-    {
-        base_env.insert(
-            env_var.to_string(),
-            config_dir.to_string_lossy().to_string(),
+    base_env.remove("HCOM_RESUME_SESSION_ID");
+    base_env.remove("HCOM_OPENCODE_AGENT");
+    base_env.remove("HCOM_OPENCODE_MODEL");
+    ensure_tool_config_env(&normalized, &mut base_env);
+
+    let working_dir = params.cwd.as_deref().unwrap_or(".");
+    let canonical_dir = std::fs::canonicalize(working_dir)
+        .unwrap_or_else(|_| std::path::PathBuf::from(working_dir));
+
+    // Codex preflight and hook setup must use the same effective CODEX_HOME as
+    // the child, including overrides from ~/.hcom/env and caller-provided env.
+    let codex_home = if matches!(normalized, LaunchTool::Codex) {
+        crate::tools::codex_preprocessing::resolve_codex_home_from_env(&base_env, &canonical_dir)
+            .map(|(path, explicit)| (crate::shared::platform::child_process_path(&path), explicit))
+    } else {
+        None
+    };
+    if let Some((ref path, explicit_env)) = codex_home {
+        insert_effective_env(
+            &mut base_env,
+            "CODEX_HOME".to_string(),
+            path.to_string_lossy().into_owned(),
+            cfg!(windows),
         );
+        crate::tools::codex_preprocessing::ensure_codex_home_writable_at(path, explicit_env)?;
     }
+
+    // Ensure hooks are installed (strict: refuse to launch without hooks)
+    ensure_hooks_installed(
+        &normalized,
+        hcom_config.auto_approve,
+        codex_home.as_ref().map(|(path, _)| path.as_path()),
+    )?;
 
     // Tag resolution
     let effective_tag = if let Some(ref tag) = params.tag {
@@ -1823,9 +2008,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         base_env.insert("GEMINI_SYSTEM_MD".to_string(), path);
     }
 
-    let working_dir = params.cwd.as_deref().unwrap_or(".");
-    let canonical_dir = std::fs::canonicalize(working_dir)
-        .unwrap_or_else(|_| std::path::PathBuf::from(working_dir));
     // Folder trust: on first run each tool shows a "do you trust this folder?"
     // prompt — the user accepts to continue or declines and it exits. When an
     // agent launches another agent via hcom, auto-approve the prompt for the
@@ -1874,7 +2056,14 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // paired with a project layer that hcom itself just marked trusted — that
     // layer could contribute a hook source the scan never saw.
     let codex_hook_trust = if matches!(normalized, LaunchTool::Codex) {
-        codex_preprocessing::resolve_codex_hook_trust(&params.args, &canonical_dir)
+        codex_preprocessing::resolve_codex_hook_trust_at(
+            &params.args,
+            &canonical_dir,
+            codex_home
+                .as_ref()
+                .map(|(path, _)| path.as_path())
+                .expect("Codex launch must resolve CODEX_HOME"),
+        )
     } else {
         codex_preprocessing::CodexHookTrustOutcome::NoActionNeeded
     };
@@ -1983,6 +2172,16 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
         let tool_type = base_tool;
         instance_env.insert("HCOM_TOOL".to_string(), tool_type.to_string());
+        // A resumed OpenCode session emits no session event until the first
+        // prompt, so the plugin binds at startup from this instead. Always set
+        // (empty unless resuming) so a launch from inside a resumed agent does
+        // not inherit it.
+        if matches!(tool_type, "opencode" | "kilo") {
+            instance_env.insert(
+                "HCOM_RESUME_SESSION_ID".to_string(),
+                params.prior_session_id.clone().unwrap_or_default(),
+            );
+        }
 
         // Pre-format the pane title for templates that substitute
         // `{pane_title}` (custom user templates only — the built-in herdr
@@ -2090,7 +2289,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                                     log_file,
                                     pid,
                                     effective_preset,
-                                );
+                                )?;
                                 Ok(true)
                             }
                             _ => Ok(false),
@@ -2271,6 +2470,29 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_name,
                         hcom_config.auto_approve,
                     );
+                    let effective_args = if normalized == LaunchTool::OpenCode {
+                        let args = opencode_preprocessing::preprocess_opencode_args(
+                            &params.args,
+                            &mut instance_env,
+                            std::path::Path::new(working_dir),
+                        )?;
+                        if let Some(forked_id) = instance_env
+                            .get("HCOM_RESUME_SESSION_ID")
+                            .filter(|s| !s.is_empty())
+                        {
+                            instances::update_instance_position(
+                                db,
+                                &instance_name,
+                                &serde_json::Map::from_iter([(
+                                    "session_id".to_string(),
+                                    json!(forked_id),
+                                )]),
+                            );
+                        }
+                        args
+                    } else {
+                        params.args.clone()
+                    };
 
                     instances::update_instance_position(
                         db,
@@ -2294,7 +2516,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             handles: &mut handles,
                         },
                         &mut instance_env,
-                        &params.args,
+                        &effective_args,
                         &params,
                         inside_ai_tool,
                     )
@@ -3564,6 +3786,17 @@ mod tests {
             content.contains("exit $LASTEXITCODE"),
             "runner must surface the wrapped process's real exit code, not always report success"
         );
+        let environment_ready = content
+            .find("[hcom runner] environment ready")
+            .expect("background launches should expose the environment stage");
+        let sidecar_source = content
+            .find("Test-Path '")
+            .expect("ambient env should be sourced from a sidecar file");
+        let wrapper_start = content
+            .find("[hcom runner] starting PTY wrapper")
+            .expect("background launches should expose the wrapper stage");
+        assert!(environment_ready < sidecar_source);
+        assert!(sidecar_source < wrapper_start);
 
         let sidecar = content
             .split("Test-Path '")
@@ -3587,6 +3820,147 @@ mod tests {
 
         std::fs::remove_file(&script).ok();
         std::fs::remove_file(sidecar).ok();
+    }
+
+    #[test]
+    fn test_windows_runner_invocation_reuses_outer_powershell() {
+        let command = runner_invocation_command_for_platform(r"C:\tmp\it's runner.ps1", true);
+        assert_eq!(command, r"& 'C:\tmp\it''s runner.ps1'");
+        assert!(
+            !command.to_ascii_lowercase().contains("powershell"),
+            "the outer PowerShell must not launch a redundant nested host"
+        );
+    }
+
+    #[test]
+    fn test_unix_runner_invocation_uses_bash() {
+        let command = runner_invocation_command_for_platform("/tmp/it's runner.sh", false);
+        assert_eq!(command, "bash '/tmp/it'\\''s runner.sh'");
+    }
+
+    #[test]
+    fn test_runner_binary_dirs_prioritize_selected_node_and_deduplicate() {
+        let resolved = HashMap::from([
+            ("codex", "pnpm/bin/codex"),
+            ("hcom", "target/debug/hcom"),
+            ("node", "nvm/bin/node"),
+            ("python3", "system/bin/python3"),
+        ]);
+        // Model an earlier dev-root/current-exe insertion. Resolving hcom to the
+        // same directory must not add it twice.
+        let binaries = resolve_runner_binaries(vec!["target/debug".to_string()], "codex", |name| {
+            resolved.get(name).map(ToString::to_string)
+        });
+
+        assert_eq!(
+            binaries.path_dirs,
+            ["nvm/bin", "target/debug", "pnpm/bin", "system/bin"].map(ToString::to_string)
+        );
+        assert_eq!(binaries.tool_path.as_deref(), Some("pnpm/bin/codex"));
+        assert!(
+            binaries.path_dirs.iter().position(|dir| dir == "nvm/bin")
+                < binaries
+                    .path_dirs
+                    .iter()
+                    .position(|dir| dir == "system/bin"),
+            "the selected Node directory must precede every generic system directory"
+        );
+    }
+
+    #[test]
+    fn test_runner_binary_dirs_keep_system_tool_explicit_behind_selected_node() {
+        let resolved = HashMap::from([
+            ("codex", "system/bin/codex"),
+            ("hcom", "system/bin/hcom"),
+            ("node", "nvm/bin/node"),
+            ("python3", "system/bin/python3"),
+        ]);
+
+        let binaries = resolve_runner_binaries(vec![], "codex", |name| {
+            resolved.get(name).map(ToString::to_string)
+        });
+
+        assert_eq!(
+            binaries.path_dirs,
+            ["nvm/bin", "system/bin"].map(ToString::to_string)
+        );
+        assert_eq!(binaries.tool_path.as_deref(), Some("system/bin/codex"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_tool_config_env_copies_ambient_override_into_clean_child_env() {
+        let _guard = EnvVarGuard::remove(vec!["CODEX_HOME".to_string()]);
+        unsafe { std::env::set_var("CODEX_HOME", "/isolated/codex-home") };
+        let mut env = HashMap::from([("HOME".to_string(), "/clean-shell-home".to_string())]);
+
+        ensure_tool_config_env(&LaunchTool::Codex, &mut env);
+
+        assert_eq!(
+            env.get("CODEX_HOME").map(String::as_str),
+            Some("/isolated/codex-home")
+        );
+    }
+
+    #[test]
+    fn test_windows_env_override_replaces_different_key_casing() {
+        let mut env = HashMap::from([(
+            "CODEX_HOME".to_string(),
+            r"C:\ambient-codex-home".to_string(),
+        )]);
+
+        insert_effective_env(
+            &mut env,
+            "Codex_Home".to_string(),
+            r"C:\caller-codex-home".to_string(),
+            true,
+        );
+
+        assert_eq!(env.len(), 1);
+        assert_eq!(
+            effective_env_value(&env, "CODEX_HOME", true),
+            Some(r"C:\caller-codex-home")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_launch_env_distinct_codex_homes_and_runner_quoting() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        unsafe { std::env::set_var("CODEX_HOME", "/ambient/codex-home") };
+
+        let config = crate::config::HcomConfig::default();
+        let mut base_env = build_launch_env(&config, LaunchEnvRegime::HumanShell);
+
+        // Ambient was pulled in by ensure_tool_config_env
+        ensure_tool_config_env(&LaunchTool::Codex, &mut base_env);
+        assert_eq!(
+            effective_env_value(&base_env, "CODEX_HOME", cfg!(windows)),
+            Some("/ambient/codex-home")
+        );
+
+        // Caller overrides with child-specific CODEX_HOME
+        let caller_override = HashMap::from([(
+            "CODEX_HOME".to_string(),
+            "/child/custom-codex-home".to_string(),
+        )]);
+        for (k, v) in caller_override {
+            insert_effective_env(&mut base_env, k, v, cfg!(windows));
+        }
+        ensure_tool_config_env(&LaunchTool::Codex, &mut base_env);
+        assert_eq!(
+            effective_env_value(&base_env, "CODEX_HOME", cfg!(windows)),
+            Some("/child/custom-codex-home")
+        );
+
+        // Test runner quoting preservation
+        let script_win =
+            runner_invocation_command_for_platform(r"C:\dir with spaces\test's.ps1", true);
+        assert_eq!(script_win, r"& 'C:\dir with spaces\test''s.ps1'");
+
+        let script_unix =
+            runner_invocation_command_for_platform("/dir with spaces/test's.sh", false);
+        assert_eq!(script_unix, "bash '/dir with spaces/test'\\''s.sh'");
     }
 
     // Tool args must travel via the JSON sidecar, never inline on the run
@@ -3807,6 +4181,49 @@ mod tests {
         assert!(resolve_explicit_name_conflict(&db, "zeno").is_ok());
         // Row must be gone so the launcher can create a fresh row with the same name.
         assert!(db.get_instance("zeno").unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn finalize_background_launch_records_pid_identity_and_metadata() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        insert_test_instance(&db, "luna", "inactive");
+
+        let mut log_files = Vec::new();
+        let mut handles = Vec::new();
+        let mut ctx = BackgroundLaunchCtx {
+            db: &db,
+            tool: "codex",
+            instance_name: "luna",
+            process_id: "proc-luna",
+            terminal_mode: Some("kitty"),
+            tag: "tag-luna",
+            working_dir: "/tmp/workspace",
+            log_files: &mut log_files,
+            handles: &mut handles,
+        };
+
+        finalize_background_launch(
+            &mut ctx,
+            "/tmp/luna.log".to_string(),
+            std::process::id(),
+            "kitty-tab".to_string(),
+        )
+        .unwrap();
+
+        let orphans = crate::pidtrack::get_orphan_processes(&hcom_dir, None);
+        assert_eq!(orphans.len(), 1);
+        let orphan = &orphans[0];
+        assert_eq!(orphan.tool, "codex");
+        assert_eq!(orphan.names, vec!["luna"]);
+        assert_eq!(orphan.directory, "/tmp/workspace");
+        assert_eq!(orphan.process_id, "proc-luna");
+        assert_eq!(orphan.terminal_preset, "kitty-tab");
+        assert_eq!(orphan.tag, "tag-luna");
+        assert!(!orphan.pid_identity.is_empty());
+        assert_eq!(log_files, vec!["/tmp/luna.log"]);
+        assert_eq!(handles.len(), 1);
     }
 
     #[test]

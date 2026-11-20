@@ -1,11 +1,11 @@
 //! `hcom send` command — send messages to hcom instances.
 
-use std::io::{IsTerminal, Read as IoRead};
+use std::io::{IsTerminal, Read as IoRead, Write as IoWrite};
 
+use crate::cli_context::InlineBatch;
 use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
 use crate::identity;
-use crate::instances;
 use crate::messages::{
     InstanceInfo, MessageEnvelope, MessageScope, compute_scope, sender_instance_key,
     should_deliver_message, validate_intent, validate_message,
@@ -113,6 +113,10 @@ pub struct SendArgs {
     /// Suppress output
     #[arg(long)]
     pub quiet: bool,
+
+    /// Print the event ID and recipients as one JSON line
+    #[arg(long)]
+    pub json: bool,
 
     // ── Inline bundle ──
     /// Bundle title (creates inline bundle)
@@ -383,15 +387,15 @@ fn print_broadcast_preview(db: &HcomDb, delivered_to: &[String]) {
 
 ///
 /// Validates message, computes scope, logs event, wakes recipients' delivery
-/// loops (system-wide fan-out only for explicit broadcasts). Returns
-/// delivered_to list (base names).
-pub fn send_message(
+/// loops (system-wide fan-out only for explicit broadcasts). Returns the
+/// logged event ID and delivered_to list (base names).
+fn send_message_logged(
     db: &HcomDb,
     identity: &SenderIdentity,
     message: &str,
     envelope: Option<&MessageEnvelope>,
     explicit_targets: Option<&[String]>,
-) -> Result<Vec<String>, String> {
+) -> Result<(i64, Vec<String>), String> {
     validate_message(message)?;
 
     let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
@@ -459,7 +463,7 @@ pub fn send_message(
     };
 
     // Log event to DB
-    let _event_id = db
+    let event_id = db
         .log_event("message", &routing_instance, &data)
         .map_err(|e| format!("Failed to write message to database: {e}"))?;
 
@@ -477,7 +481,7 @@ pub fn send_message(
             && matches!(identity.kind, SenderKind::Instance)
             && delivery.effective_scope == MessageScope::Mentions
         {
-            create_request_watches(db, &identity.name, _event_id, &delivery.delivered_to);
+            create_request_watches(db, &identity.name, event_id, &delivery.delivered_to);
         }
     }
 
@@ -497,26 +501,86 @@ pub fn send_message(
     // Trigger relay push so remote devices see the message immediately
     crate::relay::trigger_push();
 
-    Ok(delivery.delivered_to)
+    Ok((event_id, delivery.delivered_to))
 }
 
-/// Resolve reply_to to local event ID. Returns None if not found.
-fn resolve_reply_to_local(db: &HcomDb, reply_to: &str) -> Option<i64> {
-    // reply_to can be "42" or "42:BOXE" (remote)
-    let local_part = reply_to.split(':').next()?;
-    let id: i64 = local_part.parse().ok()?;
+/// Preserve the stable public send API for non-CLI callers that only need the
+/// resolved recipient list.
+pub fn send_message(
+    db: &HcomDb,
+    identity: &SenderIdentity,
+    message: &str,
+    envelope: Option<&MessageEnvelope>,
+    explicit_targets: Option<&[String]>,
+) -> Result<Vec<String>, String> {
+    send_message_logged(db, identity, message, envelope, explicit_targets)
+        .map(|(_, delivered_to)| delivered_to)
+}
 
-    // Verify event exists and is a message
+/// Resolve reply_to to local event ID. Device-qualified references use either
+/// a locally originated row for this device or unique relay origin metadata,
+/// and fail closed when the origin/device pair is missing or ambiguous.
+fn resolve_reply_to_local(db: &HcomDb, reply_to: &str) -> Option<i64> {
+    let reply_to = reply_to.trim();
+    if reply_to.is_empty() {
+        return None;
+    }
+
+    if let Some((origin_str, device_short)) = crate::relay::control::split_device_suffix(reply_to) {
+        let origin_id: i64 = origin_str.parse().ok()?;
+        if origin_id <= 0 {
+            return None;
+        }
+
+        let own_short_id = crate::relay::read_device_uuid()
+            .map(|device_id| crate::relay::device_short_id_for_db(db, &device_id));
+        if own_short_id.as_deref() == Some(device_short) {
+            let local_id: Option<i64> = db
+                .conn()
+                .query_row(
+                    "SELECT id FROM events WHERE id = ? AND id > 0 AND type = 'message' \
+                     AND json_type(data, '$._relay') IS NULL",
+                    rusqlite::params![origin_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            return local_id;
+        }
+
+        let mut stmt = db
+            .conn()
+            .prepare(
+                "SELECT id FROM events WHERE type = 'message' \
+                 AND json_type(data, '$._relay.id') = 'integer' \
+                 AND json_extract(data, '$._relay.id') = ? \
+                 AND json_extract(data, '$._relay.short') = ? \
+                 LIMIT 2",
+            )
+            .ok()?;
+        let matching_ids: Vec<i64> = stmt
+            .query_map(rusqlite::params![origin_id, device_short], |row| row.get(0))
+            .ok()?
+            .flatten()
+            .collect();
+        return if matching_ids.len() == 1 {
+            Some(matching_ids[0])
+        } else {
+            None
+        };
+    }
+
+    // Bare IDs are local event IDs. Keep this path unchanged for callers that
+    // do not have a relay device suffix.
+    let local_id: i64 = reply_to.parse().ok()?;
     let exists: bool = db
         .conn()
         .query_row(
             "SELECT 1 FROM events WHERE id = ? AND type = 'message'",
-            rusqlite::params![id],
+            rusqlite::params![local_id],
             |_| Ok(true),
         )
         .unwrap_or(false);
-
-    if exists { Some(id) } else { None }
+    exists.then_some(local_id)
 }
 
 /// Get thread from an event (for --reply-to thread inheritance).
@@ -656,6 +720,17 @@ fn read_stdin() -> Result<String, String> {
     } else {
         Err("No input received on stdin".to_string())
     }
+}
+
+fn write_json_send_result(event_id: i64, delivered_to: &[String]) -> Result<(), String> {
+    let recipients = serde_json::to_string(delivered_to)
+        .map_err(|e| format!("could not serialize JSON output: {e}"))?;
+    let line = format!(r#"{{"event_id":{event_id},"delivered_to":{recipients}}}"#) + "\n";
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(line.as_bytes())
+        .and_then(|_| stdout.flush())
+        .map_err(|e| format!("could not write JSON output: {e}"))
 }
 
 /// Process positional args without `--` separator.
@@ -1125,7 +1200,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         || envelope.thread.is_some()
         || envelope.bundle_id.is_some();
 
-    let delivered_to = match send_message(
+    let (event_id, delivered_to) = match send_message_logged(
         db,
         &sender_identity,
         &message,
@@ -1139,6 +1214,22 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     };
 
+    // From here send owns the receiver's inline delivery. It either emits a
+    // capped batch and acknowledges it after flush, or deliberately leaves it
+    // unread (--quiet or a failed output write). The router must not drain it
+    // a second time.
+    crate::cli_context::claim_inline_delivery();
+
+    if args.json {
+        if let Err(e) = write_json_send_result(event_id, &delivered_to) {
+            eprintln!("Message sent, but {e}");
+            crate::relay::worker::ensure_worker(true);
+            return 1;
+        }
+        crate::relay::worker::ensure_worker(true);
+        return 0;
+    }
+
     // ── Feedback ──
     if args.quiet {
         crate::relay::worker::ensure_worker(true);
@@ -1147,62 +1238,57 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
     let feedback = get_recipient_feedback(db, &delivered_to);
 
-    // Show unread messages if instance context (full delivery with cursor advance)
-    if matches!(sender_identity.kind, SenderKind::Instance) {
-        let messages = db.get_unread_messages(&sender_identity.name);
-        if !messages.is_empty() {
-            // Advance cursor
-            if let Some(last) = messages.last()
-                && let Some(id) = last.event_id
-            {
-                let mut updates = serde_json::Map::new();
-                updates.insert("last_event_id".into(), serde_json::json!(id));
-                instances::update_instance_position(db, &sender_identity.name, &updates);
-            }
+    // Deliver the receiver's unread messages inline. With an external sender
+    // (`--from`), use the process-bound adhoc receiver, if any; Codex remains
+    // hook-delivered. A normal instance sender may show its own unread inline.
+    let receiver = if matches!(sender_identity.kind, SenderKind::Instance) {
+        Some((&sender_identity, false))
+    } else {
+        ctx.and_then(crate::cli_context::inline_receiver)
+            .map(|actor| (actor, true))
+    };
+    let batch = receiver
+        .as_ref()
+        .and_then(|(receiver, _)| InlineBatch::take(db, &receiver.name));
+    let noted_remaining = batch.as_ref().is_some_and(|b| b.remaining > 0);
+    if let (Some((receiver, set_status)), Some(batch)) = (receiver, batch) {
+        let subagent_names: std::collections::HashSet<String> = db
+            .conn()
+            .prepare("SELECT name FROM instances WHERE parent_name = ?")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map(rusqlite::params![&receiver.name], |row| row.get(0))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (sub_msgs, main_msgs): (Vec<_>, Vec<_>) = batch
+            .messages
+            .iter()
+            .partition(|msg| subagent_names.contains(&msg.from));
 
-            // Separate subagent messages from main messages
-            let subagent_names: std::collections::HashSet<String> = db
-                .conn()
-                .prepare("SELECT name FROM instances WHERE parent_name = ?")
-                .ok()
-                .map(|mut stmt| {
-                    stmt.query_map(rusqlite::params![&sender_identity.name], |row| row.get(0))
-                        .ok()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|r| r.ok())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let mut main_msgs = Vec::new();
-            let mut sub_msgs = Vec::new();
-            for msg in &messages {
-                if subagent_names.contains(&msg.from) {
-                    sub_msgs.push(msg);
-                } else {
-                    main_msgs.push(msg);
-                }
-            }
-
-            const MAX_MSGS: usize = 50;
-
-            print!("{feedback}");
-            if !main_msgs.is_empty() {
-                let capped: Vec<&_> = main_msgs.iter().take(MAX_MSGS).copied().collect();
-                let formatted = format_messages_for_hook(db, &capped, &sender_identity.name);
-                println!("\n{formatted}");
-            }
-            if !sub_msgs.is_empty() {
-                let capped: Vec<&_> = sub_msgs.iter().take(MAX_MSGS).copied().collect();
-                let formatted = format_messages_for_hook(db, &capped, &sender_identity.name);
-                println!("\n[Subagent messages]\n{formatted}");
-            }
-            if main_msgs.is_empty() && sub_msgs.is_empty() {
-                println!();
-            }
-        } else {
-            println!("{feedback}");
+        let mut output = feedback.clone();
+        if !main_msgs.is_empty() {
+            output.push_str(&format!(
+                "\n{}",
+                format_messages_for_hook(db, &main_msgs, &receiver.name)
+            ));
+        }
+        if !sub_msgs.is_empty() {
+            output.push_str(&format!(
+                "\n[Subagent messages]\n{}",
+                format_messages_for_hook(db, &sub_msgs, &receiver.name)
+            ));
+        }
+        output.push('\n');
+        output.push_str(&batch.remaining_note(&receiver.name));
+        if let Err(e) = batch.emit(db, &receiver.name, &output, set_status) {
+            eprintln!("Message sent, but {e}");
+            crate::relay::worker::ensure_worker(true);
+            return 1;
         }
     } else {
         println!("{feedback}");
@@ -1220,15 +1306,16 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         println!("  To send '--name {sender_name}' as literal text, don't put it at the very end.");
     }
 
-    // Adhoc unread delivery: for --name instances, show unread preview
-    if explicit_name.is_some() && matches!(sender_identity.kind, SenderKind::Instance) {
-        let messages = db.get_unread_messages(&sender_identity.name);
-        if !messages.is_empty() {
-            println!("\n{}", "─".repeat(40));
-            println!("[hcom] new message(s)");
-            println!("{}", "─".repeat(40));
-            println!("\nRun: hcom listen --name {}", sender_identity.name);
-        }
+    // Messages arriving after the batch was taken are intentionally left for
+    // the next command, but tell an adhoc caller that more work is pending.
+    if let Some((receiver, _)) = receiver
+        && !noted_remaining
+        && !db.get_unread_messages(&receiver.name).is_empty()
+    {
+        println!(
+            "[hcom] new message(s) arrived — run: hcom listen --name {}",
+            receiver.name
+        );
     }
 
     // Show intent tip
@@ -1414,6 +1501,12 @@ mod tests {
     fn parse_quiet_flag() {
         let args = SendArgs::try_parse_from(["send", "--quiet", "-b", "--", "hi"]).unwrap();
         assert!(args.quiet);
+    }
+
+    #[test]
+    fn parse_json_flag() {
+        let args = SendArgs::try_parse_from(["send", "--json", "-b", "--", "hi"]).unwrap();
+        assert!(args.json);
     }
 
     #[test]
@@ -2245,6 +2338,281 @@ mod tests {
             !await_connect(&vine_probe, Duration::from_millis(200)),
             "stopped agent's stale endpoint must stay dark"
         );
+
+        cleanup_test_db(path);
+    }
+
+    fn insert_imported_remote_message(
+        db: &HcomDb,
+        local_id: i64,
+        origin_id: serde_json::Value,
+        short: &str,
+        text: &str,
+        thread: Option<&str>,
+        intent: Option<&str>,
+    ) {
+        let mut data = serde_json::json!({
+            "from": format!("remote:{short}"),
+            "text": text,
+            "_relay": {
+                "id": origin_id,
+                "short": short,
+                "device": format!("dev-{short}"),
+            },
+        });
+        if let Some(thread) = thread {
+            data["thread"] = serde_json::json!(thread);
+        }
+        if let Some(intent) = intent {
+            data["intent"] = serde_json::json!(intent);
+        }
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) \
+                 VALUES (?, 'message', 'remote-inst', '2026-09-04T00:00:00Z', ?)",
+                rusqlite::params![local_id, data.to_string()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn remote_reply_uses_origin_and_device_instead_of_local_row_id() {
+        let (db, path, _env) = setup_test_db();
+        let own_short = crate::relay::read_device_uuid()
+            .map(|device_id| crate::relay::device_short_id_for_db(&db, &device_id))
+            .unwrap();
+        let foreign_shorts: Vec<&str> = ["BOXE", "WAVE", "MISO"]
+            .into_iter()
+            .filter(|short| *short != own_short)
+            .take(2)
+            .collect();
+        let foreign_a = foreign_shorts[0];
+        let foreign_b = foreign_shorts[1];
+        db.conn()
+            .execute(
+                "INSERT INTO events (id, type, instance, timestamp, data) \
+                 VALUES (42, 'message', 'local', '2026-09-04T00:00:00Z', ?)",
+                [serde_json::json!({"text": "local"}).to_string()],
+            )
+            .unwrap();
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            foreign_a,
+            "remote foreign-a",
+            None,
+            None,
+        );
+        insert_imported_remote_message(
+            &db,
+            200,
+            serde_json::json!(42),
+            foreign_b,
+            "remote foreign-b",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            resolve_reply_to_local(&db, &format!("42:{foreign_a}")),
+            Some(100)
+        );
+        assert_eq!(
+            resolve_reply_to_local(&db, &format!("42:{foreign_b}")),
+            Some(200)
+        );
+        assert_eq!(
+            resolve_reply_to_local(&db, &format!("42:{own_short}")),
+            Some(42)
+        );
+        assert_eq!(
+            resolve_reply_to_local(&db, &format!("999:{own_short}")),
+            None
+        );
+        insert_imported_remote_message(
+            &db,
+            300,
+            serde_json::json!(42),
+            &own_short,
+            "imported local-id collision",
+            None,
+            None,
+        );
+        assert_eq!(
+            resolve_reply_to_local(&db, &format!("300:{own_short}")),
+            None
+        );
+        assert_eq!(resolve_reply_to_local(&db, "42"), Some(42));
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn remote_reply_rejects_malformed_or_ambiguous_metadata() {
+        let (db, path, _env) = setup_test_db();
+        let own_short = crate::relay::read_device_uuid()
+            .map(|device_id| crate::relay::device_short_id_for_db(&db, &device_id))
+            .unwrap();
+        let foreign_shorts: Vec<&str> = ["BOXE", "WAVE", "MISO"]
+            .into_iter()
+            .filter(|short| *short != own_short)
+            .take(2)
+            .collect();
+        let foreign_a = foreign_shorts[0];
+        let foreign_b = foreign_shorts[1];
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            foreign_a,
+            "remote",
+            None,
+            None,
+        );
+        insert_imported_remote_message(
+            &db,
+            101,
+            serde_json::json!(42),
+            foreign_a,
+            "duplicate",
+            None,
+            None,
+        );
+        insert_imported_remote_message(
+            &db,
+            102,
+            serde_json::json!("42"),
+            foreign_b,
+            "string origin",
+            None,
+            None,
+        );
+
+        assert_eq!(
+            resolve_reply_to_local(&db, &format!("42:{foreign_a}")),
+            None
+        );
+        assert_eq!(
+            resolve_reply_to_local(&db, &format!("42:{foreign_b}")),
+            None
+        );
+        for malformed in ["", "   ", "42:", ":BOXE", "42:BOXE:EXTRA", "abc:BOXE"] {
+            assert_eq!(
+                resolve_reply_to_local(&db, malformed),
+                None,
+                "{malformed:?}"
+            );
+        }
+        for noncanonical in ["42:boxe", "42:Boxe", "42:BO", "42:BOX", "42:BOXES"] {
+            assert_eq!(
+                resolve_reply_to_local(&db, noncanonical),
+                None,
+                "{noncanonical:?}"
+            );
+        }
+
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    #[serial]
+    fn cmd_send_inherits_remote_thread_and_ack_guard_uses_remote_event() {
+        let (db, path, _env) = setup_test_db();
+        let own_short = crate::relay::read_device_uuid()
+            .map(|device_id| crate::relay::device_short_id_for_db(&db, &device_id))
+            .unwrap();
+        let remote_short = if own_short == "BOXE" { "WAVE" } else { "BOXE" };
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('sender', 1000.0), ('target', 1000.0), ('luna', 1000.0)",
+                [],
+            )
+            .unwrap();
+        insert_imported_remote_message(
+            &db,
+            100,
+            serde_json::json!(42),
+            remote_short,
+            "remote request",
+            Some("remote-thread"),
+            Some("request"),
+        );
+
+        let mut args = SendArgs::try_parse_from([
+            "send",
+            "@target",
+            "--from",
+            "sender",
+            "--intent",
+            "ack",
+            "--reply-to",
+            &format!("42:{remote_short}"),
+            "--",
+            "pong",
+        ])
+        .unwrap();
+        args.had_separator = true;
+        assert_eq!(cmd_send(&db, &args, None), 0);
+
+        let (reply_to, reply_to_local, thread): (Option<String>, Option<i64>, Option<String>) = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.reply_to'), \
+                        json_extract(data, '$.reply_to_local'), \
+                        json_extract(data, '$.thread') \
+                 FROM events WHERE type = 'message' AND id != 100 \
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let expected_reply_to = format!("42:{remote_short}");
+        assert_eq!(reply_to.as_deref(), Some(expected_reply_to.as_str()));
+        assert_eq!(reply_to_local, Some(100));
+        assert_eq!(thread.as_deref(), Some("remote-thread"));
+
+        insert_imported_remote_message(
+            &db,
+            110,
+            serde_json::json!(10),
+            remote_short,
+            "inform",
+            None,
+            Some("inform"),
+        );
+        let sender = SenderIdentity {
+            kind: SenderKind::Instance,
+            name: "luna".into(),
+            instance_data: None,
+            session_id: None,
+        };
+        let ack_inform = MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Ack),
+            reply_to: Some(format!("10:{remote_short}")),
+            ..Default::default()
+        };
+        let error = send_message(&db, &sender, "ack", Some(&ack_inform), None).unwrap_err();
+        assert!(error.contains("Cannot ack an inform"), "{error}");
+
+        insert_imported_remote_message(
+            &db,
+            120,
+            serde_json::json!(20),
+            remote_short,
+            "ack",
+            None,
+            Some("ack"),
+        );
+        let ack_ack = MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Ack),
+            reply_to: Some(format!("20:{remote_short}")),
+            ..Default::default()
+        };
+        let error = send_message(&db, &sender, "ack", Some(&ack_ack), None).unwrap_err();
+        assert!(error.contains("Ack-on-ack loop detected"), "{error}");
 
         cleanup_test_db(path);
     }
