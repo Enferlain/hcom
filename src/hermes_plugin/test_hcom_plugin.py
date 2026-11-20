@@ -1,7 +1,6 @@
 """Stdlib-only unit tests for the hcom hermes plugin.
 
-Run:  python3 -m unittest test_hcom_plugin -v   (from src/hermes_plugin/)
-or:   python3 src/hermes_plugin/test_hcom_plugin.py
+Run:  ./test.sh   (from this project directory)
 
 The plugin talks to hcom exclusively through argv subprocess RPC, so these
 tests stub the `hcom` binary (HCOM_BIN) with a script that records every
@@ -9,7 +8,7 @@ invocation to a JSONL file and emits canned JSON per subcommand — the same
 contract the Rust side implements in src/hooks/hermes.rs.
 """
 
-import importlib
+import importlib.util
 import json
 import os
 import socket
@@ -18,8 +17,10 @@ import tempfile
 import unittest
 
 HERMES_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERMES_PLUGIN_DIR))
-hermes_plugin = importlib.import_module("hermes_plugin")
+spec = importlib.util.spec_from_file_location("hermes_plugin", os.path.join(HERMES_PLUGIN_DIR, "__init__.py"))
+hermes_plugin = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = hermes_plugin
+spec.loader.exec_module(hermes_plugin)
 
 STUB = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -39,11 +40,14 @@ elif mode == "hermes-read" and "--format" in argv:
     print(json.dumps({"context": "<hcom>hello from sol</hcom>", "up_to": 7, "count": 1}))
 elif mode == "hermes-read" and "--ack" in argv:
     print(json.dumps({"acked_to": 7}))
-elif mode == "hermes-read" and "--check" in argv:
+elif mode == "hermes-read":
     # request-intent by default; inform-only tests set HCOM_TEST_CHECK_REQUEST=0
     import os as _os
-    print(json.dumps({"has_unread": True,
-                      "has_request": _os.environ.get("HCOM_TEST_CHECK_REQUEST", "1") == "1"}))
+    if _os.environ.get("HCOM_TEST_NO_UNREAD") == "1":
+        print(json.dumps([]))
+    else:
+        intent = "request" if _os.environ.get("HCOM_TEST_CHECK_REQUEST", "1") == "1" else "inform"
+        print(json.dumps([{"from": "sol", "message": "hello", "intent": intent}]))
 elif mode == "hermes-status":
     print(json.dumps({"ok": True}))
 elif mode == "hermes-beforetool":
@@ -261,13 +265,12 @@ class HcomPluginTest(unittest.TestCase):
         self.assertIn("--soft", stops[0])
         self.assertEqual(stops[0][stops[0].index("--reason") + 1], "reset")
 
-    def test_session_end_hard_finalizes(self):
+    def test_session_end_keeps_binding_between_turns(self):
         self.bind()
-        hermes_plugin.on_session_end(session_id="ses-1")
+        hermes_plugin.on_session_end(session_id="ses-1", platform="tui")
         stops = [c for c in self.calls() if c and c[0] == "hermes-stop"]
-        self.assertEqual(len(stops), 1)
-        self.assertNotIn("--soft", stops[0])
-        self.assertIsNone(hermes_plugin._STATE["name"])
+        self.assertEqual(stops, [])
+        self.assertEqual(hermes_plugin._STATE["name"], "luna")
 
     # ── notify listener reuse (no socket leak per rebind) ─────────────────
 
@@ -308,10 +311,10 @@ class HcomPluginTest(unittest.TestCase):
         content, key = ctx.injected[0]
         self.assertEqual(content, "<hcom>")
         self.assertEqual(key, "ses-1")
-        # The check ran before the inject (filter step).
+        # The unread query ran before the inject (filter step).
         check_calls = [
             c for c in self.calls()
-            if c[:1] == ["hermes-read"] and "--check" in c
+            if c[:1] == ["hermes-read"] and "--format" not in c and "--ack" not in c
         ]
         self.assertEqual(len(check_calls), 1, f"calls: {self.calls()}")
 
@@ -325,10 +328,10 @@ class HcomPluginTest(unittest.TestCase):
                 self.injected.append((content, session_key))
                 return True
 
-        # Replace the stub with a --check:false variant for this test.
+        # Replace the stub with an empty-unread variant for this test.
         no_unread_stub = STUB.replace(
-            '"has_unread": True,',
-            '"has_unread": False,')
+            'if _os.environ.get("HCOM_TEST_NO_UNREAD") == "1":',
+            'if True:')
         stub_path = os.path.join(self.tmp.name, "hcom-nounread.py")
         with open(stub_path, "w") as f:
             f.write(no_unread_stub)

@@ -17,6 +17,7 @@ backend with the live session id; the backend maps it to the hcom name.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import subprocess
 from pathlib import Path
@@ -26,11 +27,12 @@ from pydantic import BaseModel
 
 router = APIRouter()
 
-_HCOM_DB = Path.home() / ".hcom" / "hcom.db"
-_HCOM_BIN = "hcom"
+_HCOM_DB = Path(os.environ.get("HCOM_DIR", str(Path.home() / ".hcom"))) / "hcom.db"
+_HERMES_DB = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "state.db"
+_HCOM_BIN = os.environ.get("HCOM_BIN", "hcom")
 
 
-def _hcom_json(args: list[str], timeout: float = 5.0) -> dict | None:
+def _hcom_json(args: list[str], timeout: float = 5.0) -> dict | list | None:
     """Run an hcom RPC subcommand; return parsed JSON stdout or None."""
     try:
         proc = subprocess.run(
@@ -47,7 +49,7 @@ def _hcom_json(args: list[str], timeout: float = 5.0) -> dict | None:
         parsed = json.loads(out)
     except json.JSONDecodeError:
         return None
-    return parsed if isinstance(parsed, dict) else None
+    return parsed if isinstance(parsed, (dict, list)) else None
 
 
 def _name_for_session(session_id: str) -> str | None:
@@ -55,9 +57,8 @@ def _name_for_session(session_id: str) -> str | None:
 
     Accepts the durable session key (e.g. 20260925_214123_0e89a3) or the
     ephemeral UI session uuid: the instances table records the durable id,
-    and a UI id maps through the Hermes sessions registry if needed. Falls
-    back to the single active hermes-tool instance only when exactly one
-    exists (unambiguous); never guesses among several.
+    and a UI id maps through the Hermes sessions registry if needed. An
+    unresolved session must not read or drain another session's mail.
     """
     import sqlite3
 
@@ -95,27 +96,7 @@ def _name_for_session(session_id: str) -> str | None:
             if name:
                 return name
 
-    # 3. Fallback: newest-seen hermes instance. Two live rows is the NORM
-    #    after a session switch (old row stays listening until stale-marked),
-    #    so refusing on ambiguity hides the chip exactly when it matters.
-    #    last_seen breaks the tie toward the conversation actually in use.
-    try:
-        conn = sqlite3.connect(f"file:{_HCOM_DB}?mode=ro", uri=True, timeout=3.0)
-    except sqlite3.Error:
-        return None
-    try:
-        # last_seen is not maintained for hermes-tool rows; last_stop (the
-        # last status transition timestamp) is the reliable recency signal.
-        row = conn.execute(
-            "SELECT name FROM instances WHERE tool = 'hermes' "
-            "AND status IN ('listening', 'active') "
-            "ORDER BY last_stop DESC LIMIT 1"
-        ).fetchone()
-        return row[0] if row else None
-    except sqlite3.Error:
-        return None
-    finally:
-        conn.close()
+    return None
 
 
 def _session_title(session_id: str) -> str:
@@ -127,7 +108,7 @@ def _session_title(session_id: str) -> str:
     """
     import sqlite3
 
-    db = Path.home() / ".hermes" / "state.db"
+    db = _HERMES_DB
     if not session_id or not db.exists():
         return ""
     try:
@@ -155,7 +136,7 @@ def _ui_uuid_to_durable(ui_id: str) -> str | None:
     """
     import sqlite3
 
-    db = Path.home() / ".hermes" / "state.db"
+    db = _HERMES_DB
     if not db.exists():
         return None
     try:
@@ -215,35 +196,23 @@ class DrainRequest(BaseModel):
     session_id: str = ""
 
 
-_DEBUG_LOG = Path.home() / ".hcom" / "plugin_status_debug.log"
-
-
-def _dbg(line: str) -> None:
-    """Temporary instrumentation: append to a plain file I can read back."""
-    try:
-        with open(_DEBUG_LOG, "a") as f:
-            f.write(line + "\n")
-    except OSError:
-        pass
-
-
 @router.get("/status")
 def status(session_id: str = "") -> dict:
     name = _name_for_session(session_id)
-    _dbg(f"status session_id={session_id!r} -> name={name!r}")
     if not name:
         # Not mesh-bound (pre-bind window or plain session): no chip data.
         return {"bound": False}
-    check = _hcom_json(["hermes-read", "--name", name, "--check"]) or {}
+    raw = _hcom_json(["hermes-read", "--name", name])
+    messages = [m for m in raw if isinstance(m, dict)] if isinstance(raw, list) else []
     title = _session_title(session_id)
     return {
         "bound": True,
         "name": name,
         "session_title": title,
-        "has_unread": bool(check.get("has_unread")),
-        "has_request": bool(check.get("has_request")),
-        "count": int(check.get("count") or 0),
-        "latest_from": str(check.get("latest_from") or ""),
+        "has_unread": bool(messages),
+        "has_request": any(m.get("intent") == "request" for m in messages),
+        "count": len(messages),
+        "latest_from": str(messages[-1].get("from") or "") if messages else "",
     }
 
 

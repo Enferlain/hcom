@@ -145,22 +145,24 @@ def _handle_wake_ping() -> None:
     now = time.monotonic()
     if now - _LAST_WAKE_MONOTONIC < _WAKE_MIN_INTERVAL_S:
         return
-    check = _hcom(["hermes-read", "--name", name, "--check"], timeout=5.0)
-    if not isinstance(check, dict) or not check.get("has_unread"):
+    unread = _hcom(["hermes-read", "--name", name], timeout=5.0)
+    messages = unread.get("value") if isinstance(unread, dict) else None
+    if not isinstance(messages, list) or not messages:
         return
     # Wake policy: only request-intent mail (a sender blocked on a reply)
     # buys an autonomous LLM turn. Inform/broadcast pings stay badge-only —
     # they deliver at the next natural turn via the ordinary drain.
-    # has_request missing (older hcom) degrades to wake-on-any-unread.
-    if not check.get("has_request", True):
+    if not any(isinstance(msg, dict) and msg.get("intent") == "request"
+               for msg in messages):
         _log("info", "wake_skipped_inform", name=name)
         return
-    _LAST_WAKE_MONOTONIC = now
     try:
         accepted = ctx.inject_message(_WAKE_TEXT, session_key=session_id)
     except Exception as exc:
         _log("warning", "wake_inject_failed", name=name, error=str(exc))
         return
+    if accepted:
+        _LAST_WAKE_MONOTONIC = now
     _log("info", "wake_submitted", name=name, accepted=bool(accepted))
 
 
@@ -338,24 +340,12 @@ def post_tool_call(**kwargs: Any) -> None:
 
 
 def on_session_end(**kwargs: Any) -> None:
-    """Finalize the hcom instance when the session ends.
+    """A Hermes `on_session_end` hook marks a turn, not a process exit.
 
-    On long-lived platforms (desktop/gateway) on_session_end fires after
-    EVERY turn — each turn is a fresh agent run — so a hard stop here would
-    delete the instance row between turns and the rebind's cursor seed
-    would silently skip messages that arrived in the gap. post_llm_call
-    already reports `listening` at turn end (the correct idle state, same
-    semantic as Claude's Stop hook); real departures fall to hcom's
-    staleness marking, like any unmanaged agent.
+    The host emits this hook after `run_conversation()` on TUI as well as
+    desktop/gateway. Keep the binding between turns; `post_llm_call` sets
+    listening and hcom staleness handles a process that actually departs.
     """
-    platform = str(kwargs.get("platform") or "")
-    if platform in ("desktop", "gateway"):
-        return
-    name = _STATE.get("name")
-    _clear_state()
-    if name:
-        _hcom(["hermes-stop", "--name", name,
-               "--reason", "session_end"], timeout=5.0)
 
 
 def on_session_reset(**kwargs: Any) -> None:

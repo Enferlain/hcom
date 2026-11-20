@@ -142,7 +142,7 @@ function MeshPanelBody({ rest }) {
       jsx(Button, {
         variant: 'outline',
         size: 'sm',
-        disabled: count === 0,
+        disabled: count === 0 || !has_request,
         onClick: async () => {
           await rest('/drain', {
             method: 'POST',
@@ -151,13 +151,13 @@ function MeshPanelBody({ rest }) {
           })
           refetch()
         },
-        children: 'Drain now',
+        children: 'Wake for request',
       }),
       count > 0 && !has_request
         ? jsx('div', {
             style: { color: 'var(--ui-text-quaternary)', fontSize: '11px' },
             children:
-              'inform mail — drains at your next message in this session, or wake it now',
+              'inform mail — drains at your next message in this session',
           })
         : null,
     ],
