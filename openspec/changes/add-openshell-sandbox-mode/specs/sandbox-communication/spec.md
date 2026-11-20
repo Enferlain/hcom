@@ -10,6 +10,10 @@ Keep host and sandboxed workers on the same explicitly scoped hcom team, with re
 
 The system SHALL route messages among authorized host and sandboxed workers through ordinary hcom targets, threads, intents, and reply references. A sandbox-to-sandbox conversation MUST NOT require a parent agent to relay messages manually. Display aliases MUST resolve to unambiguous location-aware identities.
 
+#### Scenario: An existing local Hermes requester delegates to a guest
+- **WHEN** an authorized local Hermes session requests work from a sandboxed worker
+- **THEN** it uses its existing host identity and ordinary hcom delivery to receive the correlated result without moving its session into a sandbox
+
 #### Scenario: Two sandboxed workers collaborate
 - **WHEN** a worker in sandbox A sends a targeted question to a team member in sandbox B
 - **THEN** the question and its reply travel through the bridge with the original conversation references preserved

@@ -218,6 +218,11 @@ impl HcomDb {
         &self.db_path
     }
 
+    /// Filesystem identity captured when this database connection was opened.
+    pub(crate) fn file_identity(&self) -> u64 {
+        self.db_inode
+    }
+
     /// Open the hcom database at ~/.hcom/hcom.db with schema migration/compat.
     pub fn open() -> Result<Self> {
         let hcom_dir = crate::paths::hcom_dir();

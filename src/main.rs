@@ -32,6 +32,7 @@ mod pty;
 pub mod relay;
 pub mod router;
 mod runtime_env;
+pub mod sandbox;
 pub mod scripts;
 pub mod shared;
 mod shell_env;

@@ -391,6 +391,13 @@ fn launch_json_reports_names_for_kill_json() {
     use std::os::unix::fs::PermissionsExt;
 
     let h = Hcom::new();
+    assert_eq!(h.run(["events", "--cursor"]).0, 0);
+    let db = rusqlite::Connection::open(h.hcom_dir.join("hcom.db")).expect("open fixture database");
+    let schema_version = || {
+        db.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("read schema version")
+    };
+    let before = schema_version();
     // A stand-in `claude` that answers --version and then idles: enough for
     // hcom to launch, track, and kill it without a real tool.
     let fake_bin = h.root_path().join("fake-bin");
@@ -447,6 +454,15 @@ fn launch_json_reports_names_for_kill_json() {
         "{report}"
     );
     assert_eq!(outcome["resume"], format!("hcom r {name}"));
+    assert_eq!(schema_version(), before);
+    let sandbox_tables: i64 = db
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name GLOB 'sandbox_*'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read sandbox table count");
+    assert_eq!(sandbox_tables, 0);
 }
 
 #[test]

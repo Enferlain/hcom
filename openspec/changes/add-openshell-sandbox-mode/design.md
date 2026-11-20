@@ -4,7 +4,9 @@
 
 See [proposal.md](proposal.md) for motivation and the three capability deltas for the behavioral contract. This is a researched design, not an implemented or live-qualified integration.
 
-Research was limited to this hcom checkout, Git objects at its recorded upstream base, the requested `OpenShell-current` checkout, and primary OpenShell documentation. No historical plans or isolation implementations from other hcom folders were consulted.
+The original research used this hcom checkout, Git objects at its recorded upstream base, the then-current OpenShell checkout, and primary OpenShell documentation.
+
+The local VM evaluation now points to `OpenShell-v0.1.7` at `5d25211b25a8fc887e8d5c606d57d6ab22f1d76c`, with a recorded downstream VM generation fix. The older `OpenShell-current` path has been retired. The local evaluation has separate v0.1.7 CLI and gateway binaries; PATH still selects v0.1.3. Use the evaluation binaries as the candidate and record their hashes, source and local diff, and live gateway identity before relying on the October transport assumptions.
 
 ### Evidence and resulting constraints
 
@@ -36,7 +38,13 @@ Primary references, checked alongside the local source:
 - [Runtime selection and VM mount limitations](https://github.com/NVIDIA/OpenShell/blob/a24340bebaa9ee173725ce87c48011d2cc2cacd9/docs/how-it-works/sandboxes/runtimes.mdx).
 - [Provider endpoint binding](https://github.com/NVIDIA/OpenShell/blob/a24340bebaa9ee173725ce87c48011d2cc2cacd9/docs/how-it-works/providers/profiles.mdx).
 
-Graph coverage checks reported no recorded gaps for the source paths above; material behavior was checked in exact source. Coverage remains a best-effort signal. The CLI versions/help and source were checked live, but no gateway was started and no agent or transport was live-qualified during planning.
+Graph coverage checks reported no recorded gaps for the source paths above. The October research checked CLI versions, help, and source. The November preflight below adds live fixture evidence.
+
+### Runtime preflight on 2026-11-21
+
+- A disposable loopback gateway used the OpenShell 0.1.7 VM evaluation build and Ubuntu fixture image `nvcr.io/nvidia/base/ubuntu@sha256:fef8f2708dbb85fbfcba6503d805397d89d9210f375362ff3b9f7888eb297ca5`. Two guests kept different values written at the same path. A detached guest command completed after its launching exec closed, and a later exec read the result.
+- Exec consumed 2 MiB of piped stdin, and a 5 MiB attempt returned the explicit 4 MiB limit. One exec delivered 4.5 MiB of stdout while consuming 2 MiB of stdin. The first large-output fixture hit the guest policy on `/dev/zero`; the repeat generated text under the same policy and passed.
+- All disposable sandbox IDs reached absence and both gateways stopped. The local evidence directory `~/.local/state/hcom/openshell-preflight-0e8k2m_4/` contains the binary fingerprints, runtime patch, fixture results, and logs. The probe used shell fixtures. Bridge replay, Claude/Hermes readiness, and Z.ai egress remain covered by their later qualification tasks.
 
 ## Goals / Non-Goals
 
@@ -88,7 +96,19 @@ hcom claude --hcom-sandbox coding --headless --dir /path/to/repo --go
 
 Host launch parsing validates combinations before tool-specific host preparation. Sandbox mode removes its own options, serializes raw tool arguments, and asks guest hcom to perform normal tool setup at guest paths. The bridge uses absolute executable paths and argument vectors; no guest data is interpolated into host shell commands. Host env files, terminal context, and host trust settings are not guest defaults.
 
-The reference tool is Claude Code's existing live PTY mode, including for headless launches. Do not force print/Agent SDK mode or a provider/model change. A qualified profile supplies its guest-only unattended permission setting. OpenShell policy proposal approval remains operator-controlled; the profile must not enable automatic boundary expansion to avoid tool prompts.
+The reference tool uses Claude Code's existing live PTY mode for headless launches. The reference profile sets GLM 5.3 Flash through Z.ai for primary and auxiliary inference, attaches the Z.ai credential through an explicit provider reference, and denies Anthropic API egress. Provider failure is surfaced to the requester. This provider and model default applies only to the sandbox profile. A qualified profile supplies its guest-only unattended permission setting. OpenShell policy proposal approval remains operator-controlled.
+
+### CLI qualification
+
+| CLI | Qualification case |
+| --- | --- |
+| Claude Code | First guest worker, with the Z.ai-only GLM reference profile. |
+| Codex | Qualify its own guest runtime, provider, permissions, and hcom delivery. |
+| Oh My Pi (OMP) | Qualify its own guest configuration, provider, and hcom delivery. |
+| OpenCode | Qualify its own guest profile, provider, and hcom delivery. |
+| Hermes | First qualify an ordinary local Hermes session as host requester, using its existing identity and delivery. Then qualify Hermes as a worker with a fresh guest profile and private state. |
+
+Each guest profile references an image with the required CLI version and dependencies. Reuse an image when it satisfies the profile and passes that CLI's qualification. Each worker receives its own writable VM, repository, tool state, and hcom state even when the workers use the same image. Keep checkout inputs and credentials outside the reusable image.
 
 Guest roles do not start the host sandbox router or trusted relay worker. The role marker is a behavior setting, not a security credential. Unsupported desktop/nested/cross-device combinations fail before provisioning; adding another tool or runtime requires a bounded qualification record.
 
@@ -219,9 +239,9 @@ The existing manifest's "No isolation implementation" statement describes the cu
 
 ## Migration Plan
 
-1. Implement and qualify the bounded protocol/storage/authorization path before integrating unattended agent launch. This phase uses controlled guest endpoints; no production relay enrollment or host permission changes.
+1. Preflight the selected VM runtime using disposable guests and fixture data. Confirm exec disconnect leaves a detached process running and separately characterize stdin limits and stdout progress. Then implement and qualify the bounded protocol/storage/authorization path using controlled guest endpoints before integrating unattended agent launch.
 2. Add optional profile and launch integration. Build a pinned guest image and record the host CLI, gateway, guest runtime, hcom protocol, and tool versions. Import credentials and configure a gateway only within separately authorized operational scope.
-3. Run one host and two VM guest workers through conversation, reconnect, final-result, and Git handoff scenarios. Preserve failures and raw provenance; include an idle-recipient wake and a byte-budget rotation.
+3. Run the first end-to-end request from local Hermes to a sandboxed Claude Code worker on GLM. Then exercise two Claude Code guests for sibling file isolation, conversation, reconnect, final results, and Git handoff. Qualify Codex, OMP, OpenCode, and Hermes guest profiles individually. Preserve failures and raw provenance; include an idle-recipient wake and a byte-budget rotation.
 4. Run focused and complete appropriate Rust quality gates, existing fork contract checks, and independent review. Publish limitations for untested platforms and providers. Do not install or publish a release as part of this change without authorization.
 5. Roll back by stopping the sandbox controller and routing new work locally. Keep ordinary hcom data intact; retain sandbox-namespaced tables and captured IDs for later collection/cleanup. Downgrading must not turn guest projections into local process handles. Remove owned guest resources only after collection or an explicit discard.
 

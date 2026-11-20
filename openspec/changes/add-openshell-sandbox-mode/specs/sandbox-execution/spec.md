@@ -50,6 +50,26 @@ Each sandbox worker SHALL have private hcom and tool state. Guest configuration 
 - **WHEN** a worker attempts to read host home files or write the launcher's checkout outside its provided snapshot
 - **THEN** the configured boundary denies access and the host files remain unchanged
 
+#### Scenario: Peers start from the same image and source
+- **WHEN** two workers start from the same image and commit and write different contents at matching paths in their checkout, tool profile, and hcom state
+- **THEN** each worker sees only its own writes, the host checkout stays unchanged, and a peer can receive a Git artifact only through an explicit authorized transfer
+
+### Requirement: Sandbox CLI profiles qualify independently
+
+The system SHALL qualify guest profiles for Claude Code, Codex, Oh My Pi, OpenCode, and Hermes. Each supported guest profile MUST demonstrate launch, local hcom delivery, a correlated result, and Git handoff inside the configured VM boundary. The reference Claude Code profile MUST default to GLM 5.3 Flash through Z.ai, use an explicit Z.ai provider binding, and prevent Anthropic API egress and provider fallback.
+
+#### Scenario: Reference Claude worker uses GLM
+- **WHEN** the sandboxed Claude Code worker requests inference with the reference profile
+- **THEN** the request succeeds through Z.ai and access to `api.anthropic.com` from that sandbox is denied
+
+#### Scenario: Z.ai inference fails
+- **WHEN** the configured Z.ai provider is unavailable or rejects an inference request
+- **THEN** the sandbox launch or worker reports the provider failure and makes no fallback request to Anthropic
+
+#### Scenario: Hermes runs as a guest
+- **WHEN** a worker is launched with the qualified Hermes guest profile
+- **THEN** it uses private guest state and does not reuse the local Hermes session identity, profile, or files
+
 ### Requirement: Repository inputs are explicit committed snapshots
 
 The system SHALL record the repository identity and exact input commit. The initial mode MUST transfer only a selected committed repository snapshot and its necessary Git objects, excluding host Git configuration, credentials, hooks, and unrelated refs. Dirty source trees MUST require an explicit committed-only source selection rather than silently omitting local work.

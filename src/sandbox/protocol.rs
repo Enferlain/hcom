@@ -1,0 +1,340 @@
+use std::io::{ErrorKind, Read, Write};
+
+use anyhow::{Result, ensure};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+pub const VERSION: u32 = 1;
+pub const MAX_ENCODED_FRAME: u32 = 256 * 1024;
+const HEADER_LEN: u32 = 4;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Origin {
+    pub worker: String,
+    pub generation: String,
+    pub incarnation: String,
+}
+
+impl Origin {
+    pub(super) fn validate(&self) -> Result<()> {
+        validate_identifier(&self.worker)?;
+        validate_identifier(&self.generation)?;
+        let incarnation = Uuid::try_parse(&self.incarnation)?;
+        ensure!(
+            !incarnation.is_nil() && incarnation.hyphenated().to_string() == self.incarnation,
+            "invalid database incarnation"
+        );
+        Ok(())
+    }
+}
+
+pub(super) fn validate_identifier(value: &str) -> Result<()> {
+    ensure!(
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)),
+        "invalid sandbox identifier"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageId {
+    pub origin: Origin,
+    pub sequence: i64,
+}
+
+impl MessageId {
+    fn validate(&self) -> Result<()> {
+        self.origin.validate()?;
+        ensure!(self.sequence > 0, "invalid message sequence");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Intent {
+    Request,
+    Inform,
+    Ack,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessagePayload {
+    pub target: String,
+    pub thread: Option<String>,
+    pub reply_to: Option<MessageId>,
+    pub intent: Intent,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Message {
+    pub id: MessageId,
+    pub payload: MessagePayload,
+    pub digest: [u8; 32],
+}
+
+impl Message {
+    pub fn new(id: MessageId, payload: MessagePayload) -> Result<Self> {
+        let digest = digest_payload(&payload)?;
+        let message = Self {
+            id,
+            payload,
+            digest,
+        };
+        message.validate()?;
+        Ok(message)
+    }
+
+    pub(super) fn validate(&self) -> Result<()> {
+        self.id.validate()?;
+        if let Some(reply) = &self.payload.reply_to {
+            reply.validate()?;
+        }
+        validate_identifier(&self.payload.target)?;
+        if let Some(thread) = &self.payload.thread {
+            validate_identifier(thread)?;
+        }
+        ensure!(
+            self.digest == digest_payload(&self.payload)?,
+            "sandbox payload digest mismatch"
+        );
+        Ok(())
+    }
+}
+
+fn digest_payload(payload: &MessagePayload) -> Result<[u8; 32]> {
+    Ok(Sha256::digest(serde_json::to_vec(payload)?).into())
+}
+
+/// The controller chooses this binding independently of data supplied by the guest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Binding {
+    pub team: String,
+    pub sandbox: String,
+    pub worker: Origin,
+}
+
+impl Binding {
+    pub(super) fn validate(&self) -> Result<()> {
+        validate_identifier(&self.team)?;
+        validate_identifier(&self.sandbox)?;
+        self.worker.validate()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "body",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum FrameBody {
+    /// Version 1 peers agree on one frame limit, including the length prefix.
+    Hello {
+        max_frame_bytes: u32,
+    },
+    Send(Message),
+    Deliver(Message),
+    Accepted {
+        id: MessageId,
+        digest: [u8; 32],
+    },
+    Close,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Frame {
+    pub version: u32,
+    pub epoch: i64,
+    pub binding: Binding,
+    pub body: FrameBody,
+}
+
+impl Frame {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.version == VERSION,
+            "unsupported sandbox protocol version"
+        );
+        ensure!(self.epoch > 0, "invalid sandbox connection epoch");
+        self.binding.validate()?;
+        match &self.body {
+            FrameBody::Send(message) => {
+                ensure!(
+                    message.id.origin == self.binding.worker,
+                    "sandbox sender mismatch"
+                );
+                message.validate()
+            }
+            FrameBody::Deliver(message) => {
+                ensure!(
+                    message.payload.target == self.binding.worker.worker,
+                    "sandbox delivery target mismatch"
+                );
+                message.validate()
+            }
+            FrameBody::Accepted { id, .. } => id.validate(),
+            FrameBody::Hello { max_frame_bytes } => {
+                ensure!(
+                    *max_frame_bytes == MAX_ENCODED_FRAME,
+                    "incompatible sandbox frame limit"
+                );
+                Ok(())
+            }
+            FrameBody::Close => Ok(()),
+        }
+    }
+}
+
+fn encode(frame: &Frame) -> Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(frame)?;
+    ensure!(
+        bytes.len() <= (MAX_ENCODED_FRAME - HEADER_LEN) as usize,
+        "sandbox frame exceeds size limit"
+    );
+    Ok(bytes)
+}
+
+pub fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<()> {
+    frame.validate()?;
+    let bytes = encode(frame)?;
+    writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
+    writer.write_all(&bytes)?;
+    Ok(())
+}
+
+fn read_frame(reader: &mut impl Read) -> Result<Option<Frame>> {
+    let mut header = [0; HEADER_LEN as usize];
+    loop {
+        match reader.read(&mut header[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    reader.read_exact(&mut header[1..])?;
+    let len = u32::from_be_bytes(header);
+    ensure!(
+        (1..=MAX_ENCODED_FRAME - HEADER_LEN).contains(&len),
+        "invalid sandbox frame length"
+    );
+    let mut bytes = vec![0; len as usize];
+    reader.read_exact(&mut bytes)?;
+    let frame: Frame = serde_json::from_slice(&bytes)?;
+    frame.validate()?;
+    Ok(Some(frame))
+}
+
+#[derive(Clone, Copy)]
+pub enum Receiver {
+    Host,
+    Guest,
+}
+
+pub struct Connection {
+    binding: Binding,
+    epoch: i64,
+    receiver: Receiver,
+    ready: bool,
+    closed: bool,
+}
+
+impl Connection {
+    pub fn new(binding: Binding, epoch: i64, receiver: Receiver) -> Result<Self> {
+        binding.validate()?;
+        ensure!(epoch > 0, "invalid sandbox connection epoch");
+        Ok(Self {
+            binding,
+            epoch,
+            receiver,
+            ready: false,
+            closed: false,
+        })
+    }
+
+    /// The caller supplies the currently owned epoch for every frame. Use a
+    /// blocking reader. An interrupted syscall is retried; any other error
+    /// closes the stream so a partially consumed frame cannot be retried.
+    pub fn receive(
+        &mut self,
+        reader: &mut impl Read,
+        current_epoch: i64,
+    ) -> Result<Option<FrameBody>> {
+        let result = self.receive_inner(reader, current_epoch);
+        if !matches!(&result, Ok(Some(_))) {
+            self.closed = true;
+        }
+        result
+    }
+
+    fn receive_inner(
+        &mut self,
+        reader: &mut impl Read,
+        current_epoch: i64,
+    ) -> Result<Option<FrameBody>> {
+        ensure!(!self.closed, "sandbox connection is closed");
+        ensure!(
+            current_epoch == self.epoch,
+            "stale sandbox connection epoch"
+        );
+        let Some(frame) = read_frame(reader)? else {
+            return Ok(None);
+        };
+        ensure!(frame.epoch == self.epoch, "sandbox frame epoch mismatch");
+        ensure!(
+            frame.binding == self.binding,
+            "sandbox connection binding mismatch"
+        );
+        ensure!(
+            matches!(frame.body, FrameBody::Hello { .. }) != self.ready,
+            "sandbox handshake out of order"
+        );
+        match (&self.receiver, &frame.body) {
+            (Receiver::Host, FrameBody::Deliver(_)) | (Receiver::Guest, FrameBody::Send(_)) => {
+                anyhow::bail!("sandbox frame direction mismatch");
+            }
+            (_, FrameBody::Hello { .. }) => self.ready = true,
+            (_, FrameBody::Close) => self.closed = true,
+            _ => {}
+        }
+        Ok(Some(frame.body))
+    }
+}
+
+/// Size the longest message envelope, including the maximum decimal epoch
+/// width. This sizing frame is never sent or checked against a live epoch.
+pub(super) fn validate_message_size(
+    receiver: Receiver,
+    binding: &Binding,
+    message: &Message,
+) -> Result<()> {
+    let frame = Frame {
+        version: VERSION,
+        epoch: i64::MAX,
+        binding: binding.clone(),
+        body: match receiver {
+            Receiver::Host => FrameBody::Send(message.clone()),
+            Receiver::Guest => FrameBody::Deliver(message.clone()),
+        },
+    };
+    frame.validate()?;
+    encode(&frame)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;
