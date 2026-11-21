@@ -315,3 +315,6 @@ fn stage_guest_message(tx: &Transaction<'_>, message: &Message) -> Result<i64> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod live;

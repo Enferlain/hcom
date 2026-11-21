@@ -133,6 +133,13 @@ impl<'store, 'db> Peer<'store, 'db> {
         self.ready
     }
 
+    #[cfg(test)]
+    pub(super) fn receipt_pending(&self) -> bool {
+        self.writes
+            .iter()
+            .any(|write| write.kind == WriteKind::Receipt)
+    }
+
     pub(super) fn start_clock(&mut self) {
         self.started = Instant::now();
         self.next_queue_check = self.started;
