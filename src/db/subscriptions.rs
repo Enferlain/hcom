@@ -1176,10 +1176,18 @@ fn send_reaction_message(
             mentions,
         }
     };
+    let sandbox_names = crate::sandbox::directory::active_worker_names(db)?;
+    anyhow::ensure!(
+        !scope_result
+            .mentions
+            .iter()
+            .any(|target| sandbox_names.contains(target)),
+        "sandbox targets require a team-scoped send path"
+    );
     let (scope, mention_list, delivered_to) = if scope_result.scope == MessageScope::Broadcast {
         let delivered: Vec<String> = instances
             .iter()
-            .filter(|inst| inst.name != sender_name)
+            .filter(|inst| inst.name != sender_name && !sandbox_names.contains(&inst.name))
             .map(|inst| inst.name.clone())
             .collect();
         ("broadcast".to_string(), vec![], delivered)

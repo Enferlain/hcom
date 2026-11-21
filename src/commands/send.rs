@@ -326,10 +326,19 @@ fn resolve_delivery(
     };
 
     let scope_data = build_scope_data(identity, effective_scope, &effective_mentions);
+    let sandbox_names = crate::sandbox::directory::active_worker_names(db)
+        .map_err(|error| format!("Failed to read sandbox directory: {error}"))?;
+    if effective_mentions
+        .iter()
+        .any(|target| sandbox_names.contains(target))
+    {
+        return Err("Sandbox targets require a team-scoped send path".into());
+    }
     let delivered_to = rows
         .iter()
         .filter(|inst| {
-            should_deliver_message(&scope_data, &inst.name, &identity.name).unwrap_or(false)
+            !sandbox_names.contains(&inst.name)
+                && should_deliver_message(&scope_data, &inst.name, &identity.name).unwrap_or(false)
         })
         .map(|inst| inst.name.clone())
         .collect();
@@ -1668,6 +1677,66 @@ mod tests {
         let shm = PathBuf::from(format!("{}-shm", path.display()));
         let _ = std::fs::remove_file(wal);
         let _ = std::fs::remove_file(shm);
+    }
+
+    #[test]
+    fn ordinary_broadcast_omits_sandbox_projections() {
+        use crate::sandbox::directory::{Access, Placement};
+        use crate::sandbox::store::Store;
+
+        let root = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&root.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1), ('nova', 2);",
+            )
+            .unwrap();
+        let sender = identity::resolve_from_name(&db, "luna").unwrap();
+        let ordinary = resolve_delivery(&db, &sender, "hello", None, Some(&[])).unwrap();
+        let store = Store::initialize(&db).unwrap();
+        let team = store.create_team(None).unwrap();
+        let controller = team.external_controller.unwrap();
+        let worker = store
+            .reserve_worker(
+                &team.id,
+                Access::Controller(&controller),
+                "sandbox",
+                crate::tool::Tool::Claude,
+                Placement {
+                    gateway: "gateway",
+                    workspace: "default",
+                    sandbox: "sandbox",
+                    incarnation: "fedc8acb-cc62-422d-9724-54e730e64f6e",
+                },
+            )
+            .unwrap();
+        let with_sandbox = resolve_delivery(&db, &sender, "hello", None, Some(&[])).unwrap();
+        assert_eq!(ordinary.delivered_to, ["nova"]);
+        assert_eq!(with_sandbox.delivered_to, ordinary.delivered_to);
+        let name = worker.binding.worker.worker;
+        let before = db.get_last_event_id();
+        assert!(
+            send_message(
+                &db,
+                &sender,
+                "hello",
+                None,
+                Some(std::slice::from_ref(&name))
+            )
+            .is_err()
+        );
+        assert!(send_message(&db, &sender, &format!("hello @{name}"), None, None).is_err());
+        assert_eq!(db.get_last_event_id(), before);
+        assert_eq!(
+            db.send_system_message("[system]", "hello").unwrap(),
+            ["luna", "nova"]
+        );
+        let before = db.get_last_event_id();
+        assert!(
+            db.send_system_message("[system]", &format!("hello @{name}"))
+                .is_err()
+        );
+        assert_eq!(db.get_last_event_id(), before);
     }
 
     #[test]

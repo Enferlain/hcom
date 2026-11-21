@@ -3,16 +3,16 @@ use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
-use rusqlite::Transaction;
 
 use crate::sandbox::openshell::ROTATION_BYTES;
 use crate::sandbox::protocol::{
-    Binding, Connection, Frame, FrameBody, MAX_ENCODED_FRAME, Message, MessageId, Receiver,
-    VERSION, write_frame,
+    Binding, Connection, Frame, FrameBody, MAX_ENCODED_FRAME, MessageId, Receiver, VERSION,
+    write_frame,
 };
-use crate::sandbox::store::Store;
+use crate::sandbox::store::{Import, Store};
 use crate::shared::time::now_epoch_i64;
 
+use super::Inbound;
 use super::wire::{Input, Reader, try_write};
 
 #[derive(Clone, Copy)]
@@ -308,7 +308,7 @@ impl<'store, 'db> Peer<'store, 'db> {
     pub(super) fn read_step(
         &mut self,
         input: &mut impl Read,
-        import: &mut impl FnMut(&Transaction<'_>, &Message) -> Result<i64>,
+        import: &mut impl Inbound,
     ) -> Result<bool> {
         if self.input_eof {
             return Ok(false);
@@ -333,11 +333,7 @@ impl<'store, 'db> Peer<'store, 'db> {
         }
     }
 
-    fn handle(
-        &mut self,
-        body: FrameBody,
-        import: &mut impl FnMut(&Transaction<'_>, &Message) -> Result<i64>,
-    ) -> Result<()> {
+    fn handle(&mut self, body: FrameBody, import: &mut impl Inbound) -> Result<()> {
         if matches!(body, FrameBody::Hello { .. }) {
             if matches!(self.receiver, Receiver::Guest) {
                 self.attach()?;
@@ -354,13 +350,16 @@ impl<'store, 'db> Peer<'store, 'db> {
                     "sandbox bridge exceeded payload credit"
                 );
                 self.incoming_credit_used = true;
-                store.import(
+                let result = store.import(
                     self.receiver,
                     self.binding,
                     &message,
                     now_epoch_i64(),
-                    |tx| import(tx, &message),
+                    |tx| import.insert(tx, &message),
                 )?;
+                if let Import::Inserted(event_id) = result {
+                    import.committed(event_id);
+                }
                 // After queueing our close we still persist a peer's final
                 // payload. Any undelivered receipt is recovered by replay.
                 if self.draining.is_none() {

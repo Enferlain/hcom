@@ -372,12 +372,7 @@ pub fn location(db: &HcomDb, row: &InstanceRow) -> Result<Location> {
 }
 
 fn current_worker(conn: &Connection, name: &str) -> Result<Option<Worker>> {
-    let has_directory: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sandbox_workers')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_directory {
+    if !has_directory(conn)? {
         return Ok(None);
     }
     let mut stmt = conn.prepare_cached(
@@ -386,6 +381,25 @@ fn current_worker(conn: &Connection, name: &str) -> Result<Option<Worker>> {
     )?;
     let mut rows = stmt.query([name])?;
     rows.next()?.map(decode_worker).transpose()
+}
+
+fn has_directory(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sandbox_workers')",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+pub(crate) fn active_worker_names(db: &HcomDb) -> Result<std::collections::HashSet<String>> {
+    let conn = db.conn();
+    if !has_directory(conn)? {
+        return Ok(Default::default());
+    }
+    let mut stmt = conn.prepare("SELECT name FROM sandbox_workers WHERE retired = 0")?;
+    Ok(stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 fn decode_worker(row: &rusqlite::Row<'_>) -> Result<Worker> {

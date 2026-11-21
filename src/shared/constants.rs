@@ -31,9 +31,10 @@ pub const STOP_HOOK_POLL_INTERVAL_SECS: f64 = 0.1;
 /// - paths: /file.@test
 /// - identifiers: var_@name, some-id@mention
 ///
-/// Capture group 1 is the name. Includes `:` for remote names (@luna:BOXE).
-pub static MENTION_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:^|[^a-zA-Z0-9._\-])@([a-zA-Z0-9][\w:\-]*)").unwrap());
+/// Capture group 1 is the name, including a relay suffix or a sandbox realm.
+pub static MENTION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^a-zA-Z0-9._\-])@([a-z0-9_]+\.[0-9a-f]{8}\b|[a-zA-Z0-9][\w:\-]*)").unwrap()
+});
 
 /// Extract all @mention names from text.
 pub fn extract_mentions(text: &str) -> Vec<String> {

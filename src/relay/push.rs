@@ -452,6 +452,7 @@ pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>,
              WHERE id > ? AND instance NOT LIKE '%:%'
              AND instance != '_device'
              AND json_extract(data, '$._relay') IS NULL
+             AND json_extract(data, '$._sandbox') IS NULL
              ORDER BY id LIMIT 101",
         )
         .ok()
@@ -626,12 +627,25 @@ mod tests {
         let recent_id = db
             .log_event("message", "recent", &json!({"text": "recent"}))
             .unwrap();
+        let sandbox_id = db
+            .log_event(
+                "message",
+                "sandbox-origin",
+                &json!({"text": "sandbox message", "_sandbox": {"team": "team"}}),
+            )
+            .unwrap();
         safe_kv_set(&db, "relay_last_push_id", Some(&recent_id.to_string()));
 
         let (_state, events, max_id, has_more) = build_push_payload(&db, "device-a");
 
         assert!(!has_more);
         assert_eq!(max_id, recent_id);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["id"].as_i64() == Some(sandbox_id)),
+            "sandbox messages are private to their team"
+        );
         assert!(
             events
                 .iter()

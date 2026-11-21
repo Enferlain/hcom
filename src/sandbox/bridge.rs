@@ -15,8 +15,25 @@ use super::store::Store;
 use crate::db::HcomDb;
 use crate::shared::time::now_iso;
 
+mod inbox;
 mod peer;
 mod wire;
+
+pub use inbox::HostInbox;
+
+pub trait Inbound {
+    fn insert(&mut self, tx: &Transaction<'_>, message: &Message) -> Result<i64>;
+    fn committed(&mut self, _event_id: i64) {}
+}
+
+impl<F> Inbound for F
+where
+    F: FnMut(&Transaction<'_>, &Message) -> Result<i64>,
+{
+    fn insert(&mut self, tx: &Transaction<'_>, message: &Message) -> Result<i64> {
+        self(tx, message)
+    }
+}
 
 use peer::{Limits, Peer};
 
@@ -46,7 +63,7 @@ pub fn exec(
     target: ExecTarget<'_>,
     binding: &Binding,
     stop: impl FnMut() -> bool,
-    import: impl FnMut(&Transaction<'_>, &Message) -> Result<i64>,
+    import: impl Inbound,
 ) -> Result<Exit> {
     ensure!(
         absolute_guest_path(target.guest_manifest),
@@ -77,7 +94,7 @@ fn run_host(
     command: Command,
     mut peer: Peer<'_, '_>,
     stop: impl FnMut() -> bool,
-    import: impl FnMut(&Transaction<'_>, &Message) -> Result<i64>,
+    import: impl Inbound,
 ) -> Result<Exit> {
     let mut process = Process::spawn(command)?;
     peer.start_clock();
@@ -94,7 +111,7 @@ fn drive_host(
     process: &mut Process,
     mut peer: Peer<'_, '_>,
     mut stop: impl FnMut() -> bool,
-    mut import: impl FnMut(&Transaction<'_>, &Message) -> Result<i64>,
+    mut import: impl Inbound,
 ) -> Result<Exit> {
     loop {
         peer.check()?;
@@ -217,6 +234,14 @@ impl Drop for Process {
 struct GuestManifest {
     binding: Binding,
     database: PathBuf,
+    local_worker: Option<LocalWorker>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalWorker {
+    name: String,
+    created_at: f64,
 }
 
 pub(crate) fn guest_main(args: &[String]) -> Result<()> {
@@ -281,14 +306,27 @@ pub(crate) fn guest_main(args: &[String]) -> Result<()> {
         None,
         Limits::default(),
     )?;
+    if let Some(local_worker) = &manifest.local_worker {
+        let inbox = inbox::GuestInbox::new(&db, &manifest.binding, local_worker)?;
+        return drive_guest(&mut input, &mut output, &mut peer, inbox);
+    }
+    drive_guest(&mut input, &mut output, &mut peer, stage_guest_message)
+}
+
+fn drive_guest(
+    input: &mut impl std::io::Read,
+    output: &mut impl std::io::Write,
+    peer: &mut Peer<'_, '_>,
+    mut inbound: impl Inbound,
+) -> Result<()> {
     loop {
         peer.check()?;
-        let mut progress = peer.read_step(&mut input, &mut stage_guest_message)?;
+        let mut progress = peer.read_step(input, &mut inbound)?;
         ensure!(
             !peer.input_eof || peer.remote_closed,
             "sandbox bridge host disconnected without closing"
         );
-        progress |= peer.write_step(&mut output)?;
+        progress |= peer.write_step(output)?;
         if peer.close_written {
             return Ok(());
         }
