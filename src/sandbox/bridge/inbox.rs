@@ -178,6 +178,13 @@ impl<'a> Inbox<'a> {
         });
         if !wake_target {
             data["queued_to"] = json!([target]);
+        } else if !self.private_guest {
+            let created_at: f64 = tx.query_row(
+                "SELECT created_at FROM instances WHERE name = ?",
+                [target],
+                |row| row.get(0),
+            )?;
+            data["_sandbox"]["recipient_created_at"] = json!(created_at);
         }
         if let Some(thread) = &payload.thread {
             data["thread"] = json!(thread);

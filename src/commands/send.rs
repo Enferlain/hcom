@@ -259,6 +259,7 @@ struct ResolvedDelivery {
     effective_mentions: Vec<String>,
     delivered_to: Vec<String>,
     is_thread_resolved: bool,
+    sandbox_target: Option<crate::sandbox::directory::Worker>,
 }
 
 fn deliverable_instances(db: &HcomDb) -> Result<Vec<InstanceInfo>, String> {
@@ -328,12 +329,21 @@ fn resolve_delivery(
     let scope_data = build_scope_data(identity, effective_scope, &effective_mentions);
     let sandbox_names = crate::sandbox::directory::active_worker_names(db)
         .map_err(|error| format!("Failed to read sandbox directory: {error}"))?;
-    if effective_mentions
+    let sandbox_target = if let Some(target) = effective_mentions
         .iter()
-        .any(|target| sandbox_names.contains(target))
+        .find(|target| sandbox_names.contains(*target))
     {
-        return Err("Sandbox targets require a team-scoped send path".into());
-    }
+        if effective_mentions.len() != 1 || is_thread_resolved {
+            return Err("Target one sandbox worker explicitly".into());
+        }
+        Some(
+            crate::sandbox::directory::current_worker(db.conn(), target)
+                .map_err(|error| format!("Failed to read sandbox worker: {error}"))?
+                .ok_or_else(|| "Sandbox worker is no longer enrolled".to_string())?,
+        )
+    } else {
+        None
+    };
     let delivered_to = rows
         .iter()
         .filter(|inst| {
@@ -349,6 +359,7 @@ fn resolve_delivery(
         effective_mentions,
         delivered_to,
         is_thread_resolved,
+        sandbox_target,
     })
 }
 
@@ -411,6 +422,9 @@ pub fn send_message(
     validate_message(message)?;
 
     let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
+    if delivery.sandbox_target.is_some() {
+        return Err("Sandbox targets require the sandbox send path".into());
+    }
     let scope_str = delivery.effective_scope.as_str();
 
     // Build event data
@@ -1134,6 +1148,10 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     }
 
     // ── Create bundle event if inline flags provided ──
+    if preview_delivery.sandbox_target.is_some() && bundle_data.is_some() {
+        eprintln!("Error: Sandbox sends do not support host bundles");
+        return 1;
+    }
     if let Some(mut bundle) = bundle_data {
         if let Err(e) = crate::core::bundles::validate_bundle(&mut bundle) {
             eprintln!("Error: {e}");
@@ -1238,17 +1256,43 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         || envelope.thread.is_some()
         || envelope.bundle_id.is_some();
 
-    let (event_id, delivered_to) = match send_message(
-        db,
-        &sender_identity,
-        &message,
-        if has_envelope { Some(&envelope) } else { None },
-        targets_to_pass,
-    ) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: {e}");
-            return 1;
+    let queued = if let Some(target) = &preview_delivery.sandbox_target {
+        let reply_event = envelope
+            .reply_to
+            .as_deref()
+            .and_then(|reply| resolve_reply_to_local(db, reply));
+        match crate::sandbox::outgoing::queue(
+            db,
+            &sender_identity,
+            target,
+            &message,
+            &envelope,
+            reply_event,
+        ) {
+            Ok(queued) => Some(queued),
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    let (event_id, delivered_to) = if let Some(queued) = &queued {
+        (queued.event_id, Vec::new())
+    } else {
+        match send_message(
+            db,
+            &sender_identity,
+            &message,
+            if has_envelope { Some(&envelope) } else { None },
+            targets_to_pass,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return 1;
+            }
         }
     };
     // From here send owns the receiver's inline delivery: it delivers the batch
@@ -1258,28 +1302,50 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
     // ── Feedback ──
     if args.json {
-        let out = serde_json::json!({
+        let mut out = serde_json::json!({
             "event_id": event_id,
             "delivered_to": delivered_to,
         });
+        if let Some(queued) = &queued {
+            out["queued_to"] = serde_json::json!([queued.target]);
+            out["forwarding"] = serde_json::json!(queued.forwarding);
+            if let Some(reason) = &queued.forwarding_reason {
+                out["forwarding_reason"] = serde_json::json!(reason);
+            }
+        }
         println!("{}", serde_json::to_string(&out).unwrap());
-        crate::relay::worker::try_spawn_worker();
+        if queued.is_none() {
+            crate::relay::worker::try_spawn_worker();
+        }
         return 0;
     }
 
     if args.quiet {
-        crate::relay::worker::try_spawn_worker();
+        if queued.is_none() {
+            crate::relay::worker::try_spawn_worker();
+        }
         return 0;
     }
 
-    let feedback = get_recipient_feedback(
-        db,
-        &delivered_to,
-        envelope
-            .thread
-            .as_deref()
-            .filter(|_| preview_delivery.is_thread_resolved),
-    );
+    let feedback = if let Some(queued) = &queued {
+        let mut feedback = format!(
+            "Queued for: {} (forwarding {})",
+            queued.target, queued.forwarding
+        );
+        if let Some(reason) = &queued.forwarding_reason {
+            feedback.push_str(&format!("\n{reason}"));
+        }
+        feedback
+    } else {
+        get_recipient_feedback(
+            db,
+            &delivered_to,
+            envelope
+                .thread
+                .as_deref()
+                .filter(|_| preview_delivery.is_thread_resolved),
+        )
+    };
 
     // Use the same adhoc-only receive policy as other commands. With --from,
     // the invoking instance receives while the outgoing author stays external.
@@ -1323,8 +1389,12 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         output.push('\n');
         output.push_str(&batch.remaining_note(&receiver.name));
         if let Err(e) = batch.emit(db, &receiver.name, &output, set_status) {
-            eprintln!("Message sent, but {e}");
-            crate::relay::worker::try_spawn_worker();
+            if queued.is_some() {
+                eprintln!("Message queued, but {e}");
+            } else {
+                eprintln!("Message sent, but {e}");
+                crate::relay::worker::try_spawn_worker();
+            }
             return 1;
         }
     } else {
@@ -1363,7 +1433,9 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         crate::core::tips::maybe_show_tip(db, &sender_identity.name, &tip_key, false);
     }
 
-    crate::relay::worker::try_spawn_worker();
+    if queued.is_none() {
+        crate::relay::worker::try_spawn_worker();
+    }
 
     0
 }
@@ -1677,6 +1749,240 @@ mod tests {
         let shm = PathBuf::from(format!("{}-shm", path.display()));
         let _ = std::fs::remove_file(wal);
         let _ = std::fs::remove_file(shm);
+    }
+
+    #[test]
+    fn cli_queues_only_an_enrolled_single_sandbox_target() {
+        use crate::sandbox::directory::{Access, HostIdentity, Placement};
+        use crate::sandbox::store::Store;
+
+        let root = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&root.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1), ('nova', 2);",
+            )
+            .unwrap();
+        let identity = identity::resolve_from_name(&db, "luna").unwrap();
+        let member = HostIdentity::capture(&db, &identity).unwrap();
+        let store = Store::initialize(&db).unwrap();
+        let team = store.create_team(Some(&member)).unwrap();
+        let binding = store
+            .reserve_worker(
+                &team.id,
+                Access::Host(&member),
+                "sandbox",
+                crate::tool::Tool::Claude,
+                Placement {
+                    gateway: "gateway",
+                    workspace: "default",
+                    sandbox: "sandbox",
+                    incarnation: "fedc8acb-cc62-422d-9724-54e730e64f6e",
+                },
+            )
+            .unwrap()
+            .binding;
+        let target = format!("@{}", binding.worker.worker);
+        let ctx = |name| CommandContext {
+            explicit_name: None,
+            identity: Some(identity::resolve_from_name(&db, name).unwrap()),
+            go: true,
+            identity_warning: None,
+        };
+        let parse = |args: &[&str]| {
+            let mut args = SendArgs::try_parse_from(args).unwrap();
+            // The router records the separator before Clap removes it.
+            args.had_separator = true;
+            args
+        };
+        let args = parse(&[
+            "send",
+            "--json",
+            "--intent",
+            "request",
+            "--thread",
+            "work",
+            &target,
+            "--",
+            "hello\r\nworld",
+        ]);
+        let observer = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        observer.set_nonblocking(true).unwrap();
+        db.upsert_notify_endpoint(
+            "luna",
+            "events_stream",
+            observer.local_addr().unwrap().port(),
+        )
+        .unwrap();
+        assert_eq!(cmd_send(&db, &args, Some(&ctx("nova"))), 1);
+        let mixed = parse(&["send", "--json", &target, "@nova", "--", "hello"]);
+        assert_eq!(cmd_send(&db, &mixed, Some(&ctx("luna"))), 1);
+        let bundle = parse(&[
+            "send",
+            "--json",
+            "--title",
+            "bundle",
+            "--description",
+            "context",
+            &target,
+            "--",
+            "hello",
+        ]);
+        assert_eq!(cmd_send(&db, &bundle, Some(&ctx("luna"))), 1);
+        assert_eq!(db.get_last_event_id(), 0);
+        assert_eq!(
+            observer.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(cmd_send(&db, &args, Some(&ctx("luna"))), 0);
+        observer
+            .accept()
+            .expect("queued event wakes observers after commit");
+
+        let event_id = db.get_last_event_id();
+        let message = store
+            .next_pending(&binding, crate::shared::time::now_epoch_i64())
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.payload.text, "hello\nworld");
+        assert_eq!(message.payload.thread.as_deref(), Some("work"));
+        let data: String = db
+            .conn()
+            .query_row("SELECT data FROM events WHERE id = ?", [event_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(
+            data["queued_to"],
+            serde_json::json!([binding.worker.worker])
+        );
+        assert_eq!(data["delivered_to"], serde_json::json!([]));
+        assert_eq!(data["_sandbox"]["id"], serde_json::json!(message.id));
+        assert!(
+            crate::relay::push::build_push_payload(&db, "device")
+                .1
+                .is_empty()
+        );
+
+        let reply_id = event_id.to_string();
+        let reply = parse(&[
+            "send",
+            "--json",
+            "--reply-to",
+            &reply_id,
+            &target,
+            "--",
+            "followup",
+        ]);
+        assert_eq!(cmd_send(&db, &reply, Some(&ctx("luna"))), 0);
+        store
+            .acknowledge(
+                &binding,
+                &message.id,
+                &message.digest,
+                crate::shared::time::now_epoch_i64(),
+            )
+            .unwrap();
+        let reply = store
+            .next_pending(&binding, crate::shared::time::now_epoch_i64())
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.payload.reply_to, Some(message.id));
+        assert_eq!(reply.payload.thread.as_deref(), Some("work"));
+
+        #[cfg(unix)]
+        {
+            use crate::sandbox::bridge::{HostInbox, Inbound};
+            use crate::sandbox::protocol::{Intent, Message, MessageId, MessagePayload, Receiver};
+            use crate::sandbox::store::Import;
+
+            let incoming = Message::new(
+                MessageId {
+                    origin: binding.worker.clone(),
+                    sequence: 1,
+                },
+                MessagePayload {
+                    target: "luna".into(),
+                    thread: Some("work".into()),
+                    reply_to: None,
+                    intent: Intent::Request,
+                    text: "from guest".into(),
+                },
+            )
+            .unwrap();
+            let mut inbox = HostInbox::new(&db, &store, &binding);
+            let now = crate::shared::time::now_epoch_i64();
+            let Import::Inserted(incoming_event) = store
+                .import(Receiver::Host, &binding, &incoming, now, |tx| {
+                    inbox.insert(tx, &incoming)
+                })
+                .unwrap()
+            else {
+                panic!("fixture did not import the guest message");
+            };
+            inbox.committed(incoming_event);
+            let args = parse(&[
+                "send",
+                "--json",
+                "--reply-to",
+                &incoming_event.to_string(),
+                &target,
+                "--",
+                "answer",
+            ]);
+            assert_eq!(cmd_send(&db, &args, Some(&ctx("luna"))), 0);
+            store
+                .acknowledge(&binding, &reply.id, &reply.digest, now)
+                .unwrap();
+            assert_eq!(
+                store
+                    .next_pending(&binding, now)
+                    .unwrap()
+                    .unwrap()
+                    .payload
+                    .reply_to,
+                Some(incoming.id),
+            );
+        }
+
+        store
+            .retire_worker(Access::Host(&member), &binding)
+            .unwrap();
+        let replacement = store
+            .reserve_worker(
+                &team.id,
+                Access::Host(&member),
+                "sandbox",
+                crate::tool::Tool::Claude,
+                Placement {
+                    gateway: "gateway",
+                    workspace: "default",
+                    sandbox: "replacement",
+                    incarnation: "321741fe-a026-4bd1-be86-0099e22498c4",
+                },
+            )
+            .unwrap()
+            .binding;
+        assert_eq!(replacement.worker.worker, binding.worker.worker);
+        let stale_reply = parse(&[
+            "send",
+            "--json",
+            "--reply-to",
+            &reply_id,
+            &target,
+            "--",
+            "stale",
+        ]);
+        let before = db.get_last_event_id();
+        assert_eq!(cmd_send(&db, &stale_reply, Some(&ctx("luna"))), 1);
+        assert_eq!(db.get_last_event_id(), before);
+        assert!(
+            store
+                .next_pending(&replacement, crate::shared::time::now_epoch_i64())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

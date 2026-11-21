@@ -371,7 +371,7 @@ pub fn location(db: &HcomDb, row: &InstanceRow) -> Result<Location> {
     }
 }
 
-fn current_worker(conn: &Connection, name: &str) -> Result<Option<Worker>> {
+pub(crate) fn current_worker(conn: &Connection, name: &str) -> Result<Option<Worker>> {
     if !has_directory(conn)? {
         return Ok(None);
     }
@@ -381,6 +381,24 @@ fn current_worker(conn: &Connection, name: &str) -> Result<Option<Worker>> {
     )?;
     let mut rows = stmt.query([name])?;
     rows.next()?.map(decode_worker).transpose()
+}
+
+pub(super) fn check_sender(conn: &Connection, team: &str, host: &HostIdentity) -> Result<()> {
+    authorize(conn, team, Access::Host(host), false).map(|_| ())
+}
+
+impl HostIdentity {
+    pub(super) fn created_at(&self) -> f64 {
+        self.created_at
+    }
+
+    pub(super) fn origin(&self, incarnation: &str) -> Origin {
+        Origin {
+            worker: self.name.clone(),
+            generation: format!("host-{:016x}", self.created_at.to_bits()),
+            incarnation: incarnation.into(),
+        }
+    }
 }
 
 fn has_directory(conn: &Connection) -> Result<bool> {
