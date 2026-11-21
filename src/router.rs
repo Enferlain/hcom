@@ -200,6 +200,8 @@ pub enum Action {
     /// Run relay-worker process
     RelayWorker,
     SandboxWorker,
+    #[cfg(unix)]
+    SandboxGuestBridge,
 }
 
 /// Global flags extracted from argv before dispatch.
@@ -366,6 +368,10 @@ pub fn resolve_action(argv: &[String]) -> Action {
     }
     if first == "sandbox-worker" {
         return Action::SandboxWorker;
+    }
+    #[cfg(unix)]
+    if first == crate::sandbox::bridge::GUEST_COMMAND {
+        return Action::SandboxGuestBridge;
     }
 
     // PTY mode: `hcom pty <tool> [args...]`
@@ -705,6 +711,10 @@ pub fn dispatch() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    #[cfg(unix)]
+    if matches!(action, Action::SandboxGuestBridge) {
+        return crate::sandbox::bridge::guest_main(&argv[1..]);
+    }
 
     // Skip dev_root re-exec for `config dev_root` so a stale pointer can't
     // trap the user. Also keep `update` on the invoked (installed) binary;
@@ -752,6 +762,10 @@ pub fn dispatch() -> anyhow::Result<()> {
                 log_error("sandbox", "controller.exit", &format!("{error:#}"));
                 return Err(error);
             }
+        }
+        #[cfg(unix)]
+        Action::SandboxGuestBridge => {
+            unreachable!("guest bridge dispatched before dev-root routing")
         }
         Action::Command { ref cmd, ref args } if cmd == "sandbox" => {
             let (mut stripped, _, help) = extract_global_flags_full(args);

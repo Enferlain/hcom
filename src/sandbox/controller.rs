@@ -48,6 +48,11 @@ impl<'store, 'db> Owner<'store, 'db> {
     pub fn allocate_connection_epoch(&self) -> Result<i64> {
         self.store.allocate_epoch()
     }
+
+    #[cfg(unix)]
+    pub(super) fn store(&self) -> &Store<'db> {
+        self.store
+    }
 }
 
 fn lock_file(db_path: &Path, name: &str) -> Result<File> {

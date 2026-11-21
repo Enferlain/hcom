@@ -216,6 +216,21 @@ pub fn write_frame(writer: &mut impl Write, frame: &Frame) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn frame_length(header: [u8; HEADER_LEN as usize]) -> Result<usize> {
+    let len = u32::from_be_bytes(header);
+    ensure!(
+        (1..=MAX_ENCODED_FRAME - HEADER_LEN).contains(&len),
+        "invalid sandbox frame length"
+    );
+    Ok(len as usize)
+}
+
+pub(super) fn decode_frame(bytes: &[u8]) -> Result<Frame> {
+    let frame: Frame = serde_json::from_slice(bytes)?;
+    frame.validate()?;
+    Ok(frame)
+}
+
 fn read_frame(reader: &mut impl Read) -> Result<Option<Frame>> {
     let mut header = [0; HEADER_LEN as usize];
     loop {
@@ -227,16 +242,9 @@ fn read_frame(reader: &mut impl Read) -> Result<Option<Frame>> {
         }
     }
     reader.read_exact(&mut header[1..])?;
-    let len = u32::from_be_bytes(header);
-    ensure!(
-        (1..=MAX_ENCODED_FRAME - HEADER_LEN).contains(&len),
-        "invalid sandbox frame length"
-    );
-    let mut bytes = vec![0; len as usize];
+    let mut bytes = vec![0; frame_length(header)?];
     reader.read_exact(&mut bytes)?;
-    let frame: Frame = serde_json::from_slice(&bytes)?;
-    frame.validate()?;
-    Ok(Some(frame))
+    Ok(Some(decode_frame(&bytes)?))
 }
 
 #[derive(Clone, Copy)]
@@ -286,14 +294,32 @@ impl Connection {
         reader: &mut impl Read,
         current_epoch: i64,
     ) -> Result<Option<FrameBody>> {
+        self.check_current(current_epoch)?;
+        let Some(frame) = read_frame(reader)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.accept(frame, current_epoch)?))
+    }
+
+    fn check_current(&self, current_epoch: i64) -> Result<()> {
         ensure!(!self.closed, "sandbox connection is closed");
         ensure!(
             current_epoch == self.epoch,
             "stale sandbox connection epoch"
         );
-        let Some(frame) = read_frame(reader)? else {
-            return Ok(None);
-        };
+        Ok(())
+    }
+
+    pub(super) fn accept(&mut self, frame: Frame, current_epoch: i64) -> Result<FrameBody> {
+        let result = self.accept_inner(frame, current_epoch);
+        if result.is_err() {
+            self.closed = true;
+        }
+        result
+    }
+
+    fn accept_inner(&mut self, frame: Frame, current_epoch: i64) -> Result<FrameBody> {
+        self.check_current(current_epoch)?;
         ensure!(frame.epoch == self.epoch, "sandbox frame epoch mismatch");
         ensure!(
             frame.binding == self.binding,
@@ -311,7 +337,7 @@ impl Connection {
             (_, FrameBody::Close) => self.closed = true,
             _ => {}
         }
-        Ok(Some(frame.body))
+        Ok(frame.body)
     }
 }
 

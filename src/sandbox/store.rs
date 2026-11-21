@@ -19,6 +19,10 @@ const SCHEMA: &str = "
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
         epoch INTEGER NOT NULL CHECK (epoch > 0)
     ) STRICT;
+    CREATE TABLE IF NOT EXISTS sandbox_bridge_epochs (
+        route TEXT PRIMARY KEY,
+        epoch INTEGER NOT NULL CHECK (epoch > 0)
+    ) STRICT;
     CREATE TABLE IF NOT EXISTS sandbox_usage (
         scope TEXT NOT NULL,
         scope_key TEXT NOT NULL,
@@ -69,6 +73,7 @@ pub struct Store<'db> {
     db: &'db HcomDb,
     incarnation: String,
     limits: Limits,
+    bridge: Option<(String, i64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +124,7 @@ impl<'db> Store<'db> {
             db,
             incarnation,
             limits,
+            bridge: None,
         })
     }
 
@@ -139,6 +145,47 @@ impl<'db> Store<'db> {
 
     pub fn incarnation(&self) -> &str {
         &self.incarnation
+    }
+
+    /// Attach a connection after checking its independently configured binding.
+    /// Only a strictly newer epoch may take over this route.
+    pub(super) fn attach_bridge(&self, binding: &Binding, epoch: i64) -> Result<Self> {
+        binding.validate()?;
+        ensure!(epoch > 0, "invalid sandbox connection epoch");
+        let key = serde_json::to_string(binding)?;
+        self.write(|tx| {
+            let changed = tx.execute(
+                "INSERT INTO sandbox_bridge_epochs VALUES (?, ?)
+                 ON CONFLICT (route) DO UPDATE SET epoch = excluded.epoch
+                 WHERE excluded.epoch > sandbox_bridge_epochs.epoch",
+                params![key, epoch],
+            )?;
+            ensure!(changed == 1, "stale sandbox connection epoch");
+            Ok(())
+        })?;
+        Ok(Self {
+            db: self.db,
+            incarnation: self.incarnation.clone(),
+            limits: self.limits,
+            bridge: Some((key, epoch)),
+        })
+    }
+
+    pub(super) fn check_bridge(&self) -> Result<()> {
+        ensure_current_database(self.db)?;
+        self.check_bridge_on(self.db.conn())
+    }
+
+    fn check_bridge_on(&self, conn: &rusqlite::Connection) -> Result<()> {
+        if let Some((key, epoch)) = &self.bridge {
+            let current: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sandbox_bridge_epochs WHERE route = ? AND epoch = ?)",
+                params![key, epoch],
+                |row| row.get(0),
+            )?;
+            ensure!(current, "stale sandbox connection epoch");
+        }
+        Ok(())
     }
 
     /// Commit the associated event and outbox row before reporting acceptance.
@@ -409,6 +456,7 @@ impl<'db> Store<'db> {
     ) -> Result<T> {
         ensure_current_database(self.db)?;
         self.db.with_immediate_transaction(|tx| {
+            self.check_bridge_on(tx)?;
             let result = operation(tx)?;
             ensure_current_database(self.db)?;
             Ok(result)
