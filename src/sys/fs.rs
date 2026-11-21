@@ -23,6 +23,19 @@ pub fn create_private_new(path: &Path) -> io::Result<File> {
     opts.open(path)
 }
 
+/// Try to acquire an exclusive lock without waiting. Retry interrupted calls.
+pub fn try_lock_exclusive(file: &File) -> io::Result<bool> {
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(true),
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::fs::TryLockError::Error(error))
+                if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
 /// Acquire a blocking exclusive lock on an open file. The lock is released when
 /// the file handle is closed (dropped).
 ///

@@ -321,7 +321,7 @@ pub(super) fn validate_message_size(
     receiver: Receiver,
     binding: &Binding,
     message: &Message,
-) -> Result<()> {
+) -> Result<i64> {
     let frame = Frame {
         version: VERSION,
         epoch: i64::MAX,
@@ -332,8 +332,7 @@ pub(super) fn validate_message_size(
         },
     };
     frame.validate()?;
-    encode(&frame)?;
-    Ok(())
+    Ok(encode(&frame)?.len() as i64 + i64::from(HEADER_LEN))
 }
 
 #[cfg(test)]

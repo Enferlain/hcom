@@ -1,9 +1,10 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, Transaction, params};
 use uuid::Uuid;
 
 use crate::db::HcomDb;
 
+use super::admission::Limits;
 use super::protocol::{
     Binding, Message, MessageId, MessagePayload, Origin, Receiver, validate_message_size,
 };
@@ -14,6 +15,23 @@ const SCHEMA: &str = "
         incarnation TEXT NOT NULL,
         last_sequence INTEGER NOT NULL CHECK (last_sequence >= 0)
     ) STRICT;
+    CREATE TABLE IF NOT EXISTS sandbox_controller_clock (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        epoch INTEGER NOT NULL CHECK (epoch > 0)
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS sandbox_usage (
+        scope TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        messages INTEGER NOT NULL,
+        bytes INTEGER NOT NULL,
+        PRIMARY KEY (scope, scope_key)
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS sandbox_pacing (
+        run_key TEXT PRIMARY KEY,
+        started_at INTEGER NOT NULL,
+        messages INTEGER NOT NULL,
+        bytes INTEGER NOT NULL
+    ) STRICT;
     CREATE TABLE IF NOT EXISTS sandbox_origin_incarnations (
         worker TEXT NOT NULL,
         generation TEXT NOT NULL,
@@ -22,14 +40,20 @@ const SCHEMA: &str = "
     ) STRICT;
     CREATE TABLE IF NOT EXISTS sandbox_outbox (
         sequence INTEGER PRIMARY KEY,
+        origin_worker TEXT NOT NULL,
+        origin_generation TEXT NOT NULL,
         route TEXT NOT NULL,
         digest BLOB NOT NULL CHECK (length(digest) = 32),
         message TEXT NOT NULL,
         event_id INTEGER NOT NULL,
-        accepted INTEGER NOT NULL DEFAULT 0 CHECK (accepted IN (0, 1))
+        wire_bytes INTEGER NOT NULL CHECK (wire_bytes > 0),
+        expires_at INTEGER NOT NULL,
+        accepted INTEGER NOT NULL DEFAULT 0 CHECK (accepted IN (0, 1, 2))
     ) STRICT;
     CREATE INDEX IF NOT EXISTS sandbox_outbox_pending
         ON sandbox_outbox (route, sequence) WHERE accepted = 0;
+    CREATE INDEX IF NOT EXISTS sandbox_outbox_expiring
+        ON sandbox_outbox (expires_at, sequence) WHERE accepted = 0;
     CREATE TABLE IF NOT EXISTS sandbox_inbox (
         worker TEXT NOT NULL,
         generation TEXT NOT NULL,
@@ -44,6 +68,21 @@ const SCHEMA: &str = "
 pub struct Store<'db> {
     db: &'db HcomDb,
     incarnation: String,
+    limits: Limits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+    Pending,
+    AwaitingExpiry,
+    Accepted,
+    Expired,
+}
+
+#[derive(Debug)]
+pub struct ExpiredMessage {
+    pub sequence: i64,
+    pub event_id: i64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -55,6 +94,11 @@ pub enum Import {
 impl<'db> Store<'db> {
     /// Called by opted-in sandbox participation, outside upstream migrations.
     pub fn initialize(db: &'db HcomDb) -> Result<Self> {
+        Self::with_limits(db, Limits::default())
+    }
+
+    pub fn with_limits(db: &'db HcomDb, limits: Limits) -> Result<Self> {
+        limits.validate()?;
         ensure_current_database(db)?;
         let incarnation = db.with_immediate_transaction(|tx| {
             tx.execute_batch(SCHEMA)?;
@@ -70,7 +114,26 @@ impl<'db> Store<'db> {
             ensure_current_database(db)?;
             Ok(incarnation)
         })?;
-        Ok(Self { db, incarnation })
+        Ok(Self {
+            db,
+            incarnation,
+            limits,
+        })
+    }
+
+    pub(super) fn path(&self) -> &std::path::Path {
+        self.db.path()
+    }
+
+    pub(super) fn allocate_epoch(&self) -> Result<i64> {
+        self.write(|tx| {
+            Ok(tx.query_row(
+                "INSERT INTO sandbox_controller_clock VALUES (1, 1)
+             ON CONFLICT (singleton) DO UPDATE SET epoch = epoch + 1 RETURNING epoch",
+                [],
+                |row| row.get(0),
+            )?)
+        })
     }
 
     pub fn incarnation(&self) -> &str {
@@ -87,6 +150,7 @@ impl<'db> Store<'db> {
         route: &Binding,
         origin: Origin,
         payload: MessagePayload,
+        now: i64,
         insert_event: impl FnOnce(&Transaction<'_>, &Message) -> Result<i64>,
     ) -> Result<Message> {
         ensure!(
@@ -104,39 +168,56 @@ impl<'db> Store<'db> {
                 .optional()?
                 .ok_or_else(|| anyhow::anyhow!("sandbox outbox database incarnation changed"))?;
             let message = Message::new(MessageId { origin, sequence }, payload)?;
-            validate_message_size(receiver, route, &message)?;
+            let wire_bytes = validate_message_size(receiver, route, &message)?;
+            self.limits.pending(tx, wire_bytes)?;
             let event_id = insert_event(tx, &message)?;
+            self.limits.record(tx, route, wire_bytes, event_id, None)?;
             tx.execute(
                 "INSERT INTO sandbox_outbox
-                    (sequence, route, digest, message, event_id)
-                 VALUES (?, ?, ?, ?, ?)",
+                    (sequence, origin_worker, origin_generation, route, digest,
+                     message, event_id, wire_bytes, expires_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     sequence,
+                    message.id.origin.worker,
+                    message.id.origin.generation,
                     serde_json::to_string(route)?,
                     message.digest.as_slice(),
                     serde_json::to_string(&message)?,
                     event_id,
+                    wire_bytes,
+                    now.saturating_add(self.limits.queue_ttl_seconds),
                 ],
             )?;
             Ok(message)
         })
     }
 
-    pub fn next_pending(&self, route: &Binding) -> Result<Option<Message>> {
+    pub fn next_pending(&self, route: &Binding, now: i64) -> Result<Option<Message>> {
         ensure_current_database(self.db)?;
-        let row: Option<(String, Vec<u8>)> = self
+        let row = self
             .db
             .conn()
             .query_row(
-                "SELECT message, digest FROM sandbox_outbox
-             WHERE route = ? AND accepted = 0 ORDER BY sequence LIMIT 1",
-                [serde_json::to_string(route)?],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT message, digest, sequence, origin_worker, origin_generation FROM sandbox_outbox
+                 WHERE route = ? AND accepted = 0 AND expires_at > ? ORDER BY sequence LIMIT 1",
+                params![serde_json::to_string(route)?, now],
+                |row| Ok((
+                    row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?, row.get::<_, String>(4)?,
+                )),
             )
             .optional()?;
-        row.map(|(body, digest)| {
+        row.map(|(body, digest, sequence, worker, generation)| {
             let message: Message = serde_json::from_str(&body)?;
             message.validate()?;
+            ensure!(
+                message.id.sequence == sequence
+                    && message.id.origin.worker == worker
+                    && message.id.origin.generation == generation
+                    && message.id.origin.incarnation == self.incarnation,
+                "stored sandbox outbox identity mismatch"
+            );
             ensure!(
                 digest == message.digest,
                 "stored sandbox outbox digest mismatch"
@@ -146,41 +227,111 @@ impl<'db> Store<'db> {
         .transpose()
     }
 
+    /// Rediscover eligible routes after restart. Invalid stored bindings are
+    /// reported per route so they do not prevent recovery of valid queues.
+    pub fn pending_routes(&self, now: i64) -> Result<Vec<Result<Binding>>> {
+        ensure_current_database(self.db)?;
+        let mut statement = self.db.conn().prepare(
+            "SELECT route, min(sequence) FROM sandbox_outbox
+             WHERE accepted = 0 AND expires_at > ? GROUP BY route ORDER BY min(sequence)",
+        )?;
+        let mut rows = statement.query([now])?;
+        let mut routes = Vec::new();
+        while let Some(row) = rows.next()? {
+            let sequence: i64 = row.get(1)?;
+            let binding = (|| -> Result<Binding> {
+                let route: String = row.get(0)?;
+                let binding: Binding = serde_json::from_str(&route)?;
+                binding.validate()?;
+                Ok(binding)
+            })();
+            routes.push(
+                binding
+                    .with_context(|| format!("unreadable sandbox route for sequence {sequence}")),
+            );
+        }
+        Ok(routes)
+    }
+
     /// Only a receipt for the exact pending message and authenticated route can retire it.
     pub fn acknowledge(
         &self,
         route: &Binding,
         message: &MessageId,
         digest: &[u8; 32],
+        now: i64,
     ) -> Result<()> {
         ensure!(
             message.origin.incarnation == self.incarnation,
             "receipt incarnation mismatch"
         );
         self.write(|tx| {
-            let encoded = tx
-                .query_row(
-                    "SELECT message FROM sandbox_outbox
-                 WHERE sequence = ? AND route = ? AND digest = ?",
-                    params![
-                        message.sequence,
-                        serde_json::to_string(route)?,
-                        digest.as_slice()
-                    ],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            let Some(encoded) = encoded else {
-                anyhow::bail!("receipt does not match sandbox outbox");
-            };
-            let stored: Message = serde_json::from_str(&encoded)?;
-            ensure!(&stored.id == message, "receipt origin mismatch");
-            tx.execute(
-                "UPDATE sandbox_outbox SET accepted = 1 WHERE sequence = ?",
-                [message.sequence],
+            let changed = tx.execute(
+                "UPDATE sandbox_outbox SET accepted = 1
+                 WHERE sequence = ? AND origin_worker = ? AND origin_generation = ?
+                   AND route = ? AND digest = ?
+                   AND (accepted = 1 OR (accepted = 0 AND expires_at > ?))",
+                params![
+                    message.sequence,
+                    message.origin.worker,
+                    message.origin.generation,
+                    serde_json::to_string(route)?,
+                    digest.as_slice(),
+                    now,
+                ],
             )?;
+            ensure!(changed == 1, "receipt does not match sandbox outbox");
             Ok(())
         })
+    }
+
+    /// Persist terminal failures in bounded batches. A late receipt cannot
+    /// resurrect an expired send. History quotas remain charged. Call until
+    /// this returns an empty batch when draining after downtime.
+    pub fn expire_pending(&self, now: i64) -> Result<Vec<ExpiredMessage>> {
+        self.write(|tx| {
+            let mut stmt = tx.prepare(
+                "UPDATE sandbox_outbox SET accepted = 2
+                 WHERE sequence IN (
+                    SELECT sequence FROM sandbox_outbox WHERE accepted = 0 AND expires_at <= ?
+                    ORDER BY expires_at, sequence LIMIT 64
+                 ) RETURNING sequence, event_id",
+            )?;
+            let rows = stmt.query_map([now], |row| {
+                Ok(ExpiredMessage {
+                    sequence: row.get(0)?,
+                    event_id: row.get(1)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+
+    pub fn delivery(&self, id: &MessageId, now: i64) -> Result<Option<Delivery>> {
+        ensure_current_database(self.db)?;
+        if id.origin.incarnation != self.incarnation {
+            return Ok(None);
+        }
+        let row: Option<(i64, i64)> = self
+            .db
+            .conn()
+            .query_row(
+                "SELECT accepted, expires_at FROM sandbox_outbox
+                 WHERE sequence = ? AND origin_worker = ? AND origin_generation = ?",
+                params![id.sequence, id.origin.worker, id.origin.generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((status, expires_at)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(match status {
+            0 if expires_at > now => Delivery::Pending,
+            0 => Delivery::AwaitingExpiry,
+            1 => Delivery::Accepted,
+            2 => Delivery::Expired,
+            _ => anyhow::bail!("invalid sandbox delivery state"),
+        }))
     }
 
     /// Map a validated inbound message to its event in the same transaction.
@@ -188,10 +339,13 @@ impl<'db> Store<'db> {
     /// Call outside an ambient transaction; the callback uses this call's transaction.
     pub fn import(
         &self,
+        receiver: Receiver,
+        binding: &Binding,
         message: &Message,
+        now: i64,
         insert_event: impl FnOnce(&Transaction<'_>) -> Result<i64>,
     ) -> Result<Import> {
-        message.validate()?;
+        let wire_bytes = validate_message_size(receiver, binding, message)?;
         let id = &message.id;
         let origin = &id.origin;
         self.write(|tx| {
@@ -230,6 +384,9 @@ impl<'db> Store<'db> {
                 return Ok(Import::Replay(event_id));
             }
             let event_id = insert_event(tx)?;
+            let paced_at = matches!(receiver, Receiver::Host).then_some(now);
+            self.limits
+                .record(tx, binding, wire_bytes, event_id, paced_at)?;
             tx.execute(
                 "INSERT INTO sandbox_inbox VALUES (?, ?, ?, ?, ?, ?)",
                 params![
