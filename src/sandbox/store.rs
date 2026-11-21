@@ -108,6 +108,7 @@ impl<'db> Store<'db> {
         let incarnation = db.with_immediate_transaction(|tx| {
             tx.execute_batch(SCHEMA)?;
             tx.execute_batch(super::controller::SCHEMA)?;
+            tx.execute_batch(super::directory::SCHEMA)?;
             tx.execute(
                 "INSERT OR IGNORE INTO sandbox_identity VALUES (1, ?, 0)",
                 [Uuid::new_v4().to_string()],
@@ -154,6 +155,7 @@ impl<'db> Store<'db> {
         ensure!(epoch > 0, "invalid sandbox connection epoch");
         let key = serde_json::to_string(binding)?;
         self.write(|tx| {
+            super::directory::check_route(tx, &key)?;
             let changed = tx.execute(
                 "INSERT INTO sandbox_bridge_epochs VALUES (?, ?)
                  ON CONFLICT (route) DO UPDATE SET epoch = excluded.epoch
@@ -178,6 +180,7 @@ impl<'db> Store<'db> {
 
     fn check_bridge_on(&self, conn: &rusqlite::Connection) -> Result<()> {
         if let Some((key, epoch)) = &self.bridge {
+            super::directory::check_route(conn, key)?;
             let current: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sandbox_bridge_epochs WHERE route = ? AND epoch = ?)",
                 params![key, epoch],
@@ -186,6 +189,17 @@ impl<'db> Store<'db> {
             ensure!(current, "stale sandbox connection epoch");
         }
         Ok(())
+    }
+
+    fn check_binding(&self, conn: &rusqlite::Connection, binding: &Binding) -> Result<()> {
+        let key = serde_json::to_string(binding)?;
+        if let Some((attached, _)) = &self.bridge {
+            ensure!(*attached == key, "sandbox connection binding mismatch");
+            // write() already checked the attached generation and epoch.
+            Ok(())
+        } else {
+            super::directory::check_route(conn, &key)
+        }
     }
 
     /// Commit the associated event and outbox row before reporting acceptance.
@@ -206,6 +220,7 @@ impl<'db> Store<'db> {
             "outbox incarnation mismatch"
         );
         self.write(|tx| {
+            self.check_binding(tx, route)?;
             let sequence = tx
                 .query_row(
                     "UPDATE sandbox_identity SET last_sequence = last_sequence + 1
@@ -314,6 +329,7 @@ impl<'db> Store<'db> {
             "receipt incarnation mismatch"
         );
         self.write(|tx| {
+            self.check_binding(tx, route)?;
             let changed = tx.execute(
                 "UPDATE sandbox_outbox SET accepted = 1
                  WHERE sequence = ? AND origin_worker = ? AND origin_generation = ?
@@ -397,6 +413,7 @@ impl<'db> Store<'db> {
         let id = &message.id;
         let origin = &id.origin;
         self.write(|tx| {
+            self.check_binding(tx, binding)?;
             tx.execute(
                 "INSERT OR IGNORE INTO sandbox_origin_incarnations VALUES (?, ?, ?)",
                 params![origin.worker, origin.generation, origin.incarnation],

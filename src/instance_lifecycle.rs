@@ -1152,6 +1152,16 @@ pub fn cleanup_stale_instances(
 
     if let Ok(instances) = db.iter_instances_full() {
         for data in &instances {
+            // Sandbox generations have their own lifecycle and no host PID.
+            if (data.origin_device_id.is_some() || data.name.contains('.'))
+                && !matches!(
+                    crate::sandbox::directory::location(db, data),
+                    Ok(crate::sandbox::directory::Location::Local
+                        | crate::sandbox::directory::Location::TrustedRelay(_))
+                )
+            {
+                continue;
+            }
             // Direct evidence beats clock inference, even inside wake grace.
             match reap_if_process_gone(db, data) {
                 TrackedProcess::Reaped => {
@@ -1245,28 +1255,40 @@ fn cleanup_stale_remote_instances(db: &HcomDb) {
         .collect();
 
     if let Ok(instances) = db.iter_instances_full() {
-        let device_ids: std::collections::HashSet<String> = instances
+        let mut logged_devices = std::collections::HashSet::new();
+        for instance in instances
             .iter()
-            .filter_map(|d| d.origin_device_id.clone())
-            .collect();
-
-        for device_id in device_ids {
+            .filter(|instance| instance.origin_device_id.is_some())
+        {
+            let Ok(crate::sandbox::directory::Location::TrustedRelay(device_id)) =
+                crate::sandbox::directory::location(db, instance)
+            else {
+                continue;
+            };
             let sync_val = sync_map.get(&format!("relay_sync_time_{device_id}"));
             let sync_time: f64 = sync_val.and_then(|s| s.parse().ok()).unwrap_or(0.0);
             if sync_time > 0.0 && (now - sync_time) <= REMOTE_DEVICE_STALE_THRESHOLD {
                 continue;
             }
-            if let Err(e) = db.conn().execute(
-                "DELETE FROM instances WHERE origin_device_id = ?",
-                rusqlite::params![device_id],
+            match db.conn().execute(
+                "DELETE FROM instances WHERE name = ? AND origin_device_id = ?",
+                rusqlite::params![instance.name, device_id],
             ) {
-                crate::log::log_warn("cleanup", "remote_stale_cleanup_fail", &e.to_string());
-            } else {
-                crate::log::log_info(
-                    "cleanup",
-                    "remote_device_stale",
-                    crate::relay::device_id_prefix(&device_id),
-                );
+                Err(error) => {
+                    crate::log::log_warn(
+                        "cleanup",
+                        "remote_stale_cleanup_fail",
+                        &error.to_string(),
+                    );
+                }
+                Ok(1) if logged_devices.insert(device_id.clone()) => {
+                    crate::log::log_info(
+                        "cleanup",
+                        "remote_device_stale",
+                        crate::relay::device_id_prefix(&device_id),
+                    );
+                }
+                _ => {}
             }
         }
     }
@@ -1337,6 +1359,49 @@ mod tests {
 
     fn instance_exists(db: &HcomDb, name: &str) -> bool {
         db.get_instance_full(name).unwrap().is_some()
+    }
+
+    #[test]
+    fn stale_cleanup_preserves_aged_sandbox_projections() {
+        use crate::sandbox::directory::{Access, Placement};
+        use crate::sandbox::store::Store;
+
+        let _guard = wake_test_guard();
+        let root = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&root.path().join("hcom.db")).unwrap();
+        let store = Store::initialize(&db).unwrap();
+        let team = store.create_team(None).unwrap();
+        let controller = team.external_controller.unwrap();
+        let worker = store
+            .reserve_worker(
+                &team.id,
+                Access::Controller(&controller),
+                "worker",
+                crate::tool::Tool::Claude,
+                Placement {
+                    gateway: "gateway",
+                    workspace: "default",
+                    sandbox: "owned-vm",
+                    incarnation: "fedc8acb-cc62-422d-9724-54e730e64f6e",
+                },
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, created_at)
+             VALUES ('old:RELY', 'stale-relay', 1)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET status_time = ? WHERE name = ?",
+                rusqlite::params![now_epoch_i64() - 7200, worker.binding.worker.worker],
+            )
+            .unwrap();
+        cleanup_stale_instances(&db, 3600, 3600);
+        assert!(instance_exists(&db, &worker.binding.worker.worker));
+        assert!(!instance_exists(&db, "old:RELY"));
     }
 
     #[test]
