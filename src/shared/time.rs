@@ -25,6 +25,29 @@ pub fn now_epoch_i64() -> i64 {
         .unwrap_or(0)
 }
 
+/// A system-wide clock for comparing liveness observations across processes.
+pub fn monotonic_seconds() -> std::io::Result<i64> {
+    #[cfg(unix)]
+    {
+        let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: clock_gettime fills the timespec on success.
+        let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, ts.as_mut_ptr()) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: clock_gettime succeeded.
+        let seconds = unsafe { ts.assume_init() }.tv_sec;
+        #[allow(clippy::useless_conversion)]
+        Ok(i64::from(seconds))
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: this Win32 query takes no arguments and returns milliseconds.
+        let millis = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+        Ok((millis / 1000) as i64)
+    }
+}
+
 /// Current time as ISO 8601 string with microsecond precision (for TEXT timestamp columns).
 pub fn now_iso() -> String {
     chrono::Utc::now()

@@ -465,6 +465,103 @@ fn launch_json_reports_names_for_kill_json() {
     assert_eq!(sandbox_tables, 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn sandbox_controller_survives_launcher_exit_and_stays_disabled_after_stop() {
+    use std::os::unix::process::CommandExt;
+
+    struct StopController<'a>(&'a Hcom);
+    impl Drop for StopController<'_> {
+        fn drop(&mut self) {
+            let _ = self.0.run(["sandbox", "controller", "stop"]);
+        }
+    }
+
+    let h = Hcom::new();
+    let controller_dir = h.hcom_dir.join(".sandbox-controller");
+    let snapshot = |action| -> serde_json::Value {
+        let (code, stdout, stderr) = h.run(["sandbox", "controller", action]);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        serde_json::from_str(&stdout).unwrap()
+    };
+    assert_eq!(snapshot("status")["enabled"], false);
+    assert!(!controller_dir.exists());
+    let _cleanup = StopController(&h);
+    let mut launcher = h.cmd();
+    launcher
+        .args(["sandbox", "controller", "start"])
+        .env_remove("CODEX_SANDBOX");
+    // SAFETY: setsid is async-signal-safe and this modifies only the forked child.
+    unsafe {
+        launcher.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = launcher.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let started: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pid = started["owner"]["pid"].as_i64().unwrap() as libc::pid_t;
+    assert!(pid > 1);
+    // SAFETY: getsid only observes the fixture's detached process.
+    assert_eq!(unsafe { libc::getsid(pid) }, pid);
+    let running = snapshot("status");
+    assert_eq!(running["ready"], true);
+    assert_eq!(running["owner"]["epoch"], started["owner"]["epoch"]);
+    assert_eq!(snapshot("start")["owner"]["pid"], started["owner"]["pid"]);
+
+    let stopped = snapshot("stop");
+    assert_eq!(stopped["enabled"], false);
+    assert!(stopped["owner"].is_null());
+    assert!(h.cmd().arg("sandbox-worker").status().unwrap().success());
+    assert!(snapshot("status")["owner"].is_null());
+
+    let starters: Vec<_> = (0..4)
+        .map(|_| {
+            let mut command = h.cmd();
+            command
+                .args(["sandbox", "controller", "start"])
+                .env_remove("CODEX_SANDBOX");
+            command
+        })
+        .collect();
+    let concurrent = std::thread::scope(|scope| {
+        let runs: Vec<_> = starters
+            .into_iter()
+            .map(|mut command| scope.spawn(move || command.output().unwrap()))
+            .collect();
+        runs.into_iter()
+            .map(|run| {
+                let output = run.join().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+            })
+            .collect::<Vec<_>>()
+    });
+    assert!(concurrent[0]["owner"]["epoch"].as_i64() > started["owner"]["epoch"].as_i64());
+    for state in &concurrent {
+        assert_eq!(state["ready"], true);
+        assert_eq!(state["owner"]["epoch"], concurrent[0]["owner"]["epoch"]);
+        assert_eq!(state["owner"]["pid"], concurrent[0]["owner"]["pid"]);
+    }
+    assert!(snapshot("stop")["owner"].is_null());
+    let recipient = h.start();
+    let (code, _, stderr) = h.run(["send", "-b", &format!("@{recipient}"), "--", "still local"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(snapshot("status")["enabled"], false);
+    assert!(snapshot("recover")["owner"].is_null());
+}
+
 #[test]
 fn events_empty_in_fresh_dir() {
     let h = Hcom::new();

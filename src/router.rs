@@ -37,6 +37,7 @@ const COMMANDS: &[&str] = &[
     "kill",
     "term",
     "relay",
+    "sandbox",
     "run",
     "update",
 ];
@@ -166,13 +167,23 @@ fn dispatch_hook_for_tool(tool: Tool, hook: &str, args: &[String]) -> (i32, Stri
 #[derive(Debug, PartialEq)]
 pub enum Action {
     /// Run a hook handler. Args are the full argv[1..] passed through.
-    Hook { hook: String, args: Vec<String> },
+    Hook {
+        hook: String,
+        args: Vec<String>,
+    },
     /// Run a CLI command. Args are the full argv[1..] passed through.
-    Command { cmd: String, args: Vec<String> },
+    Command {
+        cmd: String,
+        args: Vec<String>,
+    },
     /// Launch tool (e.g. `hcom 3 claude --model haiku`)
-    Launch { args: Vec<String> },
+    Launch {
+        args: Vec<String>,
+    },
     /// Run PTY wrapper mode
-    Pty { args: Vec<String> },
+    Pty {
+        args: Vec<String>,
+    },
     /// Run TUI (no arguments)
     Tui,
     /// Show version
@@ -181,11 +192,14 @@ pub enum Action {
     Help,
     /// `hcom help <topic...>`: print that topic's help page. Never dispatches
     /// the target, since not every target (scripts, relay-worker) honors --help.
-    TopicHelp { args: Vec<String> },
+    TopicHelp {
+        args: Vec<String>,
+    },
     /// Open TUI in new terminal window
     NewTerminal,
     /// Run relay-worker process
     RelayWorker,
+    SandboxWorker,
 }
 
 /// Global flags extracted from argv before dispatch.
@@ -350,6 +364,9 @@ pub fn resolve_action(argv: &[String]) -> Action {
     if first == "relay-worker" {
         return Action::RelayWorker;
     }
+    if first == "sandbox-worker" {
+        return Action::SandboxWorker;
+    }
 
     // PTY mode: `hcom pty <tool> [args...]`
     if first == "pty" {
@@ -507,6 +524,10 @@ fn print_topic_help(args: &[String]) -> i32 {
         crate::commands::help::print_help();
         return 0;
     };
+    if name == "sandbox" {
+        println!("{}", crate::sandbox::controller::USAGE);
+        return 0;
+    }
     let topic = if is_command(name) {
         crate::commands::help::help_topic(name, &words[1..])
     } else if is_launch_tool(name) || matches!(name, "resume" | "fork") {
@@ -688,7 +709,10 @@ pub fn dispatch() -> anyhow::Result<()> {
     // Skip dev_root re-exec for `config dev_root` so a stale pointer can't
     // trap the user. Also keep `update` on the invoked (installed) binary;
     // otherwise the checkout's version and path would drive update decisions.
-    if !is_config_dev_root_invocation(argv) && !is_update_invocation(argv) {
+    if !matches!(action, Action::SandboxWorker)
+        && !is_config_dev_root_invocation(argv)
+        && !is_update_invocation(argv)
+    {
         maybe_reexec_dev_root();
     }
 
@@ -721,6 +745,20 @@ pub fn dispatch() -> anyhow::Result<()> {
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
+        }
+        Action::SandboxWorker => {
+            anyhow::ensure!(argv.len() == 1, "sandbox-worker takes no arguments");
+            if let Err(error) = crate::sandbox::controller::run_worker() {
+                log_error("sandbox", "controller.exit", &format!("{error:#}"));
+                return Err(error);
+            }
+        }
+        Action::Command { ref cmd, ref args } if cmd == "sandbox" => {
+            let (mut stripped, _, help) = extract_global_flags_full(args);
+            if help {
+                stripped.push("--help".into());
+            }
+            crate::sandbox::controller::run_command(&stripped[1..])?;
         }
         Action::Hook { ref hook, ref args } => {
             let Some(tool) = Tool::from_hook_name(hook) else {

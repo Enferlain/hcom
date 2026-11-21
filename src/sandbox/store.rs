@@ -102,6 +102,7 @@ impl<'db> Store<'db> {
         ensure_current_database(db)?;
         let incarnation = db.with_immediate_transaction(|tx| {
             tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(super::controller::SCHEMA)?;
             tx.execute(
                 "INSERT OR IGNORE INTO sandbox_identity VALUES (1, ?, 0)",
                 [Uuid::new_v4().to_string()],
@@ -402,13 +403,21 @@ impl<'db> Store<'db> {
         })
     }
 
-    fn write<T>(&self, operation: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
+    pub(super) fn write<T>(
+        &self,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
         ensure_current_database(self.db)?;
         self.db.with_immediate_transaction(|tx| {
             let result = operation(tx)?;
             ensure_current_database(self.db)?;
             Ok(result)
         })
+    }
+
+    pub(super) fn connection(&self) -> Result<&rusqlite::Connection> {
+        ensure_current_database(self.db)?;
+        Ok(self.db.conn())
     }
 }
 

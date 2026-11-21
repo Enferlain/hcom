@@ -1,9 +1,20 @@
 use std::fs::File;
 use std::io::ErrorKind;
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
 use super::store::Store;
+
+mod lifecycle;
+mod state;
+
+pub(crate) use lifecycle::USAGE;
+pub use lifecycle::{
+    Forwarding, QueuedSend, enqueue_host, ensure_after_launch, run_command, run_worker,
+};
+pub(super) use state::SCHEMA;
+pub use state::{ControllerStatus, Process, RunState, status};
 
 /// Held for the controller's lifetime. The kernel releases ownership on exit.
 /// The lock file is never unlinked, so contenders always lock the same file.
@@ -16,16 +27,7 @@ pub struct Owner<'store, 'db> {
 
 impl<'store, 'db> Owner<'store, 'db> {
     pub fn try_acquire(store: &'store Store<'db>) -> Result<Option<Self>> {
-        let directory = store.path().with_file_name(".sandbox-controller");
-        crate::paths::ensure_private_directory(&directory)?;
-        let path = directory.join("owner.lock");
-        let lock = match crate::sys::fs::create_private_new(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-                File::options().read(true).write(true).open(path)?
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let lock = lock_file(store.path(), "owner.lock")?;
         if !crate::sys::fs::try_lock_exclusive(&lock).context("lock sandbox controller")? {
             return Ok(None);
         }
@@ -45,6 +47,30 @@ impl<'store, 'db> Owner<'store, 'db> {
     /// bind it to its route before admitting any traffic from that connection.
     pub fn allocate_connection_epoch(&self) -> Result<i64> {
         self.store.allocate_epoch()
+    }
+}
+
+fn lock_file(db_path: &Path, name: &str) -> Result<File> {
+    let directory = db_path.with_file_name(".sandbox-controller");
+    crate::paths::ensure_private_directory(&directory)?;
+    let path = directory.join(name);
+    match crate::sys::fs::create_private_new(&path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            Ok(File::options().read(true).write(true).open(path)?)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn owner_released(db_path: &Path) -> Result<bool> {
+    let path = db_path
+        .with_file_name(".sandbox-controller")
+        .join("owner.lock");
+    match File::options().read(true).write(true).open(path) {
+        Ok(file) => Ok(crate::sys::fs::try_lock_exclusive(&file)?),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
     }
 }
 
