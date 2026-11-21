@@ -52,7 +52,9 @@ const SCHEMA: &str = "
         event_id INTEGER NOT NULL,
         wire_bytes INTEGER NOT NULL CHECK (wire_bytes > 0),
         expires_at INTEGER NOT NULL,
-        accepted INTEGER NOT NULL DEFAULT 0 CHECK (accepted IN (0, 1, 2))
+        accepted INTEGER NOT NULL DEFAULT 0 CHECK (accepted IN (0, 1, 2)),
+        forwarded_sequence INTEGER CHECK (forwarded_sequence > 0),
+        forwarded_incarnation TEXT
     ) STRICT;
     CREATE INDEX IF NOT EXISTS sandbox_outbox_pending
         ON sandbox_outbox (route, sequence) WHERE accepted = 0;
@@ -74,6 +76,12 @@ pub struct Store<'db> {
     incarnation: String,
     limits: Limits,
     bridge: Option<(String, i64)>,
+}
+
+#[derive(Clone, Copy)]
+pub struct ForwardRoute<'a> {
+    pub source: &'a Binding,
+    pub destination: &'a Binding,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +117,7 @@ impl<'db> Store<'db> {
             tx.execute_batch(SCHEMA)?;
             tx.execute_batch(super::controller::SCHEMA)?;
             tx.execute_batch(super::directory::SCHEMA)?;
+            ensure_forwarding_schema(tx)?;
             tx.execute(
                 "INSERT OR IGNORE INTO sandbox_identity VALUES (1, ?, 0)",
                 [Uuid::new_v4().to_string()],
@@ -221,15 +230,7 @@ impl<'db> Store<'db> {
         );
         self.write(|tx| {
             self.check_binding(tx, route)?;
-            let sequence = tx
-                .query_row(
-                    "UPDATE sandbox_identity SET last_sequence = last_sequence + 1
-                     WHERE singleton = 1 AND incarnation = ? RETURNING last_sequence",
-                    [&self.incarnation],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .ok_or_else(|| anyhow::anyhow!("sandbox outbox database incarnation changed"))?;
+            let sequence = self.allocate_queue_sequence(tx)?;
             let message = Message::new(MessageId { origin, sequence }, payload)?;
             let wire_bytes = validate_message_size(receiver, route, &message)?;
             self.limits.pending(tx, wire_bytes)?;
@@ -256,37 +257,115 @@ impl<'db> Store<'db> {
         })
     }
 
+    fn allocate_queue_sequence(&self, tx: &Transaction<'_>) -> Result<i64> {
+        tx.query_row(
+            "UPDATE sandbox_identity SET last_sequence = last_sequence + 1
+             WHERE singleton = 1 AND incarnation = ? RETURNING last_sequence",
+            [&self.incarnation],
+            |row| row.get(0),
+        )
+        .optional()?
+        .context("sandbox outbox database incarnation changed")
+    }
+
+    /// Append a host-authorized next hop inside the inbound event transaction.
+    /// The queue sequence orders the host spool. The sender's wire identity
+    /// and digest remain unchanged across the host relay.
+    pub fn forward_in(
+        &self,
+        tx: &Transaction<'_>,
+        route: ForwardRoute<'_>,
+        message: &Message,
+        event_id: i64,
+        now: i64,
+    ) -> Result<()> {
+        ensure!(
+            self.bridge.is_none() && message.id.origin.incarnation != self.incarnation,
+            "sandbox forward must use the host store and a foreign origin"
+        );
+        let ForwardRoute {
+            source,
+            destination,
+        } = route;
+        source.validate()?;
+        ensure!(
+            message.id.origin == source.worker
+                && source.team == destination.team
+                && source != destination,
+            "sandbox forward does not match an authorized team hop"
+        );
+        self.check_binding(tx, source)?;
+        self.check_binding(tx, destination)?;
+        // Validating the Deliver envelope also checks its target against this binding.
+        let wire_bytes = validate_message_size(Receiver::Guest, destination, message)?;
+        self.limits.pending(tx, wire_bytes)?;
+        let ordinal = self.allocate_queue_sequence(tx)?;
+        self.limits
+            .record(tx, destination, wire_bytes, event_id, None)?;
+        tx.execute(
+            "INSERT INTO sandbox_outbox
+                (sequence, origin_worker, origin_generation, route, digest,
+                 message, event_id, wire_bytes, expires_at,
+                 forwarded_sequence, forwarded_incarnation)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                ordinal,
+                message.id.origin.worker,
+                message.id.origin.generation,
+                serde_json::to_string(destination)?,
+                message.digest.as_slice(),
+                serde_json::to_string(message)?,
+                event_id,
+                wire_bytes,
+                now.saturating_add(self.limits.queue_ttl_seconds),
+                message.id.sequence,
+                message.id.origin.incarnation,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn next_pending(&self, route: &Binding, now: i64) -> Result<Option<Message>> {
         ensure_current_database(self.db)?;
         let row = self
             .db
             .conn()
             .query_row(
-                "SELECT message, digest, sequence, origin_worker, origin_generation FROM sandbox_outbox
-                 WHERE route = ? AND accepted = 0 AND expires_at > ? ORDER BY sequence LIMIT 1",
-                params![serde_json::to_string(route)?, now],
-                |row| Ok((
-                    row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?, row.get::<_, String>(4)?,
-                )),
+                "SELECT message, digest, COALESCE(forwarded_sequence, sequence),
+                        origin_worker, origin_generation, COALESCE(forwarded_incarnation, ?)
+                   FROM sandbox_outbox
+                  WHERE route = ? AND accepted = 0 AND expires_at > ? ORDER BY sequence LIMIT 1",
+                params![self.incarnation, serde_json::to_string(route)?, now],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
             )
             .optional()?;
-        row.map(|(body, digest, sequence, worker, generation)| {
-            let message: Message = serde_json::from_str(&body)?;
-            message.validate()?;
-            ensure!(
-                message.id.sequence == sequence
-                    && message.id.origin.worker == worker
-                    && message.id.origin.generation == generation
-                    && message.id.origin.incarnation == self.incarnation,
-                "stored sandbox outbox identity mismatch"
-            );
-            ensure!(
-                digest == message.digest,
-                "stored sandbox outbox digest mismatch"
-            );
-            Ok(message)
-        })
+        row.map(
+            |(body, digest, sequence, worker, generation, incarnation)| {
+                let message: Message = serde_json::from_str(&body)?;
+                message.validate()?;
+                ensure!(
+                    message.id.sequence == sequence
+                        && message.id.origin.worker == worker
+                        && message.id.origin.generation == generation
+                        && message.id.origin.incarnation == incarnation,
+                    "stored sandbox outbox identity mismatch"
+                );
+                ensure!(
+                    digest == message.digest,
+                    "stored sandbox outbox digest mismatch"
+                );
+                Ok(message)
+            },
+        )
         .transpose()
     }
 
@@ -324,19 +403,19 @@ impl<'db> Store<'db> {
         digest: &[u8; 32],
         now: i64,
     ) -> Result<()> {
-        ensure!(
-            message.origin.incarnation == self.incarnation,
-            "receipt incarnation mismatch"
-        );
         self.write(|tx| {
             self.check_binding(tx, route)?;
             let changed = tx.execute(
                 "UPDATE sandbox_outbox SET accepted = 1
-                 WHERE sequence = ? AND origin_worker = ? AND origin_generation = ?
-                   AND route = ? AND digest = ?
-                   AND (accepted = 1 OR (accepted = 0 AND expires_at > ?))",
+                 WHERE ((sequence = ?1 AND forwarded_sequence IS NULL AND ?2 = ?3)
+                        OR (forwarded_sequence = ?1 AND forwarded_incarnation = ?3))
+                   AND origin_worker = ?4 AND origin_generation = ?5
+                   AND route = ?6 AND digest = ?7
+                   AND (accepted = 1 OR (accepted = 0 AND expires_at > ?8))",
                 params![
                     message.sequence,
+                    self.incarnation,
+                    message.origin.incarnation,
                     message.origin.worker,
                     message.origin.generation,
                     serde_json::to_string(route)?,
@@ -381,7 +460,8 @@ impl<'db> Store<'db> {
             .conn()
             .query_row(
                 "SELECT accepted, expires_at FROM sandbox_outbox
-                 WHERE sequence = ? AND origin_worker = ? AND origin_generation = ?",
+                 WHERE sequence = ? AND forwarded_sequence IS NULL
+                   AND origin_worker = ? AND origin_generation = ?",
                 params![id.sequence, id.origin.worker, id.origin.generation],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -484,6 +564,34 @@ impl<'db> Store<'db> {
         ensure_current_database(self.db)?;
         Ok(self.db.conn())
     }
+}
+
+fn ensure_forwarding_schema(tx: &Transaction<'_>) -> Result<()> {
+    for (column, sql) in [
+        (
+            "forwarded_sequence",
+            "ALTER TABLE sandbox_outbox ADD COLUMN forwarded_sequence INTEGER CHECK (forwarded_sequence > 0)",
+        ),
+        (
+            "forwarded_incarnation",
+            "ALTER TABLE sandbox_outbox ADD COLUMN forwarded_incarnation TEXT",
+        ),
+    ] {
+        let present: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sandbox_outbox') WHERE name = ?)",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !present {
+            tx.execute_batch(sql)?;
+        }
+    }
+    tx.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS sandbox_outbox_forwarded
+           ON sandbox_outbox(route, origin_worker, origin_generation, forwarded_incarnation, forwarded_sequence)
+           WHERE forwarded_sequence IS NOT NULL;",
+    )?;
+    Ok(())
 }
 
 fn ensure_current_database(db: &HcomDb) -> Result<()> {

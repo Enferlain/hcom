@@ -105,6 +105,14 @@ fn enqueue_and_receipt_are_atomic_and_survive_reopen() {
         .unwrap();
     assert_eq!(message.id.sequence, 1);
     assert_eq!(event_count(&db), 1);
+    // Simulate reopening a queue created before foreign forwarding existed.
+    db.conn()
+        .execute_batch(
+            "DROP INDEX sandbox_outbox_forwarded;
+         ALTER TABLE sandbox_outbox DROP COLUMN forwarded_sequence;
+         ALTER TABLE sandbox_outbox DROP COLUMN forwarded_incarnation;",
+        )
+        .unwrap();
     drop(db);
 
     let db = HcomDb::open_at(&path).unwrap();
@@ -145,6 +153,134 @@ fn enqueue_and_receipt_are_atomic_and_survive_reopen() {
         .unwrap();
     assert!(store.next_pending(&route, NOW).unwrap().is_none());
     assert_eq!(event_count(&db), 1);
+}
+
+#[test]
+fn foreign_forwarding_keeps_the_wire_id_and_orders_with_local_sends() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("hcom.db");
+    let db = HcomDb::open_at(&path).unwrap();
+    let store = Store::initialize(&db).unwrap();
+    let source = origin("worker-a", &Uuid::new_v4().to_string());
+    // Both senders can produce the same sequence number. Their wire origins
+    // also differ from the host's queue order.
+    let remote = Message::new(
+        MessageId {
+            origin: source,
+            sequence: 1,
+        },
+        payload("remote"),
+    )
+    .unwrap();
+    let source_binding = incoming_binding(&remote);
+    let destination = Binding {
+        team: source_binding.team.clone(),
+        sandbox: "sandbox-b".into(),
+        worker: origin("worker-b", &Uuid::new_v4().to_string()),
+    };
+    let hop = ForwardRoute {
+        source: &source_binding,
+        destination: &destination,
+    };
+    let local = store
+        .enqueue(
+            Receiver::Guest,
+            &destination,
+            origin("host", store.incarnation()),
+            payload("local"),
+            NOW,
+            |tx, _| insert_event(tx),
+        )
+        .unwrap();
+    assert_eq!(local.id.sequence, remote.id.sequence);
+
+    let failed = store.import(Receiver::Host, &source_binding, &remote, NOW, |tx| {
+        let event = insert_event(tx)?;
+        store.forward_in(tx, hop, &remote, event, NOW)?;
+        anyhow::bail!("interrupt before commit")
+    });
+    assert!(failed.is_err());
+    assert_eq!(event_count(&db), 1);
+    store
+        .acknowledge(&destination, &local.id, &local.digest, NOW)
+        .unwrap();
+    assert!(store.next_pending(&destination, NOW).unwrap().is_none());
+
+    let received = store
+        .import(Receiver::Host, &source_binding, &remote, NOW, |tx| {
+            let event = insert_event(tx)?;
+            let cross_team = Binding {
+                team: "other".into(),
+                ..destination.clone()
+            };
+            assert!(
+                store
+                    .forward_in(
+                        tx,
+                        ForwardRoute {
+                            source: &source_binding,
+                            destination: &cross_team,
+                        },
+                        &remote,
+                        event,
+                        NOW
+                    )
+                    .is_err()
+            );
+            let mut wrong_worker = destination.clone();
+            wrong_worker.worker.worker = "not-the-message-target".into();
+            assert!(
+                store
+                    .forward_in(
+                        tx,
+                        ForwardRoute {
+                            source: &source_binding,
+                            destination: &wrong_worker,
+                        },
+                        &remote,
+                        event,
+                        NOW,
+                    )
+                    .is_err()
+            );
+            store.forward_in(tx, hop, &remote, event, NOW)?;
+            Ok(event)
+        })
+        .unwrap();
+    let Import::Inserted(event) = received else {
+        panic!("first import should insert a local event");
+    };
+    assert_eq!(
+        store
+            .import(Receiver::Host, &source_binding, &remote, NOW, |_| {
+                panic!("replay must not forward again")
+            })
+            .unwrap(),
+        Import::Replay(event)
+    );
+    drop(db);
+
+    let db = HcomDb::open_at(&path).unwrap();
+    let store = Store::initialize(&db).unwrap();
+    let before_ack = store.next_pending(&destination, NOW).unwrap();
+    assert_eq!(before_ack, Some(remote.clone()));
+    let mut forged = remote.id.clone();
+    forged.origin.incarnation = store.incarnation().into();
+    assert!(
+        store
+            .acknowledge(&destination, &forged, &remote.digest, NOW)
+            .is_err()
+    );
+    assert!(
+        store
+            .acknowledge(&source_binding, &remote.id, &remote.digest, NOW)
+            .is_err()
+    );
+    store
+        .acknowledge(&destination, &remote.id, &remote.digest, NOW)
+        .unwrap();
+    assert!(store.next_pending(&destination, NOW).unwrap().is_none());
+    assert_eq!(event_count(&db), 2);
 }
 
 #[test]

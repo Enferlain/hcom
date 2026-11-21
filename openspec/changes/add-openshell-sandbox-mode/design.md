@@ -189,6 +189,8 @@ Use sandbox-namespaced tables in the existing local SQLite database, initialized
 
 For messages involving sandbox routing, queue acceptance and the local message event commit together. Inbound dedup state, event mapping, and inbox insertion also share one transaction. Publish wakes and subscription effects after commit. Observers/exporters have their own cursor; they never call agent inbox consumption APIs to obtain traffic. Existing local hooks/PTY code records actual context delivery. A guest adapter exports that evidence, not timestamp-derived read inference.
 
+The forwarding queue keeps the host's append order separate from a guest message's wire identity. A host-authorized same-team hop adds the next outbox row in the inbound event transaction and preserves the original origin, sequence, and digest. The host charges both durable records against the team and host limits, and charges each record against its corresponding run. The receiving worker's receipt must match that wire identity and its bound destination. Existing local outbox records keep their original identity and order when the optional sandbox tables are reopened.
+
 Transport promises retry with deduplicated inbox insertion, per-sender ordering, and visible unresolved failure. It does not promise exactly-once model actions. Database replacement/incarnation mismatch fails closed until explicit reconciliation or a new run generation is created. Do not reuse source event numbers across database resets.
 
 **Alternative:** A separate router SQLite file would simplify module ownership but cannot atomically commit its dedup state with hcom inbox insertion. Namespaced tables give the necessary atomicity without taking over upstream migrations.
