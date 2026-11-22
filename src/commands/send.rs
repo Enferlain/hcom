@@ -259,7 +259,12 @@ struct ResolvedDelivery {
     effective_mentions: Vec<String>,
     delivered_to: Vec<String>,
     is_thread_resolved: bool,
-    sandbox_target: Option<crate::sandbox::directory::Worker>,
+    sandbox_target: Option<SandboxTarget>,
+}
+
+enum SandboxTarget {
+    Host(crate::sandbox::directory::Worker),
+    Guest(crate::sandbox::guest_send::Target),
 }
 
 fn deliverable_instances(db: &HcomDb) -> Result<Vec<InstanceInfo>, String> {
@@ -291,6 +296,18 @@ fn resolve_delivery(
     envelope: Option<&MessageEnvelope>,
     explicit_targets: Option<&[String]>,
 ) -> Result<ResolvedDelivery, String> {
+    if let Some(target) = crate::sandbox::guest_send::resolve(db, identity, explicit_targets)
+        .map_err(|error| format!("{error:#}"))?
+    {
+        return Ok(ResolvedDelivery {
+            original_scope: MessageScope::Mentions,
+            effective_scope: MessageScope::Mentions,
+            effective_mentions: Vec::new(),
+            delivered_to: Vec::new(),
+            is_thread_resolved: false,
+            sandbox_target: Some(SandboxTarget::Guest(target)),
+        });
+    }
     // Deliverable agents: exclude session-stopped (exit:*) and launch_failed placeholders.
     // Adhoc instances use inactive:tool:* between commands — still @mentionable.
     let rows = deliverable_instances(db)?;
@@ -397,7 +414,7 @@ fn resolve_delivery(
         effective_mentions,
         delivered_to,
         is_thread_resolved,
-        sandbox_target,
+        sandbox_target: sandbox_target.map(SandboxTarget::Host),
     })
 }
 
@@ -1108,28 +1125,6 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     };
 
-    // Self-delivery is always filtered out, so an all-self target list would
-    // otherwise "succeed" with no recipients.
-    if !effective_targets.is_empty()
-        && effective_targets.iter().all(|t| {
-            // Routing treats bigboss:DEVICE as bigboss (device-agnostic identity).
-            let base = match t.split_once(':') {
-                Some((base, _)) if base == SENDER => base,
-                _ => t.as_str(),
-            };
-            identity::resolve_display_name(db, base)
-                .as_deref()
-                .unwrap_or(base)
-                == sender_identity.name
-        })
-    {
-        eprintln!(
-            "Error: @{} is you ({}); agents don't receive their own messages",
-            effective_targets[0], sender_identity.name
-        );
-        return 1;
-    }
-
     let targets_to_pass: Option<&[String]> =
         if args.has_separator() || !effective_targets.is_empty() || args.broadcast {
             Some(&effective_targets)
@@ -1159,6 +1154,31 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     };
 
+    // Self-delivery is always filtered out, so an all-self target list would
+    // otherwise "succeed" with no recipients.
+    if !matches!(
+        preview_delivery.sandbox_target,
+        Some(SandboxTarget::Guest(_))
+    ) && !effective_targets.is_empty()
+        && effective_targets.iter().all(|t| {
+            // Routing treats bigboss:DEVICE as bigboss (device-agnostic identity).
+            let base = match t.split_once(':') {
+                Some((base, _)) if base == SENDER => base,
+                _ => t.as_str(),
+            };
+            identity::resolve_display_name(db, base)
+                .as_deref()
+                .unwrap_or(base)
+                == sender_identity.name
+        })
+    {
+        eprintln!(
+            "Error: @{} is you ({}); agents don't receive their own messages",
+            effective_targets[0], sender_identity.name
+        );
+        return 1;
+    }
+
     if preview_delivery.original_scope == MessageScope::Broadcast
         && !preview_delivery.is_thread_resolved
         && !args.broadcast
@@ -1187,7 +1207,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
     // ── Create bundle event if inline flags provided ──
     if preview_delivery.sandbox_target.is_some() && bundle_data.is_some() {
-        eprintln!("Error: Sandbox sends do not support host bundles");
+        eprintln!("Error: Sandbox sends do not support inline bundles");
         return 1;
     }
     if let Some(mut bundle) = bundle_data {
@@ -1299,14 +1319,25 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             .reply_to
             .as_deref()
             .and_then(|reply| resolve_reply_to_local(db, reply));
-        match crate::sandbox::outgoing::queue(
-            db,
-            &sender_identity,
-            target,
-            &message,
-            &envelope,
-            reply_event,
-        ) {
+        let result = match target {
+            SandboxTarget::Host(worker) => crate::sandbox::outgoing::queue(
+                db,
+                &sender_identity,
+                worker,
+                &message,
+                &envelope,
+                reply_event,
+            ),
+            SandboxTarget::Guest(peer) => crate::sandbox::guest_send::queue(
+                db,
+                &sender_identity,
+                peer,
+                &message,
+                &envelope,
+                reply_event,
+            ),
+        };
+        match result {
             Ok(queued) => Some(queued),
             Err(error) => {
                 eprintln!("Error: {error}");
@@ -2061,6 +2092,7 @@ mod tests {
                         )
                         .unwrap(),
                     ),
+                    sender_routing_generation: None,
                     thread: Some("work".into()),
                     reply_to: None,
                     intent: Intent::Request,

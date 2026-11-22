@@ -3,8 +3,10 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
 use crate::db::HcomDb;
-use crate::sandbox::directory::host_recipient_generation;
-use crate::sandbox::protocol::{Binding, Message, MessageId, TeamPeer, validate_identifier};
+use crate::sandbox::directory::{host_generation, host_recipient_generation};
+use crate::sandbox::protocol::{
+    Binding, Message, MessageId, Origin, TeamPeer, validate_identifier,
+};
 use crate::sandbox::store::{ForwardRoute, Store};
 use crate::shared::time::now_epoch_i64;
 
@@ -16,6 +18,11 @@ pub struct HostInbox<'a, 'db> {
     inbox: Inbox<'db>,
 }
 
+enum Recipient<'a> {
+    Guest(&'a Binding),
+    Host { name: &'a str, created_at: f64 },
+}
+
 impl<'a, 'db> HostInbox<'a, 'db> {
     pub fn new(db: &'db HcomDb, store: &'a Store<'db>, source: &'a Binding) -> Self {
         Self {
@@ -23,6 +30,55 @@ impl<'a, 'db> HostInbox<'a, 'db> {
             source,
             inbox: Inbox::new(db, false),
         }
+    }
+
+    fn check_reply(
+        &self,
+        tx: &Transaction<'_>,
+        message: &Message,
+        recipient: Recipient<'_>,
+    ) -> Result<()> {
+        let Some(parent) = &message.payload.reply_to else {
+            return Ok(());
+        };
+        let event = reply_event(
+            tx,
+            &self.source.team,
+            message.payload.thread.as_deref(),
+            parent,
+        )?
+        .context("sandbox reply is not in this team conversation")?;
+        let queued_for = |binding: &Binding| -> Result<bool> {
+            Ok(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sandbox_outbox WHERE event_id = ? AND route = ?)",
+                params![event, serde_json::to_string(binding)?],
+                |row| row.get(0),
+            )?)
+        };
+        let matches = if parent.origin == self.source.worker {
+            match recipient {
+                Recipient::Guest(binding) => queued_for(binding)?,
+                Recipient::Host { name, created_at } => tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events e, json_each(e.data, '$.delivered_to') d
+                     WHERE e.id = ?1 AND d.value = ?2
+                       AND json_extract(e.data, '$._sandbox.recipient_created_at') = ?3)",
+                    params![event, name, created_at],
+                    |row| row.get(0),
+                )?,
+            }
+        } else {
+            let expected = match recipient {
+                Recipient::Guest(binding) => binding.worker.clone(),
+                Recipient::Host { name, created_at } => Origin {
+                    worker: name.into(),
+                    generation: host_generation(created_at),
+                    incarnation: self.store.incarnation().into(),
+                },
+            };
+            parent.origin == expected && queued_for(self.source)?
+        };
+        ensure!(matches, "sandbox reply is not between these participants");
+        Ok(())
     }
 }
 
@@ -56,6 +112,7 @@ impl Inbound for HostInbox<'_, '_> {
                 destination.worker.generation == target_generation,
                 "sandbox message target generation is stale"
             );
+            self.check_reply(tx, message, Recipient::Guest(&destination))?;
             let event = self
                 .inbox
                 .insert(tx, &self.source.team, target, false, message)?;
@@ -86,6 +143,14 @@ impl Inbound for HostInbox<'_, '_> {
             host_recipient_generation(tx, target, local_created_at)? == target_generation,
             "sandbox message target generation is stale"
         );
+        self.check_reply(
+            tx,
+            message,
+            Recipient::Host {
+                name: target,
+                created_at: local_created_at,
+            },
+        )?;
         self.inbox
             .insert(tx, &self.source.team, target, true, message)
     }
@@ -232,6 +297,9 @@ impl<'a> Inbox<'a> {
                 |row| row.get(0),
             )?;
             data["_sandbox"]["recipient_created_at"] = json!(created_at);
+        }
+        if let Some(generation) = &payload.sender_routing_generation {
+            data["_sandbox"]["sender_routing_generation"] = json!(generation);
         }
         if let Some(thread) = &payload.thread {
             data["thread"] = json!(thread);

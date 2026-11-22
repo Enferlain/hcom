@@ -8,6 +8,7 @@ fn payload(text: &str) -> MessagePayload {
     MessagePayload {
         target: "worker-b".into(),
         target_generation: None,
+        sender_routing_generation: None,
         thread: None,
         reply_to: None,
         intent: Intent::Inform,

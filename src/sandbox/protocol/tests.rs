@@ -21,6 +21,7 @@ fn fixture() -> (Binding, Message) {
         MessagePayload {
             target: "worker-b".into(),
             target_generation: None,
+            sender_routing_generation: None,
             thread: Some("work".into()),
             reply_to: None,
             intent: Intent::Inform,
@@ -66,7 +67,11 @@ fn recipient_generation_is_in_the_digest_and_checked_against_delivery_binding() 
     assert_ne!(stale.digest, good.digest);
     assert!(validate_message_size(Receiver::Guest, &binding, &stale).is_err());
     payload.target_generation = Some("bad generation".into());
-    assert!(Message::new(old.id, payload).is_err());
+    assert!(Message::new(old.id.clone(), payload).is_err());
+    let mut forged = old.payload;
+    forged.sender_routing_generation = Some("fake-host-route".into());
+    let forged = Message::new(old.id, forged).unwrap();
+    assert!(validate_message_size(Receiver::Host, &binding, &forged).is_err());
 }
 
 #[test]

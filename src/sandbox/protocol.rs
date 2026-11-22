@@ -74,6 +74,10 @@ pub struct MessagePayload {
     // Preserve the digest of retained messages written before this field was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_generation: Option<String>,
+    /// Host-authored messages carry the sender's opaque directory generation
+    /// for reply correlation. Guest senders use their bound origin generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_routing_generation: Option<String>,
     pub thread: Option<String>,
     pub reply_to: Option<MessageId>,
     pub intent: Intent,
@@ -117,6 +121,9 @@ impl Message {
         }
         validate_identifier(&self.payload.target)?;
         if let Some(generation) = &self.payload.target_generation {
+            validate_identifier(generation)?;
+        }
+        if let Some(generation) = &self.payload.sender_routing_generation {
             validate_identifier(generation)?;
         }
         if let Some(thread) = &self.payload.thread {
@@ -205,6 +212,10 @@ impl Frame {
                 ensure!(
                     message.id.origin == self.binding.worker,
                     "sandbox sender mismatch"
+                );
+                ensure!(
+                    message.payload.sender_routing_generation.is_none(),
+                    "guest cannot set a sandbox sender routing generation"
                 );
                 message.validate()
             }

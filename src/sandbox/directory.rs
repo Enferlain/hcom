@@ -545,7 +545,6 @@ pub(super) fn host_generation(created_at: f64) -> String {
     format!("host-{:016x}", created_at.to_bits())
 }
 
-#[cfg(unix)]
 fn directory_key(conn: &Connection) -> Result<Vec<u8>> {
     Ok(conn.query_row(
         "SELECT secret FROM sandbox_directory_key WHERE singleton = 1",
@@ -554,7 +553,6 @@ fn directory_key(conn: &Connection) -> Result<Vec<u8>> {
     )?)
 }
 
-#[cfg(unix)]
 fn recipient_generation(key: &[u8], name: &str, created_at: f64) -> String {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use sha2::{Digest, Sha256};
@@ -567,7 +565,6 @@ fn recipient_generation(key: &[u8], name: &str, created_at: f64) -> String {
     format!("recipient-{}", URL_SAFE_NO_PAD.encode(digest.finalize()))
 }
 
-#[cfg(unix)]
 pub(crate) fn host_recipient_generation(
     conn: &Connection,
     name: &str,
@@ -954,6 +951,7 @@ mod tests {
             super::super::protocol::MessagePayload {
                 target: "host".into(),
                 target_generation: None,
+                sender_routing_generation: None,
                 thread: None,
                 reply_to: None,
                 intent: super::super::protocol::Intent::Inform,

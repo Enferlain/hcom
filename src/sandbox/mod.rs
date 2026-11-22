@@ -5,6 +5,7 @@ pub mod admission;
 pub mod bridge;
 pub mod controller;
 pub mod directory;
+pub(crate) mod guest_send;
 pub mod openshell;
 pub(crate) mod outgoing;
 pub mod protocol;

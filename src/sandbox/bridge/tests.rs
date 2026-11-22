@@ -128,6 +128,7 @@ fn payload(target: &str, text: String) -> MessagePayload {
         target: target.into(),
         target_generation: None,
         text,
+        sender_routing_generation: None,
         thread: None,
         reply_to: None,
         intent: Intent::Inform,

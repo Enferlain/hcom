@@ -7,7 +7,7 @@ use crate::messages::{MessageEnvelope, MessageIntent};
 use crate::shared::SenderIdentity;
 
 use super::controller::{Forwarding, enqueue_host};
-use super::directory::{HostIdentity, Worker, check_sender};
+use super::directory::{HostIdentity, Worker, check_sender, host_recipient_generation};
 use super::protocol::{Intent, MessageId, MessagePayload};
 use super::store::Store;
 
@@ -18,14 +18,7 @@ pub(crate) struct Queued {
     pub forwarding_reason: Option<String>,
 }
 
-pub(crate) fn queue(
-    db: &HcomDb,
-    sender: &SenderIdentity,
-    worker: &Worker,
-    text: &str,
-    envelope: &MessageEnvelope,
-    reply_event: Option<i64>,
-) -> Result<Queued> {
+pub(super) fn wire_text(text: &str) -> Result<String> {
     let text = text.replace("\r\n", "\n");
     crate::messages::validate_message(&text).map_err(anyhow::Error::msg)?;
     ensure!(
@@ -34,6 +27,26 @@ pub(crate) fn queue(
             .any(|c| c.is_control() && c != '\n' && c != '\t'),
         "sandbox message contains prohibited control characters"
     );
+    Ok(text)
+}
+
+pub(super) fn wire_intent(envelope: &MessageEnvelope) -> Intent {
+    match envelope.intent.unwrap_or(MessageIntent::Inform) {
+        MessageIntent::Request => Intent::Request,
+        MessageIntent::Inform => Intent::Inform,
+        MessageIntent::Ack => Intent::Ack,
+    }
+}
+
+pub(crate) fn queue(
+    db: &HcomDb,
+    sender: &SenderIdentity,
+    worker: &Worker,
+    text: &str,
+    envelope: &MessageEnvelope,
+    reply_event: Option<i64>,
+) -> Result<Queued> {
+    let text = wire_text(text)?;
     ensure!(
         envelope.bundle_id.is_none(),
         "sandbox sends do not support host bundles"
@@ -50,11 +63,7 @@ pub(crate) fn queue(
     let store = Store::initialize(db)?;
     let origin = host.origin(store.incarnation());
     let route = serde_json::to_string(binding)?;
-    let intent = match envelope.intent.unwrap_or(MessageIntent::Inform) {
-        MessageIntent::Request => Intent::Request,
-        MessageIntent::Inform => Intent::Inform,
-        MessageIntent::Ack => Intent::Ack,
-    };
+    let intent = wire_intent(envelope);
     let resolve_reply = || -> Result<Option<MessageId>> {
         let Some(event) = reply_event else {
             return Ok(None);
@@ -103,6 +112,11 @@ pub(crate) fn queue(
     let payload = MessagePayload {
         target: target.into(),
         target_generation: Some(binding.worker.generation.clone()),
+        sender_routing_generation: Some(host_recipient_generation(
+            db.conn(),
+            &sender.name,
+            host.created_at(),
+        )?),
         thread: envelope.thread.clone(),
         reply_to: resolve_reply()?,
         intent,

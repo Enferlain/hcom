@@ -13,6 +13,7 @@ fn message(origin: Origin, sequence: i64, target: &str) -> Message {
         MessagePayload {
             target: target.into(),
             target_generation: None,
+            sender_routing_generation: None,
             thread: Some("thread".into()),
             reply_to: None,
             intent: Intent::Request,
@@ -497,4 +498,267 @@ fn guest_handshake_replaces_its_persisted_directory_on_reconnect() {
     let mut replacement = GuestInbox::new(&guest_db, &binding, &local_replacement).unwrap();
     assert!(handshake(&mut replacement, 5, None).is_err());
     assert_eq!(stored(), vec![peer]);
+}
+
+#[test]
+fn ordinary_guest_send_uses_the_directory_and_replies_to_the_bound_host() {
+    use clap::Parser;
+
+    let root = tempfile::tempdir().unwrap();
+    let guest_db = HcomDb::open_at(&root.path().join("guest.db")).unwrap();
+    let host_db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    guest_db
+        .conn()
+        .execute(
+            "INSERT INTO instances (name, created_at) VALUES ('host', 1)",
+            [],
+        )
+        .unwrap();
+    host_db
+        .conn()
+        .execute_batch("INSERT INTO instances (name, created_at) VALUES ('host', 2), ('other', 3);")
+        .unwrap();
+    let guest_store = Store::initialize(&guest_db).unwrap();
+    let host_store = Store::initialize(&host_db).unwrap();
+    let host = crate::identity::resolve_from_name(&host_db, "host").unwrap();
+    let host_member = HostIdentity::capture(&host_db, &host).unwrap();
+    let other = crate::identity::resolve_from_name(&host_db, "other").unwrap();
+    let owner = HostIdentity::capture(&host_db, &other).unwrap();
+    let team = host_store.create_team(Some(&owner)).unwrap();
+    host_store
+        .enroll_host(&team.id, Access::Host(&owner), &host_member)
+        .unwrap();
+    let worker = host_store
+        .reserve_worker(
+            &team.id,
+            Access::Host(&owner),
+            "guest",
+            Tool::Claude,
+            Placement {
+                gateway: "gateway",
+                workspace: "default",
+                sandbox: "guest",
+                incarnation: guest_store.incarnation(),
+            },
+        )
+        .unwrap();
+    let binding = &worker.binding;
+    let sibling = host_store
+        .reserve_worker(
+            &team.id,
+            Access::Host(&owner),
+            "sibling",
+            Tool::Codex,
+            Placement {
+                gateway: "gateway",
+                workspace: "default",
+                sandbox: "sibling",
+                incarnation: &uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .unwrap();
+    let collision = host_store
+        .reserve_worker(
+            &team.id,
+            Access::Host(&owner),
+            "host",
+            Tool::Codex,
+            Placement {
+                gateway: "gateway",
+                workspace: "default",
+                sandbox: "alias-collision",
+                incarnation: &uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .unwrap();
+    let local = LocalWorker {
+        name: "host".into(),
+        created_at: 1.0,
+    };
+    let mut guest_inbox = GuestInbox::new(&guest_db, binding, &local).unwrap();
+    let snapshot = host_store.snapshot_directory(binding).unwrap().unwrap();
+    let attached = guest_store.attach_bridge(binding, 1).unwrap();
+    attached
+        .write(|tx| guest_inbox.replace_directory(tx, Some(&snapshot)))
+        .unwrap();
+
+    let request = crate::sandbox::outgoing::queue(
+        &host_db,
+        &host,
+        &worker,
+        "test request",
+        &crate::messages::MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Request),
+            thread: Some("work".into()),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    let now = now_epoch_i64();
+    let work = host_store.next_pending(binding, now).unwrap().unwrap();
+    let Imported::New(request_event) = apply(
+        &guest_store,
+        Receiver::Guest,
+        binding,
+        &work,
+        &mut guest_inbox,
+    ) else {
+        panic!("expected guest inbox request");
+    };
+    let ctx = crate::shared::CommandContext {
+        explicit_name: None,
+        identity: Some(crate::identity::resolve_from_name(&guest_db, "host").unwrap()),
+        go: true,
+        identity_warning: None,
+    };
+    let send = |argv: &[&str]| {
+        let mut args = crate::commands::send::SendArgs::try_parse_from(argv).unwrap();
+        args.had_separator = true;
+        crate::commands::send::cmd_send(&guest_db, &args, Some(&ctx))
+    };
+    let reference = request_event.to_string();
+    assert_eq!(send(&["send", "--json", "@missing", "--", "wrong"]), 1);
+    assert_eq!(
+        send(&[
+            "send",
+            "--json",
+            "--reply-to",
+            &reference,
+            "@other",
+            "--",
+            "wrong"
+        ]),
+        1
+    );
+    assert_eq!(guest_db.get_last_event_id(), request_event);
+    assert_eq!(
+        send(&[
+            "send",
+            "--json",
+            "--intent",
+            "ack",
+            "--reply-to",
+            &reference,
+            "@host",
+            "--",
+            "received"
+        ]),
+        0
+    );
+    let reply = guest_store.next_pending(binding, now).unwrap().unwrap();
+    assert_eq!(reply.id.origin, binding.worker);
+    assert_eq!(reply.payload.reply_to, Some(work.id.clone()));
+    assert_eq!(reply.payload.thread.as_deref(), Some("work"));
+
+    let mut host_inbox = HostInbox::new(&host_db, &host_store, binding);
+    let mut wrong = reply.payload.clone();
+    wrong.target = "other".into();
+    wrong.target_generation =
+        Some(host_recipient_generation(host_db.conn(), "other", 3.0).unwrap());
+    let wrong = Message::new(reply.id.clone(), wrong).unwrap();
+    let rejected = host_store
+        .import(Receiver::Host, binding, &wrong, now, |tx| {
+            host_inbox.insert(tx, &wrong)
+        })
+        .unwrap_err();
+    assert!(rejected.to_string().contains("between these participants"));
+    let Imported::New(reply_event) = apply(
+        &host_store,
+        Receiver::Host,
+        binding,
+        &reply,
+        &mut host_inbox,
+    ) else {
+        panic!("expected host inbox reply");
+    };
+    let data = event(&host_db, reply_event);
+    assert_eq!(data["delivered_to"], json!(["host"]));
+    assert_eq!(data["reply_to_local"], request.event_id);
+    assert!(
+        host_store
+            .next_pending(&collision.binding, now)
+            .unwrap()
+            .is_none()
+    );
+
+    assert_eq!(send(&["send", "--json", "@sibling", "--", "hello peer"]), 0);
+    assert_eq!(
+        guest_store.next_pending(binding, now).unwrap(),
+        Some(reply.clone())
+    );
+    guest_store
+        .acknowledge(binding, &reply.id, &reply.digest, now)
+        .unwrap();
+    let direct = guest_store.next_pending(binding, now).unwrap().unwrap();
+    assert_eq!(direct.payload.target, sibling.binding.worker.worker);
+    let Imported::New(forwarded) = apply(
+        &host_store,
+        Receiver::Host,
+        binding,
+        &direct,
+        &mut host_inbox,
+    ) else {
+        panic!("expected sibling forwarding");
+    };
+    assert_eq!(
+        event(&host_db, forwarded)["queued_to"],
+        json!([direct.payload.target])
+    );
+    assert_eq!(
+        host_store.next_pending(&sibling.binding, now).unwrap(),
+        Some(direct.clone())
+    );
+    guest_db
+        .conn()
+        .execute(
+            "UPDATE sandbox_outbox SET expires_at = ?1 WHERE sequence = ?2",
+            params![now - 1, direct.id.sequence],
+        )
+        .unwrap();
+    assert_eq!(send(&["send", "--json", "@host", "--", "after expiry"]), 0);
+    assert_eq!(
+        guest_store.delivery(&direct.id, now).unwrap(),
+        Some(crate::sandbox::store::Delivery::Expired)
+    );
+    assert_eq!(
+        guest_store
+            .next_pending(binding, now)
+            .unwrap()
+            .unwrap()
+            .payload
+            .text,
+        "after expiry"
+    );
+    host_db
+        .conn()
+        .execute(
+            "UPDATE instances SET created_at = 4 WHERE name = 'host'",
+            [],
+        )
+        .unwrap();
+    let replacement = crate::identity::resolve_from_name(&host_db, "host").unwrap();
+    let replacement = HostIdentity::capture(&host_db, &replacement).unwrap();
+    host_store
+        .enroll_host(&team.id, Access::Host(&owner), &replacement)
+        .unwrap();
+    let snapshot = host_store.snapshot_directory(binding).unwrap().unwrap();
+    let attached = guest_store.attach_bridge(binding, 2).unwrap();
+    attached
+        .write(|tx| guest_inbox.replace_directory(tx, Some(&snapshot)))
+        .unwrap();
+    let before = guest_db.get_last_event_id();
+    assert_eq!(
+        send(&[
+            "send",
+            "--json",
+            "--reply-to",
+            &reference,
+            "@host",
+            "--",
+            "stale reply"
+        ]),
+        1
+    );
+    assert_eq!(guest_db.get_last_event_id(), before);
 }
