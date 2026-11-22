@@ -2053,6 +2053,7 @@ mod tests {
                 },
                 MessagePayload {
                     target: "luna".into(),
+                    target_generation: Some("host-3ff0000000000000".into()),
                     thread: Some("work".into()),
                     reply_to: None,
                     intent: Intent::Request,

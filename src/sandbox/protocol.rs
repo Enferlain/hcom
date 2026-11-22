@@ -69,10 +69,23 @@ pub enum Intent {
 #[serde(deny_unknown_fields)]
 pub struct MessagePayload {
     pub target: String,
+    // Preserve the digest of retained messages written before this field was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_generation: Option<String>,
     pub thread: Option<String>,
     pub reply_to: Option<MessageId>,
     pub intent: Intent,
     pub text: String,
+}
+
+impl MessagePayload {
+    pub(super) fn addresses(&self, target: &Origin) -> bool {
+        self.target == target.worker
+            && self
+                .target_generation
+                .as_ref()
+                .is_none_or(|generation| generation == &target.generation)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +114,9 @@ impl Message {
             reply.validate()?;
         }
         validate_identifier(&self.payload.target)?;
+        if let Some(generation) = &self.payload.target_generation {
+            validate_identifier(generation)?;
+        }
         if let Some(thread) = &self.payload.thread {
             validate_identifier(thread)?;
         }
@@ -181,7 +197,7 @@ impl Frame {
             }
             FrameBody::Deliver(message) => {
                 ensure!(
-                    message.payload.target == self.binding.worker.worker,
+                    message.payload.addresses(&self.binding.worker),
                     "sandbox delivery target mismatch"
                 );
                 message.validate()

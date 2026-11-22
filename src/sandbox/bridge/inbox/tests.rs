@@ -12,6 +12,7 @@ fn message(origin: Origin, sequence: i64, target: &str) -> Message {
         MessageId { origin, sequence },
         MessagePayload {
             target: target.into(),
+            target_generation: None,
             thread: Some("thread".into()),
             reply_to: None,
             intent: Intent::Request,
@@ -19,6 +20,11 @@ fn message(origin: Origin, sequence: i64, target: &str) -> Message {
         },
     )
     .unwrap()
+}
+
+fn addressed(mut message: Message, generation: &str) -> Message {
+    message.payload.target_generation = Some(generation.into());
+    Message::new(message.id, message.payload).unwrap()
 }
 
 fn event(db: &HcomDb, id: i64) -> Value {
@@ -58,7 +64,10 @@ fn local_guest_inbox_maps_recipient_and_publishes_only_after_commit() {
         generation: "one".into(),
         incarnation: uuid::Uuid::new_v4().to_string(),
     };
-    let input = message(sender, 1, &binding.worker.worker);
+    let input = addressed(
+        message(sender, 1, &binding.worker.worker),
+        &binding.worker.generation,
+    );
     let local_worker = LocalWorker {
         name: "guest".into(),
         created_at: 1.0,
@@ -221,13 +230,21 @@ fn host_inbox_delivers_to_enrolled_local_or_forwards_to_same_team() {
     let db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
     db.conn()
         .execute_batch(
-            "INSERT INTO instances (name, created_at) VALUES ('host', 1), ('outsider', 2);",
+            "INSERT INTO instances (name, created_at) VALUES ('host', 1), ('outsider', 2), ('member', 3);",
         )
         .unwrap();
     let identity = crate::identity::resolve_from_name(&db, "host").unwrap();
     let member = HostIdentity::capture(&db, &identity).unwrap();
     let store = Store::initialize(&db).unwrap();
     let team = store.create_team(Some(&member)).unwrap();
+    let enroll_local = || {
+        let local = crate::identity::resolve_from_name(&db, "member").unwrap();
+        let local = HostIdentity::capture(&db, &local).unwrap();
+        store
+            .enroll_host(&team.id, Access::Host(&member), &local)
+            .unwrap();
+    };
+    enroll_local();
     let make_worker = |name| {
         store
             .reserve_worker(
@@ -248,13 +265,19 @@ fn host_inbox_delivers_to_enrolled_local_or_forwards_to_same_team() {
     let destination = make_worker("destination").binding;
     let mut inbox = HostInbox::new(&db, &store, &source);
 
-    let local = message(source.worker.clone(), 1, "host");
+    let local = addressed(
+        message(source.worker.clone(), 1, "member"),
+        &host_generation(3.0),
+    );
     let Imported::New(id) = apply(&store, Receiver::Host, &source, &local, &mut inbox) else {
         panic!("expected local import")
     };
-    assert_eq!(event(&db, id)["mentions"], json!(["host"]));
+    assert_eq!(event(&db, id)["mentions"], json!(["member"]));
 
-    let forwarded = message(source.worker.clone(), 2, &destination.worker.worker);
+    let forwarded = addressed(
+        message(source.worker.clone(), 2, &destination.worker.worker),
+        &destination.worker.generation,
+    );
     let Imported::New(id) = apply(&store, Receiver::Host, &source, &forwarded, &mut inbox) else {
         panic!("expected forwarded import")
     };
@@ -265,19 +288,55 @@ fn host_inbox_delivers_to_enrolled_local_or_forwards_to_same_team() {
     assert_eq!(event(&db, id)["delivered_to"], json!([]));
     assert_eq!(
         store.next_pending(&destination, now_epoch_i64()).unwrap(),
-        Some(forwarded)
+        Some(forwarded.clone())
     );
 
-    let unauthorized = message(source.worker.clone(), 3, "outsider");
+    let reject = |inbox: &mut HostInbox<'_, '_>, message: &Message| {
+        store
+            .import(Receiver::Host, &source, message, now_epoch_i64(), |tx| {
+                inbox.insert(tx, message)
+            })
+            .unwrap_err()
+            .to_string()
+    };
+    let before = db.get_last_event_id();
+    let unauthorized = addressed(
+        message(source.worker.clone(), 3, "outsider"),
+        &host_generation(2.0),
+    );
+    assert!(reject(&mut inbox, &unauthorized).contains("outside the team"));
+    let unbound = message(source.worker.clone(), 3, "member");
+    assert!(reject(&mut inbox, &unbound).contains("requires a target generation"));
+
+    db.conn()
+        .execute(
+            "UPDATE instances SET created_at = 4 WHERE name = 'member'",
+            [],
+        )
+        .unwrap();
+    enroll_local();
+    let stale_local = addressed(
+        message(source.worker.clone(), 3, "member"),
+        &host_generation(3.0),
+    );
+    assert!(reject(&mut inbox, &stale_local).contains("target generation is stale"));
+
+    store
+        .retire_worker(Access::Host(&member), &destination)
+        .unwrap();
+    let replacement = make_worker("destination").binding;
+    assert_eq!(replacement.worker.worker, destination.worker.worker);
+    assert_ne!(replacement.worker.generation, destination.worker.generation);
+    let stale_guest = addressed(
+        message(source.worker.clone(), 3, &destination.worker.worker),
+        &destination.worker.generation,
+    );
+    assert!(reject(&mut inbox, &stale_guest).contains("target generation is stale"));
+    assert_eq!(db.get_last_event_id(), before);
     assert!(
         store
-            .import(
-                Receiver::Host,
-                &source,
-                &unauthorized,
-                now_epoch_i64(),
-                |tx| inbox.insert(tx, &unauthorized)
-            )
-            .is_err()
+            .next_pending(&replacement, now_epoch_i64())
+            .unwrap()
+            .is_none()
     );
 }

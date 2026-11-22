@@ -435,10 +435,14 @@ impl HostIdentity {
     pub(super) fn origin(&self, incarnation: &str) -> Origin {
         Origin {
             worker: self.name.clone(),
-            generation: format!("host-{:016x}", self.created_at.to_bits()),
+            generation: host_generation(self.created_at),
             incarnation: incarnation.into(),
         }
     }
+}
+
+pub(super) fn host_generation(created_at: f64) -> String {
+    format!("host-{:016x}", created_at.to_bits())
 }
 
 fn has_directory(conn: &Connection) -> Result<bool> {
@@ -745,6 +749,7 @@ mod tests {
             },
             super::super::protocol::MessagePayload {
                 target: "host".into(),
+                target_generation: None,
                 thread: None,
                 reply_to: None,
                 intent: super::super::protocol::Intent::Inform,

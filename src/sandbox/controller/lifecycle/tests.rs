@@ -49,6 +49,7 @@ fn send(store: &Store<'_>, route: &Binding, spawn: impl Fn(&Path) -> Result<Chil
         },
         MessagePayload {
             target: route.worker.worker.clone(),
+            target_generation: None,
             thread: None,
             reply_to: None,
             intent: Intent::Request,

@@ -102,6 +102,7 @@ pub(crate) fn queue(
 
     let payload = MessagePayload {
         target: target.into(),
+        target_generation: Some(binding.worker.generation.clone()),
         thread: envelope.thread.clone(),
         reply_to: resolve_reply()?,
         intent,

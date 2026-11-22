@@ -3,6 +3,7 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
 use crate::db::HcomDb;
+use crate::sandbox::directory::host_generation;
 use crate::sandbox::protocol::{Binding, Message, MessageId, validate_identifier};
 use crate::sandbox::store::{ForwardRoute, Store};
 use crate::shared::time::now_epoch_i64;
@@ -37,6 +38,11 @@ impl Inbound for HostInbox<'_, '_> {
             "sandbox sender is not enrolled"
         );
         let target = &message.payload.target;
+        let target_generation = message
+            .payload
+            .target_generation
+            .as_deref()
+            .context("sandbox guest send requires a target generation")?;
         let destination: Option<String> = tx
             .query_row(
                 "SELECT binding FROM sandbox_workers WHERE team = ? AND name = ? AND retired = 0",
@@ -46,6 +52,10 @@ impl Inbound for HostInbox<'_, '_> {
             .optional()?;
         if let Some(destination) = destination {
             let destination: Binding = serde_json::from_str(&destination)?;
+            ensure!(
+                destination.worker.generation == target_generation,
+                "sandbox message target generation is stale"
+            );
             let event = self
                 .inbox
                 .insert(tx, &self.source.team, target, false, message)?;
@@ -61,14 +71,21 @@ impl Inbound for HostInbox<'_, '_> {
             )?;
             return Ok(event);
         }
-        let local: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sandbox_team_hosts h JOIN instances i
+        let local_created_at: Option<f64> = tx
+            .query_row(
+                "SELECT i.created_at FROM sandbox_team_hosts h JOIN instances i
                ON i.name = h.name AND i.created_at = h.created_at
-             WHERE h.team = ? AND h.name = ? AND COALESCE(i.origin_device_id, '') = '')",
-            params![self.source.team, target],
-            |row| row.get(0),
-        )?;
-        ensure!(local, "sandbox message target is outside the team");
+             WHERE h.team = ? AND h.name = ? AND COALESCE(i.origin_device_id, '') = ''",
+                params![self.source.team, target],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let local_created_at =
+            local_created_at.context("sandbox message target is outside the team")?;
+        ensure!(
+            host_generation(local_created_at) == target_generation,
+            "sandbox message target generation is stale"
+        );
         self.inbox
             .insert(tx, &self.source.team, target, true, message)
     }
@@ -106,7 +123,7 @@ impl<'a> GuestInbox<'a> {
 impl Inbound for GuestInbox<'_> {
     fn insert(&mut self, tx: &Transaction<'_>, message: &Message) -> Result<i64> {
         ensure!(
-            message.payload.target == self.binding.worker.worker,
+            message.payload.addresses(&self.binding.worker),
             "sandbox delivery target mismatch"
         );
         let local: bool = tx.query_row(

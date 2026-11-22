@@ -19,6 +19,7 @@ fn fixture() -> (Binding, Message) {
         },
         MessagePayload {
             target: "worker-b".into(),
+            target_generation: None,
             thread: Some("work".into()),
             reply_to: None,
             intent: Intent::Inform,
@@ -39,6 +40,32 @@ fn raw_frame(frame: &Frame) -> Vec<u8> {
     let mut bytes = (data.len() as u32).to_be_bytes().to_vec();
     bytes.extend(data);
     bytes
+}
+
+#[test]
+fn recipient_generation_is_in_the_digest_and_checked_against_delivery_binding() {
+    let (binding, old) = fixture();
+    let json =
+        br#"{"target":"worker-b","thread":"work","reply_to":null,"intent":"inform","text":"test"}"#;
+    assert_eq!(serde_json::to_vec(&old.payload).unwrap(), json);
+    assert_eq!(
+        serde_json::from_slice::<MessagePayload>(json).unwrap(),
+        old.payload
+    );
+    old.validate().unwrap();
+
+    let mut payload = old.payload.clone();
+    payload.target = binding.worker.worker.clone();
+    payload.target_generation = Some(binding.worker.generation.clone());
+    let good = Message::new(old.id.clone(), payload.clone()).unwrap();
+    validate_message_size(Receiver::Guest, &binding, &good).unwrap();
+
+    payload.target_generation = Some("retired".into());
+    let stale = Message::new(old.id.clone(), payload.clone()).unwrap();
+    assert_ne!(stale.digest, good.digest);
+    assert!(validate_message_size(Receiver::Guest, &binding, &stale).is_err());
+    payload.target_generation = Some("bad generation".into());
+    assert!(Message::new(old.id, payload).is_err());
 }
 
 #[test]
