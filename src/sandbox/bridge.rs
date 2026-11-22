@@ -80,6 +80,18 @@ pub fn exec(
         absolute_guest_path(target.guest_manifest),
         "sandbox bridge requires an absolute guest manifest path"
     );
+    let worker =
+        super::directory::current_worker(owner.store().connection()?, &binding.worker.worker)?;
+    if let Some(worker) = worker {
+        ensure!(
+            worker.binding == *binding,
+            "sandbox exec route no longer matches enrollment"
+        );
+        adapter.verify_owned_target(target.sandbox_name, &worker)?;
+    } else {
+        // The low-level VM qualification fixture is the only unregistered route.
+        ensure!(cfg!(test), "sandbox exec route is not enrolled");
+    }
     let epoch = owner.allocate_connection_epoch()?;
     let command = adapter.managed_exec(
         target.sandbox_name,

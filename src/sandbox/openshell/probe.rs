@@ -150,7 +150,7 @@ pub(super) fn check(profile: &Profile, expected: &Fingerprint) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn output(mut command: Command, label: &str, timeout: Duration) -> Result<String> {
+pub(super) fn output(mut command: Command, label: &str, timeout: Duration) -> Result<String> {
     use std::io::{ErrorKind, Read};
     use std::process::Stdio;
     use std::time::Instant;
@@ -228,7 +228,7 @@ fn output(mut command: Command, label: &str, timeout: Duration) -> Result<String
 }
 
 #[cfg(not(unix))]
-fn output(_: Command, _: &str, _: Duration) -> Result<String> {
+pub(super) fn output(_: Command, _: &str, _: Duration) -> Result<String> {
     anyhow::bail!("the initial OpenShell VM adapter requires a Unix host")
 }
 

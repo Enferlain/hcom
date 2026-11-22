@@ -36,10 +36,36 @@ case "$*" in
   '--gateway pinned --gateway-endpoint http://127.0.0.1:8791 --workspace default --color never sandbox list --page-size 1 --output json')
     @WORKSPACE_FAILURE@
     printf '%s' '{"sandboxes":[]}';;
+  '--gateway pinned --gateway-endpoint http://127.0.0.1:8791 --workspace default --color never sandbox get --output json owned')
+    printf '%s' '{"id":"@SANDBOX_ID@","name":"owned","workspace":"@ROUTE_WORKSPACE@","phase":"@PHASE@","policy":"fixture-private-value"}';;
   *) exit 3;;
 esac
 "#;
         let script = script
+            .replace(
+                "@SANDBOX_ID@",
+                if failure == "reused-name" {
+                    "replacement"
+                } else {
+                    "captured"
+                },
+            )
+            .replace(
+                "@ROUTE_WORKSPACE@",
+                if failure == "route-workspace" {
+                    "wrong"
+                } else {
+                    "default"
+                },
+            )
+            .replace(
+                "@PHASE@",
+                if failure == "not-ready" {
+                    "Stopped"
+                } else {
+                    "Ready"
+                },
+            )
             .replace(
                 "@WORKSPACE_FAILURE@",
                 if failure == "workspace" {
@@ -120,6 +146,84 @@ mem_mib = 2560
             _root: root,
             profile,
             receipt,
+        }
+    }
+}
+
+#[test]
+fn enrolled_bridge_verifies_the_gateway_id_workspace_and_ready_phase() {
+    use crate::db::HcomDb;
+    use crate::sandbox::bridge::{ExecTarget, exec};
+    use crate::sandbox::controller::Owner;
+    use crate::sandbox::directory::{Access, Placement};
+    use crate::sandbox::store::Store;
+
+    for (failure, expected) in [
+        ("", None),
+        ("reused-name", Some("no longer resolves to the owned ID")),
+        (
+            "route-workspace",
+            Some("no longer resolves to the owned ID"),
+        ),
+        ("not-ready", Some("is not Ready")),
+    ] {
+        let fixture = Fixture::new(failure);
+        let adapter = Adapter::preflight(fixture.profile.clone(), &fixture.receipt).unwrap();
+        let db = HcomDb::open_at(&fixture._root.path().join("host.db")).unwrap();
+        let store = Store::initialize(&db).unwrap();
+        let team = store.create_team(None).unwrap();
+        let worker = store
+            .reserve_worker(
+                &team.id,
+                Access::Controller(team.external_controller.as_ref().unwrap()),
+                "guest",
+                crate::tool::Tool::Claude,
+                Placement {
+                    gateway: "pinned",
+                    workspace: "default",
+                    sandbox: "captured",
+                    incarnation: &uuid::Uuid::new_v4().to_string(),
+                },
+            )
+            .unwrap();
+        if let Some(expected) = expected {
+            let owner = Owner::try_acquire(&store).unwrap().unwrap();
+            let error = exec(
+                &owner,
+                &adapter,
+                ExecTarget {
+                    sandbox_name: "owned",
+                    guest_hcom: "/opt/hcom",
+                    guest_manifest: "/opt/manifest",
+                },
+                &worker.binding,
+                || false,
+                |_: &rusqlite::Transaction<'_>, _: &crate::sandbox::protocol::Message| {
+                    anyhow::bail!("fixture must not start")
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("fixture-private-value"));
+            let connections: i64 = db
+                .conn()
+                .query_row("SELECT count(*) FROM sandbox_bridge_epochs", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(connections, 0);
+        } else {
+            adapter.verify_owned_target("owned", &worker).unwrap();
+            let mut moved = worker;
+            moved.gateway = "another".into();
+            assert!(
+                adapter
+                    .verify_owned_target("owned", &moved)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("owned gateway and workspace")
+            );
         }
     }
 }

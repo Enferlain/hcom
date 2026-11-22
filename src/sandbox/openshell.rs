@@ -6,11 +6,13 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::directory::Worker;
 use super::protocol::{MAX_ENCODED_FRAME, validate_identifier};
 
 mod probe;
@@ -18,6 +20,7 @@ mod probe;
 pub const ROTATION_BYTES: u64 = 2 * 1024 * 1024;
 pub const CONTROL_HEADROOM_BYTES: u64 = 64 * 1024;
 const MIN_INPUT_BYTES: u64 = ROTATION_BYTES + MAX_ENCODED_FRAME as u64 + CONTROL_HEADROOM_BYTES;
+const ROUTE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +70,14 @@ pub struct Adapter {
     profile: Profile,
     cli_stamp: FileStamp,
     stdin_bytes: u64,
+}
+
+#[derive(Deserialize)]
+struct SandboxRoute {
+    id: String,
+    name: String,
+    workspace: String,
+    phase: String,
 }
 
 impl Adapter {
@@ -131,6 +142,33 @@ impl Adapter {
         self.stdin_bytes
     }
 
+    /// The pinned CLI resolves an exec name again when starting the command.
+    /// This check catches stale placement records before any bridge data is sent.
+    pub fn verify_owned_target(&self, name: &str, worker: &Worker) -> Result<()> {
+        validate_routable_name(name)?;
+        ensure!(
+            worker.gateway == self.profile.gateway && worker.workspace == self.profile.workspace,
+            "OpenShell adapter does not match the owned gateway and workspace"
+        );
+        self.check_cli_stamp()?;
+        let mut command = self.profile.command();
+        command.args(["sandbox", "get", "--output", "json", name]);
+        let response = probe::output(command, "owned sandbox lookup", ROUTE_LOOKUP_TIMEOUT)?;
+        let route: SandboxRoute =
+            serde_json::from_str(&response).context("invalid OpenShell sandbox lookup response")?;
+        ensure!(
+            route.id == worker.binding.sandbox
+                && route.name == name
+                && route.workspace == worker.workspace,
+            "OpenShell sandbox name no longer resolves to the owned ID and workspace"
+        );
+        ensure!(
+            route.phase == "Ready",
+            "owned OpenShell sandbox is not Ready"
+        );
+        Ok(())
+    }
+
     /// The lifecycle layer resolves and confirms the owned sandbox ID before
     /// supplying its current name. The argument vector is owned by the host.
     pub fn managed_exec(
@@ -144,10 +182,7 @@ impl Adapter {
             guest_program.starts_with('/') && !guest_program.chars().any(char::is_control),
             "managed OpenShell executable must be an absolute guest path"
         );
-        ensure!(
-            file_stamp(&self.profile.cli)? == self.cli_stamp,
-            "OpenShell executable changed after preflight"
-        );
+        self.check_cli_stamp()?;
         let mut command = self.profile.command();
         command
             .args([
@@ -169,6 +204,14 @@ impl Adapter {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         Ok(command)
+    }
+
+    fn check_cli_stamp(&self) -> Result<()> {
+        ensure!(
+            file_stamp(&self.profile.cli)? == self.cli_stamp,
+            "OpenShell executable changed after preflight"
+        );
+        Ok(())
     }
 }
 
