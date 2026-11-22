@@ -7,8 +7,8 @@ use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
 use crate::identity;
 use crate::messages::{
-    InstanceInfo, MessageEnvelope, MessageScope, compute_scope, sender_instance_key,
-    should_deliver_message, validate_intent, validate_message,
+    InstanceInfo, MessageEnvelope, MessageScope, compute_scope, resolve_targets,
+    sender_instance_key, should_deliver_message, validate_intent, validate_message,
 };
 use crate::shared::{
     CommandContext, SENDER, SenderIdentity, SenderKind, is_inside_ai_tool, status_icon,
@@ -294,6 +294,44 @@ fn resolve_delivery(
     // Deliverable agents: exclude session-stopped (exit:*) and launch_failed placeholders.
     // Adhoc instances use inactive:tool:* between commands — still @mentionable.
     let rows = deliverable_instances(db)?;
+    let sandbox_names = crate::sandbox::directory::active_worker_names(db)
+        .map_err(|error| format!("Failed to read sandbox directory: {error}"))?;
+    let mut canonical_targets = Vec::new();
+    let mut alias_worker = None;
+    let explicit_targets = if let Some(targets) =
+        explicit_targets.filter(|_| !sandbox_names.is_empty())
+    {
+        for target in targets {
+            if !crate::identity::is_valid_base_name(&target.to_ascii_lowercase()) {
+                canonical_targets.push(target.clone());
+                continue;
+            }
+            match crate::sandbox::directory::resolve_host_alias(db, identity, target)
+                .map_err(|error| format!("{error:#}"))?
+            {
+                Some(worker) => {
+                    let (ordinary, _) = resolve_targets(std::slice::from_ref(target), &rows)?;
+                    if !ordinary.is_empty() {
+                        return Err(format!(
+                            "ambiguous sandbox alias @{target}; use @alias.realm to target a sandbox"
+                        ));
+                    }
+                    if alias_worker
+                        .as_ref()
+                        .is_some_and(|previous| previous != &worker)
+                    {
+                        return Err("Target one sandbox worker explicitly".into());
+                    }
+                    canonical_targets.push(worker.binding.worker.worker.clone());
+                    alias_worker = Some(worker);
+                }
+                None => canonical_targets.push(target.clone()),
+            }
+        }
+        Some(canonical_targets.as_slice())
+    } else {
+        explicit_targets
+    };
 
     // Compute scope and routing. Thread-only sends keep their original message
     // semantics; membership only affects the delivery target set.
@@ -327,15 +365,12 @@ fn resolve_delivery(
     };
 
     let scope_data = build_scope_data(identity, effective_scope, &effective_mentions);
-    let sandbox_names = crate::sandbox::directory::active_worker_names(db)
-        .map_err(|error| format!("Failed to read sandbox directory: {error}"))?;
-    let sandbox_target = if let Some(target) = effective_mentions
+    let sandbox_target = if alias_worker.is_some() {
+        alias_worker
+    } else if let Some(target) = effective_mentions
         .iter()
         .find(|target| sandbox_names.contains(*target))
     {
-        if effective_mentions.len() != 1 || is_thread_resolved {
-            return Err("Target one sandbox worker explicitly".into());
-        }
         Some(
             crate::sandbox::directory::current_worker(db.conn(), target)
                 .map_err(|error| format!("Failed to read sandbox worker: {error}"))?
@@ -344,6 +379,9 @@ fn resolve_delivery(
     } else {
         None
     };
+    if sandbox_target.is_some() && (effective_mentions.len() != 1 || is_thread_resolved) {
+        return Err("Target one sandbox worker explicitly".into());
+    }
     let delivered_to = rows
         .iter()
         .filter(|inst| {
@@ -1749,6 +1787,117 @@ mod tests {
         let shm = PathBuf::from(format!("{}-shm", path.display()));
         let _ = std::fs::remove_file(wal);
         let _ = std::fs::remove_file(shm);
+    }
+
+    #[test]
+    fn cli_sandbox_aliases_resolve_only_for_current_members_and_reject_collisions() {
+        use crate::sandbox::directory::{Access, HostIdentity, Placement};
+        use crate::sandbox::store::Store;
+
+        let root = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&root.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1), ('nova', 2);",
+            )
+            .unwrap();
+        let owner = identity::resolve_from_name(&db, "luna").unwrap();
+        let member = HostIdentity::capture(&db, &owner).unwrap();
+        let outsider =
+            HostIdentity::capture(&db, &identity::resolve_from_name(&db, "nova").unwrap()).unwrap();
+        let store = Store::initialize(&db).unwrap();
+        let team = store.create_team(Some(&member)).unwrap();
+        let other = store.create_team(Some(&outsider)).unwrap();
+        let reserve = |team: &str, host, sandbox| {
+            store
+                .reserve_worker(
+                    team,
+                    Access::Host(host),
+                    "helper",
+                    crate::tool::Tool::Claude,
+                    Placement {
+                        gateway: "gateway",
+                        workspace: "default",
+                        sandbox,
+                        incarnation: "fedc8acb-cc62-422d-9724-54e730e64f6e",
+                    },
+                )
+                .unwrap()
+                .binding
+        };
+        let helper = reserve(&team.id, &member, "vm-a");
+        let other_helper = reserve(&other.id, &outsider, "vm-b");
+        let ctx = CommandContext {
+            explicit_name: None,
+            identity: Some(owner),
+            go: true,
+            identity_warning: None,
+        };
+        let send = |targets: &[&str]| {
+            let argv = ["send", "--json"]
+                .into_iter()
+                .chain(targets.iter().copied())
+                .chain(["--", "hello"]);
+            let mut args = SendArgs::try_parse_from(argv).unwrap();
+            args.had_separator = true;
+            cmd_send(&db, &args, Some(&ctx))
+        };
+        assert_eq!(send(&["@Helper", "@nova"]), 1);
+        assert_eq!(db.get_last_event_id(), 0);
+        assert_eq!(send(&["@Helper"]), 0);
+        let now = crate::shared::time::now_epoch_i64();
+        let message = store.next_pending(&helper, now).unwrap().unwrap();
+        assert_eq!(message.payload.target, helper.worker.worker);
+        assert!(store.next_pending(&other_helper, now).unwrap().is_none());
+        assert_eq!(send(&["@nova"]), 0);
+        let delivered_to: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.delivered_to') FROM events WHERE id = ?",
+                [db.get_last_event_id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delivered_to, r#"["nova"]"#);
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('helper', 3)",
+                [],
+            )
+            .unwrap();
+        let before = db.get_last_event_id();
+        assert_eq!(send(&["@helper"]), 1);
+        assert_eq!(db.get_last_event_id(), before);
+        db.conn()
+            .execute("DELETE FROM instances WHERE name = 'helper'", [])
+            .unwrap();
+
+        store
+            .enroll_host(&other.id, Access::Host(&outsider), &member)
+            .unwrap();
+        assert_eq!(send(&["@helper"]), 1);
+        assert_eq!(db.get_last_event_id(), before);
+        assert_eq!(send(&[&format!("@{}", helper.worker.worker)]), 0);
+
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = 4 WHERE name = 'luna'",
+                [],
+            )
+            .unwrap();
+        let before = db.get_last_event_id();
+        assert!(
+            crate::sandbox::directory::resolve_host_alias(
+                &db,
+                ctx.identity.as_ref().unwrap(),
+                "helper",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(send(&["@helper"]), 1);
+        assert_eq!(db.get_last_event_id(), before);
     }
 
     #[test]

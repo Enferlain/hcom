@@ -387,6 +387,46 @@ pub(super) fn check_sender(conn: &Connection, team: &str, host: &HostIdentity) -
     authorize(conn, team, Access::Host(host), false).map(|_| ())
 }
 
+/// Resolve a bare alias only among the sender's current memberships.
+/// Canonical names and ordinary hcom targets are handled by the caller.
+pub(crate) fn resolve_host_alias(
+    db: &HcomDb,
+    sender: &SenderIdentity,
+    alias: &str,
+) -> Result<Option<Worker>> {
+    let created_at = sender
+        .instance_data
+        .as_ref()
+        .and_then(|data| data.get("created_at"))
+        .and_then(serde_json::Value::as_f64);
+    let Some(created_at) = created_at.filter(|_| sender.kind == SenderKind::Instance) else {
+        return Ok(None);
+    };
+    let conn = db.conn();
+    if !has_directory(conn)? {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT w.alias, w.binding, w.gateway, w.workspace
+           FROM sandbox_team_hosts h
+           JOIN instances i ON i.name = h.name AND i.created_at = h.created_at
+           JOIN sandbox_workers w ON w.team = h.team
+          WHERE h.name = ?1 AND h.created_at = ?2 AND COALESCE(i.origin_device_id, '') = ''
+            AND w.alias = ?3 AND w.retired = 0
+          LIMIT 2",
+    )?;
+    let mut rows = stmt.query(params![sender.name, created_at, alias.to_ascii_lowercase()])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let worker = decode_worker(row)?;
+    ensure!(
+        rows.next()?.is_none(),
+        "ambiguous sandbox alias @{alias}; use @alias.realm to target a sandbox"
+    );
+    Ok(Some(worker))
+}
+
 impl HostIdentity {
     pub(super) fn created_at(&self) -> f64 {
         self.created_at
