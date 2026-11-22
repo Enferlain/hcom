@@ -220,6 +220,7 @@ impl Fixture {
                 sandbox_name: &self.sandbox,
                 guest_hcom: &format!("{REMOTE}/hcom"),
                 guest_manifest: &manifest,
+                startup_key: None,
             },
             binding,
             stop,

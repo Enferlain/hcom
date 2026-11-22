@@ -53,6 +53,7 @@ lru = "0.18.5"
 nix = { version = "0.31.2", features = ["term", "signal", "poll", "process", "fs", "ioctl"] }
 libc = "0.2.184"
 signal-hook = "0.4.4"
+ring = "0.17.14"
 
 # Windows-only: process/job-object control, winsock select, file locking.
 [target.'cfg(windows)'.dependencies]

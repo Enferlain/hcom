@@ -195,6 +195,7 @@ fn enrolled_bridge_verifies_the_gateway_id_workspace_and_ready_phase() {
                     sandbox_name: "owned",
                     guest_hcom: "/opt/hcom",
                     guest_manifest: "/opt/manifest",
+                    startup_key: Some(&[7; 32]),
                 },
                 &worker.binding,
                 || false,

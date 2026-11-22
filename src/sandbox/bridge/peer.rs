@@ -134,6 +134,10 @@ impl<'store, 'db> Peer<'store, 'db> {
         self.ready
     }
 
+    pub(super) fn binding_and_epoch(&self) -> (&Binding, i64) {
+        (&self.binding, self.epoch)
+    }
+
     #[cfg(test)]
     pub(super) fn receipt_pending(&self) -> bool {
         self.writes
@@ -165,14 +169,19 @@ impl<'store, 'db> Peer<'store, 'db> {
         Ok(bytes)
     }
 
-    fn queue(&mut self, kind: WriteKind, bytes: Vec<u8>) -> Result<()> {
+    pub(super) fn reserve_host_input(&mut self, bytes: usize) -> Result<()> {
         if let Some(allowance) = self.input_limit {
-            self.input_bytes += bytes.len() as u64;
+            self.input_bytes += bytes as u64;
             ensure!(
                 self.input_bytes <= allowance,
                 "sandbox bridge exhausted qualified stdin allowance"
             );
         }
+        Ok(())
+    }
+
+    fn queue(&mut self, kind: WriteKind, bytes: Vec<u8>) -> Result<()> {
+        self.reserve_host_input(bytes.len())?;
         if self.writes.is_empty() {
             self.write_deadline = Some(Instant::now() + self.limits.progress);
         }

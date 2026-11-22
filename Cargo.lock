@@ -965,6 +965,7 @@ dependencies = [
  "rand 0.10.3",
  "ratatui",
  "regex",
+ "ring",
  "rumqttc-v5-next",
  "rusqlite",
  "rustls",

@@ -185,7 +185,7 @@ impl<'a> GuestInbox<'a> {
         })
     }
 
-    fn check_local_worker(&self, tx: &Transaction<'_>) -> Result<()> {
+    pub(super) fn check_local_worker(&self, tx: &Transaction<'_>) -> Result<()> {
         let local: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM instances WHERE name = ? AND created_at = ?
               AND COALESCE(origin_device_id, '') = '')",

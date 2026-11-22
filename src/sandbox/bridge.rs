@@ -17,6 +17,7 @@ use crate::shared::time::now_iso;
 
 mod inbox;
 mod peer;
+mod proof;
 mod wire;
 
 pub use inbox::HostInbox;
@@ -58,6 +59,8 @@ pub struct ExecTarget<'a> {
     pub sandbox_name: &'a str,
     pub guest_hcom: &'a str,
     pub guest_manifest: &'a str,
+    /// Shared with the specific guest during provisioning. Never passed in argv.
+    pub startup_key: Option<&'a [u8; proof::BYTES]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +91,10 @@ pub fn exec(
             "sandbox exec route no longer matches enrollment"
         );
         adapter.verify_owned_target(target.sandbox_name, &worker)?;
+        ensure!(
+            target.startup_key.is_some(),
+            "enrolled sandbox exec requires a startup key"
+        );
     } else {
         // The low-level VM qualification fixture is the only unregistered route.
         ensure!(cfg!(test), "sandbox exec route is not enrolled");
@@ -111,7 +118,7 @@ pub fn exec(
         Limits::default(),
         owner.store().snapshot_directory(binding)?,
     )?;
-    run_host(command, peer, stop, import)
+    run_host(command, peer, stop, import, target.startup_key)
 }
 
 fn run_host(
@@ -119,11 +126,21 @@ fn run_host(
     mut peer: Peer<'_, '_>,
     stop: impl FnMut() -> bool,
     import: impl Inbound,
+    startup_key: Option<&[u8; proof::BYTES]>,
 ) -> Result<Exit> {
+    let (binding, epoch) = peer.binding_and_epoch();
+    let proof = startup_key
+        .map(|key| proof::Check::new(key, binding, epoch))
+        .transpose()?;
+    if proof.is_some() {
+        peer.reserve_host_input(proof::BYTES)?;
+    }
     let mut process = Process::spawn(command)?;
+    process.proof = proof;
     peer.start_clock();
     let result = drive_host(&mut process, peer, stop, import);
     if result.is_err()
+        && process.proof.is_none()
         && let Some(diagnostic) = process.diagnostic_tail()
     {
         return result.with_context(|| format!("sandbox bridge exec stderr: {diagnostic}"));
@@ -161,10 +178,22 @@ fn poll_host(
     import: &mut impl Inbound,
 ) -> Result<HostStep> {
     peer.check()?;
+    let mut progress = process.read_diagnostics()?;
+    if let Some(proof) = &mut process.proof {
+        let stdin = process
+            .stdin
+            .as_mut()
+            .context("missing sandbox guest startup pipe")?;
+        if !proof.poll(&mut process.stdout, stdin)? {
+            return Ok(HostStep::Waiting);
+        }
+        process.proof = None;
+        process.diagnostics.clear();
+        progress = true;
+    }
     if peer.is_ready() && peer.draining.is_none() && stop() {
         peer.begin_drain(false)?;
     }
-    let mut progress = process.read_diagnostics()?;
     progress |= peer.read_step(&mut process.stdout, import)?;
     if peer.input_eof {
         peer.note_eof();
@@ -208,6 +237,7 @@ struct Process {
     stderr_eof: bool,
     diagnostics: Vec<u8>,
     reaped: bool,
+    proof: Option<proof::Check>,
 }
 
 impl Process {
@@ -225,6 +255,7 @@ impl Process {
             stderr_eof: false,
             diagnostics: Vec::new(),
             reaped: false,
+            proof: None,
             child,
         };
         wire::nonblocking(process.stdin.as_ref().expect("piped stdin"))?;
@@ -283,6 +314,7 @@ struct GuestManifest {
     binding: Binding,
     database: PathBuf,
     local_worker: Option<LocalWorker>,
+    startup_key: Option<[u8; proof::BYTES]>,
 }
 
 #[derive(Deserialize)]
@@ -294,7 +326,7 @@ struct LocalWorker {
 
 pub(crate) fn guest_main(args: &[String]) -> Result<()> {
     use std::io::{IsTerminal, Read};
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let [manifest, epoch] = args else {
         anyhow::bail!("invalid sandbox guest bridge arguments");
@@ -318,8 +350,9 @@ pub(crate) fn guest_main(args: &[String]) -> Result<()> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(manifest)?;
+    let metadata = file.metadata()?;
     ensure!(
-        file.metadata()?.is_file(),
+        metadata.is_file(),
         "sandbox guest bridge manifest must be a regular file"
     );
     let mut bytes = Vec::new();
@@ -330,6 +363,10 @@ pub(crate) fn guest_main(args: &[String]) -> Result<()> {
     );
     let manifest: GuestManifest =
         serde_json::from_slice(&bytes).context("invalid sandbox guest bridge manifest")?;
+    ensure!(
+        manifest.startup_key.is_none() || metadata.permissions().mode() & 0o077 == 0,
+        "sandbox startup key requires a private guest manifest"
+    );
     manifest.binding.validate()?;
     ensure!(
         manifest.database.is_absolute() && manifest.database.is_file(),
@@ -357,8 +394,16 @@ pub(crate) fn guest_main(args: &[String]) -> Result<()> {
     )?;
     if let Some(local_worker) = &manifest.local_worker {
         let inbox = inbox::GuestInbox::new(&db, &manifest.binding, local_worker)?;
+        if let Some(key) = &manifest.startup_key {
+            store.write(|tx| inbox.check_local_worker(tx))?;
+            proof::answer(&mut input, &mut output, key, &manifest.binding, epoch)?;
+        }
         return drive_guest(&mut input, &mut output, &mut peer, inbox);
     }
+    ensure!(
+        manifest.startup_key.is_none(),
+        "sandbox startup key requires a registered guest worker"
+    );
     drive_guest(&mut input, &mut output, &mut peer, stage_guest_message)
 }
 

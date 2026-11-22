@@ -80,7 +80,7 @@ impl Fixture {
         shell
             .args(["-eu", "-c", script])
             .current_dir(self.dir.path());
-        run_host(shell, peer, stop, stage_guest_message)
+        run_host(shell, peer, stop, stage_guest_message, None)
     }
 
     fn send(&self, text: String) -> FrameBody {
@@ -232,6 +232,44 @@ fn rotates_before_two_mib_and_replays_same_pending_payload() {
     let mut expected = read("hello");
     expected.extend(read("replayed"));
     assert_eq!(read("host_frames"), expected);
+}
+
+#[test]
+fn enrolled_bridge_sends_only_a_challenge_until_guest_proof_matches() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let peer = Peer::new(
+        &store,
+        &fixture.binding,
+        1,
+        Receiver::Host,
+        Some(4 * 1024 * 1024),
+        Limits::default(),
+        None,
+    )
+    .unwrap();
+    let mut shell = Command::new("/bin/sh");
+    shell.args([
+        "-eu",
+        "-c",
+        "head -c 32 > challenge; printf 'unverified guest stderr' >&2; printf '%032d' 0; cat > extra",
+    ]).current_dir(fixture.dir.path());
+    let error = run_host(shell, peer, || false, stage_guest_message, Some(&[7; 32]))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("startup proof did not match"), "{error}");
+    assert!(!error.contains("unverified guest stderr"));
+    assert_eq!(
+        fs::metadata(fixture.dir.path().join("challenge"))
+            .unwrap()
+            .len(),
+        32
+    );
+    assert_eq!(
+        fs::read(fixture.dir.path().join("extra")).unwrap_or_default(),
+        b""
+    );
+    assert_eq!(fixture.db.get_last_event_id(), 0);
 }
 
 #[test]
