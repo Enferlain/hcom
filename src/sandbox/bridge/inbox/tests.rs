@@ -225,6 +225,7 @@ fn apply(
             Imported::New(event)
         }
         Import::Replay(_) => Imported::Replay,
+        Import::Rejected => panic!("fixture message was unexpectedly rejected"),
     }
 }
 
@@ -335,22 +336,24 @@ fn host_inbox_delivers_to_enrolled_local_or_forwards_to_same_team() {
         Some(forwarded.clone())
     );
 
-    let reject = |inbox: &mut HostInbox<'_, '_>, message: &Message| {
-        store
-            .import(Receiver::Host, &source, message, now_epoch_i64(), |tx| {
-                inbox.insert(tx, message)
-            })
-            .unwrap_err()
-            .to_string()
+    let import = |inbox: &mut HostInbox<'_, '_>, message: &Message| {
+        store.import(Receiver::Host, &source, message, now_epoch_i64(), |tx| {
+            inbox.insert(tx, message)
+        })
     };
     let before = db.get_last_event_id();
     let unauthorized = addressed(
         message(source.worker.clone(), 3, "outsider"),
         &host_recipient_generation(db.conn(), "outsider", 2.0).unwrap(),
     );
-    assert!(reject(&mut inbox, &unauthorized).contains("outside the team"));
-    let unbound = message(source.worker.clone(), 3, "member");
-    assert!(reject(&mut inbox, &unbound).contains("requires a target generation"));
+    assert_eq!(import(&mut inbox, &unauthorized).unwrap(), Import::Rejected);
+    let unbound = message(source.worker.clone(), 4, "member");
+    assert!(
+        import(&mut inbox, &unbound)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a target generation")
+    );
 
     db.conn()
         .execute(
@@ -360,10 +363,10 @@ fn host_inbox_delivers_to_enrolled_local_or_forwards_to_same_team() {
         .unwrap();
     enroll_local();
     let stale_local = addressed(
-        message(source.worker.clone(), 3, "member"),
+        message(source.worker.clone(), 4, "member"),
         &host_recipient_generation(db.conn(), "member", 3.0).unwrap(),
     );
-    assert!(reject(&mut inbox, &stale_local).contains("target generation is stale"));
+    assert_eq!(import(&mut inbox, &stale_local).unwrap(), Import::Rejected);
 
     store
         .retire_worker(Access::Host(&member), &destination)
@@ -372,10 +375,10 @@ fn host_inbox_delivers_to_enrolled_local_or_forwards_to_same_team() {
     assert_eq!(replacement.worker.worker, destination.worker.worker);
     assert_ne!(replacement.worker.generation, destination.worker.generation);
     let stale_guest = addressed(
-        message(source.worker.clone(), 3, &destination.worker.worker),
+        message(source.worker.clone(), 5, &destination.worker.worker),
         &destination.worker.generation,
     );
-    assert!(reject(&mut inbox, &stale_guest).contains("target generation is stale"));
+    assert_eq!(import(&mut inbox, &stale_guest).unwrap(), Import::Rejected);
     assert_eq!(db.get_last_event_id(), before);
     assert!(
         store
@@ -498,6 +501,171 @@ fn guest_handshake_replaces_its_persisted_directory_on_reconnect() {
     let mut replacement = GuestInbox::new(&guest_db, &binding, &local_replacement).unwrap();
     assert!(handshake(&mut replacement, 5, None).is_err());
     assert_eq!(stored(), vec![peer]);
+}
+
+#[test]
+fn a_lost_rejection_receipt_replays_and_releases_the_next_guest_message() {
+    use super::super::peer::Peer;
+    use crate::sandbox::store::Delivery;
+
+    fn exchange(from: &mut Peer<'_, '_>, to: &mut Peer<'_, '_>, inbox: &mut impl Inbound) {
+        let mut bytes = Vec::new();
+        while from.write_step(&mut bytes).unwrap() {}
+        let mut input = bytes.as_slice();
+        while !input.is_empty() {
+            to.read_step(&mut input, inbox).unwrap();
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let guest_db = HcomDb::open_at(&root.path().join("guest.db")).unwrap();
+    let host_db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    let guest_store = Store::initialize(&guest_db).unwrap();
+    let host_store = Store::initialize(&host_db).unwrap();
+    host_db
+        .conn()
+        .execute(
+            "INSERT INTO instances (name, created_at) VALUES ('host', 1), ('owner', 2)",
+            [],
+        )
+        .unwrap();
+    let host = crate::identity::resolve_from_name(&host_db, "host").unwrap();
+    let host = HostIdentity::capture(&host_db, &host).unwrap();
+    let owner = crate::identity::resolve_from_name(&host_db, "owner").unwrap();
+    let owner = HostIdentity::capture(&host_db, &owner).unwrap();
+    let team = host_store.create_team(Some(&owner)).unwrap();
+    let worker = host_store
+        .reserve_worker(
+            &team.id,
+            Access::Host(&owner),
+            "worker",
+            Tool::Claude,
+            Placement {
+                gateway: "gateway",
+                workspace: "default",
+                sandbox: "sandbox",
+                incarnation: guest_store.incarnation(),
+            },
+        )
+        .unwrap();
+    let binding = &worker.binding;
+    let now = now_epoch_i64();
+    let queue = |target: &str, created_at| {
+        let generation = host_recipient_generation(host_db.conn(), target, created_at).unwrap();
+        let payload = addressed(message(binding.worker.clone(), 1, target), &generation).payload;
+        guest_store
+            .enqueue(
+                Receiver::Host,
+                binding,
+                binding.worker.clone(),
+                payload,
+                now,
+                super::super::stage_guest_message,
+            )
+            .unwrap()
+    };
+    let expired = queue("owner", 2.0);
+    guest_db
+        .conn()
+        .execute(
+            "UPDATE sandbox_outbox SET expires_at = ?1 WHERE sequence = ?2",
+            params![now - 1, expired.id.sequence],
+        )
+        .unwrap();
+    let rejected = queue("host", 1.0);
+    let valid = queue("owner", 2.0);
+    let mut host_inbox = HostInbox::new(&host_db, &host_store, binding);
+    let mut guest_inbox = super::super::stage_guest_message;
+    let connect = |epoch| {
+        (
+            Peer::new(
+                &host_store,
+                binding,
+                epoch,
+                Receiver::Host,
+                None,
+                Default::default(),
+                None,
+            )
+            .unwrap(),
+            Peer::new(
+                &guest_store,
+                binding,
+                epoch,
+                Receiver::Guest,
+                None,
+                Default::default(),
+                None,
+            )
+            .unwrap(),
+        )
+    };
+
+    {
+        let (mut host, mut guest) = connect(1);
+        exchange(&mut host, &mut guest, &mut guest_inbox);
+        exchange(&mut guest, &mut host, &mut host_inbox);
+        assert!(guest.poll_outbox().unwrap());
+        exchange(&mut guest, &mut host, &mut host_inbox);
+        assert!(host.receipt_pending());
+        assert_eq!(host_db.get_last_event_id(), 0);
+        // Drop both peers after the durable rejection and before its receipt.
+    }
+    assert_eq!(
+        guest_store.delivery(&rejected.id, now).unwrap(),
+        Some(Delivery::Pending)
+    );
+    assert_eq!(
+        guest_store.delivery(&expired.id, now - 2).unwrap(),
+        Some(Delivery::Expired)
+    );
+    assert_eq!(
+        guest_store.next_pending(binding, now - 2).unwrap(),
+        Some(rejected.clone())
+    );
+    assert!(
+        guest_store
+            .reject(binding, &rejected.id, &[0; 32], now)
+            .is_err()
+    );
+    host_store
+        .enroll_host(&team.id, Access::Host(&owner), &host)
+        .unwrap();
+    let (mut host, mut guest) = connect(2);
+    exchange(&mut host, &mut guest, &mut guest_inbox);
+    exchange(&mut guest, &mut host, &mut host_inbox);
+    assert!(guest.poll_outbox().unwrap());
+    exchange(&mut guest, &mut host, &mut host_inbox);
+    exchange(&mut host, &mut guest, &mut guest_inbox);
+    assert_eq!(
+        guest_store.delivery(&rejected.id, now).unwrap(),
+        Some(Delivery::Rejected)
+    );
+    assert!(
+        guest_store
+            .acknowledge(binding, &rejected.id, &rejected.digest, now)
+            .is_err()
+    );
+    assert!(guest.poll_outbox().unwrap());
+    exchange(&mut guest, &mut host, &mut host_inbox);
+    exchange(&mut host, &mut guest, &mut guest_inbox);
+    assert_eq!(
+        guest_store.delivery(&valid.id, now).unwrap(),
+        Some(Delivery::Accepted)
+    );
+    assert_eq!(
+        event(&host_db, host_db.get_last_event_id())["delivered_to"],
+        json!(["owner"])
+    );
+    let messages: i64 = host_db
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM events WHERE type='message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(messages, 1);
 }
 
 #[test]

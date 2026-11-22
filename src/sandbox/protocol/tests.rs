@@ -129,6 +129,41 @@ fn directory_handshake_is_host_only_and_rejects_duplicate_targets() {
 }
 
 #[test]
+fn rejection_receipts_are_host_only_and_bound_to_the_guest_origin() {
+    let (binding, message) = fixture();
+    let hello = Frame {
+        version: VERSION,
+        epoch: 1,
+        binding: binding.clone(),
+        body: hello_body(),
+    };
+    let body = FrameBody::Rejected {
+        id: message.id.clone(),
+        digest: message.digest,
+    };
+    let frame = Frame {
+        body: body.clone(),
+        ..hello.clone()
+    };
+    let mut guest = Connection::new(binding.clone(), 1, Receiver::Guest).unwrap();
+    guest.accept(hello.clone(), 1).unwrap();
+    assert_eq!(guest.accept(frame.clone(), 1).unwrap(), body);
+
+    let mut host = Connection::new(binding, 1, Receiver::Host).unwrap();
+    host.accept(hello, 1).unwrap();
+    assert!(host.accept(frame.clone(), 1).is_err());
+
+    let mut forged = frame;
+    let mut other = message.id;
+    other.origin.generation = "other".into();
+    forged.body = FrameBody::Rejected {
+        id: other,
+        digest: message.digest,
+    };
+    assert!(write_frame(&mut Vec::new(), &forged).is_err());
+}
+
+#[test]
 fn length_is_checked_before_reading_body_and_eof_is_distinct() {
     for length in [0, MAX_ENCODED_FRAME - HEADER_LEN + 1, u32::MAX] {
         let mut input = length.to_be_bytes().to_vec();

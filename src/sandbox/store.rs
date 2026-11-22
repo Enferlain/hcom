@@ -53,6 +53,7 @@ const SCHEMA: &str = "
         wire_bytes INTEGER NOT NULL CHECK (wire_bytes > 0),
         expires_at INTEGER NOT NULL,
         accepted INTEGER NOT NULL DEFAULT 0 CHECK (accepted IN (0, 1, 2)),
+        rejected INTEGER NOT NULL DEFAULT 0 CHECK (rejected IN (0, 1)),
         forwarded_sequence INTEGER CHECK (forwarded_sequence > 0),
         forwarded_incarnation TEXT
     ) STRICT;
@@ -68,6 +69,11 @@ const SCHEMA: &str = "
         digest BLOB NOT NULL CHECK (length(digest) = 32),
         event_id INTEGER NOT NULL,
         PRIMARY KEY (worker, generation, incarnation, sequence)
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS sandbox_rejected_head (
+        route TEXT PRIMARY KEY,
+        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        digest BLOB NOT NULL CHECK (length(digest) = 32)
     ) STRICT;
 ";
 
@@ -90,6 +96,7 @@ pub enum Delivery {
     AwaitingExpiry,
     Accepted,
     Expired,
+    Rejected,
 }
 
 #[derive(Debug)]
@@ -102,7 +109,12 @@ pub struct ExpiredMessage {
 pub enum Import {
     Inserted(i64),
     Replay(i64),
+    Rejected,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct UnavailableRecipient(pub &'static str);
 
 impl<'db> Store<'db> {
     /// Called by opted-in sandbox participation, outside upstream migrations.
@@ -403,15 +415,42 @@ impl<'db> Store<'db> {
         digest: &[u8; 32],
         now: i64,
     ) -> Result<()> {
+        self.settle(route, message, digest, now, false)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn reject(
+        &self,
+        route: &Binding,
+        message: &MessageId,
+        digest: &[u8; 32],
+        now: i64,
+    ) -> Result<()> {
+        ensure!(
+            message.origin == route.worker,
+            "sandbox rejection sender mismatch"
+        );
+        self.settle(route, message, digest, now, true)
+    }
+
+    fn settle(
+        &self,
+        route: &Binding,
+        message: &MessageId,
+        digest: &[u8; 32],
+        now: i64,
+        rejected: bool,
+    ) -> Result<()> {
         self.write(|tx| {
             self.check_binding(tx, route)?;
             let changed = tx.execute(
-                "UPDATE sandbox_outbox SET accepted = 1
+                "UPDATE sandbox_outbox SET accepted = ?9, rejected = ?10
                  WHERE ((sequence = ?1 AND forwarded_sequence IS NULL AND ?2 = ?3)
                         OR (forwarded_sequence = ?1 AND forwarded_incarnation = ?3))
                    AND origin_worker = ?4 AND origin_generation = ?5
                    AND route = ?6 AND digest = ?7
-                   AND (accepted = 1 OR (accepted = 0 AND expires_at > ?8))",
+                   AND ((accepted = ?9 AND rejected = ?10)
+                        OR (accepted = 0 AND expires_at > ?8))",
                 params![
                     message.sequence,
                     self.incarnation,
@@ -421,6 +460,8 @@ impl<'db> Store<'db> {
                     serde_json::to_string(route)?,
                     digest.as_slice(),
                     now,
+                    if rejected { 2 } else { 1 },
+                    rejected,
                 ],
             )?;
             ensure!(changed == 1, "receipt does not match sandbox outbox");
@@ -450,29 +491,44 @@ impl<'db> Store<'db> {
         })
     }
 
+    pub(super) fn expire_guest_pending_if_due(&self, now: i64) -> Result<()> {
+        let due: bool = self.connection()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sandbox_outbox WHERE accepted = 0 AND expires_at <= ?)",
+            [now],
+            |row| row.get(0),
+        )?;
+        if due {
+            // Persist skipped deadlines before choosing a higher sequence. A
+            // backward clock change must not make that older entry eligible again.
+            while !self.expire_pending(now)?.is_empty() {}
+        }
+        Ok(())
+    }
+
     pub fn delivery(&self, id: &MessageId, now: i64) -> Result<Option<Delivery>> {
         ensure_current_database(self.db)?;
         if id.origin.incarnation != self.incarnation {
             return Ok(None);
         }
-        let row: Option<(i64, i64)> = self
+        let row: Option<(i64, bool, i64)> = self
             .db
             .conn()
             .query_row(
-                "SELECT accepted, expires_at FROM sandbox_outbox
+                "SELECT accepted, rejected, expires_at FROM sandbox_outbox
                  WHERE sequence = ? AND forwarded_sequence IS NULL
                    AND origin_worker = ? AND origin_generation = ?",
                 params![id.sequence, id.origin.worker, id.origin.generation],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((status, expires_at)) = row else {
+        let Some((status, rejected, expires_at)) = row else {
             return Ok(None);
         };
         Ok(Some(match status {
             0 if expires_at > now => Delivery::Pending,
             0 => Delivery::AwaitingExpiry,
             1 => Delivery::Accepted,
+            2 if rejected => Delivery::Rejected,
             2 => Delivery::Expired,
             _ => anyhow::bail!("invalid sandbox delivery state"),
         }))
@@ -528,7 +584,49 @@ impl<'db> Store<'db> {
                 );
                 return Ok(Import::Replay(event_id));
             }
-            let event_id = insert_event(tx)?;
+            let event_id = if matches!(receiver, Receiver::Host) {
+                let route = serde_json::to_string(binding)?;
+                let last: Option<(i64, Vec<u8>)> = tx
+                    .query_row(
+                        "SELECT sequence, digest FROM sandbox_rejected_head WHERE route = ?",
+                        [&route],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((sequence, digest)) = last
+                    && id.sequence <= sequence
+                {
+                    ensure!(
+                        id.sequence == sequence && digest == message.digest,
+                        "stale or conflicting sandbox rejection replay"
+                    );
+                    return Ok(Import::Rejected);
+                }
+
+                tx.execute_batch("SAVEPOINT sandbox_inbound_event")?;
+                match insert_event(tx) {
+                    Ok(event_id) => {
+                        tx.execute_batch("RELEASE sandbox_inbound_event")?;
+                        event_id
+                    }
+                    Err(error) if error.is::<UnavailableRecipient>() => {
+                        tx.execute_batch(
+                            "ROLLBACK TO sandbox_inbound_event; RELEASE sandbox_inbound_event",
+                        )?;
+                        self.limits.pace_guest(tx, binding, wire_bytes, now)?;
+                        tx.execute(
+                            "INSERT INTO sandbox_rejected_head VALUES (?, ?, ?)
+                             ON CONFLICT(route) DO UPDATE
+                             SET sequence = excluded.sequence, digest = excluded.digest",
+                            params![route, id.sequence, message.digest.as_slice()],
+                        )?;
+                        return Ok(Import::Rejected);
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                insert_event(tx)?
+            };
             let paced_at = matches!(receiver, Receiver::Host).then_some(now);
             self.limits
                 .record(tx, binding, wire_bytes, event_id, paced_at)?;
@@ -575,6 +673,10 @@ fn ensure_forwarding_schema(tx: &Transaction<'_>) -> Result<()> {
         (
             "forwarded_incarnation",
             "ALTER TABLE sandbox_outbox ADD COLUMN forwarded_incarnation TEXT",
+        ),
+        (
+            "rejected",
+            "ALTER TABLE sandbox_outbox ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0 CHECK (rejected IN (0, 1))",
         ),
     ] {
         let present: bool = tx.query_row(

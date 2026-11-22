@@ -187,6 +187,11 @@ pub enum FrameBody {
         id: MessageId,
         digest: [u8; 32],
     },
+    /// The host could not route this guest message to its requested recipient.
+    Rejected {
+        id: MessageId,
+        digest: [u8; 32],
+    },
     Close,
 }
 
@@ -227,6 +232,13 @@ impl Frame {
                 message.validate()
             }
             FrameBody::Accepted { id, .. } => id.validate(),
+            FrameBody::Rejected { id, .. } => {
+                ensure!(
+                    id.origin == self.binding.worker,
+                    "sandbox rejection sender mismatch"
+                );
+                id.validate()
+            }
             FrameBody::Hello {
                 max_frame_bytes,
                 directory,
@@ -394,6 +406,9 @@ impl Connection {
             "sandbox handshake out of order"
         );
         match (&self.receiver, &frame.body) {
+            (Receiver::Host, FrameBody::Rejected { .. }) => {
+                anyhow::bail!("guest cannot reject a sandbox send");
+            }
             (
                 Receiver::Host,
                 FrameBody::Hello {

@@ -253,7 +253,11 @@ impl<'store, 'db> Peer<'store, 'db> {
             return Ok(false);
         }
         let store = self.attached.as_ref().expect("handshake attaches bridge");
-        let Some(message) = store.next_pending(self.binding, now_epoch_i64())? else {
+        let now_epoch = now_epoch_i64();
+        if matches!(self.receiver, Receiver::Guest) {
+            store.expire_guest_pending_if_due(now_epoch)?;
+        }
+        let Some(message) = store.next_pending(self.binding, now_epoch)? else {
             self.next_queue_check = now + Duration::from_millis(40);
             return Ok(false);
         };
@@ -367,24 +371,37 @@ impl<'store, 'db> Peer<'store, 'db> {
                 // After queueing our close we still persist a peer's final
                 // payload. Any undelivered receipt is recovered by replay.
                 if self.draining.is_none() {
-                    let bytes = self.encode(FrameBody::Accepted {
-                        id: message.id,
-                        digest: message.digest,
-                    })?;
+                    let receipt = match result {
+                        Import::Rejected => FrameBody::Rejected {
+                            id: message.id,
+                            digest: message.digest,
+                        },
+                        Import::Inserted(_) | Import::Replay(_) => FrameBody::Accepted {
+                            id: message.id,
+                            digest: message.digest,
+                        },
+                    };
+                    let bytes = self.encode(receipt)?;
                     self.queue(WriteKind::Receipt, bytes)?;
                     if self.input_limit.is_some() && self.input_bytes >= self.limits.rotation {
                         self.begin_drain(true)?;
                     }
                 }
             }
-            FrameBody::Accepted { id, digest } => {
+            FrameBody::Accepted { ref id, ref digest }
+            | FrameBody::Rejected { ref id, ref digest } => {
                 ensure!(
                     self.outstanding.as_ref().is_some_and(|send| {
-                        send.sent && send.id == id && send.digest == digest
+                        send.sent && &send.id == id && &send.digest == digest
                     }),
                     "sandbox bridge receipt does not match the sent payload"
                 );
-                store.acknowledge(self.binding, &id, &digest, now_epoch_i64())?;
+                let now = now_epoch_i64();
+                if matches!(body, FrameBody::Rejected { .. }) {
+                    store.reject(self.binding, id, digest, now)?;
+                } else {
+                    store.acknowledge(self.binding, id, digest, now)?;
+                }
                 self.outstanding = None;
             }
             FrameBody::Close => {

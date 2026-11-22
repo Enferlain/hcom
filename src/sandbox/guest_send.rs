@@ -199,7 +199,7 @@ pub(crate) fn queue(
     };
     let now = now_epoch_i64();
     // The private guest store has no host controller to reclaim expired slots.
-    while !store.expire_pending(now)?.is_empty() {}
+    store.expire_guest_pending_if_due(now)?;
     let mut event_id = 0;
     store.enqueue(
         Receiver::Host,

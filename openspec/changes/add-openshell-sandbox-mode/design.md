@@ -205,7 +205,7 @@ The enrolled guest can use ordinary `hcom send` with a single explicit team targ
 
 Task 3.2 still needs team broadcasts, thread-only target resolution, and controller wiring for the host inbox adapter.
 
-The bridge currently closes on a host admission error. A previously queued guest message whose target later becomes stale can hold its sender stream until the queue deadline. A terminal rejection receipt is needed to advance past that entry before continuous controller forwarding is enabled.
+When a guest targets an unavailable or replaced recipient, the host commits a rejection before sending a terminal receipt. It keeps one rejection record per sender route, with the sequence and digest needed to replay a lost receipt. Replayed rejections use no extra pacing credit. The guest matches the receipt to the outstanding payload, records the terminal rejection separately from expiry, and advances to the next message. Rejection writes no recipient event. Database and transient admission errors still close the connection and leave the sender's payload pending for retry. The rejection frame requires matching host and guest builds.
 
 Transport promises retry with deduplicated inbox insertion, per-sender ordering, and visible unresolved failure. It does not promise exactly-once model actions. Database replacement/incarnation mismatch fails closed until explicit reconciliation or a new run generation is created. Do not reuse source event numbers across database resets.
 

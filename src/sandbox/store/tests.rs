@@ -112,7 +112,8 @@ fn enqueue_and_receipt_are_atomic_and_survive_reopen() {
         .execute_batch(
             "DROP INDEX sandbox_outbox_forwarded;
          ALTER TABLE sandbox_outbox DROP COLUMN forwarded_sequence;
-         ALTER TABLE sandbox_outbox DROP COLUMN forwarded_incarnation;",
+         ALTER TABLE sandbox_outbox DROP COLUMN forwarded_incarnation;
+         ALTER TABLE sandbox_outbox DROP COLUMN rejected;",
         )
         .unwrap();
     drop(db);
@@ -283,6 +284,70 @@ fn foreign_forwarding_keeps_the_wire_id_and_orders_with_local_sends() {
         .unwrap();
     assert!(store.next_pending(&destination, NOW).unwrap().is_none());
     assert_eq!(event_count(&db), 2);
+}
+
+#[test]
+fn terminal_rejection_rolls_back_callback_writes_and_charges_pacing_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&temp.path().join("hcom.db")).unwrap();
+    let limits = Limits {
+        pace: Budget {
+            messages: 1,
+            bytes: 1024 * 1024,
+        },
+        ..Limits::default()
+    };
+    let store = Store::with_limits(&db, limits).unwrap();
+    let origin = origin("worker-a", &Uuid::new_v4().to_string());
+    let make = |sequence, text| {
+        Message::new(
+            MessageId {
+                origin: origin.clone(),
+                sequence,
+            },
+            payload(text),
+        )
+        .unwrap()
+    };
+    let first = make(1, "first");
+    let second = make(2, "second");
+    let binding = incoming_binding(&first);
+    let reject = |tx: &Transaction<'_>| {
+        insert_event(tx)?;
+        Err(UnavailableRecipient("fixture rejection after a tentative event").into())
+    };
+    let import = |msg, now| store.import(Receiver::Host, &binding, msg, now, reject);
+
+    assert_eq!(import(&first, NOW).unwrap(), Import::Rejected);
+    assert_eq!(event_count(&db), 0);
+    assert_eq!(
+        store
+            .import(Receiver::Host, &binding, &first, NOW, |_| panic!(
+                "replay must not recheck the recipient"
+            ))
+            .unwrap(),
+        Import::Rejected,
+    );
+    assert_error(import(&second, NOW), "guest pacing");
+    assert_eq!(event_count(&db), 0);
+    assert_error(
+        import(&make(1, "different digest"), NOW),
+        "conflicting sandbox rejection",
+    );
+    // A paced-out sequence leaves no rejection. It can be accepted when credit returns.
+    assert!(matches!(
+        store
+            .import(
+                Receiver::Host,
+                &binding,
+                &second,
+                NOW + limits.pace_seconds,
+                insert_event
+            )
+            .unwrap(),
+        Import::Inserted(_),
+    ));
+    assert_eq!(event_count(&db), 1);
 }
 
 #[test]

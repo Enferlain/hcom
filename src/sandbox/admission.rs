@@ -150,4 +150,15 @@ impl Limits {
         )?;
         Ok(())
     }
+
+    pub(super) fn pace_guest(
+        self,
+        tx: &Transaction<'_>,
+        binding: &Binding,
+        wire_bytes: i64,
+        now: i64,
+    ) -> Result<()> {
+        let run_key = serde_json::to_string(&(&binding.sandbox, &binding.worker.generation))?;
+        self.record_pacing(tx, &run_key, wire_bytes, now)
+    }
 }

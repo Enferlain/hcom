@@ -7,7 +7,7 @@ use crate::sandbox::directory::{host_generation, host_recipient_generation};
 use crate::sandbox::protocol::{
     Binding, Message, MessageId, Origin, TeamPeer, validate_identifier,
 };
-use crate::sandbox::store::{ForwardRoute, Store};
+use crate::sandbox::store::{ForwardRoute, Store, UnavailableRecipient};
 use crate::shared::time::now_epoch_i64;
 
 use super::{Inbound, LocalWorker};
@@ -108,10 +108,11 @@ impl Inbound for HostInbox<'_, '_> {
             .optional()?;
         if let Some(destination) = destination {
             let destination: Binding = serde_json::from_str(&destination)?;
-            ensure!(
-                destination.worker.generation == target_generation,
-                "sandbox message target generation is stale"
-            );
+            if destination.worker.generation != target_generation {
+                return Err(
+                    UnavailableRecipient("sandbox message target generation is stale").into(),
+                );
+            }
             self.check_reply(tx, message, Recipient::Guest(&destination))?;
             let event = self
                 .inbox
@@ -137,12 +138,12 @@ impl Inbound for HostInbox<'_, '_> {
                 |row| row.get(0),
             )
             .optional()?;
-        let local_created_at =
-            local_created_at.context("sandbox message target is outside the team")?;
-        ensure!(
-            host_recipient_generation(tx, target, local_created_at)? == target_generation,
-            "sandbox message target generation is stale"
-        );
+        let local_created_at = local_created_at.ok_or(UnavailableRecipient(
+            "sandbox message target is outside the team",
+        ))?;
+        if host_recipient_generation(tx, target, local_created_at)? != target_generation {
+            return Err(UnavailableRecipient("sandbox message target generation is stale").into());
+        }
         self.check_reply(
             tx,
             message,
