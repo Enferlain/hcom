@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -36,10 +37,14 @@ struct Capabilities {
     driver_version: String,
 }
 
-pub(super) fn check(profile: &Profile, expected: &Fingerprint) -> Result<()> {
+pub(super) fn check(
+    profile: &Profile,
+    expected: &Fingerprint,
+    stop: Option<&AtomicBool>,
+) -> Result<()> {
     let mut version = profile.base_command();
     version.arg("--version");
-    let version = output(version, "version", TIMEOUT)?;
+    let version = output(version, "version", TIMEOUT, stop)?;
     ensure!(
         version.trim() == expected.cli_version,
         "OpenShell CLI version differs from qualification"
@@ -62,7 +67,7 @@ pub(super) fn check(profile: &Profile, expected: &Fingerprint) -> Result<()> {
     ] {
         let mut command = profile.base_command();
         command.args(args);
-        let help = output(command, args[1], TIMEOUT)?;
+        let help = output(command, args[1], TIMEOUT, stop)?;
         for flag in required {
             ensure!(
                 help.lines().any(|line| {
@@ -85,7 +90,7 @@ pub(super) fn check(profile: &Profile, expected: &Fingerprint) -> Result<()> {
     let mut list = profile.base_command();
     list.args(["--color", "never", "gateway", "list", "--output", "json"]);
     let registrations: Vec<Registration> =
-        serde_json::from_str(&output(list, "gateway registration", TIMEOUT)?)
+        serde_json::from_str(&output(list, "gateway registration", TIMEOUT, stop)?)
             .context("invalid OpenShell gateway registration output")?;
     let mut selected = registrations
         .iter()
@@ -113,9 +118,13 @@ pub(super) fn check(profile: &Profile, expected: &Fingerprint) -> Result<()> {
 
     let mut info = profile.command();
     info.args(["gateway", "info", "--output", "json"]);
-    let info: GatewayInfo =
-        serde_json::from_str(&output(info, "authenticated gateway/driver", TIMEOUT)?)
-            .context("invalid OpenShell gateway runtime output")?;
+    let info: GatewayInfo = serde_json::from_str(&output(
+        info,
+        "authenticated gateway/driver",
+        TIMEOUT,
+        stop,
+    )?)
+    .context("invalid OpenShell gateway runtime output")?;
     ensure!(
         info.gateway == profile.gateway && info.server.trim_end_matches('/') == profile.endpoint,
         "OpenShell gateway response differs from profile"
@@ -138,7 +147,7 @@ pub(super) fn check(profile: &Profile, expected: &Fingerprint) -> Result<()> {
     let mut list = profile.command();
     list.args(["sandbox", "list", "--page-size", "1", "--output", "json"]);
     let workspace: serde_json::Value =
-        serde_json::from_str(&output(list, "workspace access", TIMEOUT)?)
+        serde_json::from_str(&output(list, "workspace access", TIMEOUT, stop)?)
             .context("invalid OpenShell workspace probe output")?;
     ensure!(
         workspace
@@ -150,7 +159,15 @@ pub(super) fn check(profile: &Profile, expected: &Fingerprint) -> Result<()> {
 }
 
 #[cfg(unix)]
-pub(super) fn output(mut command: Command, label: &str, timeout: Duration) -> Result<String> {
+pub(super) fn output(
+    mut command: Command,
+    label: &str,
+    timeout: Duration,
+    stop: Option<&AtomicBool>,
+) -> Result<String> {
+    use std::sync::atomic::Ordering;
+    let cancelled = || stop.is_some_and(|flag| flag.load(Ordering::Relaxed));
+    ensure!(!cancelled(), "OpenShell probe cancelled");
     use std::io::{ErrorKind, Read};
     use std::process::Stdio;
     use std::time::Instant;
@@ -190,6 +207,7 @@ pub(super) fn output(mut command: Command, label: &str, timeout: Duration) -> Re
         .stderr(Stdio::piped());
     let mut child = crate::sys::process::spawn_detached(&mut command)
         .with_context(|| format!("start OpenShell {label} probe"))?;
+    let mut reaped = false;
     let result = (|| {
         let mut stdout = child.stdout.take().context("missing probe stdout")?;
         let mut stderr = child.stderr.take().context("missing probe stderr")?;
@@ -199,12 +217,14 @@ pub(super) fn output(mut command: Command, label: &str, timeout: Duration) -> Re
         let mut output = Vec::new();
         let mut diagnostics = Vec::new();
         loop {
+            ensure!(!cancelled(), "OpenShell probe cancelled");
             let out_eof = drain(&mut stdout, &mut output)?;
             let err_eof = drain(&mut stderr, &mut diagnostics)?;
-            if let Some(status) = child.try_wait()?
-                && out_eof
+            if out_eof
                 && err_eof
+                && let Some(status) = child.try_wait()?
             {
+                reaped = true;
                 // Diagnostics may contain profile details. Return the probe and
                 // status without echoing stderr into an hcom event.
                 ensure!(
@@ -220,7 +240,8 @@ pub(super) fn output(mut command: Command, label: &str, timeout: Duration) -> Re
             std::thread::sleep(Duration::from_millis(10));
         }
     })();
-    if result.is_err() && !matches!(child.try_wait(), Ok(Some(_))) {
+    if result.is_err() && !reaped {
+        // Keep the process group identity reserved while descendants hold a pipe.
         crate::sys::process::kill_child_group(&mut child);
         let _ = child.wait();
     }
@@ -228,7 +249,7 @@ pub(super) fn output(mut command: Command, label: &str, timeout: Duration) -> Re
 }
 
 #[cfg(not(unix))]
-pub(super) fn output(_: Command, _: &str, _: Duration) -> Result<String> {
+pub(super) fn output(_: Command, _: &str, _: Duration, _: Option<&AtomicBool>) -> Result<String> {
     anyhow::bail!("the initial OpenShell VM adapter requires a Unix host")
 }
 
@@ -240,12 +261,41 @@ mod tests {
     fn probe_capture_and_wait_are_bounded() {
         let mut noisy = Command::new("/bin/sh");
         noisy.args(["-c", "while :; do printf '0123456789abcdef'; done"]);
-        let error = output(noisy, "fixture", Duration::from_secs(2)).unwrap_err();
+        let error = output(noisy, "fixture", Duration::from_secs(2), None).unwrap_err();
         assert!(error.to_string().contains("capture limit"));
 
         let mut stalled = Command::new("/bin/sh");
         stalled.args(["-c", "sleep 30"]);
-        let error = output(stalled, "fixture", Duration::from_millis(80)).unwrap_err();
+        let error = output(stalled, "fixture", Duration::from_millis(80), None).unwrap_err();
         assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn cancel_interrupts_a_running_gateway_probe() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("started");
+        let stop = AtomicBool::new(false);
+        let mut stalled = Command::new("/bin/sh");
+        stalled
+            .args(["-c", "(sleep .2; touch escaped) & touch started; exit 0"])
+            .current_dir(root.path());
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !marker.exists() && start.elapsed() < Duration::from_secs(2) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+            let error = output(stalled, "fixture", TIMEOUT, Some(&stop)).unwrap_err();
+            assert!(error.to_string().contains("cancelled"));
+        });
+        assert!(marker.exists());
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(!root.path().join("escaped").exists());
     }
 }

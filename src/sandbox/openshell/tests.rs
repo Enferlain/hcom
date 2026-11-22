@@ -256,10 +256,10 @@ fn receipt(
 }
 
 fn rejected(profile: Profile, receipt: &Qualification, expected: &str) {
-    let message = Adapter::preflight(profile, receipt)
+    let error = Adapter::preflight(profile, receipt)
         .err()
-        .expect("preflight accepted")
-        .to_string();
+        .expect("preflight accepted");
+    let message = format!("{error:#}");
     assert!(message.contains(expected), "{message}");
 }
 

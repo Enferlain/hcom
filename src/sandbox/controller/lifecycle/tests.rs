@@ -176,7 +176,7 @@ fn idle_retirement_distinguishes_retained_runs_and_pending_work() {
                 true
             )
             .unwrap(),
-        Tick::Exit
+        Tick::LostOwnership
     );
     let tick = |now| {
         store

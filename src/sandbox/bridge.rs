@@ -83,22 +83,46 @@ pub fn exec(
         absolute_guest_path(target.guest_manifest),
         "sandbox bridge requires an absolute guest manifest path"
     );
-    let worker =
-        super::directory::current_worker(owner.store().connection()?, &binding.worker.worker)?;
-    if let Some(worker) = worker {
-        ensure!(
-            worker.binding == *binding,
-            "sandbox exec route no longer matches enrollment"
-        );
+    if let Some(worker) = validate_local_exec(owner.store(), binding, &target)? {
         adapter.verify_owned_target(target.sandbox_name, &worker)?;
-        ensure!(
-            target.startup_key.is_some(),
-            "enrolled sandbox exec requires a startup key"
-        );
-    } else {
-        // The low-level VM qualification fixture is the only unregistered route.
-        ensure!(cfg!(test), "sandbox exec route is not enrolled");
     }
+    let session = start_verified(owner, adapter, target, binding)?;
+    session.run(stop, import)
+}
+
+fn validate_local_exec(
+    store: &Store<'_>,
+    binding: &Binding,
+    target: &ExecTarget<'_>,
+) -> Result<Option<super::directory::Worker>> {
+    let worker = super::directory::current_worker(store.connection()?, &binding.worker.worker)?;
+    match &worker {
+        Some(worker) => ensure!(
+            worker.binding == *binding && target.startup_key.is_some(),
+            "sandbox exec route or startup key no longer matches enrollment"
+        ),
+        // The low-level VM qualification fixture is the only unregistered route.
+        None => ensure!(
+            cfg!(test) && target.startup_key.is_none(),
+            "sandbox exec route is not enrolled"
+        ),
+    }
+    Ok(worker)
+}
+
+/// The caller has just verified OpenShell placement. The local binding and
+/// epoch are checked again here, before starting the authenticated exec.
+pub(super) fn start_verified<'store, 'db>(
+    owner: &'store Owner<'_, 'db>,
+    adapter: &Adapter,
+    target: ExecTarget<'_>,
+    binding: &Binding,
+) -> Result<Session<'store, 'db>> {
+    ensure!(
+        absolute_guest_path(target.guest_manifest),
+        "sandbox bridge requires an absolute guest manifest path"
+    );
+    validate_local_exec(owner.store(), binding, &target)?;
     let epoch = owner.allocate_connection_epoch()?;
     let command = adapter.managed_exec(
         target.sandbox_name,
@@ -118,34 +142,65 @@ pub fn exec(
         Limits::default(),
         owner.store().snapshot_directory(binding)?,
     )?;
-    run_host(command, peer, stop, import, target.startup_key)
+    Session::new(command, peer, target.startup_key)
 }
 
+pub(super) struct Session<'store, 'db> {
+    process: Process,
+    peer: Peer<'store, 'db>,
+}
+
+impl<'store, 'db> Session<'store, 'db> {
+    fn new(
+        command: Command,
+        mut peer: Peer<'store, 'db>,
+        startup_key: Option<&[u8; proof::BYTES]>,
+    ) -> Result<Self> {
+        let (binding, epoch) = peer.binding_and_epoch();
+        let proof = startup_key
+            .map(|key| proof::Check::new(key, binding, epoch))
+            .transpose()?;
+        if proof.is_some() {
+            peer.reserve_host_input(proof::BYTES)?;
+        }
+        let mut process = Process::spawn(command)?;
+        process.proof = proof;
+        peer.start_clock();
+        Ok(Self { process, peer })
+    }
+
+    pub(super) fn poll(&mut self, stop: bool, inbox: &mut impl Inbound) -> Result<Option<Exit>> {
+        match poll_host(&mut self.process, &mut self.peer, || stop, inbox)? {
+            HostStep::Finished(exit) => Ok(Some(exit)),
+            HostStep::Progress | HostStep::Waiting => Ok(None),
+        }
+    }
+
+    pub(super) fn ready(&self) -> bool {
+        self.peer.is_ready()
+    }
+
+    fn run(mut self, stop: impl FnMut() -> bool, import: impl Inbound) -> Result<Exit> {
+        let result = drive_host(&mut self.process, self.peer, stop, import);
+        if result.is_err()
+            && self.process.proof.is_none()
+            && let Some(diagnostic) = self.process.diagnostic_tail()
+        {
+            return result.with_context(|| format!("sandbox bridge exec stderr: {diagnostic}"));
+        }
+        result
+    }
+}
+
+#[cfg(test)]
 fn run_host(
     command: Command,
-    mut peer: Peer<'_, '_>,
+    peer: Peer<'_, '_>,
     stop: impl FnMut() -> bool,
     import: impl Inbound,
     startup_key: Option<&[u8; proof::BYTES]>,
 ) -> Result<Exit> {
-    let (binding, epoch) = peer.binding_and_epoch();
-    let proof = startup_key
-        .map(|key| proof::Check::new(key, binding, epoch))
-        .transpose()?;
-    if proof.is_some() {
-        peer.reserve_host_input(proof::BYTES)?;
-    }
-    let mut process = Process::spawn(command)?;
-    process.proof = proof;
-    peer.start_clock();
-    let result = drive_host(&mut process, peer, stop, import);
-    if result.is_err()
-        && process.proof.is_none()
-        && let Some(diagnostic) = process.diagnostic_tail()
-    {
-        return result.with_context(|| format!("sandbox bridge exec stderr: {diagnostic}"));
-    }
-    result
+    Session::new(command, peer, startup_key)?.run(stop, import)
 }
 
 fn drive_host(
@@ -431,7 +486,7 @@ fn drive_guest(
     }
 }
 
-fn absolute_guest_path(path: &str) -> bool {
+pub(super) fn absolute_guest_path(path: &str) -> bool {
     path.starts_with('/') && !path.chars().any(char::is_control)
 }
 

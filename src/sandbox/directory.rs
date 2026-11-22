@@ -321,6 +321,14 @@ impl Store<'_> {
             )?;
             ensure!(changed == 1, "sandbox worker generation is not active");
             tx.execute(
+                "DELETE FROM sandbox_controller_routes WHERE generation = ?",
+                [&binding.worker.generation],
+            )?;
+            tx.execute(
+                "UPDATE sandbox_controller_work SET state = 'terminal' WHERE run_key = ?",
+                [&binding.worker.generation],
+            )?;
+            tx.execute(
                 "DELETE FROM instances WHERE name = ? AND origin_device_id = ?",
                 params![
                     binding.worker.worker,

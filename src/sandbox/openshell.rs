@@ -6,6 +6,7 @@ use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -22,7 +23,7 @@ pub const CONTROL_HEADROOM_BYTES: u64 = 64 * 1024;
 const MIN_INPUT_BYTES: u64 = ROTATION_BYTES + MAX_ENCODED_FRAME as u64 + CONTROL_HEADROOM_BYTES;
 const ROUTE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub cli: PathBuf,
@@ -59,7 +60,7 @@ pub struct VmAllocation {
     pub mem_mib: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Qualification {
     pub fingerprint: Fingerprint,
@@ -82,6 +83,14 @@ struct SandboxRoute {
 
 impl Adapter {
     pub fn preflight(profile: Profile, qualification: &Qualification) -> Result<Self> {
+        Self::preflight_until(profile, qualification, None)
+    }
+
+    pub(super) fn preflight_until(
+        profile: Profile,
+        qualification: &Qualification,
+        stop: Option<&AtomicBool>,
+    ) -> Result<Self> {
         let stdin_bytes = qualification
             .measured_stdin_bytes
             .context("unknown OpenShell stdin allowance")?;
@@ -126,7 +135,7 @@ impl Adapter {
         );
         // Gateway info reports runtime versions and driver identity. The
         // artifact hashes above cover the operator-supplied local files.
-        probe::check(&profile, expected)?;
+        probe::check(&profile, expected, stop)?;
         ensure!(
             file_stamp(&profile.cli)? == cli_stamp,
             "OpenShell executable changed during preflight"
@@ -145,6 +154,15 @@ impl Adapter {
     /// The pinned CLI resolves an exec name again when starting the command.
     /// This check catches stale placement records before any bridge data is sent.
     pub fn verify_owned_target(&self, name: &str, worker: &Worker) -> Result<()> {
+        self.verify_owned_target_until(name, worker, None)
+    }
+
+    pub(super) fn verify_owned_target_until(
+        &self,
+        name: &str,
+        worker: &Worker,
+        stop: Option<&AtomicBool>,
+    ) -> Result<()> {
         validate_routable_name(name)?;
         ensure!(
             worker.gateway == self.profile.gateway && worker.workspace == self.profile.workspace,
@@ -153,7 +171,7 @@ impl Adapter {
         self.check_cli_stamp()?;
         let mut command = self.profile.command();
         command.args(["sandbox", "get", "--output", "json", name]);
-        let response = probe::output(command, "owned sandbox lookup", ROUTE_LOOKUP_TIMEOUT)?;
+        let response = probe::output(command, "owned sandbox lookup", ROUTE_LOOKUP_TIMEOUT, stop)?;
         let route: SandboxRoute =
             serde_json::from_str(&response).context("invalid OpenShell sandbox lookup response")?;
         ensure!(

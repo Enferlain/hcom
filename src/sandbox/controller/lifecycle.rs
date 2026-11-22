@@ -248,29 +248,50 @@ fn run_worker_in(db: &HcomDb) -> Result<()> {
     if !store.claim_controller(&owner)? {
         return Ok(());
     }
-    let result = supervise(&store, &ownership);
+    let result = supervise(db, &store, &ownership);
     let cleanup = store.clear_controller(ownership.epoch());
     result.and(cleanup)
 }
 
-fn supervise(store: &Store<'_>, owner: &Owner<'_, '_>) -> Result<()> {
+fn supervise(_db: &HcomDb, store: &Store<'_>, owner: &Owner<'_, '_>) -> Result<()> {
+    #[cfg(unix)]
+    let mut routes = super::routes::Routes::default();
     let mut idle_since = Instant::now();
+    let mut tick_at = idle_since;
     loop {
-        let now = now_epoch_i64();
-        match store.tick_controller(
-            owner.epoch(),
-            now,
-            monotonic_seconds()?,
-            idle_since.elapsed() >= IDLE_TIMEOUT,
-        )? {
-            Tick::Exit => return Ok(()),
-            Tick::Work => idle_since = Instant::now(),
-            Tick::Idle => {}
+        if Instant::now() >= tick_at {
+            let now = now_epoch_i64();
+            match store.tick_controller(
+                owner.epoch(),
+                now,
+                monotonic_seconds()?,
+                idle_since.elapsed() >= IDLE_TIMEOUT,
+            )? {
+                Tick::Exit => {
+                    #[cfg(unix)]
+                    routes.drain(_db, store);
+                    return Ok(());
+                }
+                Tick::LostOwnership => bail!("sandbox controller lost database ownership"),
+                Tick::Work => idle_since = Instant::now(),
+                Tick::Idle => {}
+            }
+            if !store.expire_pending(now)?.is_empty() {
+                idle_since = Instant::now();
+            }
+            #[cfg(unix)]
+            routes.refresh(store)?;
+            tick_at = Instant::now() + TICK;
         }
-        if !store.expire_pending(now)?.is_empty() {
-            idle_since = Instant::now();
+        #[cfg(unix)]
+        {
+            routes.poll(_db, owner);
+            if routes.is_active() {
+                thread::sleep(super::routes::STEP);
+                continue;
+            }
         }
-        thread::sleep(TICK);
+        thread::sleep(tick_at.saturating_duration_since(Instant::now()));
     }
 }
 

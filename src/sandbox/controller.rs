@@ -7,12 +7,16 @@ use anyhow::{Context, Result};
 use super::store::Store;
 
 mod lifecycle;
+#[cfg(unix)]
+mod routes;
 mod state;
 
 pub(crate) use lifecycle::USAGE;
 pub use lifecycle::{
     Forwarding, QueuedSend, enqueue_host, ensure_after_launch, run_command, run_worker,
 };
+#[cfg(unix)]
+pub use routes::BridgePlan;
 pub(super) use state::SCHEMA;
 pub use state::{ControllerStatus, Process, RunState, status};
 

@@ -33,6 +33,10 @@ pub(in crate::sandbox) const SCHEMA: &str = "
         state TEXT NOT NULL CHECK (state IN ('provisioning', 'running', 'unknown', 'stopped', 'terminal')),
         artifact_pending INTEGER NOT NULL CHECK (artifact_pending IN (0, 1))
     ) STRICT;
+    CREATE TABLE IF NOT EXISTS sandbox_controller_routes (
+        generation TEXT PRIMARY KEY REFERENCES sandbox_workers(generation),
+        plan TEXT NOT NULL
+    ) STRICT;
 ";
 
 const HEARTBEAT_TTL_SECONDS: i64 = 8;
@@ -153,6 +157,15 @@ impl Store<'_> {
     ) -> Result<()> {
         super::super::protocol::validate_identifier(run_key)?;
         self.write(|tx| {
+            let retired: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sandbox_workers WHERE generation = ? AND retired = 1)",
+                [run_key],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                !retired || matches!(state, RunState::Terminal),
+                "retired sandbox worker cannot resume controller work"
+            );
             tx.execute(
                 "INSERT INTO sandbox_controller_work VALUES (?, ?, ?)
                  ON CONFLICT (run_key) DO UPDATE SET state = excluded.state,
@@ -212,7 +225,7 @@ impl Store<'_> {
                 [epoch], |row| row.get::<_, bool>(0),
             ).optional()?;
             let Some(enabled) = row else {
-                return Ok(Tick::Exit);
+                return Ok(Tick::LostOwnership);
             };
             let pending: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM sandbox_outbox WHERE accepted = 0 AND expires_at > ?)
@@ -249,6 +262,7 @@ fn clear_controller(conn: &Connection, epoch: i64) -> Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Tick {
     Exit,
+    LostOwnership,
     Work,
     Idle,
 }
