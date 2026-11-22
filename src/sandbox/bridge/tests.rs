@@ -235,6 +235,74 @@ fn rotates_before_two_mib_and_replays_same_pending_payload() {
 }
 
 #[test]
+fn host_polls_an_active_route_while_another_child_is_stalled() {
+    let stalled = Fixture::new();
+    let mut active = Fixture::new();
+    active.binding.sandbox = "active-vm".into();
+    active.binding.worker.worker = "active".into();
+    let store = stalled.store();
+    let peer = |store, binding| {
+        Peer::new(
+            store,
+            binding,
+            1,
+            Receiver::Host,
+            None,
+            Limits::default(),
+            None,
+        )
+        .unwrap()
+    };
+    let mut stalled_peer = peer(&store, &stalled.binding);
+    let mut active_peer = peer(&store, &active.binding);
+    active.hello(1);
+    active.frame("send", 1, active.send("still responsive".into()));
+    active.frame("close", 1, FrameBody::Close);
+
+    let spawn = |fixture: &Fixture, script: &str| {
+        let mut shell = Command::new("/bin/sh");
+        shell
+            .args(["-eu", "-c", script])
+            .current_dir(fixture.dir.path());
+        Process::spawn(shell).unwrap()
+    };
+    let mut stalled_child = spawn(&stalled, "exec sleep 30");
+    let mut active_child = spawn(&active, "cat hello send; cat >/dev/null; cat close");
+    stalled_peer.start_clock();
+    active_peer.start_clock();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut inbound = stage_guest_message;
+    loop {
+        let stalled_step = poll_host(
+            &mut stalled_child,
+            &mut stalled_peer,
+            || false,
+            &mut inbound,
+        )
+        .unwrap();
+        assert!(!matches!(stalled_step, HostStep::Finished(_)));
+        let step = poll_host(
+            &mut active_child,
+            &mut active_peer,
+            || ingress_count(&stalled) == 1,
+            &mut inbound,
+        )
+        .unwrap();
+        if let HostStep::Finished(exit) = step {
+            assert_eq!(exit, Exit::Stopped);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "active route stalled behind the other child"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    assert_eq!(ingress_count(&stalled), 1);
+    assert!(!stalled_peer.is_ready());
+}
+
+#[test]
 fn process_failure_or_eof_never_acknowledge_payload() {
     for (tail, error) in [
         ("exit 7", "exec failed"),

@@ -58,7 +58,7 @@ struct Outstanding {
 pub(super) struct Peer<'store, 'db> {
     store: &'store Store<'db>,
     attached: Option<Store<'db>>,
-    binding: &'store Binding,
+    binding: Binding,
     receiver: Receiver,
     epoch: i64,
     connection: Connection,
@@ -85,7 +85,7 @@ pub(super) struct Peer<'store, 'db> {
 impl<'store, 'db> Peer<'store, 'db> {
     pub(super) fn new(
         store: &'store Store<'db>,
-        binding: &'store Binding,
+        binding: &Binding,
         epoch: i64,
         receiver: Receiver,
         input_limit: Option<u64>,
@@ -96,7 +96,7 @@ impl<'store, 'db> Peer<'store, 'db> {
         let mut peer = Self {
             store,
             attached: None,
-            binding,
+            binding: binding.clone(),
             receiver,
             epoch,
             connection: Connection::new(binding.clone(), epoch, receiver)?,
@@ -149,7 +149,7 @@ impl<'store, 'db> Peer<'store, 'db> {
     }
 
     fn attach(&mut self) -> Result<()> {
-        self.attached = Some(self.store.attach_bridge(self.binding, self.epoch)?);
+        self.attached = Some(self.store.attach_bridge(&self.binding, self.epoch)?);
         Ok(())
     }
 
@@ -257,7 +257,7 @@ impl<'store, 'db> Peer<'store, 'db> {
         if matches!(self.receiver, Receiver::Guest) {
             store.expire_guest_pending_if_due(now_epoch)?;
         }
-        let Some(message) = store.next_pending(self.binding, now_epoch)? else {
+        let Some(message) = store.next_pending(&self.binding, now_epoch)? else {
             self.next_queue_check = now + Duration::from_millis(40);
             return Ok(false);
         };
@@ -360,7 +360,7 @@ impl<'store, 'db> Peer<'store, 'db> {
                 self.incoming_credit_used = true;
                 let result = store.import(
                     self.receiver,
-                    self.binding,
+                    &self.binding,
                     &message,
                     now_epoch_i64(),
                     |tx| import.insert(tx, &message),
@@ -398,9 +398,9 @@ impl<'store, 'db> Peer<'store, 'db> {
                 );
                 let now = now_epoch_i64();
                 if matches!(body, FrameBody::Rejected { .. }) {
-                    store.reject(self.binding, id, digest, now)?;
+                    store.reject(&self.binding, id, digest, now)?;
                 } else {
-                    store.acknowledge(self.binding, id, digest, now)?;
+                    store.acknowledge(&self.binding, id, digest, now)?;
                 }
                 self.outstanding = None;
             }

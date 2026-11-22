@@ -126,42 +126,66 @@ fn drive_host(
     mut import: impl Inbound,
 ) -> Result<Exit> {
     loop {
-        peer.check()?;
-        if peer.is_ready() && peer.draining.is_none() && stop() {
-            peer.begin_drain(false)?;
-        }
-        let mut progress = process.read_diagnostics()?;
-        progress |= peer.read_step(&mut process.stdout, &mut import)?;
-        if peer.input_eof {
-            peer.note_eof();
-            process.stdin.take();
-        }
-        if let Some(stdin) = process.stdin.as_mut() {
-            progress |= peer.write_step(stdin)?;
-            if peer.close_written {
-                process.stdin.take();
-            }
-        }
-        if peer.input_eof
-            && process.stderr_eof
-            && let Some(status) = process.status()?
-        {
-            ensure!(status.success(), "sandbox bridge exec failed ({status})");
-            ensure!(
-                peer.remote_closed && peer.close_written,
-                "sandbox bridge exec disconnected before completing the close handshake"
-            );
-            return Ok(if peer.rotating() {
-                Exit::Rotate
-            } else {
-                Exit::Stopped
-            });
-        }
-        progress |= peer.poll_outbox()?;
-        if !progress {
-            std::thread::sleep(POLL_INTERVAL);
+        match poll_host(process, &mut peer, &mut stop, &mut import)? {
+            HostStep::Finished(exit) => return Ok(exit),
+            HostStep::Progress => {}
+            HostStep::Waiting => std::thread::sleep(POLL_INTERVAL),
         }
     }
+}
+
+enum HostStep {
+    Progress,
+    Waiting,
+    Finished(Exit),
+}
+
+/// Advance one route without waiting on subprocess I/O. The caller can
+/// interleave other routes and controller state transitions before polling again.
+fn poll_host(
+    process: &mut Process,
+    peer: &mut Peer<'_, '_>,
+    stop: impl FnOnce() -> bool,
+    import: &mut impl Inbound,
+) -> Result<HostStep> {
+    peer.check()?;
+    if peer.is_ready() && peer.draining.is_none() && stop() {
+        peer.begin_drain(false)?;
+    }
+    let mut progress = process.read_diagnostics()?;
+    progress |= peer.read_step(&mut process.stdout, import)?;
+    if peer.input_eof {
+        peer.note_eof();
+        process.stdin.take();
+    }
+    if let Some(stdin) = process.stdin.as_mut() {
+        progress |= peer.write_step(stdin)?;
+        if peer.close_written {
+            process.stdin.take();
+        }
+    }
+    if peer.input_eof
+        && process.stderr_eof
+        && let Some(status) = process.status()?
+    {
+        ensure!(status.success(), "sandbox bridge exec failed ({status})");
+        ensure!(
+            peer.remote_closed && peer.close_written,
+            "sandbox bridge exec disconnected before completing the close handshake"
+        );
+        let exit = if peer.rotating() {
+            Exit::Rotate
+        } else {
+            Exit::Stopped
+        };
+        return Ok(HostStep::Finished(exit));
+    }
+    progress |= peer.poll_outbox()?;
+    Ok(if progress {
+        HostStep::Progress
+    } else {
+        HostStep::Waiting
+    })
 }
 
 struct Process {
