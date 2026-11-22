@@ -241,6 +241,7 @@ impl Fixture {
             Receiver::Host,
             Some(adapter.measured_stdin_bytes()),
             Limits::default(),
+            None,
         )?;
         let command = adapter.managed_exec(
             &self.sandbox,

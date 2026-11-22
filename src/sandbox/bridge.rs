@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use super::controller::Owner;
 use super::openshell::Adapter;
-use super::protocol::{Binding, Message, Receiver};
+use super::protocol::{Binding, Message, Receiver, TeamPeer};
 use super::store::Store;
 use crate::db::HcomDb;
 use crate::shared::time::now_iso;
@@ -24,6 +24,17 @@ pub use inbox::HostInbox;
 pub trait Inbound {
     fn insert(&mut self, tx: &Transaction<'_>, message: &Message) -> Result<i64>;
     fn committed(&mut self, _event_id: i64) {}
+    fn replace_directory(
+        &mut self,
+        _tx: &Transaction<'_>,
+        peers: Option<&[TeamPeer]>,
+    ) -> Result<()> {
+        ensure!(
+            peers.is_none(),
+            "sandbox bridge has no local worker for a team directory"
+        );
+        Ok(())
+    }
 }
 
 impl<F> Inbound for F
@@ -86,6 +97,7 @@ pub fn exec(
         Receiver::Host,
         Some(adapter.measured_stdin_bytes()),
         Limits::default(),
+        owner.store().snapshot_directory(binding)?,
     )?;
     run_host(command, peer, stop, import)
 }
@@ -305,6 +317,7 @@ pub(crate) fn guest_main(args: &[String]) -> Result<()> {
         Receiver::Guest,
         None,
         Limits::default(),
+        None,
     )?;
     if let Some(local_worker) = &manifest.local_worker {
         let inbox = inbox::GuestInbox::new(&db, &manifest.binding, local_worker)?;

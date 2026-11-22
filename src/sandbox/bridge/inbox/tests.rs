@@ -91,6 +91,7 @@ fn local_guest_inbox_maps_recipient_and_publishes_only_after_commit() {
         Receiver::Guest,
         None,
         Default::default(),
+        None,
     )
     .unwrap();
     let failure = feed(&mut rollback_peer, &binding, 1, &input, &mut inbox);
@@ -110,6 +111,7 @@ fn local_guest_inbox_maps_recipient_and_publishes_only_after_commit() {
         Receiver::Guest,
         None,
         Default::default(),
+        None,
     )
     .unwrap();
     feed(&mut peer, &binding, 2, &input, &mut inbox).unwrap();
@@ -178,6 +180,7 @@ fn feed(
     for body in [
         FrameBody::Hello {
             max_frame_bytes: MAX_ENCODED_FRAME,
+            directory: None,
         },
         FrameBody::Deliver(message.clone()),
     ] {
@@ -263,11 +266,51 @@ fn host_inbox_delivers_to_enrolled_local_or_forwards_to_same_team() {
     };
     let source = make_worker("source").binding;
     let destination = make_worker("destination").binding;
+    let other_team = store.create_team(None).unwrap();
+    let outside = store
+        .reserve_worker(
+            &other_team.id,
+            Access::Controller(other_team.external_controller.as_ref().unwrap()),
+            "outside",
+            Tool::Codex,
+            Placement {
+                gateway: "other-gateway",
+                workspace: "outside-workspace",
+                sandbox: "outside-sandbox",
+                incarnation: &uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .unwrap();
+    let snapshot = store.snapshot_directory(&source).unwrap().unwrap();
+    assert_eq!(
+        snapshot,
+        vec![
+            TeamPeer {
+                name: destination.worker.worker.clone(),
+                alias: Some("destination".into()),
+                generation: destination.worker.generation.clone(),
+            },
+            TeamPeer {
+                name: "host".into(),
+                alias: None,
+                generation: host_recipient_generation(db.conn(), "host", 1.0).unwrap(),
+            },
+            TeamPeer {
+                name: "member".into(),
+                alias: None,
+                generation: host_recipient_generation(db.conn(), "member", 3.0).unwrap(),
+            },
+        ]
+    );
+    assert_ne!(
+        store.snapshot_directory(&outside.binding).unwrap().unwrap(),
+        snapshot
+    );
     let mut inbox = HostInbox::new(&db, &store, &source);
 
     let local = addressed(
         message(source.worker.clone(), 1, "member"),
-        &host_generation(3.0),
+        &host_recipient_generation(db.conn(), "member", 3.0).unwrap(),
     );
     let Imported::New(id) = apply(&store, Receiver::Host, &source, &local, &mut inbox) else {
         panic!("expected local import")
@@ -302,7 +345,7 @@ fn host_inbox_delivers_to_enrolled_local_or_forwards_to_same_team() {
     let before = db.get_last_event_id();
     let unauthorized = addressed(
         message(source.worker.clone(), 3, "outsider"),
-        &host_generation(2.0),
+        &host_recipient_generation(db.conn(), "outsider", 2.0).unwrap(),
     );
     assert!(reject(&mut inbox, &unauthorized).contains("outside the team"));
     let unbound = message(source.worker.clone(), 3, "member");
@@ -317,7 +360,7 @@ fn host_inbox_delivers_to_enrolled_local_or_forwards_to_same_team() {
     enroll_local();
     let stale_local = addressed(
         message(source.worker.clone(), 3, "member"),
-        &host_generation(3.0),
+        &host_recipient_generation(db.conn(), "member", 3.0).unwrap(),
     );
     assert!(reject(&mut inbox, &stale_local).contains("target generation is stale"));
 
@@ -339,4 +382,119 @@ fn host_inbox_delivers_to_enrolled_local_or_forwards_to_same_team() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn guest_handshake_replaces_its_persisted_directory_on_reconnect() {
+    use super::super::peer::Peer;
+
+    let root = tempfile::tempdir().unwrap();
+    let guest_db = HcomDb::open_at(&root.path().join("guest.db")).unwrap();
+    guest_db
+        .conn()
+        .execute(
+            "INSERT INTO instances (name, created_at) VALUES ('guest', 1)",
+            [],
+        )
+        .unwrap();
+    let guest_store = Store::initialize(&guest_db).unwrap();
+    let binding = Binding {
+        team: "team".into(),
+        sandbox: "sandbox".into(),
+        worker: Origin {
+            worker: "guest.realm".into(),
+            generation: "one".into(),
+            incarnation: guest_store.incarnation().into(),
+        },
+    };
+    let host_db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    let host_store = Store::initialize(&host_db).unwrap();
+    let local = LocalWorker {
+        name: "guest".into(),
+        created_at: 1.0,
+    };
+    let mut inbox = GuestInbox::new(&guest_db, &binding, &local).unwrap();
+    let peer = TeamPeer {
+        name: "host".into(),
+        alias: None,
+        generation: host_recipient_generation(host_db.conn(), "host", 2.0).unwrap(),
+    };
+    let retired = TeamPeer {
+        name: "other.realm".into(),
+        alias: Some("other".into()),
+        generation: "two".into(),
+    };
+
+    let stored = || {
+        let raw: String = guest_db
+            .conn()
+            .query_row(
+                "SELECT peers FROM sandbox_guest_directory WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str::<Vec<TeamPeer>>(&raw).unwrap()
+    };
+    let handshake =
+        |inbox: &mut GuestInbox<'_>, epoch, peers: Option<Vec<TeamPeer>>| -> Result<()> {
+            let mut host = Peer::new(
+                &host_store,
+                &binding,
+                epoch,
+                Receiver::Host,
+                None,
+                Default::default(),
+                peers,
+            )?;
+            let mut guest = Peer::new(
+                &guest_store,
+                &binding,
+                epoch,
+                Receiver::Guest,
+                None,
+                Default::default(),
+                None,
+            )?;
+            let mut hello = Vec::new();
+            while host.write_step(&mut hello)? {}
+            let mut input = hello.as_slice();
+            while !input.is_empty() {
+                guest.read_step(&mut input, inbox)?;
+            }
+            ensure!(
+                guest.is_ready(),
+                "guest did not finish its directory handshake"
+            );
+            let mut ack = Vec::new();
+            while guest.write_step(&mut ack)? {}
+            let mut input = ack.as_slice();
+            while !input.is_empty() {
+                host.read_step(&mut input, &mut super::super::stage_guest_message)?;
+            }
+            assert!(host.is_ready());
+            Ok(())
+        };
+    handshake(&mut inbox, 1, Some(vec![peer.clone(), retired.clone()])).unwrap();
+    assert_eq!(stored(), vec![peer.clone(), retired]);
+    handshake(&mut inbox, 2, Some(vec![peer.clone()])).unwrap();
+    assert_eq!(stored(), vec![peer.clone()]);
+    handshake(&mut inbox, 3, None).unwrap();
+    assert!(stored().is_empty());
+    handshake(&mut inbox, 4, Some(vec![peer.clone()])).unwrap();
+
+    guest_db
+        .conn()
+        .execute(
+            "UPDATE instances SET created_at = 2 WHERE name = 'guest'",
+            [],
+        )
+        .unwrap();
+    let local_replacement = LocalWorker {
+        name: "guest".into(),
+        created_at: 2.0,
+    };
+    let mut replacement = GuestInbox::new(&guest_db, &binding, &local_replacement).unwrap();
+    assert!(handshake(&mut replacement, 5, None).is_err());
+    assert_eq!(stored(), vec![peer]);
 }

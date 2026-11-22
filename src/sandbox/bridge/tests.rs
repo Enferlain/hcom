@@ -74,6 +74,7 @@ impl Fixture {
                 drain: Duration::from_millis(350),
                 ..Limits::default()
             },
+            None,
         )?;
         let mut shell = Command::new("/bin/sh");
         shell
@@ -112,6 +113,7 @@ impl Fixture {
             epoch,
             FrameBody::Hello {
                 max_frame_bytes: MAX_ENCODED_FRAME,
+                directory: None,
             },
         )
     }

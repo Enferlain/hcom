@@ -6,8 +6,8 @@ use anyhow::{Result, ensure};
 
 use crate::sandbox::openshell::ROTATION_BYTES;
 use crate::sandbox::protocol::{
-    Binding, Connection, Frame, FrameBody, MAX_ENCODED_FRAME, MessageId, Receiver, VERSION,
-    write_frame,
+    Binding, Connection, Frame, FrameBody, MAX_ENCODED_FRAME, MessageId, Receiver, TeamPeer,
+    VERSION, write_frame,
 };
 use crate::sandbox::store::{Import, Store};
 use crate::shared::time::now_epoch_i64;
@@ -90,6 +90,7 @@ impl<'store, 'db> Peer<'store, 'db> {
         receiver: Receiver,
         input_limit: Option<u64>,
         limits: Limits,
+        directory: Option<Vec<TeamPeer>>,
     ) -> Result<Self> {
         let now = Instant::now();
         let mut peer = Self {
@@ -120,7 +121,7 @@ impl<'store, 'db> Peer<'store, 'db> {
         };
         if matches!(receiver, Receiver::Host) {
             peer.attach()?;
-            peer.queue_hello()?;
+            peer.queue_hello(directory)?;
         }
         Ok(peer)
     }
@@ -183,9 +184,10 @@ impl<'store, 'db> Peer<'store, 'db> {
         Ok(())
     }
 
-    fn queue_hello(&mut self) -> Result<()> {
+    fn queue_hello(&mut self, directory: Option<Vec<TeamPeer>>) -> Result<()> {
         let bytes = self.encode(FrameBody::Hello {
             max_frame_bytes: MAX_ENCODED_FRAME,
+            directory,
         })?;
         self.queue(WriteKind::Hello, bytes)
     }
@@ -334,10 +336,12 @@ impl<'store, 'db> Peer<'store, 'db> {
     }
 
     fn handle(&mut self, body: FrameBody, import: &mut impl Inbound) -> Result<()> {
-        if matches!(body, FrameBody::Hello { .. }) {
+        if let FrameBody::Hello { directory, .. } = body {
             if matches!(self.receiver, Receiver::Guest) {
                 self.attach()?;
-                self.queue_hello()?;
+                let store = self.attached.as_ref().expect("handshake attaches bridge");
+                store.write(|tx| import.replace_directory(tx, directory.as_deref()))?;
+                self.queue_hello(None)?;
             }
             self.ready = true;
             return Ok(());

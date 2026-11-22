@@ -2053,7 +2053,14 @@ mod tests {
                 },
                 MessagePayload {
                     target: "luna".into(),
-                    target_generation: Some("host-3ff0000000000000".into()),
+                    target_generation: Some(
+                        crate::sandbox::directory::host_recipient_generation(
+                            db.conn(),
+                            "luna",
+                            1.0,
+                        )
+                        .unwrap(),
+                    ),
                     thread: Some("work".into()),
                     reply_to: None,
                     intent: Intent::Request,

@@ -3,8 +3,8 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 
 use crate::db::HcomDb;
-use crate::sandbox::directory::host_generation;
-use crate::sandbox::protocol::{Binding, Message, MessageId, validate_identifier};
+use crate::sandbox::directory::host_recipient_generation;
+use crate::sandbox::protocol::{Binding, Message, MessageId, TeamPeer, validate_identifier};
 use crate::sandbox::store::{ForwardRoute, Store};
 use crate::shared::time::now_epoch_i64;
 
@@ -83,7 +83,7 @@ impl Inbound for HostInbox<'_, '_> {
         let local_created_at =
             local_created_at.context("sandbox message target is outside the team")?;
         ensure!(
-            host_generation(local_created_at) == target_generation,
+            host_recipient_generation(tx, target, local_created_at)? == target_generation,
             "sandbox message target generation is stale"
         );
         self.inbox
@@ -118,6 +118,17 @@ impl<'a> GuestInbox<'a> {
             worker,
         })
     }
+
+    fn check_local_worker(&self, tx: &Transaction<'_>) -> Result<()> {
+        let local: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM instances WHERE name = ? AND created_at = ?
+              AND COALESCE(origin_device_id, '') = '')",
+            params![self.worker.name, self.worker.created_at],
+            |row| row.get(0),
+        )?;
+        ensure!(local, "sandbox guest inbox worker is missing");
+        Ok(())
+    }
 }
 
 impl Inbound for GuestInbox<'_> {
@@ -126,19 +137,38 @@ impl Inbound for GuestInbox<'_> {
             message.payload.addresses(&self.binding.worker),
             "sandbox delivery target mismatch"
         );
-        let local: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM instances WHERE name = ? AND created_at = ?
-              AND COALESCE(origin_device_id, '') = '')",
-            params![self.worker.name, self.worker.created_at],
-            |row| row.get(0),
-        )?;
-        ensure!(local, "sandbox guest inbox worker is missing");
+        self.check_local_worker(tx)?;
         self.inbox
             .insert(tx, &self.binding.team, &self.worker.name, true, message)
     }
 
     fn committed(&mut self, event_id: i64) {
         self.inbox.publish(event_id);
+    }
+
+    fn replace_directory(
+        &mut self,
+        tx: &Transaction<'_>,
+        peers: Option<&[TeamPeer]>,
+    ) -> Result<()> {
+        self.check_local_worker(tx)?;
+        let changed = tx.execute(
+            "INSERT INTO sandbox_guest_directory VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(singleton) DO UPDATE SET peers = excluded.peers
+             WHERE binding = excluded.binding AND local_name = excluded.local_name
+               AND local_created_at = excluded.local_created_at",
+            params![
+                serde_json::to_string(self.binding)?,
+                self.worker.name,
+                self.worker.created_at,
+                serde_json::to_string(peers.unwrap_or_default())?,
+            ],
+        )?;
+        ensure!(
+            changed == 1,
+            "sandbox guest directory does not match its existing enrollment"
+        );
+        Ok(())
     }
 }
 

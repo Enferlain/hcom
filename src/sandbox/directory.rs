@@ -44,6 +44,18 @@ pub(super) const SCHEMA: &str = "
         ON sandbox_workers(name);
     CREATE INDEX IF NOT EXISTS sandbox_workers_team_alias
         ON sandbox_workers(team, alias) WHERE retired = 0;
+    CREATE TABLE IF NOT EXISTS sandbox_guest_directory (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        binding TEXT NOT NULL,
+        local_name TEXT NOT NULL,
+        local_created_at REAL NOT NULL,
+        peers TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS sandbox_directory_key (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        secret BLOB NOT NULL CHECK (length(secret) = 32)
+    ) STRICT;
+    INSERT OR IGNORE INTO sandbox_directory_key VALUES (1, randomblob(32));
 ";
 
 /// Captured from the resolved local hcom identity, then rechecked in every
@@ -51,6 +63,74 @@ pub(super) const SCHEMA: &str = "
 pub struct HostIdentity {
     name: String,
     created_at: f64,
+}
+
+#[cfg(unix)]
+impl Store<'_> {
+    pub(super) fn snapshot_directory(
+        &self,
+        binding: &Binding,
+    ) -> Result<Option<Vec<super::protocol::TeamPeer>>> {
+        use super::protocol::{MAX_DIRECTORY_PEERS, TeamPeer};
+
+        // The complete snapshot, including authorization, uses one host transaction.
+        self.write(|tx| {
+            let active = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sandbox_workers WHERE binding = ? AND retired = 0)",
+                [serde_json::to_string(binding)?],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !active {
+                // Private transport fixtures have no directory enrollment.
+                return Ok(None);
+            }
+            let key = directory_key(tx)?;
+
+            let mut query = tx.prepare(
+                "SELECT w.name, w.alias, w.generation, NULL
+                 FROM sandbox_workers w JOIN instances i ON i.name = w.name
+                    AND i.origin_device_id = 'openshell:' || w.generation
+                 WHERE w.team = ?1 AND w.retired = 0 AND w.generation != ?2
+                 UNION ALL
+                 SELECT h.name, NULL, NULL, i.created_at
+                 FROM sandbox_team_hosts h JOIN instances i
+                    ON i.name = h.name AND i.created_at = h.created_at
+                 WHERE h.team = ?1 AND COALESCE(i.origin_device_id, '') = ''
+                 ORDER BY 1 LIMIT ?3",
+            )?;
+            let peers = query
+                .query_map(
+                    params![
+                        binding.team,
+                        binding.worker.generation,
+                        (MAX_DIRECTORY_PEERS + 1) as i64
+                    ],
+                    |row| {
+                        let generation = match row.get::<_, Option<String>>(2)? {
+                            Some(generation) => generation,
+                            None => {
+                                recipient_generation(&key, &row.get::<_, String>(0)?, row.get(3)?)
+                            }
+                        };
+                        Ok(TeamPeer {
+                            name: row.get(0)?,
+                            alias: row.get(1)?,
+                            generation,
+                        })
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if peers.len() > MAX_DIRECTORY_PEERS {
+                crate::log::log_warn(
+                    "sandbox",
+                    "directory.unavailable",
+                    "Existing team exceeds the directory peer limit",
+                );
+                return Ok(None);
+            }
+            Ok(Some(peers))
+        })
+    }
 }
 
 impl HostIdentity {
@@ -222,6 +302,7 @@ impl Store<'_> {
                     now_epoch_f64(),
                 ],
             )?;
+            check_team_member_limit(tx, team)?;
             Ok(Worker {
                 alias: alias.into(),
                 binding,
@@ -290,10 +371,29 @@ impl Store<'_> {
 }
 
 fn add_host(conn: &Connection, team: &str, host: &HostIdentity) -> Result<()> {
-    conn.execute(
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO sandbox_team_hosts VALUES (?, ?, ?)",
         params![team, host.name, host.created_at],
     )?;
+    if inserted != 0 {
+        check_team_member_limit(conn, team)?;
+    }
+    Ok(())
+}
+
+fn check_team_member_limit(conn: &Connection, team: &str) -> Result<()> {
+    let members: i64 = conn.query_row(
+        "SELECT (SELECT count(*) FROM sandbox_workers WHERE team = ?1 AND retired = 0)
+              + (SELECT count(*) FROM sandbox_team_hosts h JOIN instances i
+                   ON i.name = h.name AND i.created_at = h.created_at
+                 WHERE h.team = ?1 AND COALESCE(i.origin_device_id, '') = '')",
+        [team],
+        |row| row.get(0),
+    )?;
+    ensure!(
+        members <= (super::protocol::MAX_DIRECTORY_PEERS + 1) as i64,
+        "sandbox team member limit reached"
+    );
     Ok(())
 }
 
@@ -445,6 +545,41 @@ pub(super) fn host_generation(created_at: f64) -> String {
     format!("host-{:016x}", created_at.to_bits())
 }
 
+#[cfg(unix)]
+fn directory_key(conn: &Connection) -> Result<Vec<u8>> {
+    Ok(conn.query_row(
+        "SELECT secret FROM sandbox_directory_key WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+#[cfg(unix)]
+fn recipient_generation(key: &[u8], name: &str, created_at: f64) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(b"hcom sandbox host recipient\0");
+    digest.update(name.as_bytes());
+    digest.update(created_at.to_bits().to_be_bytes());
+    digest.update(key);
+    format!("recipient-{}", URL_SAFE_NO_PAD.encode(digest.finalize()))
+}
+
+#[cfg(unix)]
+pub(crate) fn host_recipient_generation(
+    conn: &Connection,
+    name: &str,
+    created_at: f64,
+) -> Result<String> {
+    Ok(recipient_generation(
+        &directory_key(conn)?,
+        name,
+        created_at,
+    ))
+}
+
 fn has_directory(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sandbox_workers')",
@@ -536,6 +671,75 @@ mod tests {
             sandbox,
             incarnation: "fedc8acb-cc62-422d-9724-54e730e64f6e",
         }
+    }
+
+    #[test]
+    fn team_capacity_is_shared_by_host_enrollment_and_guest_reservations() {
+        let fixture = Fixture::new();
+        let owner = fixture.host("owner", 1.0);
+        let joining = fixture.host("joining", 2.0);
+        let store = fixture.store();
+        let team = store.create_team(Some(&owner)).unwrap();
+        let access = Access::Host(&owner);
+        let conn = fixture.db.conn();
+        let fill = super::super::protocol::MAX_DIRECTORY_PEERS as i64 - 1;
+        conn.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?)
+             INSERT INTO instances(name, created_at) SELECT 'filler_' || i, 3 FROM n",
+            [fill],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sandbox_team_hosts SELECT ?1, name, created_at FROM instances
+             WHERE created_at = 3",
+            [&team.id],
+        )
+        .unwrap();
+        let worker = store
+            .reserve_worker(&team.id, access, "worker", Tool::Codex, placement("last"))
+            .unwrap();
+        assert!(store.enroll_host(&team.id, access, &joining).is_err());
+        assert!(
+            store
+                .reserve_worker(
+                    &team.id,
+                    access,
+                    "overflow",
+                    Tool::Claude,
+                    placement("extra")
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .resolve_worker(&team.id, access, "overflow")
+                .unwrap()
+                .is_none()
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                store
+                    .snapshot_directory(&worker.binding)
+                    .unwrap()
+                    .unwrap()
+                    .len(),
+                fill as usize + 1
+            );
+            conn.execute(
+                "INSERT INTO sandbox_team_hosts VALUES (?1, 'joining', 2)",
+                [&team.id],
+            )
+            .unwrap();
+            assert!(store.snapshot_directory(&worker.binding).unwrap().is_none());
+            conn.execute(
+                "DELETE FROM sandbox_team_hosts WHERE team=?1 AND name='joining'",
+                [&team.id],
+            )
+            .unwrap();
+        }
+        store.retire_worker(access, &worker.binding).unwrap();
+        store.enroll_host(&team.id, access, &joining).unwrap();
     }
 
     #[test]

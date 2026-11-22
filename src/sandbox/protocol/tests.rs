@@ -3,6 +3,7 @@ use super::*;
 fn hello_body() -> FrameBody {
     FrameBody::Hello {
         max_frame_bytes: MAX_ENCODED_FRAME,
+        directory: None,
     }
 }
 
@@ -66,6 +67,60 @@ fn recipient_generation_is_in_the_digest_and_checked_against_delivery_binding() 
     assert!(validate_message_size(Receiver::Guest, &binding, &stale).is_err());
     payload.target_generation = Some("bad generation".into());
     assert!(Message::new(old.id, payload).is_err());
+}
+
+#[test]
+fn directory_handshake_is_host_only_and_rejects_duplicate_targets() {
+    let (binding, _) = fixture();
+    let entry = TeamPeer {
+        name: "host".into(),
+        alias: None,
+        generation: "host-generation".into(),
+    };
+    let mut frame = Frame {
+        version: VERSION,
+        epoch: 1,
+        binding: binding.clone(),
+        body: FrameBody::Hello {
+            max_frame_bytes: MAX_ENCODED_FRAME,
+            directory: Some(vec![entry.clone()]),
+        },
+    };
+    assert!(
+        Connection::new(binding.clone(), 1, Receiver::Guest)
+            .unwrap()
+            .accept(frame.clone(), 1)
+            .is_ok()
+    );
+    assert!(
+        Connection::new(binding.clone(), 1, Receiver::Host)
+            .unwrap()
+            .accept(frame.clone(), 1)
+            .is_err()
+    );
+    frame.body = FrameBody::Hello {
+        max_frame_bytes: MAX_ENCODED_FRAME,
+        directory: Some(vec![entry.clone(), entry]),
+    };
+    assert!(write_frame(&mut Vec::new(), &frame).is_err());
+    frame.body = FrameBody::Hello {
+        max_frame_bytes: MAX_ENCODED_FRAME,
+        directory: Some(
+            (0..=MAX_DIRECTORY_PEERS)
+                .map(|index| TeamPeer {
+                    name: format!("peer_{index}"),
+                    alias: None,
+                    generation: "generation".into(),
+                })
+                .collect(),
+        ),
+    };
+    assert!(
+        write_frame(&mut Vec::new(), &frame)
+            .unwrap_err()
+            .to_string()
+            .contains("peer limit")
+    );
 }
 
 #[test]
@@ -157,6 +212,7 @@ fn invalid_frames_cannot_begin_or_change_a_binding() {
     incorrect = hello.clone();
     incorrect.body = FrameBody::Hello {
         max_frame_bytes: MAX_ENCODED_FRAME / 2,
+        directory: None,
     };
     assert!(
         Connection::new(binding.clone(), 2, Receiver::Host)

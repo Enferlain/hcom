@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{ErrorKind, Read, Write};
 
 use anyhow::{Result, ensure};
@@ -8,6 +9,7 @@ use uuid::Uuid;
 pub const VERSION: u32 = 1;
 pub const MAX_ENCODED_FRAME: u32 = 256 * 1024;
 const HEADER_LEN: u32 = 4;
+pub(super) const MAX_DIRECTORY_PEERS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,6 +151,15 @@ impl Binding {
     }
 }
 
+/// Only the routing fields a guest needs. Host and sandbox internals stay host-side.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamPeer {
+    pub name: String,
+    pub alias: Option<String>,
+    pub generation: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -160,6 +171,8 @@ pub enum FrameBody {
     /// Version 1 peers agree on one frame limit, including the length prefix.
     Hello {
         max_frame_bytes: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directory: Option<Vec<TeamPeer>>,
     },
     Send(Message),
     Deliver(Message),
@@ -203,11 +216,35 @@ impl Frame {
                 message.validate()
             }
             FrameBody::Accepted { id, .. } => id.validate(),
-            FrameBody::Hello { max_frame_bytes } => {
+            FrameBody::Hello {
+                max_frame_bytes,
+                directory,
+            } => {
                 ensure!(
                     *max_frame_bytes == MAX_ENCODED_FRAME,
                     "incompatible sandbox frame limit"
                 );
+                if let Some(peers) = directory {
+                    ensure!(
+                        peers.len() <= MAX_DIRECTORY_PEERS,
+                        "sandbox directory exceeds peer limit"
+                    );
+                    let mut names = HashSet::new();
+                    for peer in peers {
+                        validate_identifier(&peer.name)?;
+                        validate_identifier(&peer.generation)?;
+                        if let Some(alias) = &peer.alias {
+                            ensure!(
+                                alias.len() <= 24 && crate::identity::is_valid_base_name(alias),
+                                "invalid sandbox directory alias"
+                            );
+                        }
+                        ensure!(
+                            peer.name != self.binding.worker.worker && names.insert(&peer.name),
+                            "sandbox directory contains a self or duplicate target"
+                        );
+                    }
+                }
                 Ok(())
             }
             FrameBody::Close => Ok(()),
@@ -346,6 +383,14 @@ impl Connection {
             "sandbox handshake out of order"
         );
         match (&self.receiver, &frame.body) {
+            (
+                Receiver::Host,
+                FrameBody::Hello {
+                    directory: Some(_), ..
+                },
+            ) => {
+                anyhow::bail!("guest cannot publish a sandbox team directory");
+            }
             (Receiver::Host, FrameBody::Deliver(_)) | (Receiver::Guest, FrameBody::Send(_)) => {
                 anyhow::bail!("sandbox frame direction mismatch");
             }
