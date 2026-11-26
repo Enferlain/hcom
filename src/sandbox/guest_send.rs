@@ -18,10 +18,27 @@ struct Enrollment {
     peers: Vec<TeamPeer>,
 }
 
-pub(crate) struct Target {
-    binding: Binding,
-    requested: String,
-    peer: TeamPeer,
+pub(crate) enum Target {
+    Direct {
+        binding: Binding,
+        requested: String,
+        peer: TeamPeer,
+    },
+    Broadcast {
+        binding: Binding,
+    },
+}
+
+impl Target {
+    pub(crate) fn is_broadcast(&self) -> bool {
+        matches!(self, Self::Broadcast { .. })
+    }
+
+    fn binding(&self) -> &Binding {
+        match self {
+            Self::Direct { binding, .. } | Self::Broadcast { binding } => binding,
+        }
+    }
 }
 
 impl Enrollment {
@@ -116,15 +133,36 @@ pub(crate) fn resolve(
     db: &HcomDb,
     sender: &SenderIdentity,
     targets: Option<&[String]>,
+    broadcast: bool,
+    thread: Option<&str>,
+    has_reply_to: bool,
 ) -> Result<Option<Target>> {
     let Some(enrollment) = Enrollment::read(db.conn())? else {
         return Ok(None);
     };
     enrollment.check_sender(db.conn(), sender)?;
+    if broadcast {
+        ensure!(
+            thread.is_none() && targets.is_none_or(|t| t.is_empty()),
+            "--broadcast cannot be combined with agent targets or --thread"
+        );
+        ensure!(
+            !has_reply_to,
+            "--broadcast cannot be combined with --reply-to in a sandbox"
+        );
+        return Ok(Some(Target::Broadcast {
+            binding: enrollment.binding,
+        }));
+    }
+    if thread.is_none() && targets.is_none_or(|t| t.is_empty()) {
+        anyhow::bail!(
+            "Refusing implicit broadcast: no explicit recipient was resolved.\nTarget an agent with @name, reuse a seeded --thread, or add --broadcast."
+        );
+    }
     let Some([requested]) = targets else {
         anyhow::bail!("Target one sandbox team member explicitly");
     };
-    Ok(Some(Target {
+    Ok(Some(Target::Direct {
         peer: enrollment.resolve(requested)?.clone(),
         binding: enrollment.binding,
         requested: requested.clone(),
@@ -149,16 +187,30 @@ pub(crate) fn queue(
         envelope.reply_to.is_none() || reply_event.is_some(),
         "sandbox reply event was not found"
     );
+    let binding = target.binding();
+    if target.is_broadcast() {
+        ensure!(
+            envelope.thread.is_none(),
+            "--broadcast cannot be combined with agent targets or --thread"
+        );
+        ensure!(
+            envelope.reply_to.is_none() && reply_event.is_none(),
+            "--broadcast cannot be combined with --reply-to in a sandbox"
+        );
+    }
 
     let store = Store::initialize(db)?;
     let parent = |conn: &Connection| -> Result<Option<MessageId>> {
         let Some(event_id) = reply_event else {
             return Ok(None);
         };
+        let Target::Direct { binding, peer, .. } = target else {
+            anyhow::bail!("--broadcast cannot be combined with --reply-to in a sandbox");
+        };
         let raw: String = conn.query_row(
             "SELECT data FROM events WHERE id = ?1 AND type = 'message'
              AND json_extract(data, '$._sandbox.team') = ?2 AND json_extract(data, '$.thread') IS ?3",
-            rusqlite::params![event_id, target.binding.team, envelope.thread],
+            rusqlite::params![event_id, binding.team, envelope.thread],
             |row| row.get(0),
         ).optional()?.context("sandbox reply is not in this conversation")?;
         let data: Value = serde_json::from_str(&raw)?;
@@ -168,34 +220,47 @@ pub(crate) fn queue(
                 .as_array()
                 .is_some_and(|items| items.iter().any(|value| value.as_str() == Some(name)))
         };
-        let current_peer = if id.origin == target.binding.worker {
-            contains("queued_to", &target.peer.name)
-                && data["_sandbox"]["target_generation"].as_str() == Some(&target.peer.generation)
+        let valid_parent = if id.origin == binding.worker {
+            contains("queued_to", &peer.name)
+                && data["_sandbox"]["target_generation"].as_str() == Some(&peer.generation)
         } else {
-            let generation = if target.peer.alias.is_some() {
+            let generation = if peer.alias.is_some() {
                 Some(id.origin.generation.as_str())
             } else {
                 data["_sandbox"]["sender_routing_generation"].as_str()
             };
-            id.origin.worker == target.peer.name
+            id.origin.worker == peer.name
                 && contains("delivered_to", &sender.name)
-                && generation == Some(&target.peer.generation)
+                && generation == Some(&peer.generation)
         };
-        ensure!(current_peer, "sandbox reply is not in this conversation");
+        ensure!(valid_parent, "sandbox reply is not in this conversation");
         ensure!(
             intent != Intent::Ack || !matches!(data["intent"].as_str(), Some("ack" | "inform")),
             "sandbox acknowledgment cannot reply to an acknowledgment or inform"
         );
         Ok(Some(id))
     };
-    let payload = MessagePayload {
-        target: target.peer.name.clone(),
-        target_generation: Some(target.peer.generation.clone()),
-        sender_routing_generation: None,
-        thread: envelope.thread.clone(),
-        reply_to: parent(db.conn())?,
-        intent,
-        text,
+    let payload = match target {
+        Target::Direct { peer, .. } => MessagePayload {
+            target: peer.name.clone(),
+            target_generation: Some(peer.generation.clone()),
+            sender_routing_generation: None,
+            broadcast: false,
+            thread: envelope.thread.clone(),
+            reply_to: parent(db.conn())?,
+            intent,
+            text,
+        },
+        Target::Broadcast { .. } => MessagePayload {
+            target: String::new(),
+            target_generation: None,
+            sender_routing_generation: None,
+            broadcast: true,
+            thread: None,
+            reply_to: None,
+            intent,
+            text,
+        },
     };
     let now = now_epoch_i64();
     // The private guest store has no host controller to reclaim expired slots.
@@ -203,37 +268,61 @@ pub(crate) fn queue(
     let mut event_id = 0;
     store.enqueue(
         Receiver::Host,
-        &target.binding,
-        target.binding.worker.clone(),
+        binding,
+        binding.worker.clone(),
         payload,
         now,
         |tx, message| {
             let current = Enrollment::read(tx)?.context("sandbox guest enrollment is missing")?;
             current.check_sender(tx, sender)?;
             ensure!(
-                current.binding == target.binding
-                    && current.resolve(&target.requested)? == &target.peer,
-                "sandbox directory target changed during enqueue"
+                current.binding == *binding,
+                "sandbox directory binding changed during enqueue"
             );
             ensure!(
                 parent(tx)? == message.payload.reply_to,
                 "sandbox reply changed during enqueue"
             );
-            let mut data = json!({
-                "from": sender.name,
-                "sender_kind": "instance",
-                "scope": "mentions",
-                "text": message.payload.text,
-                "mentions": [],
-                "delivered_to": [],
-                "queued_to": [target.peer.name],
-                "intent": intent,
-                "_sandbox": {
-                    "team": target.binding.team,
-                    "id": message.id,
-                    "target_generation": target.peer.generation,
-                },
-            });
+            let mut data = match target {
+                Target::Direct {
+                    requested, peer, ..
+                } => {
+                    ensure!(
+                        current.resolve(requested)? == peer,
+                        "sandbox directory target changed during enqueue"
+                    );
+                    json!({
+                        "from": sender.name,
+                        "sender_kind": "instance",
+                        "scope": "mentions",
+                        "text": message.payload.text,
+                        "mentions": [],
+                        "delivered_to": [],
+                        "queued_to": [peer.name],
+                        "intent": intent,
+                        "_sandbox": {
+                            "team": binding.team,
+                            "id": message.id,
+                            "target_generation": peer.generation,
+                        },
+                    })
+                }
+                Target::Broadcast { .. } => json!({
+                    "from": sender.name,
+                    "sender_kind": "instance",
+                    "scope": "mentions",
+                    "text": message.payload.text,
+                    "mentions": [],
+                    "delivered_to": [],
+                    "queued_to": [],
+                    "intent": intent,
+                    "_sandbox": {
+                        "team": binding.team,
+                        "id": message.id,
+                        "broadcast": true,
+                    },
+                }),
+            };
             if let Some(thread) = &envelope.thread {
                 data["thread"] = json!(thread);
             }
@@ -246,9 +335,15 @@ pub(crate) fn queue(
         },
     )?;
     crate::notify::wake_observers(db);
+    let (queued_to, display_target) = match target {
+        Target::Direct { peer, .. } => (vec![peer.name.clone()], peer.name.clone()),
+        Target::Broadcast { .. } => (Vec::new(), "team broadcast".to_string()),
+    };
     Ok(Queued {
         event_id,
-        target: target.peer.name.clone(),
+        queued_to,
+        display_target,
+        broadcast: target.is_broadcast(),
         forwarding: "pending",
         forwarding_reason: None,
     })

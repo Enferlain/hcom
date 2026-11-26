@@ -78,6 +78,9 @@ pub struct MessagePayload {
     /// for reply correlation. Guest senders use their bound origin generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_routing_generation: Option<String>,
+    /// Broadcast frames require matching builds. Directed payload digests remain stable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub broadcast: bool,
     pub thread: Option<String>,
     pub reply_to: Option<MessageId>,
     pub intent: Intent,
@@ -86,11 +89,15 @@ pub struct MessagePayload {
 
 impl MessagePayload {
     pub(super) fn addresses(&self, target: &Origin) -> bool {
-        self.target == target.worker
-            && self
-                .target_generation
-                .as_ref()
-                .is_none_or(|generation| generation == &target.generation)
+        if self.broadcast {
+            self.target.is_empty() && self.target_generation.is_none()
+        } else {
+            self.target == target.worker
+                && self
+                    .target_generation
+                    .as_ref()
+                    .is_none_or(|generation| generation == &target.generation)
+        }
     }
 }
 
@@ -119,9 +126,28 @@ impl Message {
         if let Some(reply) = &self.payload.reply_to {
             reply.validate()?;
         }
-        validate_identifier(&self.payload.target)?;
-        if let Some(generation) = &self.payload.target_generation {
-            validate_identifier(generation)?;
+        if self.payload.broadcast {
+            ensure!(
+                self.payload.target.is_empty(),
+                "sandbox broadcast cannot specify a target"
+            );
+            ensure!(
+                self.payload.target_generation.is_none(),
+                "sandbox broadcast cannot specify a target generation"
+            );
+            ensure!(
+                self.payload.thread.is_none(),
+                "sandbox broadcast cannot specify a thread"
+            );
+            ensure!(
+                self.payload.reply_to.is_none(),
+                "sandbox broadcast cannot specify a reply target"
+            );
+        } else {
+            validate_identifier(&self.payload.target)?;
+            if let Some(generation) = &self.payload.target_generation {
+                validate_identifier(generation)?;
+            }
         }
         if let Some(generation) = &self.payload.sender_routing_generation {
             validate_identifier(generation)?;

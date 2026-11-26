@@ -81,6 +81,38 @@ pub fn wake_all(db: &HcomDb) {
 /// loops are woken specifically, while observer loops across all instances
 /// are woken so they can process the newly logged event.
 pub fn wake_observers(db: &HcomDb) {
+    let ports = observer_ports(db);
+    wake_ports(&ports, WAKE_FANOUT_MS);
+}
+
+/// Wake ordinary instance-loop endpoints for `instances` together with all
+/// observer endpoints in a single bounded fan-out.
+pub fn wake_instances_and_observers(db: &HcomDb, instances: &[String]) {
+    let mut ports = observer_ports(db);
+    if !instances.is_empty() {
+        let placeholders = vec!["?"; instances.len()].join(",");
+        let sql = format!(
+            "SELECT DISTINCT port FROM notify_endpoints \
+             WHERE port > 0 AND kind IN ({}) AND instance IN ({placeholders})",
+            wake_kinds_sql_list()
+        );
+        if let Ok(mut stmt) = db.conn().prepare(&sql) {
+            let params = rusqlite::params_from_iter(instances.iter().map(String::as_str));
+            if let Ok(rows) = stmt.query_map(params, |row| row.get::<_, i64>(0)) {
+                ports.extend(
+                    rows.filter_map(|r| r.ok())
+                        .filter_map(|p| u16::try_from(p).ok())
+                        .filter(|p| *p > 0),
+                );
+            }
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    wake_ports(&ports, WAKE_FANOUT_MS);
+}
+
+fn observer_ports(db: &HcomDb) -> Vec<u16> {
     let kinds = [
         WakeKind::EventsWait,
         WakeKind::EventsStream,
@@ -96,20 +128,17 @@ pub fn wake_observers(db: &HcomDb) {
          WHERE port > 0 AND kind IN ({kinds_sql})"
     );
     let Ok(mut stmt) = db.conn().prepare(&sql) else {
-        return;
+        return Vec::new();
     };
 
-    let ports: Vec<u16> = stmt
-        .query_map([], |row| row.get::<_, i64>(0))
+    stmt.query_map([], |row| row.get::<_, i64>(0))
         .ok()
         .into_iter()
         .flatten()
         .filter_map(|r| r.ok())
         .filter_map(|p| u16::try_from(p).ok())
         .filter(|p| *p > 0)
-        .collect();
-
-    wake_ports(&ports, WAKE_FANOUT_MS);
+        .collect()
 }
 
 /// Wake launch confirmations for this batch, including aggregate waiters.

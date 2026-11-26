@@ -960,6 +960,7 @@ mod tests {
                 target: "host".into(),
                 target_generation: None,
                 sender_routing_generation: None,
+                broadcast: false,
                 thread: None,
                 reply_to: None,
                 intent: super::super::protocol::Intent::Inform,

@@ -295,13 +295,26 @@ fn resolve_delivery(
     message: &str,
     envelope: Option<&MessageEnvelope>,
     explicit_targets: Option<&[String]>,
+    broadcast: bool,
 ) -> Result<ResolvedDelivery, String> {
-    if let Some(target) = crate::sandbox::guest_send::resolve(db, identity, explicit_targets)
-        .map_err(|error| format!("{error:#}"))?
+    if let Some(target) = crate::sandbox::guest_send::resolve(
+        db,
+        identity,
+        explicit_targets,
+        broadcast,
+        envelope.and_then(|env| env.thread.as_deref()),
+        envelope.and_then(|env| env.reply_to.as_ref()).is_some(),
+    )
+    .map_err(|error| format!("{error:#}"))?
     {
+        let original_scope = if target.is_broadcast() {
+            MessageScope::Broadcast
+        } else {
+            MessageScope::Mentions
+        };
         return Ok(ResolvedDelivery {
-            original_scope: MessageScope::Mentions,
-            effective_scope: MessageScope::Mentions,
+            original_scope,
+            effective_scope: original_scope,
             effective_mentions: Vec::new(),
             delivered_to: Vec::new(),
             is_thread_resolved: false,
@@ -476,7 +489,7 @@ pub fn send_message(
 ) -> Result<(i64, Vec<String>), String> {
     validate_message(message)?;
 
-    let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets)?;
+    let delivery = resolve_delivery(db, identity, message, envelope, explicit_targets, false)?;
     if delivery.sandbox_target.is_some() {
         return Err("Sandbox targets require the sandbox send path".into());
     }
@@ -1145,6 +1158,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             None
         },
         targets_to_pass,
+        args.broadcast,
     ) {
         Ok(delivery) => delivery,
         Err(e) => {
@@ -1376,7 +1390,10 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             "delivered_to": delivered_to,
         });
         if let Some(queued) = &queued {
-            out["queued_to"] = serde_json::json!([queued.target]);
+            out["queued_to"] = serde_json::json!(queued.queued_to);
+            if queued.broadcast {
+                out["scope"] = serde_json::json!("broadcast");
+            }
             out["forwarding"] = serde_json::json!(queued.forwarding);
             if let Some(reason) = &queued.forwarding_reason {
                 out["forwarding_reason"] = serde_json::json!(reason);
@@ -1399,7 +1416,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     let feedback = if let Some(queued) = &queued {
         let mut feedback = format!(
             "Queued for: {} (forwarding {})",
-            queued.target, queued.forwarding
+            queued.display_target, queued.forwarding
         );
         if let Some(reason) = &queued.forwarding_reason {
             feedback.push_str(&format!("\n{reason}"));
@@ -2095,6 +2112,7 @@ mod tests {
                     sender_routing_generation: None,
                     thread: Some("work".into()),
                     reply_to: None,
+                    broadcast: false,
                     intent: Intent::Request,
                     text: "from guest".into(),
                 },
@@ -2187,7 +2205,7 @@ mod tests {
             )
             .unwrap();
         let sender = identity::resolve_from_name(&db, "luna").unwrap();
-        let ordinary = resolve_delivery(&db, &sender, "hello", None, Some(&[])).unwrap();
+        let ordinary = resolve_delivery(&db, &sender, "hello", None, Some(&[]), false).unwrap();
         let store = Store::initialize(&db).unwrap();
         let team = store.create_team(None).unwrap();
         let controller = team.external_controller.unwrap();
@@ -2205,7 +2223,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let with_sandbox = resolve_delivery(&db, &sender, "hello", None, Some(&[])).unwrap();
+        let with_sandbox = resolve_delivery(&db, &sender, "hello", None, Some(&[]), false).unwrap();
         assert_eq!(ordinary.delivered_to, ["nova"]);
         assert_eq!(with_sandbox.delivered_to, ordinary.delivered_to);
         let name = worker.binding.worker.worker;

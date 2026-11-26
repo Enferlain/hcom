@@ -280,6 +280,7 @@ fn payload(target: &str, character: char) -> MessagePayload {
         target: target.into(),
         target_generation: None,
         sender_routing_generation: None,
+        broadcast: false,
         thread: None,
         reply_to: None,
         intent: Intent::Inform,

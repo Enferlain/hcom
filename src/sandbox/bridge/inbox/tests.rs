@@ -14,6 +14,7 @@ fn message(origin: Origin, sequence: i64, target: &str) -> Message {
             target: target.into(),
             target_generation: None,
             sender_routing_generation: None,
+            broadcast: false,
             thread: Some("thread".into()),
             reply_to: None,
             intent: Intent::Request,
@@ -929,4 +930,1099 @@ fn ordinary_guest_send_uses_the_directory_and_replies_to_the_bound_host() {
         1
     );
     assert_eq!(guest_db.get_last_event_id(), before);
+}
+
+fn broadcast_msg(origin: Origin, sequence: i64, text: &str) -> Message {
+    Message::new(
+        MessageId { origin, sequence },
+        MessagePayload {
+            target: String::new(),
+            target_generation: None,
+            sender_routing_generation: None,
+            broadcast: true,
+            thread: None,
+            reply_to: None,
+            intent: Intent::Inform,
+            text: text.into(),
+        },
+    )
+    .unwrap()
+}
+
+fn deliver_all(
+    from: &mut super::super::peer::Peer<'_, '_>,
+    to: &mut super::super::peer::Peer<'_, '_>,
+    inbox: &mut impl Inbound,
+) {
+    let mut bytes = Vec::new();
+    while from.write_step(&mut bytes).unwrap() {}
+    let mut input = bytes.as_slice();
+    while !input.is_empty() {
+        to.read_step(&mut input, inbox).unwrap();
+    }
+}
+
+fn wake_listener(db: &HcomDb, name: &str, kind: &str) -> std::net::TcpListener {
+    let socket = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    socket.set_nonblocking(true).unwrap();
+    db.upsert_notify_endpoint(name, kind, socket.local_addr().unwrap().port())
+        .unwrap();
+    socket
+}
+
+fn run_cmd_send(db: &HcomDb, actor: &str, argv: &[&str]) -> i32 {
+    use clap::Parser;
+    let ctx = crate::shared::CommandContext {
+        explicit_name: None,
+        identity: Some(crate::identity::resolve_from_name(db, actor).unwrap()),
+        go: true,
+        identity_warning: None,
+    };
+    let mut args = crate::commands::send::SendArgs::try_parse_from(argv).unwrap();
+    args.had_separator = true;
+    crate::commands::send::cmd_send(db, &args, Some(&ctx))
+}
+
+struct GuestNode {
+    db: HcomDb,
+    worker: crate::sandbox::directory::Worker,
+    local: LocalWorker,
+}
+
+impl GuestNode {
+    fn new(
+        dir: &std::path::Path,
+        file: &str,
+        host_store: &Store<'_>,
+        team: &str,
+        access: Access<'_>,
+        alias: &str,
+        created_at: f64,
+    ) -> Self {
+        let db = HcomDb::open_at(&dir.join(file)).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, last_event_id) VALUES ('guest', ?, 0)",
+                [created_at],
+            )
+            .unwrap();
+        let store = Store::initialize(&db).unwrap();
+        let worker = host_store
+            .reserve_worker(
+                team,
+                access,
+                alias,
+                Tool::Claude,
+                Placement {
+                    gateway: "gateway",
+                    workspace: "default",
+                    sandbox: alias,
+                    incarnation: store.incarnation(),
+                },
+            )
+            .unwrap();
+        let local = LocalWorker {
+            name: "guest".into(),
+            created_at,
+        };
+        let mut inbox = GuestInbox::new(&db, &worker.binding, &local).unwrap();
+        let snapshot = host_store.snapshot_directory(&worker.binding).unwrap();
+        store
+            .attach_bridge(&worker.binding, 1)
+            .unwrap()
+            .write(|tx| inbox.replace_directory(tx, snapshot.as_deref()))
+            .unwrap();
+        Self { db, worker, local }
+    }
+
+    fn store(&self) -> Store<'_> {
+        Store::initialize(&self.db).unwrap()
+    }
+
+    fn inbox(&self) -> GuestInbox<'_> {
+        GuestInbox::new(&self.db, &self.worker.binding, &self.local).unwrap()
+    }
+
+    fn refresh_directory(&self, host_store: &Store<'_>, epoch: i64) {
+        let mut inbox = self.inbox();
+        let snapshot = host_store.snapshot_directory(&self.worker.binding).unwrap();
+        self.store()
+            .attach_bridge(&self.worker.binding, epoch)
+            .unwrap()
+            .write(|tx| inbox.replace_directory(tx, snapshot.as_deref()))
+            .unwrap();
+    }
+}
+
+fn bridge_step(
+    host_store: &Store<'_>,
+    guest: &GuestNode,
+    epoch: i64,
+    host_inbox: &mut HostInbox<'_, '_>,
+    drop_after_first: bool,
+    from_host: bool,
+) {
+    use super::super::peer::Peer;
+    let mut host_peer = Peer::new(
+        host_store,
+        &guest.worker.binding,
+        epoch,
+        Receiver::Host,
+        None,
+        Default::default(),
+        host_store
+            .snapshot_directory(&guest.worker.binding)
+            .unwrap(),
+    )
+    .unwrap();
+    let guest_store = guest.store();
+    let mut guest_peer = Peer::new(
+        &guest_store,
+        &guest.worker.binding,
+        epoch,
+        Receiver::Guest,
+        None,
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let mut guest_inbox = guest.inbox();
+    deliver_all(&mut host_peer, &mut guest_peer, &mut guest_inbox);
+    deliver_all(&mut guest_peer, &mut host_peer, host_inbox);
+    loop {
+        if from_host {
+            if !host_peer.poll_outbox().unwrap() {
+                break;
+            }
+            deliver_all(&mut host_peer, &mut guest_peer, &mut guest_inbox);
+            if drop_after_first {
+                assert!(guest_peer.receipt_pending());
+                break;
+            }
+            deliver_all(&mut guest_peer, &mut host_peer, host_inbox);
+        } else {
+            if !guest_peer.poll_outbox().unwrap() {
+                break;
+            }
+            deliver_all(&mut guest_peer, &mut host_peer, host_inbox);
+            if drop_after_first {
+                assert!(host_peer.receipt_pending());
+                break;
+            }
+            deliver_all(&mut host_peer, &mut guest_peer, &mut guest_inbox);
+        }
+    }
+}
+
+#[test]
+fn guest_broadcast_routes_to_bound_team_with_stable_ids_and_postcommit_wakes() {
+    let root = tempfile::tempdir().unwrap();
+    let host_db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    host_db
+        .conn()
+        .execute_batch(
+            "INSERT INTO instances (name, created_at) VALUES
+             ('host_a', 1), ('host_b', 2), ('outsider_host', 3), ('other_team_host', 4);
+             INSERT INTO instances (name, created_at, status) VALUES ('stopped_host', 5, 'stopped');",
+        )
+        .unwrap();
+    let host_store = Store::initialize(&host_db).unwrap();
+    let cap = |name| {
+        HostIdentity::capture(
+            &host_db,
+            &crate::identity::resolve_from_name(&host_db, name).unwrap(),
+        )
+        .unwrap()
+    };
+    let (owner, host_a, stopped_host, other_owner) = (
+        cap("host_b"),
+        cap("host_a"),
+        cap("stopped_host"),
+        cap("other_team_host"),
+    );
+    let team = host_store.create_team(Some(&owner)).unwrap();
+    host_store
+        .enroll_host(&team.id, Access::Host(&owner), &host_a)
+        .unwrap();
+    host_store
+        .enroll_host(&team.id, Access::Host(&owner), &stopped_host)
+        .unwrap();
+    let other_team = host_store.create_team(Some(&other_owner)).unwrap();
+
+    let guest_a = GuestNode::new(
+        root.path(),
+        "ga.db",
+        &host_store,
+        &team.id,
+        Access::Host(&owner),
+        "alpha",
+        10.0,
+    );
+    let guest_b = GuestNode::new(
+        root.path(),
+        "gb.db",
+        &host_store,
+        &team.id,
+        Access::Host(&owner),
+        "bravo",
+        20.0,
+    );
+    guest_b
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO instances (name, created_at, last_event_id) VALUES ('unrelated', 21, 0)",
+            [],
+        )
+        .unwrap();
+    let guest_c = GuestNode::new(
+        root.path(),
+        "gc.db",
+        &host_store,
+        &team.id,
+        Access::Host(&owner),
+        "charlie",
+        30.0,
+    );
+    guest_a.refresh_directory(&host_store, 2);
+    guest_b.refresh_directory(&host_store, 2);
+    guest_c.refresh_directory(&host_store, 2);
+    let retired = host_store
+        .reserve_worker(
+            &team.id,
+            Access::Host(&owner),
+            "retired",
+            Tool::Claude,
+            Placement {
+                gateway: "gateway",
+                workspace: "default",
+                sandbox: "vm-retired",
+                incarnation: &uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .unwrap();
+    host_store
+        .retire_worker(Access::Host(&owner), &retired.binding)
+        .unwrap();
+    let outside = host_store
+        .reserve_worker(
+            &other_team.id,
+            Access::Host(&other_owner),
+            "outsider",
+            Tool::Claude,
+            Placement {
+                gateway: "gateway",
+                workspace: "default",
+                sandbox: "vm-out",
+                incarnation: &uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .unwrap();
+
+    let host_a_wake = wake_listener(&host_db, "host_a", "pty");
+    let host_b_wake = wake_listener(&host_db, "host_b", "pty");
+    let host_b_inject = wake_listener(&host_db, "host_b", "inject");
+    let outsider_wake = wake_listener(&host_db, "outsider_host", "pty");
+    let stopped_wake = wake_listener(&host_db, "stopped_host", "pty");
+    let observer_wake = wake_listener(&host_db, "host_a", "events_stream");
+    let guest_b_wake = wake_listener(&guest_b.db, "guest", "pty");
+    let guest_c_wake = wake_listener(&guest_c.db, "guest", "pty");
+
+    // Enqueue broadcast 1 via guest_send API (verifying Queued feedback & CRLF->LF), then broadcast 2
+    // and direct message 3 via ordinary `hcom send` CLI.
+    let ga_id = crate::identity::resolve_from_name(&guest_a.db, "guest").unwrap();
+    let target =
+        crate::sandbox::guest_send::resolve(&guest_a.db, &ga_id, Some(&[]), true, None, false)
+            .unwrap()
+            .unwrap();
+    let queued = crate::sandbox::guest_send::queue(
+        &guest_a.db,
+        &ga_id,
+        &target,
+        "team update\r\nline2\t@outsider_host",
+        &crate::messages::MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Request),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    assert!(queued.broadcast && queued.queued_to.is_empty());
+    assert_eq!(queued.display_target, "team broadcast");
+    assert_eq!(queued.forwarding, "pending");
+    let journal = event(&guest_a.db, queued.event_id);
+    assert_eq!(journal["queued_to"], json!([]));
+    assert_eq!(journal["_sandbox"]["broadcast"], json!(true));
+    assert_eq!(journal["text"], json!("team update\nline2\t@outsider_host"));
+    assert_eq!(
+        run_cmd_send(
+            &guest_a.db,
+            "guest",
+            &["send", "--json", "--broadcast", "--", "second broadcast"]
+        ),
+        0
+    );
+    assert_eq!(
+        run_cmd_send(
+            &guest_a.db,
+            "guest",
+            &["send", "--json", "@bravo", "--", "direct followup"]
+        ),
+        0
+    );
+
+    let now = now_epoch_i64();
+    let wire_b1 = guest_a
+        .store()
+        .next_pending(&guest_a.worker.binding, now)
+        .unwrap()
+        .unwrap();
+    let mut host_inbox_a = HostInbox::new(&host_db, &host_store, &guest_a.worker.binding);
+
+    // Start after the directory refresh at epoch 2. Drop the first receipt to exercise replay.
+    bridge_step(&host_store, &guest_a, 3, &mut host_inbox_a, true, false);
+    host_a_wake.accept().expect("host_a wakes");
+    host_b_wake.accept().expect("host_b wakes via wake_ports");
+    observer_wake.accept().expect("observer wakes");
+    for sock in [&host_b_inject, &outsider_wake, &stopped_wake] {
+        assert_eq!(
+            sock.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    let host_event_id = host_db.get_last_event_id();
+    let host_ev = event(&host_db, host_event_id);
+    assert_eq!(host_ev["mentions"], json!(["host_a", "host_b"]));
+    assert_eq!(host_ev["delivered_to"], json!(["host_a", "host_b"]));
+    assert_eq!(
+        host_ev["queued_to"],
+        json!([
+            guest_b.worker.binding.worker.worker,
+            guest_c.worker.binding.worker.worker
+        ])
+    );
+    assert_eq!(host_ev["_sandbox"]["id"], json!(wire_b1.id));
+    assert_eq!(
+        host_ev["_sandbox"]["recipient_created_ats"],
+        json!({"host_a": 1.0, "host_b": 2.0})
+    );
+    assert_eq!(host_db.get_unread_messages("host_a").len(), 1);
+    assert_eq!(host_db.get_unread_messages("host_b").len(), 1);
+    for excluded in ["outsider_host", "other_team_host", "stopped_host"] {
+        assert!(host_db.get_unread_messages(excluded).is_empty());
+    }
+    assert!(
+        crate::relay::push::build_push_payload(&host_db, "device")
+            .1
+            .is_empty()
+    );
+    for none_route in [&guest_a.worker.binding, &retired.binding, &outside.binding] {
+        assert!(host_store.next_pending(none_route, now).unwrap().is_none());
+    }
+
+    // Reconnect and replay the first broadcast before draining the other two messages.
+    bridge_step(&host_store, &guest_a, 4, &mut host_inbox_a, false, false);
+    assert_eq!(
+        host_db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM events WHERE type='message'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        3
+    );
+    for socket in [&host_a_wake, &host_b_wake] {
+        socket
+            .accept()
+            .expect("the second broadcast wakes each host");
+        assert_eq!(
+            socket.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    // Deliver to guest_b: drop after first to verify guest replay, then drain remaining in FIFO order.
+    let mut host_inbox_b = HostInbox::new(&host_db, &host_store, &guest_b.worker.binding);
+    bridge_step(&host_store, &guest_b, 3, &mut host_inbox_b, true, true);
+    guest_b_wake.accept().expect("guest_b wakes");
+    let guest_b_first = guest_b.db.get_last_event_id();
+    bridge_step(&host_store, &guest_b, 4, &mut host_inbox_b, false, true);
+    let gb_msgs: Vec<String> = guest_b
+        .db
+        .get_unread_messages("guest")
+        .into_iter()
+        .map(|m| m.text)
+        .collect();
+    assert_eq!(
+        gb_msgs,
+        [
+            "team update\nline2\t@outsider_host",
+            "second broadcast",
+            "direct followup"
+        ]
+    );
+    assert!(guest_b.db.get_unread_messages("unrelated").is_empty());
+
+    // guest_c queue remained intact until delivered independently.
+    assert_eq!(
+        host_store
+            .next_pending(&guest_c.worker.binding, now)
+            .unwrap(),
+        Some(wire_b1.clone())
+    );
+    let mut host_inbox_c = HostInbox::new(&host_db, &host_store, &guest_c.worker.binding);
+    bridge_step(&host_store, &guest_c, 3, &mut host_inbox_c, false, true);
+    guest_c_wake.accept().expect("guest_c wakes");
+    assert_eq!(guest_c.db.get_unread_messages("guest").len(), 2);
+
+    // Directed replies to received broadcast correlate for guest_b and host_a, reject outsider/replaced host.
+    assert_eq!(
+        run_cmd_send(
+            &guest_b.db,
+            "guest",
+            &[
+                "send",
+                "--json",
+                "--intent",
+                "ack",
+                "--reply-to",
+                &guest_b_first.to_string(),
+                "@alpha",
+                "--",
+                "ack broadcast"
+            ]
+        ),
+        0
+    );
+    let gb_reply = guest_b
+        .store()
+        .next_pending(&guest_b.worker.binding, now)
+        .unwrap()
+        .unwrap();
+    let Imported::New(host_reply_ev) = apply(
+        &host_store,
+        Receiver::Host,
+        &guest_b.worker.binding,
+        &gb_reply,
+        &mut host_inbox_b,
+    ) else {
+        panic!("expected forwarded guest reply");
+    };
+    assert_eq!(
+        event(&host_db, host_reply_ev)["reply_to_local"],
+        json!(host_event_id)
+    );
+    let mut guest_a_inbox = guest_a.inbox();
+    let fwd_reply = host_store
+        .next_pending(&guest_a.worker.binding, now)
+        .unwrap()
+        .unwrap();
+    let Imported::New(ga_reply_ev) = apply(
+        &guest_a.store(),
+        Receiver::Guest,
+        &guest_a.worker.binding,
+        &fwd_reply,
+        &mut guest_a_inbox,
+    ) else {
+        panic!("expected guest_a reply");
+    };
+    assert_eq!(
+        event(&guest_a.db, ga_reply_ev)["reply_to_local"],
+        json!(queued.event_id)
+    );
+
+    let host_a_id = crate::identity::resolve_from_name(&host_db, "host_a").unwrap();
+    let host_reply = crate::sandbox::outgoing::queue(
+        &host_db,
+        &host_a_id,
+        &guest_a.worker,
+        "host ack",
+        &crate::messages::MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Ack),
+            ..Default::default()
+        },
+        Some(host_event_id),
+    )
+    .unwrap();
+    assert_eq!(
+        event(&host_db, host_reply.event_id)["reply_to_local"],
+        json!(host_event_id)
+    );
+    let outsider_id = crate::identity::resolve_from_name(&host_db, "outsider_host").unwrap();
+    assert!(
+        crate::sandbox::outgoing::queue(
+            &host_db,
+            &outsider_id,
+            &guest_a.worker,
+            "outsider",
+            &Default::default(),
+            Some(host_event_id)
+        )
+        .is_err()
+    );
+    host_db
+        .conn()
+        .execute(
+            "UPDATE instances SET created_at = 99 WHERE name = 'host_a'",
+            [],
+        )
+        .unwrap();
+    let replaced_a = crate::identity::resolve_from_name(&host_db, "host_a").unwrap();
+    host_store
+        .enroll_host(
+            &team.id,
+            Access::Host(&owner),
+            &HostIdentity::capture(&host_db, &replaced_a).unwrap(),
+        )
+        .unwrap();
+    assert!(
+        crate::sandbox::outgoing::queue(
+            &host_db,
+            &replaced_a,
+            &guest_a.worker,
+            "stale",
+            &Default::default(),
+            Some(host_event_id)
+        )
+        .is_err()
+    );
+
+    // Host global `hcom send --broadcast` still reaches local hosts and omits sandboxes.
+    assert_eq!(
+        run_cmd_send(
+            &host_db,
+            "host_b",
+            &["send", "--json", "--broadcast", "--", "global"]
+        ),
+        0
+    );
+    let global = event(&host_db, host_db.get_last_event_id());
+    assert_eq!(global["scope"], json!("broadcast"));
+    let delivered = global["delivered_to"].as_array().unwrap();
+    assert!(delivered.contains(&json!("outsider_host")));
+    assert!(!delivered.contains(&json!(guest_a.worker.binding.worker.worker)));
+}
+
+#[test]
+fn guest_only_broadcast_forwards_without_waking_host_observers() {
+    let root = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO instances (name, created_at) VALUES ('observer', 1)",
+            [],
+        )
+        .unwrap();
+    let observer = wake_listener(&db, "observer", "events_stream");
+    let store = Store::initialize(&db).unwrap();
+    let team = store.create_team(None).unwrap();
+    let access = Access::Controller(team.external_controller.as_ref().unwrap());
+    let sender = GuestNode::new(root.path(), "a.db", &store, &team.id, access, "alpha", 2.0);
+    let peer = GuestNode::new(root.path(), "b.db", &store, &team.id, access, "bravo", 3.0);
+    let binding = &sender.worker.binding;
+    let message = broadcast_msg(binding.worker.clone(), 1, "guest-only broadcast");
+    let mut inbox = HostInbox::new(&db, &store, binding);
+    let Imported::New(event_id) = apply(&store, Receiver::Host, binding, &message, &mut inbox)
+    else {
+        panic!("expected a new forwarding journal event");
+    };
+    assert_eq!(event(&db, event_id)["delivered_to"], json!([]));
+    assert_eq!(
+        store
+            .next_pending(&peer.worker.binding, now_epoch_i64())
+            .unwrap(),
+        Some(message)
+    );
+    assert_eq!(
+        observer.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn guest_broadcast_rejects_mixed_scopes_forgery_and_handles_oversized_team() {
+    let root = tempfile::tempdir().unwrap();
+    let host_db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    host_db
+        .conn()
+        .execute_batch(
+            "INSERT INTO instances (name, created_at) VALUES ('host', 1), ('outsider', 2);",
+        )
+        .unwrap();
+    let host_store = Store::initialize(&host_db).unwrap();
+    let host_id = crate::identity::resolve_from_name(&host_db, "host").unwrap();
+    let owner = HostIdentity::capture(&host_db, &host_id).unwrap();
+    let team = host_store.create_team(Some(&owner)).unwrap();
+
+    let guest = GuestNode::new(
+        root.path(),
+        "guest.db",
+        &host_store,
+        &team.id,
+        Access::Host(&owner),
+        "alpha",
+        10.0,
+    );
+    let sibling = GuestNode::new(
+        root.path(),
+        "sibling.db",
+        &host_store,
+        &team.id,
+        Access::Host(&owner),
+        "bravo",
+        20.0,
+    );
+
+    // Seed direct + threaded events on guest.db to test reply-to mixed-scope rejection.
+    crate::sandbox::outgoing::queue(
+        &host_db,
+        &host_id,
+        &guest.worker,
+        "direct",
+        &crate::messages::MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Request),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    crate::sandbox::outgoing::queue(
+        &host_db,
+        &host_id,
+        &guest.worker,
+        "threaded",
+        &crate::messages::MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Request),
+            thread: Some("ops".into()),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    let now = now_epoch_i64();
+    let mut guest_inbox = guest.inbox();
+    let w1 = host_store
+        .next_pending(&guest.worker.binding, now)
+        .unwrap()
+        .unwrap();
+    host_store
+        .acknowledge(&guest.worker.binding, &w1.id, &w1.digest, now)
+        .unwrap();
+    let w2 = host_store
+        .next_pending(&guest.worker.binding, now)
+        .unwrap()
+        .unwrap();
+    let Imported::New(d_ev) = apply(
+        &guest.store(),
+        Receiver::Guest,
+        &guest.worker.binding,
+        &w1,
+        &mut guest_inbox,
+    ) else {
+        panic!("direct event")
+    };
+    let Imported::New(t_ev) = apply(
+        &guest.store(),
+        Receiver::Guest,
+        &guest.worker.binding,
+        &w2,
+        &mut guest_inbox,
+    ) else {
+        panic!("threaded event")
+    };
+
+    let before_guest = guest.db.get_last_event_id();
+    let (d_ref, t_ref) = (d_ev.to_string(), t_ev.to_string());
+    for bad in [
+        vec!["send", "--json", "--broadcast", "@host", "--", "mixed"],
+        vec![
+            "send",
+            "--json",
+            "--broadcast",
+            "--thread",
+            "ops",
+            "--",
+            "mixed",
+        ],
+        vec![
+            "send",
+            "--json",
+            "--broadcast",
+            "--reply-to",
+            &d_ref,
+            "--",
+            "mixed",
+        ],
+        vec![
+            "send",
+            "--json",
+            "--broadcast",
+            "--reply-to",
+            &t_ref,
+            "--",
+            "mixed",
+        ],
+        vec![
+            "send",
+            "--json",
+            "--broadcast",
+            "--intent",
+            "ack",
+            "--reply-to",
+            &d_ref,
+            "--",
+            "mixed",
+        ],
+        vec![
+            "send",
+            "--json",
+            "--broadcast",
+            "--title",
+            "b",
+            "--description",
+            "d",
+            "--",
+            "bundle",
+        ],
+        vec!["send", "--json", "--", "implicit"],
+        vec![
+            "send",
+            "--json",
+            "--from",
+            "bigboss",
+            "--broadcast",
+            "--",
+            "spoof",
+        ],
+        vec!["send", "--json", "-b", "--broadcast", "--", "spoof"],
+        vec!["send", "--json", "--broadcast", "--", "bad\u{1b}[31mtext"],
+        vec!["send", "--json", "--broadcast", "--", "bad\u{0007}bell"],
+        vec!["send", "--json", "--broadcast", "--", "bad\rreturn"],
+        vec!["send", "--json", "--broadcast", "--", "bad\u{007f}del"],
+        vec!["send", "--json", "--broadcast", "--", "bad\u{0085}c1"],
+    ] {
+        assert_eq!(
+            run_cmd_send(&guest.db, "guest", &bad),
+            1,
+            "expected failure for {bad:?}"
+        );
+    }
+    {
+        use clap::Parser;
+        let spoof_ctx = crate::shared::CommandContext {
+            explicit_name: Some("other".into()),
+            identity: Some(crate::shared::SenderIdentity {
+                kind: crate::shared::SenderKind::Instance,
+                name: "other".into(),
+                instance_data: Some(json!({"created_at": 10.0})),
+                session_id: None,
+            }),
+            go: true,
+            identity_warning: None,
+        };
+        let mut spoof_args = crate::commands::send::SendArgs::try_parse_from([
+            "send",
+            "--json",
+            "--broadcast",
+            "--",
+            "spoof",
+        ])
+        .unwrap();
+        spoof_args.had_separator = true;
+        assert_eq!(
+            crate::commands::send::cmd_send(&guest.db, &spoof_args, Some(&spoof_ctx)),
+            1
+        );
+    }
+    assert_eq!(guest.db.get_last_event_id(), before_guest);
+    assert!(
+        guest
+            .store()
+            .next_pending(&guest.worker.binding, now)
+            .unwrap()
+            .is_none()
+    );
+
+    // HostInbox & GuestInbox forgery, control-char, and retired-sender rejection.
+    let mut host_inbox = HostInbox::new(&host_db, &host_store, &guest.worker.binding);
+    let host_before = host_db.get_last_event_id();
+    let mut forged_gen = broadcast_msg(guest.worker.binding.worker.clone(), 1, "gen");
+    forged_gen.payload.sender_routing_generation = Some("fake".into());
+    let forged_gen = Message::new(forged_gen.id, forged_gen.payload).unwrap();
+    for bad_msg in [
+        broadcast_msg(sibling.worker.binding.worker.clone(), 1, "forged origin"),
+        forged_gen,
+        broadcast_msg(guest.worker.binding.worker.clone(), 2, "esc\u{1b}seq"),
+        broadcast_msg(guest.worker.binding.worker.clone(), 2, "bel\u{0007}seq"),
+        broadcast_msg(guest.worker.binding.worker.clone(), 2, "cr\rseq"),
+        broadcast_msg(guest.worker.binding.worker.clone(), 2, "del\u{007f}seq"),
+        broadcast_msg(guest.worker.binding.worker.clone(), 2, "c1\u{009b}seq"),
+    ] {
+        assert!(
+            host_store
+                .import(Receiver::Host, &guest.worker.binding, &bad_msg, now, |tx| {
+                    host_inbox.insert(tx, &bad_msg)
+                })
+                .is_err()
+        );
+    }
+    let self_msg = broadcast_msg(guest.worker.binding.worker.clone(), 3, "loopback");
+    assert!(
+        guest
+            .store()
+            .import(
+                Receiver::Guest,
+                &guest.worker.binding,
+                &self_msg,
+                now,
+                |tx| guest_inbox.insert(tx, &self_msg)
+            )
+            .is_err()
+    );
+
+    // Legacy oversized team (>257 members) rejects broadcasts terminally without breaking directed traffic.
+    host_db
+        .conn()
+        .execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 258)
+             INSERT INTO instances(name, created_at) SELECT 'legacy_' || i, 50 FROM n;",
+        )
+        .unwrap();
+    host_db
+        .conn()
+        .execute(
+            "INSERT INTO sandbox_team_hosts SELECT ?, name, created_at FROM instances WHERE created_at = 50",
+            [&team.id],
+        )
+        .unwrap();
+    assert!(
+        host_store
+            .snapshot_directory(&guest.worker.binding)
+            .unwrap()
+            .is_none()
+    );
+    guest
+        .store()
+        .attach_bridge(&guest.worker.binding, 2)
+        .unwrap()
+        .write(|tx| guest_inbox.replace_directory(tx, None))
+        .unwrap();
+    assert_eq!(
+        run_cmd_send(
+            &guest.db,
+            "guest",
+            &["send", "--json", "--broadcast", "--", "oversized team"]
+        ),
+        0
+    );
+    let mut host_inbox = HostInbox::new(&host_db, &host_store, &guest.worker.binding);
+    bridge_step(&host_store, &guest, 3, &mut host_inbox, false, false);
+    assert!(
+        guest
+            .store()
+            .next_pending(&guest.worker.binding, now)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(host_db.get_last_event_id(), host_before);
+    assert!(
+        host_store
+            .next_pending(&sibling.worker.binding, now)
+            .unwrap()
+            .is_none()
+    );
+    let oversized_msg_id: MessageId = serde_json::from_value(
+        event(&guest.db, guest.db.get_last_event_id())["_sandbox"]["id"].clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        guest.store().delivery(&oversized_msg_id, now).unwrap(),
+        Some(crate::sandbox::store::Delivery::Rejected)
+    );
+    let direct_msg = addressed(
+        message(
+            guest.worker.binding.worker.clone(),
+            2,
+            &sibling.worker.binding.worker.worker,
+        ),
+        &sibling.worker.binding.worker.generation,
+    );
+    assert!(matches!(
+        apply(
+            &host_store,
+            Receiver::Host,
+            &guest.worker.binding,
+            &direct_msg,
+            &mut host_inbox
+        ),
+        Imported::New(_)
+    ));
+    let directed_ev = host_db.get_last_event_id();
+    assert_eq!(
+        host_store
+            .next_pending(&sibling.worker.binding, now)
+            .unwrap(),
+        Some(direct_msg)
+    );
+
+    // Retired sender & stale guest instance rejected.
+    host_store
+        .retire_worker(Access::Host(&owner), &guest.worker.binding)
+        .unwrap();
+    let retired_msg = broadcast_msg(guest.worker.binding.worker.clone(), 4, "retired");
+    assert!(
+        host_store
+            .import(
+                Receiver::Host,
+                &guest.worker.binding,
+                &retired_msg,
+                now,
+                |tx| host_inbox.insert(tx, &retired_msg)
+            )
+            .is_err()
+    );
+    assert_eq!(host_db.get_last_event_id(), directed_ev);
+    assert_ne!(host_before, directed_ev);
+
+    guest
+        .db
+        .conn()
+        .execute(
+            "UPDATE instances SET created_at = 99 WHERE name = 'guest'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        run_cmd_send(
+            &guest.db,
+            "guest",
+            &["send", "--json", "--broadcast", "--", "stale"]
+        ),
+        1
+    );
+}
+
+#[test]
+fn guest_broadcast_rolls_back_events_all_queues_and_wakes_on_failure() {
+    use crate::sandbox::admission::{Budget, Limits};
+
+    let root = tempfile::tempdir().unwrap();
+    let host_db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    host_db
+        .conn()
+        .execute(
+            "INSERT INTO instances (name, created_at) VALUES ('host', 1)",
+            [],
+        )
+        .unwrap();
+    let host_id = crate::identity::resolve_from_name(&host_db, "host").unwrap();
+    let owner = HostIdentity::capture(&host_db, &host_id).unwrap();
+
+    // Pending budget = 1 lets sibling_b forward_in pass and fails on sibling_c -> rolls back all writes.
+    let tight = Store::with_limits(
+        &host_db,
+        Limits {
+            pending: Budget {
+                messages: 1,
+                bytes: 1024 * 1024,
+            },
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    let team = tight.create_team(Some(&owner)).unwrap();
+    let reserve = |alias| {
+        tight
+            .reserve_worker(
+                &team.id,
+                Access::Host(&owner),
+                alias,
+                Tool::Claude,
+                Placement {
+                    gateway: "gateway",
+                    workspace: "default",
+                    sandbox: alias,
+                    incarnation: &uuid::Uuid::new_v4().to_string(),
+                },
+            )
+            .unwrap()
+            .binding
+    };
+    let (sender, sibling_b, sibling_c) = (reserve("alpha"), reserve("bravo"), reserve("charlie"));
+    let host_wake = wake_listener(&host_db, "host", "pty");
+    let observer_wake = wake_listener(&host_db, "host", "events_stream");
+    let msg = broadcast_msg(sender.worker.clone(), 1, "atomic rollback");
+    let now = now_epoch_i64();
+
+    {
+        let mut inbox = HostInbox::new(&host_db, &tight, &sender);
+        assert!(
+            tight
+                .import(Receiver::Host, &sender, &msg, now, |tx| inbox
+                    .insert(tx, &msg))
+                .is_err()
+        );
+    }
+    assert_eq!(host_db.get_last_event_id(), 0);
+    assert!(tight.next_pending(&sibling_b, now).unwrap().is_none());
+    assert!(tight.next_pending(&sibling_c, now).unwrap().is_none());
+    assert_eq!(
+        host_db
+            .conn()
+            .query_row("SELECT count(*) FROM sandbox_usage", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    for sock in [&host_wake, &observer_wake] {
+        assert_eq!(
+            sock.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    // Trigger failure on sandbox_inbox after events + both outboxes wrote also rolls back completely.
+    let normal = Store::initialize(&host_db).unwrap();
+    host_db
+        .conn()
+        .execute_batch(
+            "CREATE TEMP TRIGGER abort_broadcast_inbox BEFORE INSERT ON sandbox_inbox
+             BEGIN SELECT RAISE(ABORT, 'injected broadcast inbox failure'); END;",
+        )
+        .unwrap();
+    let mut inbox = HostInbox::new(&host_db, &normal, &sender);
+    assert!(
+        normal
+            .import(Receiver::Host, &sender, &msg, now, |tx| inbox
+                .insert(tx, &msg))
+            .is_err()
+    );
+    assert_eq!(host_db.get_last_event_id(), 0);
+    assert!(normal.next_pending(&sibling_b, now).unwrap().is_none());
+    assert!(normal.next_pending(&sibling_c, now).unwrap().is_none());
+    for sock in [&host_wake, &observer_wake] {
+        assert_eq!(
+            sock.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    host_db
+        .conn()
+        .execute_batch("DROP TRIGGER abort_broadcast_inbox")
+        .unwrap();
+
+    let Imported::New(event_id) = apply(&normal, Receiver::Host, &sender, &msg, &mut inbox) else {
+        panic!("expected retry success");
+    };
+    assert_eq!(event(&host_db, event_id)["delivered_to"], json!(["host"]));
+    assert_eq!(
+        normal.next_pending(&sibling_b, now).unwrap(),
+        Some(msg.clone())
+    );
+    assert_eq!(normal.next_pending(&sibling_c, now).unwrap(), Some(msg));
+    host_wake.accept().expect("host wakes after commit");
+    observer_wake.accept().expect("observer wakes after commit");
 }

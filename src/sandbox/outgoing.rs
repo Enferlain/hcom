@@ -13,7 +13,9 @@ use super::store::Store;
 
 pub(crate) struct Queued {
     pub event_id: i64,
-    pub target: String,
+    pub queued_to: Vec<String>,
+    pub display_target: String,
+    pub broadcast: bool,
     pub forwarding: &'static str,
     pub forwarding_reason: Option<String>,
 }
@@ -82,7 +84,11 @@ pub(crate) fn queue(
                     OR
                     (instance = ?5 AND json_extract(data, '$._sandbox.id.origin.generation') = ?8
                      AND json_extract(data, '$._sandbox.id.origin.incarnation') = ?9
-                     AND json_extract(data, '$._sandbox.recipient_created_at') = ?10
+                     AND (json_extract(data, '$._sandbox.recipient_created_at') = ?10
+                          OR (json_type(data, '$._sandbox.recipient_created_ats') = 'object'
+                              AND EXISTS (
+                                  SELECT 1 FROM json_each(data, '$._sandbox.recipient_created_ats') r
+                                   WHERE r.key = ?4 AND r.value = ?10)))
                      AND EXISTS (
                         SELECT 1 FROM json_each(data, '$.delivered_to') WHERE value = ?4))
                 )",
@@ -117,6 +123,7 @@ pub(crate) fn queue(
             &sender.name,
             host.created_at(),
         )?),
+        broadcast: false,
         thread: envelope.thread.clone(),
         reply_to: resolve_reply()?,
         intent,
@@ -164,7 +171,9 @@ pub(crate) fn queue(
     };
     Ok(Queued {
         event_id,
-        target: target.to_owned(),
+        queued_to: vec![target.to_owned()],
+        display_target: target.to_owned(),
+        broadcast: false,
         forwarding,
         forwarding_reason,
     })

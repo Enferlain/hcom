@@ -51,6 +51,7 @@ fn send(store: &Store<'_>, route: &Binding, spawn: impl Fn(&Path) -> Result<Chil
             target: route.worker.worker.clone(),
             target_generation: None,
             sender_routing_generation: None,
+            broadcast: false,
             thread: None,
             reply_to: None,
             intent: Intent::Request,

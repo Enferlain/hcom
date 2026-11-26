@@ -22,6 +22,7 @@ fn fixture() -> (Binding, Message) {
             target: "worker-b".into(),
             target_generation: None,
             sender_routing_generation: None,
+            broadcast: false,
             thread: Some("work".into()),
             reply_to: None,
             intent: Intent::Inform,
@@ -378,4 +379,109 @@ fn validated_messages_reject_invalid_routing_identifiers() {
         payload.thread = Some(invalid.into());
         assert!(Message::new(message.id.clone(), payload).is_err());
     }
+}
+
+#[test]
+fn broadcast_messages_reject_targets_threads_replies_and_preserve_legacy_digests() {
+    let (binding, legacy) = fixture();
+    let legacy_json =
+        br#"{"target":"worker-b","thread":"work","reply_to":null,"intent":"inform","text":"test"}"#;
+    assert_eq!(serde_json::to_vec(&legacy.payload).unwrap(), legacy_json);
+
+    let broadcast = Message::new(
+        legacy.id.clone(),
+        MessagePayload {
+            target: String::new(),
+            target_generation: None,
+            sender_routing_generation: None,
+            broadcast: true,
+            thread: None,
+            reply_to: None,
+            intent: Intent::Inform,
+            text: "team update".into(),
+        },
+    )
+    .unwrap();
+    let other_binding = Binding {
+        sandbox: "sandbox-b".into(),
+        worker: Origin {
+            worker: "worker-b".into(),
+            generation: "generation-b".into(),
+            incarnation: binding.worker.incarnation.clone(),
+        },
+        ..binding.clone()
+    };
+    validate_message_size(Receiver::Host, &binding, &broadcast).unwrap();
+    validate_message_size(Receiver::Guest, &other_binding, &broadcast).unwrap();
+
+    let hello = Frame {
+        version: VERSION,
+        epoch: 1,
+        binding: binding.clone(),
+        body: hello_body(),
+    };
+    let mut host = Connection::new(binding.clone(), 1, Receiver::Host).unwrap();
+    host.accept(hello.clone(), 1).unwrap();
+    assert!(
+        host.accept(
+            Frame {
+                body: FrameBody::Deliver(broadcast.clone()),
+                ..hello.clone()
+            },
+            1
+        )
+        .is_err()
+    );
+    let mut guest = Connection::new(other_binding.clone(), 1, Receiver::Guest).unwrap();
+    guest
+        .accept(
+            Frame {
+                binding: other_binding.clone(),
+                ..hello
+            },
+            1,
+        )
+        .unwrap();
+    let mut forged_send = broadcast.clone();
+    forged_send.id.origin = other_binding.worker.clone();
+    let forged_send = Message::new(forged_send.id, forged_send.payload).unwrap();
+    assert!(
+        guest
+            .accept(
+                Frame {
+                    version: VERSION,
+                    epoch: 1,
+                    binding: other_binding,
+                    body: FrameBody::Send(forged_send),
+                },
+                1
+            )
+            .is_err()
+    );
+
+    let invalid_cases = [
+        MessagePayload {
+            target: "worker-b".into(),
+            ..broadcast.payload.clone()
+        },
+        MessagePayload {
+            target_generation: Some("generation-b".into()),
+            ..broadcast.payload.clone()
+        },
+        MessagePayload {
+            thread: Some("work".into()),
+            ..broadcast.payload.clone()
+        },
+        MessagePayload {
+            reply_to: Some(legacy.id.clone()),
+            ..broadcast.payload.clone()
+        },
+    ];
+    for payload in invalid_cases {
+        assert!(Message::new(legacy.id.clone(), payload).is_err());
+    }
+    let mut forged_sender_gen = broadcast.payload;
+    forged_sender_gen.sender_routing_generation = Some("fake".into());
+    let forged_sender_gen = Message::new(legacy.id, forged_sender_gen).unwrap();
+    assert!(validate_message_size(Receiver::Host, &binding, &forged_sender_gen).is_err());
 }
