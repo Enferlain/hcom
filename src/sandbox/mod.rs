@@ -4,6 +4,7 @@ pub mod admission;
 #[cfg(unix)]
 pub mod bridge;
 pub mod controller;
+pub(crate) mod conversation;
 pub mod directory;
 pub(crate) mod guest_send;
 pub mod openshell;

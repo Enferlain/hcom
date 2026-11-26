@@ -90,6 +90,15 @@ pub struct ForwardRoute<'a> {
     pub destination: &'a Binding,
 }
 
+/// One authorized host-origin hop of an [`Store::enqueue_host_batch`] fan-out.
+/// The payload carries that destination's target so every hop shares the
+/// batch's wire identity while keeping its own directed digest.
+#[derive(Clone)]
+pub struct BatchHop {
+    pub route: Binding,
+    pub payload: MessagePayload,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delivery {
     Pending,
@@ -129,6 +138,7 @@ impl<'db> Store<'db> {
             tx.execute_batch(SCHEMA)?;
             tx.execute_batch(super::controller::SCHEMA)?;
             tx.execute_batch(super::directory::SCHEMA)?;
+            tx.execute_batch(super::conversation::SCHEMA)?;
             ensure_forwarding_schema(tx)?;
             tx.execute(
                 "INSERT OR IGNORE INTO sandbox_identity VALUES (1, ?, 0)",
@@ -278,6 +288,102 @@ impl<'db> Store<'db> {
         )
         .optional()?
         .context("sandbox outbox database incarnation changed")
+    }
+
+    /// Commit a host-origin fan-out: one wire identity, one journal event, and
+    /// every authorized next hop in one transaction. The first hop owns the
+    /// spool sequence; later hops replay the same wire identity from forwarded
+    /// rows, so each destination receives the same stable message ID. The plan
+    /// callback resolves authorization and hops inside the transaction; the
+    /// event writer must defer delivery/wakes until this call succeeds. Call
+    /// outside an ambient transaction.
+    pub fn enqueue_host_batch<T>(
+        &self,
+        now: i64,
+        plan: impl FnOnce(&Transaction<'_>, i64) -> Result<(T, Origin, Vec<BatchHop>)>,
+        insert_event: impl FnOnce(&Transaction<'_>, &T, &[Message]) -> Result<i64>,
+    ) -> Result<Message> {
+        self.write(|tx| {
+            let wire_sequence = self.allocate_queue_sequence(tx)?;
+            let (context, origin, hops) = plan(tx, wire_sequence)?;
+            ensure!(
+                origin.incarnation == self.incarnation,
+                "outbox incarnation mismatch"
+            );
+            ensure!(
+                hops.len() <= super::protocol::MAX_DIRECTORY_PEERS,
+                "sandbox fan-out exceeds the peer bound"
+            );
+            let mut route_keys = Vec::with_capacity(hops.len());
+            for hop in &hops {
+                let key = serde_json::to_string(&hop.route)?;
+                ensure!(
+                    !route_keys.contains(&key),
+                    "sandbox fan-out repeats a destination route"
+                );
+                route_keys.push(key);
+            }
+            // Size and digest every hop first; these checks touch no queue
+            // state, so they cannot pass individually and fail in aggregate.
+            let mut sized = Vec::with_capacity(hops.len());
+            for hop in &hops {
+                self.check_binding(tx, &hop.route)?;
+                let message = Message::new(
+                    MessageId {
+                        origin: origin.clone(),
+                        sequence: wire_sequence,
+                    },
+                    hop.payload.clone(),
+                )?;
+                let wire_bytes = validate_message_size(Receiver::Guest, &hop.route, &message)?;
+                sized.push((message, wire_bytes));
+            }
+            let refs: Vec<Message> = sized.iter().map(|(message, _)| message.clone()).collect();
+            let event_id = insert_event(tx, &context, &refs)?;
+            // Pending capacity is checked as each row is inserted, so the
+            // shared queue bound applies to the running batch, not per hop.
+            // Any failing hop rolls the whole batch back, event included.
+            for (index, (hop, (message, wire_bytes))) in hops.iter().zip(&sized).enumerate() {
+                self.limits.pending(tx, *wire_bytes)?;
+                self.limits
+                    .record(tx, &hop.route, *wire_bytes, event_id, None)?;
+                let (sequence, forwarded_sequence, forwarded_incarnation) = if index == 0 {
+                    (wire_sequence, None, None)
+                } else {
+                    let ordinal = self.allocate_queue_sequence(tx)?;
+                    (
+                        ordinal,
+                        Some(wire_sequence),
+                        Some(origin.incarnation.as_str()),
+                    )
+                };
+                tx.execute(
+                    "INSERT INTO sandbox_outbox
+                        (sequence, origin_worker, origin_generation, route, digest,
+                         message, event_id, wire_bytes, expires_at,
+                         forwarded_sequence, forwarded_incarnation)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        sequence,
+                        message.id.origin.worker,
+                        message.id.origin.generation,
+                        route_keys[index],
+                        message.digest.as_slice(),
+                        serde_json::to_string(message)?,
+                        event_id,
+                        wire_bytes,
+                        now.saturating_add(self.limits.queue_ttl_seconds),
+                        forwarded_sequence,
+                        forwarded_incarnation,
+                    ],
+                )?;
+            }
+            sized
+                .into_iter()
+                .next()
+                .map(|(message, _)| message)
+                .context("sandbox fan-out produced no hops")
+        })
     }
 
     /// Append a host-authorized next hop inside the inbound event transaction.
@@ -505,9 +611,31 @@ impl<'db> Store<'db> {
         Ok(())
     }
 
+    /// Look up a single route's transport state. Multi-route host sends expose
+    /// no aggregate state here, even after all their route receipts arrive.
+    /// Retention must preserve the fan-out rows together or persist a separate
+    /// fan-out record before pruning individual routes (task 3.5).
     pub fn delivery(&self, id: &MessageId, now: i64) -> Result<Option<Delivery>> {
         ensure_current_database(self.db)?;
         if id.origin.incarnation != self.incarnation {
+            return Ok(None);
+        }
+        // A fan-out wire id maps to one row per destination. A single route's
+        // receipt is not a whole-batch status, so an ambiguous identity stays
+        // unknown instead of reporting the first hop's state as aggregate.
+        let fan_out: bool = self.db.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM sandbox_outbox
+             WHERE origin_worker = ? AND origin_generation = ?
+               AND forwarded_sequence = ? AND forwarded_incarnation = ?)",
+            params![
+                id.origin.worker,
+                id.origin.generation,
+                id.sequence,
+                id.origin.incarnation
+            ],
+            |row| row.get(0),
+        )?;
+        if fan_out {
             return Ok(None);
         }
         let row: Option<(i64, bool, i64)> = self

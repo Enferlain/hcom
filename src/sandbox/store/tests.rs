@@ -789,3 +789,278 @@ fn expiry_drains_bounded_batches() {
     assert_eq!(store.expire_pending(NOW + 5).unwrap().len(), 1);
     assert!(store.expire_pending(NOW + 5).unwrap().is_empty());
 }
+
+fn hop(binding: &Binding, target: &str, text: &str) -> BatchHop {
+    BatchHop {
+        route: binding.clone(),
+        payload: MessagePayload {
+            target: target.into(),
+            target_generation: Some(binding.worker.generation.clone()),
+            sender_routing_generation: None,
+            broadcast: false,
+            thread: Some("work".into()),
+            reply_to: None,
+            intent: Intent::Inform,
+            text: text.into(),
+        },
+    }
+}
+
+fn outbox_rows(db: &HcomDb) -> Vec<(i64, Option<i64>, Option<String>, i64)> {
+    let mut stmt = db
+        .conn()
+        .prepare(
+            "SELECT sequence, forwarded_sequence, forwarded_incarnation, event_id
+             FROM sandbox_outbox ORDER BY sequence",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+/// Each hop fits the shared pending queue alone, but the full batch exceeds
+/// it. The whole batch — event, queue rows, and usage charges — rolls back.
+#[test]
+fn host_batch_rolls_back_when_only_the_full_batch_exceeds_pending() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&temp.path().join("hcom.db")).unwrap();
+    let limits = Limits {
+        pending: Budget::new(1, i64::MAX / 2),
+        run: Budget::new(1_000, i64::MAX / 2),
+        team: Budget::new(1_000, i64::MAX / 2),
+        host: Budget::new(1_000, i64::MAX / 2),
+        ..Limits::default()
+    };
+    let store = Store::with_limits(&db, limits).unwrap();
+    let route_a = Binding {
+        team: "team".into(),
+        sandbox: "sandbox-a".into(),
+        worker: origin("worker-a", &Uuid::new_v4().to_string()),
+    };
+    let route_b = Binding {
+        team: "team".into(),
+        sandbox: "sandbox-b".into(),
+        worker: origin("worker-b", &Uuid::new_v4().to_string()),
+    };
+    let host_origin = Origin {
+        worker: "luna".into(),
+        generation: "host-generation".into(),
+        incarnation: store.incarnation().to_string(),
+    };
+    // One hop alone is admissible.
+    let single = store
+        .enqueue_host_batch(
+            NOW,
+            |_, _| {
+                Ok((
+                    (),
+                    host_origin.clone(),
+                    vec![hop(&route_a, "worker-a", "alone")],
+                ))
+            },
+            |tx, (), _| insert_event(tx),
+        )
+        .unwrap();
+    assert_eq!(single.id.sequence, 1);
+    assert_eq!(outbox_rows(&db).len(), 1);
+    store
+        .acknowledge(&route_a, &single.id, &single.digest, NOW)
+        .unwrap();
+
+    // Two fresh routes, each admissible alone, exceed the count bound
+    // together. Nothing may survive the failed batch.
+    let fail = store.enqueue_host_batch(
+        NOW,
+        |_, _| {
+            Ok((
+                (),
+                host_origin.clone(),
+                vec![
+                    hop(&route_b, "worker-b", "first"),
+                    hop(&route_a, "worker-a", "second"),
+                ],
+            ))
+        },
+        |tx, (), _| insert_event(tx),
+    );
+    assert!(fail.is_err());
+    assert_eq!(event_count(&db), 1);
+    assert_eq!(outbox_rows(&db).len(), 1);
+    let usage: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COALESCE(sum(messages), 0) FROM sandbox_usage WHERE scope = 'run'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(usage, 1, "only the acknowledged single hop stays charged");
+    assert!(store.next_pending(&route_b, NOW).unwrap().is_none());
+    assert!(store.next_pending(&route_a, NOW).unwrap().is_none());
+}
+
+/// A multi-hop batch shares one wire identity across destinations, replays
+/// per route, settles per route, and never reports a whole-batch status from
+/// one route's receipt.
+#[test]
+fn host_batch_shares_one_wire_identity_and_settles_per_route() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&temp.path().join("hcom.db")).unwrap();
+    let store = Store::initialize(&db).unwrap();
+    let route_a = Binding {
+        team: "team".into(),
+        sandbox: "sandbox-a".into(),
+        worker: origin("worker-a", &Uuid::new_v4().to_string()),
+    };
+    let route_b = Binding {
+        team: "team".into(),
+        sandbox: "sandbox-b".into(),
+        worker: origin("worker-b", &Uuid::new_v4().to_string()),
+    };
+    let host_origin = Origin {
+        worker: "luna".into(),
+        generation: "host-generation".into(),
+        incarnation: store.incarnation().to_string(),
+    };
+    let mut event_id = 0;
+    let route_hops = (
+        hop(&route_a, "worker-a", "one"),
+        hop(&route_b, "worker-b", "two"),
+    );
+    let message = store
+        .enqueue_host_batch(
+            NOW,
+            |_, _| {
+                Ok((
+                    (),
+                    host_origin.clone(),
+                    vec![route_hops.0.clone(), route_hops.1.clone()],
+                ))
+            },
+            |tx, (), messages| {
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[0].id, messages[1].id);
+                assert_ne!(messages[0].digest, messages[1].digest);
+                event_id = insert_event(tx)?;
+                Ok(event_id)
+            },
+        )
+        .unwrap();
+    for (route, expected) in [(&route_a, &route_hops.0), (&route_b, &route_hops.1)] {
+        let replay = store.next_pending(route, NOW).unwrap().unwrap();
+        assert_eq!(replay.id, message.id);
+        let own = Message::new(message.id.clone(), expected.payload.clone()).unwrap();
+        assert_eq!(
+            replay.digest, own.digest,
+            "each route keeps its own payload"
+        );
+        assert_eq!(replay.payload.target, expected.payload.target);
+    }
+
+    let rows = outbox_rows(&db);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0], (message.id.sequence, None, None, event_id));
+    assert_eq!(
+        rows[1],
+        (
+            message.id.sequence + 1,
+            Some(message.id.sequence),
+            Some(store.incarnation().to_string()),
+            event_id
+        )
+    );
+
+    // One route's receipt is not a whole-batch status.
+    assert_eq!(store.delivery(&message.id, NOW).unwrap(), None);
+    store
+        .acknowledge(&route_a, &message.id, &message.digest, NOW)
+        .unwrap();
+    assert!(store.next_pending(&route_a, NOW).unwrap().is_none());
+    assert!(store.next_pending(&route_b, NOW).unwrap().is_some());
+    assert_eq!(store.delivery(&message.id, NOW).unwrap(), None);
+    let second_digest = Message::new(message.id.clone(), route_hops.1.payload.clone())
+        .unwrap()
+        .digest;
+    store
+        .acknowledge(&route_b, &message.id, &second_digest, NOW)
+        .unwrap();
+    assert_eq!(store.delivery(&message.id, NOW).unwrap(), None);
+    // A foreign incarnation still reports nothing.
+    assert_eq!(
+        store
+            .delivery(
+                &MessageId {
+                    origin: route_a.worker.clone(),
+                    sequence: 1
+                },
+                NOW
+            )
+            .unwrap(),
+        None
+    );
+}
+
+/// A repeated route is rejected before any row is written.
+#[test]
+fn host_batch_rejects_duplicate_routes() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&temp.path().join("hcom.db")).unwrap();
+    let store = Store::initialize(&db).unwrap();
+    let route = Binding {
+        team: "team".into(),
+        sandbox: "sandbox-a".into(),
+        worker: origin("worker-a", &Uuid::new_v4().to_string()),
+    };
+    let host_origin = Origin {
+        worker: "luna".into(),
+        generation: "host-generation".into(),
+        incarnation: store.incarnation().to_string(),
+    };
+    let fail = store.enqueue_host_batch(
+        NOW,
+        |_, _| {
+            Ok((
+                (),
+                host_origin.clone(),
+                vec![
+                    hop(&route, "worker-a", "one"),
+                    hop(&route, "worker-a", "two"),
+                ],
+            ))
+        },
+        |tx, (), _| insert_event(tx),
+    );
+    assert!(fail.is_err());
+    assert_eq!(event_count(&db), 0);
+    assert!(outbox_rows(&db).is_empty());
+}
+
+/// A wrong incarnation cannot masquerade as this store's origin.
+#[test]
+fn host_batch_rejects_foreign_incarnation() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&temp.path().join("hcom.db")).unwrap();
+    let store = Store::initialize(&db).unwrap();
+    let route = Binding {
+        team: "team".into(),
+        sandbox: "sandbox-a".into(),
+        worker: origin("worker-a", &Uuid::new_v4().to_string()),
+    };
+    let host_origin = Origin {
+        worker: "luna".into(),
+        generation: "host-generation".into(),
+        incarnation: Uuid::new_v4().to_string(),
+    };
+    let fail = store.enqueue_host_batch(
+        NOW,
+        |_, _| Ok(((), host_origin, vec![hop(&route, "worker-a", "one")])),
+        |tx, (), _| insert_event(tx),
+    );
+    assert!(fail.is_err());
+    assert_eq!(event_count(&db), 0);
+    assert!(outbox_rows(&db).is_empty());
+}

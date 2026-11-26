@@ -10,7 +10,7 @@ pub struct Budget {
 }
 
 impl Budget {
-    const fn new(messages: i64, bytes: i64) -> Self {
+    pub(super) const fn new(messages: i64, bytes: i64) -> Self {
         Self { messages, bytes }
     }
 

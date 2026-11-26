@@ -536,6 +536,10 @@ pub(crate) fn resolve_host_alias(
 }
 
 impl HostIdentity {
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
     pub(super) fn created_at(&self) -> f64 {
         self.created_at
     }

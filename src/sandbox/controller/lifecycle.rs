@@ -46,6 +46,19 @@ pub fn enqueue_host(
     enqueue_host_with(store, route, origin, payload, insert_event, spawn_worker)
 }
 
+/// Resolve forwarding after the host outbox transaction commits.
+pub fn forwarding_after_commit(store: &Store<'_>) -> Forwarding {
+    forwarding_with(store, spawn_worker)
+}
+
+fn forwarding_with(store: &Store<'_>, spawn: impl Fn(&Path) -> Result<Child>) -> Forwarding {
+    match ensure_running(store, false, spawn) {
+        Ok(Some(owner)) => Forwarding::ControllerReady(owner),
+        Ok(None) => Forwarding::Disabled,
+        Err(error) => Forwarding::Deferred(format!("{error:#}")),
+    }
+}
+
 fn enqueue_host_with(
     store: &Store<'_>,
     route: &Binding,
@@ -62,14 +75,9 @@ fn enqueue_host_with(
         now_epoch_i64(),
         insert_event,
     )?;
-    let forwarding = match ensure_running(store, false, spawn) {
-        Ok(Some(owner)) => Forwarding::ControllerReady(owner),
-        Ok(None) => Forwarding::Disabled,
-        Err(error) => Forwarding::Deferred(format!("{error:#}")),
-    };
     Ok(QueuedSend {
         message,
-        forwarding,
+        forwarding: forwarding_with(store, spawn),
     })
 }
 

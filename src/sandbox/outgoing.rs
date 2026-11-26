@@ -11,6 +11,7 @@ use super::directory::{HostIdentity, Worker, check_sender, host_recipient_genera
 use super::protocol::{Intent, MessageId, MessagePayload};
 use super::store::Store;
 
+#[derive(Debug)]
 pub(crate) struct Queued {
     pub event_id: i64,
     pub queued_to: Vec<String>,
@@ -135,6 +136,16 @@ pub(crate) fn queue(
         // The store transaction fences the destination. Recheck sender membership
         // and reply correlation on that connection before publishing the event.
         check_sender(tx, &binding.team, &host)?;
+        // An explicit thread seeds (or expands) the team conversation in this
+        // same transaction. A sender without the participant grant proceeds
+        // without joining, so inherited-thread replies keep working and a
+        // guessed label cannot adopt membership.
+        let conversation = match envelope.thread.as_deref() {
+            Some(label) => {
+                super::conversation::seed_directed(tx, &binding.team, label, &host, worker)?
+            }
+            None => None,
+        };
         ensure!(
             resolve_reply()? == message.payload.reply_to,
             "sandbox reply changed during enqueue"
@@ -150,6 +161,9 @@ pub(crate) fn queue(
             "intent": intent,
             "_sandbox": {"team": binding.team, "id": message.id},
         });
+        if let Some(conversation) = conversation {
+            data["_sandbox"]["conversation"] = json!(conversation);
+        }
         if let Some(thread) = &envelope.thread {
             data["thread"] = json!(thread);
         }

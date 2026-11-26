@@ -265,6 +265,7 @@ struct ResolvedDelivery {
 enum SandboxTarget {
     Host(crate::sandbox::directory::Worker),
     Guest(crate::sandbox::guest_send::Target),
+    Thread(crate::sandbox::conversation::Resolved),
 }
 
 fn deliverable_instances(db: &HcomDb) -> Result<Vec<InstanceInfo>, String> {
@@ -366,50 +367,70 @@ fn resolve_delivery(
     // Compute scope and routing. Thread-only sends keep their original message
     // semantics; membership only affects the delivery target set.
     let scope_result = compute_scope(message, &rows, explicit_targets)?;
-    let thread_delivery_members =
-        if let Some(thread) = envelope.and_then(|env| env.thread.as_deref()) {
-            if scope_result.scope == MessageScope::Broadcast {
-                let members = db.get_thread_members(thread);
-                if members.is_empty() {
-                    return Err(format!(
-                        "Thread '{thread}' has no members. Seed it with @mentions first."
-                    ));
-                }
-                members
-            } else {
-                Vec::new()
+    // A thread-only sandbox send resolves through the team's conversation
+    // grants, never the ordinary name-only thread index. Collisions fail
+    // closed; ordinary labels fall through unchanged.
+    let sandbox_thread = if scope_result.scope == MessageScope::Broadcast
+        && !broadcast
+        && let Some(label) = envelope.and_then(|env| env.thread.as_deref())
+    {
+        crate::sandbox::conversation::resolve(db, identity, label)
+            .map_err(|error| format!("{error:#}"))?
+    } else {
+        None
+    };
+    let thread_delivery_members = if sandbox_thread.is_some() {
+        Vec::new()
+    } else if let Some(thread) = envelope.and_then(|env| env.thread.as_deref()) {
+        if scope_result.scope == MessageScope::Broadcast {
+            let members = db.get_thread_members(thread);
+            if members.is_empty() {
+                return Err(format!(
+                    "Thread '{thread}' has no members. Seed it with @mentions first."
+                ));
             }
+            members
         } else {
             Vec::new()
-        };
-    let is_thread_resolved = !thread_delivery_members.is_empty();
-    let effective_scope = if thread_delivery_members.is_empty() {
-        scope_result.scope
+        }
     } else {
-        MessageScope::Mentions
+        Vec::new()
     };
-    let effective_mentions = if thread_delivery_members.is_empty() {
+    let is_thread_resolved = sandbox_thread.is_some() || !thread_delivery_members.is_empty();
+    let effective_scope = if is_thread_resolved {
+        MessageScope::Mentions
+    } else {
+        scope_result.scope
+    };
+    let effective_mentions = if sandbox_thread.is_some() {
+        Vec::new()
+    } else if thread_delivery_members.is_empty() {
         scope_result.mentions.clone()
     } else {
         thread_delivery_members.clone()
     };
 
     let scope_data = build_scope_data(identity, effective_scope, &effective_mentions);
-    let sandbox_target = if alias_worker.is_some() {
-        alias_worker
+    let sandbox_target = if let Some(resolved) = sandbox_thread {
+        Some(SandboxTarget::Thread(resolved))
+    } else if alias_worker.is_some() {
+        alias_worker.map(SandboxTarget::Host)
     } else if let Some(target) = effective_mentions
         .iter()
         .find(|target| sandbox_names.contains(*target))
     {
-        Some(
+        Some(SandboxTarget::Host(
             crate::sandbox::directory::current_worker(db.conn(), target)
                 .map_err(|error| format!("Failed to read sandbox worker: {error}"))?
                 .ok_or_else(|| "Sandbox worker is no longer enrolled".to_string())?,
-        )
+        ))
     } else {
         None
     };
-    if sandbox_target.is_some() && (effective_mentions.len() != 1 || is_thread_resolved) {
+    if !matches!(sandbox_target, Some(SandboxTarget::Thread(_)))
+        && sandbox_target.is_some()
+        && (effective_mentions.len() != 1 || is_thread_resolved)
+    {
         return Err("Target one sandbox worker explicitly".into());
     }
     let delivered_to = rows
@@ -427,7 +448,7 @@ fn resolve_delivery(
         effective_mentions,
         delivered_to,
         is_thread_resolved,
-        sandbox_target: sandbox_target.map(SandboxTarget::Host),
+        sandbox_target,
     })
 }
 
@@ -1350,6 +1371,14 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
                 &envelope,
                 reply_event,
             ),
+            SandboxTarget::Thread(resolved) => crate::sandbox::conversation::queue(
+                db,
+                &sender_identity,
+                resolved,
+                &message,
+                &envelope,
+                reply_event,
+            ),
         };
         match result {
             Ok(queued) => Some(queued),
@@ -2190,6 +2219,190 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[serial]
+    #[test]
+    fn cli_thread_only_sandbox_send_fans_out_to_current_participants() {
+        use crate::sandbox::directory::{Access, HostIdentity, Placement};
+        use crate::sandbox::store::Store;
+
+        let root = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&root.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute_batch(
+                "INSERT INTO instances (name, created_at) VALUES ('luna', 1), ('nova', 2);",
+            )
+            .unwrap();
+        let identity = identity::resolve_from_name(&db, "luna").unwrap();
+        let member = HostIdentity::capture(&db, &identity).unwrap();
+        let nova =
+            HostIdentity::capture(&db, &identity::resolve_from_name(&db, "nova").unwrap()).unwrap();
+        let store = Store::initialize(&db).unwrap();
+        let team = store.create_team(Some(&member)).unwrap();
+        let binding = store
+            .reserve_worker(
+                &team.id,
+                Access::Host(&member),
+                "sandbox",
+                crate::tool::Tool::Claude,
+                Placement {
+                    gateway: "gateway",
+                    workspace: "default",
+                    sandbox: "sandbox",
+                    incarnation: "fedc8acb-cc62-422d-9724-54e730e64f6e",
+                },
+            )
+            .unwrap()
+            .binding;
+        let target = format!("@{}", binding.worker.worker);
+        let ctx = |name| CommandContext {
+            explicit_name: None,
+            identity: Some(identity::resolve_from_name(&db, name).unwrap()),
+            go: true,
+            identity_warning: None,
+        };
+        let parse = |args: &[&str]| {
+            let mut args = SendArgs::try_parse_from(args).unwrap();
+            args.had_separator = true;
+            args
+        };
+        let event_count = |db: &HcomDb| -> i64 {
+            db.conn()
+                .query_row(
+                    "SELECT count(*) FROM events WHERE type = 'message'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let last_event = |db: &HcomDb| -> serde_json::Value {
+            let data: String = db
+                .conn()
+                .query_row(
+                    "SELECT data FROM events WHERE type = 'message'
+                     ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&data).unwrap()
+        };
+        let observer = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        observer.set_nonblocking(true).unwrap();
+        db.upsert_notify_endpoint(
+            "luna",
+            "events_stream",
+            observer.local_addr().unwrap().port(),
+        )
+        .unwrap();
+        // The 50 ms best-effort wake connect can drop under load; poll the
+        // listener briefly so scheduling jitter cannot fail the assertion.
+        let wait_wake = |observer: &std::net::TcpListener, why: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match observer.accept() {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "{why}");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{why}: {error}"),
+                }
+            }
+        };
+
+        // The explicit threaded send seeds the conversation grant.
+        let seed = parse(&["send", "--json", "--thread", "work", &target, "--", "seed"]);
+        assert_eq!(cmd_send(&db, &seed, Some(&ctx("luna"))), 0);
+        wait_wake(&observer, "queued seed send wakes observers after commit");
+        let settle = |store: &Store<'_>, binding: &crate::sandbox::protocol::Binding| {
+            let now = crate::shared::time::now_epoch_i64();
+            let pending = store.next_pending(binding, now).unwrap().unwrap();
+            store
+                .acknowledge(binding, &pending.id, &pending.digest, now)
+                .unwrap();
+        };
+        settle(&store, &binding);
+        let conversation: String = db
+            .conn()
+            .query_row("SELECT id FROM sandbox_conversations", [], |row| row.get(0))
+            .unwrap();
+        let data = last_event(&db);
+        assert_eq!(
+            data["_sandbox"]["conversation"],
+            serde_json::json!(conversation)
+        );
+
+        // A same-team non-participant cannot adopt the grant by targeting it.
+        store
+            .enroll_host(&team.id, Access::Host(&member), &nova)
+            .unwrap();
+        let guess = parse(&["send", "--json", "--thread", "work", &target, "--", "guess"]);
+        assert_eq!(cmd_send(&db, &guess, Some(&ctx("nova"))), 0);
+        wait_wake(&observer, "directed non-participant send wakes observers");
+        settle(&store, &binding);
+        let data = last_event(&db);
+        assert!(data["_sandbox"].get("conversation").is_none());
+        let members: i64 = db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sandbox_conversation_members",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 2);
+
+        // The participant's thread-only send reaches current guests in one
+        // atomic batch with the shared stable wire identity.
+        let fanout = parse(&["send", "--json", "--thread", "work", "--", "fanout"]);
+        assert_eq!(cmd_send(&db, &fanout, Some(&ctx("luna"))), 0);
+        wait_wake(
+            &observer,
+            "thread-only fan-out wakes observers after commit",
+        );
+        let data = last_event(&db);
+        assert_eq!(data["thread"], serde_json::json!("work"));
+        assert_eq!(
+            data["queued_to"],
+            serde_json::json!([binding.worker.worker])
+        );
+        assert_eq!(data["mentions"], serde_json::json!([]));
+        assert_eq!(data["delivered_to"], serde_json::json!([]));
+        let message = store
+            .next_pending(&binding, crate::shared::time::now_epoch_i64())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            data["_sandbox"]["id"],
+            serde_json::json!(message.id),
+            "the queued hop replays the event's stable wire identity"
+        );
+        assert_eq!(message.payload.thread.as_deref(), Some("work"));
+        assert_eq!(
+            message.payload.target_generation.as_deref(),
+            Some(binding.worker.generation.as_str())
+        );
+        // Sandbox thread labels never enter the ordinary membership index.
+        assert!(db.get_thread_members("work").is_empty());
+        assert!(
+            crate::relay::push::build_push_payload(&db, "device")
+                .1
+                .is_empty()
+        );
+
+        // A replaced host generation resolves nothing and fails closed with
+        // the ordinary unknown-thread error, without a hidden-thread oracle.
+        db.conn()
+            .execute(
+                "UPDATE instances SET created_at = 9 WHERE name = 'luna'",
+                [],
+            )
+            .unwrap();
+        let stale = parse(&["send", "--json", "--thread", "work", "--", "stale"]);
+        assert_eq!(cmd_send(&db, &stale, Some(&ctx("luna"))), 1);
+        assert_eq!(event_count(&db), 3);
     }
 
     #[test]
