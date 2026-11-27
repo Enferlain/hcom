@@ -6,8 +6,8 @@ use anyhow::{Result, ensure};
 
 use crate::sandbox::openshell::ROTATION_BYTES;
 use crate::sandbox::protocol::{
-    Binding, Connection, Frame, FrameBody, MAX_ENCODED_FRAME, MessageId, Receiver, TeamPeer,
-    VERSION, write_frame,
+    Binding, Connection, Frame, FrameBody, MAX_ENCODED_FRAME, MessageId, ObservationKey, Receiver,
+    TeamPeer, VERSION, write_frame,
 };
 use crate::sandbox::store::{Import, Store};
 use crate::shared::time::now_epoch_i64;
@@ -39,6 +39,8 @@ enum WriteKind {
     Hello,
     Payload,
     Receipt,
+    ObservationRequest,
+    ObservationResponse,
     Close,
 }
 
@@ -55,6 +57,12 @@ struct Outstanding {
     deadline: Instant,
 }
 
+struct Observation {
+    requested: Option<(i64, ObservationKey)>,
+    sent: bool,
+    deadline: Instant,
+}
+
 pub(super) struct Peer<'store, 'db> {
     store: &'store Store<'db>,
     attached: Option<Store<'db>>,
@@ -65,6 +73,8 @@ pub(super) struct Peer<'store, 'db> {
     reader: Reader,
     writes: VecDeque<PendingWrite>,
     outstanding: Option<Outstanding>,
+    observation: Option<Observation>,
+    next_observation: Option<Instant>,
     incoming_credit_used: bool,
     ready: bool,
     pub remote_closed: bool,
@@ -72,6 +82,7 @@ pub(super) struct Peer<'store, 'db> {
     pub close_written: bool,
     pub draining: Option<Instant>,
     rotate: bool,
+    completed_rotation: bool,
     started: Instant,
     read_deadline: Option<Instant>,
     write_deadline: Option<Instant>,
@@ -103,6 +114,8 @@ impl<'store, 'db> Peer<'store, 'db> {
             reader: Reader::default(),
             writes: VecDeque::new(),
             outstanding: None,
+            observation: None,
+            next_observation: None,
             incoming_credit_used: false,
             ready: false,
             remote_closed: false,
@@ -110,6 +123,7 @@ impl<'store, 'db> Peer<'store, 'db> {
             close_written: false,
             draining: None,
             rotate: false,
+            completed_rotation: false,
             started: now,
             read_deadline: None,
             write_deadline: None,
@@ -130,6 +144,13 @@ impl<'store, 'db> Peer<'store, 'db> {
         self.rotate
     }
 
+    pub(super) fn complete_rotation(&mut self) {
+        self.completed_rotation = true;
+    }
+
+    pub(super) fn enable_observation(&mut self) {
+        self.next_observation = Some(Instant::now() + Duration::from_secs(2));
+    }
     pub(super) fn is_ready(&self) -> bool {
         self.ready
     }
@@ -241,6 +262,13 @@ impl<'store, 'db> Peer<'store, 'db> {
                     .is_some_and(|send| now >= send.deadline),
                 "sandbox bridge receipt timed out"
             );
+            ensure!(
+                !self
+                    .observation
+                    .as_ref()
+                    .is_some_and(|query| now >= query.deadline),
+                "sandbox bridge observation timed out"
+            );
         }
         Ok(())
     }
@@ -291,6 +319,43 @@ impl<'store, 'db> Peer<'store, 'db> {
         Ok(true)
     }
 
+    pub(super) fn poll_observation(&mut self) -> Result<bool> {
+        let now = Instant::now();
+        if !matches!(self.receiver, Receiver::Host)
+            || !self.ready
+            || self.draining.is_some()
+            || self.input_eof
+            || self.observation.is_some()
+            || self.next_observation.is_none_or(|due| now < due)
+        {
+            return Ok(false);
+        }
+        let store = self.attached.as_ref().expect("handshake attaches bridge");
+        let requested = store.observation_query(&self.binding)?;
+        let bytes = self.encode(FrameBody::Observe {
+            key: requested.as_ref().map(|(_, key)| key.clone()),
+        })?;
+        if self.input_limit.is_some()
+            && self.input_bytes + bytes.len() as u64 > self.limits.rotation
+        {
+            self.begin_drain(true)?;
+        } else {
+            self.queue(WriteKind::ObservationRequest, bytes)?;
+            self.observation = Some(Observation {
+                requested,
+                sent: false,
+                deadline: now + self.limits.progress,
+            });
+        }
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    pub(super) fn observe_now(&mut self) -> Result<bool> {
+        self.next_observation = Some(Instant::now());
+        self.poll_observation()
+    }
+
     pub(super) fn write_step(&mut self, output: &mut impl Write) -> Result<bool> {
         let Some(write) = self.writes.front_mut() else {
             return Ok(false);
@@ -314,6 +379,10 @@ impl<'store, 'db> Peer<'store, 'db> {
                     outstanding.deadline = Instant::now() + self.limits.progress;
                 }
                 WriteKind::Receipt => self.incoming_credit_used = false,
+                WriteKind::ObservationRequest => {
+                    self.observation.as_mut().expect("queued observation").sent = true;
+                }
+                WriteKind::ObservationResponse => {}
                 WriteKind::Close => self.close_written = true,
             }
         }
@@ -423,6 +492,53 @@ impl<'store, 'db> Peer<'store, 'db> {
                 }
                 self.remote_closed = true;
             }
+            FrameBody::Observe { key } => {
+                ensure!(
+                    !self
+                        .writes
+                        .iter()
+                        .any(|write| write.kind == WriteKind::ObservationResponse),
+                    "sandbox bridge exceeded observation credit"
+                );
+                if self.draining.is_none() {
+                    let (delivered, activity) =
+                        store.write(|tx| import.observe(tx, key.as_ref()))?;
+                    let bytes = self.encode(FrameBody::Observed {
+                        key,
+                        delivered,
+                        activity,
+                    })?;
+                    self.queue(WriteKind::ObservationResponse, bytes)?;
+                }
+            }
+            FrameBody::Observed {
+                key,
+                delivered,
+                activity,
+            } => {
+                let query = self
+                    .observation
+                    .take()
+                    .filter(|query| query.sent)
+                    .ok_or_else(|| anyhow::anyhow!("unsolicited sandbox bridge observation"))?;
+                let expected = query.requested.as_ref().map(|(_, key)| key);
+                ensure!(
+                    expected == key.as_ref(),
+                    "sandbox observation does not match the outstanding query"
+                );
+                let requested = query
+                    .requested
+                    .as_ref()
+                    .map(|(sequence, key)| (*sequence, key));
+                store.record_bridge_observation(
+                    &self.binding,
+                    self.epoch,
+                    requested,
+                    delivered,
+                    activity,
+                )?;
+                self.enable_observation();
+            }
             FrameBody::Hello { .. } => unreachable!(),
         }
         Ok(())
@@ -431,6 +547,18 @@ impl<'store, 'db> Peer<'store, 'db> {
     pub(super) fn note_eof(&mut self) {
         if self.draining.is_none() {
             self.draining = Some(Instant::now() + self.limits.drain);
+        }
+    }
+}
+
+impl Drop for Peer<'_, '_> {
+    fn drop(&mut self) {
+        if matches!(self.receiver, Receiver::Host)
+            && self.ready
+            && let Some(store) = &self.attached
+        {
+            let _ =
+                store.finish_bridge_observation(&self.binding, self.epoch, self.completed_rotation);
         }
     }
 }

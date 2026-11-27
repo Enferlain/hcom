@@ -822,6 +822,8 @@ fn handle_ext_poll(db: &HcomDb, ctx: &HcomContext, argv: &[String]) -> Value {
     };
     let inflight = ExtInflight {
         last_event_id: prepared.ack.last_event_id,
+        event_ids: prepared.ack.event_ids,
+        created_at: prepared.ack.created_at,
         status_context: prepared.ack.status_context,
         msg_ts: prepared.ack.msg_ts,
         text: prepared.formatted,
@@ -913,6 +915,10 @@ fn ext_inflight_key(name: &str) -> String {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ExtInflight {
     last_event_id: i64,
+    #[serde(default)]
+    event_ids: Vec<i64>,
+    #[serde(default)]
+    created_at: Option<f64>,
     status_context: String,
     msg_ts: String,
     text: String,
@@ -945,6 +951,9 @@ impl ExtInflight {
                 _ => true,
             };
             inflight.last_event_id > instance.last_event_id
+                && inflight
+                    .created_at
+                    .is_none_or(|created_at| created_at == instance.created_at)
                 && same_session
                 && match inflight.confirmed_at {
                     Some(confirmed) => now - confirmed < EXT_QUEUED_CONFIRM_SECS,
@@ -961,7 +970,14 @@ fn ack_ext_delivery(db: &HcomDb, name: &str, prompt: &str) -> bool {
     let Some(inflight) = ExtInflight::load(db, name) else {
         return false;
     };
-    if inflight.text.trim() != prompt {
+    if inflight.text.trim() != prompt
+        || inflight.created_at.is_some_and(|created_at| {
+            db.get_instance_full(name)
+                .ok()
+                .flatten()
+                .is_none_or(|instance| instance.created_at != created_at)
+        })
+    {
         return false;
     }
     let _ = db.kv_set(&ext_inflight_key(name), None);
@@ -971,8 +987,9 @@ fn ack_ext_delivery(db: &HcomDb, name: &str, prompt: &str) -> bool {
         db,
         &DeliveryAck {
             instance_name: name.to_string(),
-            created_at: None,
+            created_at: inflight.created_at,
             last_event_id: inflight.last_event_id,
+            event_ids: inflight.event_ids,
             status_context: inflight.status_context,
             msg_ts: inflight.msg_ts,
             mark_announced: false,
@@ -1434,9 +1451,40 @@ mod tests {
         assert_eq!(second["text"], first["text"]);
     }
 
-    /// The extension's prompt queued behind a user turn that won the race:
-    /// hooks leave its batch alone, however long that turn runs, and the
-    /// queued prompt acks it when it finally runs.
+    #[test]
+    fn ext_prompt_submit_records_sandbox_delivery_for_claimed_incarnation() {
+        let (_dir, db, ctx, message_id) = ext_test_db();
+        crate::sandbox::store::Store::initialize(&db).unwrap();
+        let created_at = db.get_instance_full("memo").unwrap().unwrap().created_at;
+        db.conn()
+            .execute(
+                "UPDATE events SET data = json_set(data,
+                '$.delivered_to', json_array('memo'),
+                '$._sandbox.id', json_object('sequence', 1),
+                '$._sandbox.recipient_created_at', ?1)
+             WHERE id = ?2",
+                rusqlite::params![created_at, message_id],
+            )
+            .unwrap();
+        db.set_status("memo", ST_LISTENING, "").unwrap();
+        let poll = handle_ext_poll(&db, &ctx, &argv(&["--session-id", "sid-fg"]));
+        let count = || {
+            db.conn()
+                .query_row(
+                    "SELECT count(*) FROM sandbox_local_delivery
+             WHERE event_id = ?1 AND name = 'memo' AND created_at = ?2",
+                    rusqlite::params![message_id, created_at],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count(), 0);
+        submit(&db, &ctx, poll["text"].as_str().unwrap());
+        assert_eq!(count(), 1);
+    }
+
+    /// The extension's prompt queued behind a user turn that won the race.
+    /// Hooks leave that batch alone until the queued prompt runs.
     #[test]
     fn hooks_defer_to_batch_queued_by_extension() {
         let (_dir, db, ctx, message_id) = ext_test_db();

@@ -16,7 +16,7 @@ const WAIT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(50);
 const TICK: Duration = Duration::from_millis(250);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const USAGE: &str = "Usage: hcom sandbox controller <start|recover|stop|status>";
+pub(crate) const USAGE: &str = "Usage: hcom sandbox controller <start|recover|stop|status>\n       hcom sandbox receipt <event-id>";
 
 #[derive(Debug)]
 pub enum Forwarding {
@@ -265,6 +265,11 @@ pub fn run_command(args: &[String]) -> Result<()> {
     if matches!(&args[..], [] | ["controller"]) || matches!(args.last(), Some(&("--help" | "-h"))) {
         println!("{USAGE}");
         return Ok(());
+    }
+    if let ["receipt", event_id] = &args[..] {
+        return crate::sandbox::receipts::show(
+            event_id.parse().context("invalid receipt event ID")?,
+        );
     }
     let db_path = crate::paths::hcom_dir().join("hcom.db");
     match &args[..] {

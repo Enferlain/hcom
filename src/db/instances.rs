@@ -1330,6 +1330,17 @@ impl HcomDb {
         announce: bool,
         created_at: Option<f64>,
     ) -> Result<bool> {
+        self.ack_hook_delivery_batch(name, event_id, announce, created_at, &[])
+    }
+
+    pub(crate) fn ack_hook_delivery_batch(
+        &self,
+        name: &str,
+        event_id: i64,
+        announce: bool,
+        created_at: Option<f64>,
+        observed_ids: &[i64],
+    ) -> Result<bool> {
         let mut connected = None;
         let updated = self.with_immediate_transaction(|tx| {
             // Read the announcement flag and parent inside the write lock;
@@ -1352,6 +1363,9 @@ impl HcomDb {
                  WHERE name = ?2 AND (?3 IS NULL OR created_at = ?3)",
                 params![event_id, name, created_at],
             )?;
+            if let Some(created_at) = created_at {
+                crate::sandbox::receipts::record_local(tx, name, created_at, observed_ids)?;
+            }
 
             if announce && prior_announced == 0 {
                 let announced = tx.execute(

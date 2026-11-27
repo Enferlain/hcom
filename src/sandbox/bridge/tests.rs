@@ -385,7 +385,11 @@ fn stalled_child_reader_does_not_block_stdout_import() {
     fixture.frame("send", 1, fixture.send("y".repeat(120 * 1024)));
     let script = "cat hello; cat send; sleep 30";
     let error = fixture.host(1, script, || false).unwrap_err().to_string();
-    assert!(error.contains("timed out"), "{error}");
+    assert!(
+        error.contains("sandbox bridge write timed out")
+            || error.contains("sandbox bridge receipt timed out"),
+        "{error}"
+    );
     assert_eq!(fixture.delivery(&message), Some(Delivery::Pending));
     assert_eq!(ingress_count(&fixture), 1);
 }

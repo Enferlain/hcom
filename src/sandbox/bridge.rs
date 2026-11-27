@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use super::controller::Owner;
 use super::openshell::Adapter;
-use super::protocol::{Binding, Message, Receiver, TeamPeer};
+use super::protocol::{Activity, Binding, Message, ObservationKey, Receiver, TeamPeer};
 use super::store::Store;
 use crate::db::HcomDb;
 use crate::shared::time::now_iso;
@@ -25,6 +25,13 @@ pub use inbox::HostInbox;
 pub trait Inbound {
     fn insert(&mut self, tx: &Transaction<'_>, message: &Message) -> Result<i64>;
     fn committed(&mut self, _event_id: i64) {}
+    fn observe(
+        &self,
+        _tx: &Transaction<'_>,
+        _key: Option<&ObservationKey>,
+    ) -> Result<(bool, Option<Activity>)> {
+        Ok((false, None))
+    }
     fn replace_directory(
         &mut self,
         _tx: &Transaction<'_>,
@@ -162,6 +169,7 @@ impl<'store, 'db> Session<'store, 'db> {
             .transpose()?;
         if proof.is_some() {
             peer.reserve_host_input(proof::BYTES)?;
+            peer.enable_observation();
         }
         let mut process = Process::spawn(command)?;
         process.proof = proof;
@@ -270,6 +278,7 @@ fn poll_host(
             "sandbox bridge exec disconnected before completing the close handshake"
         );
         let exit = if peer.rotating() {
+            peer.complete_rotation();
             Exit::Rotate
         } else {
             Exit::Stopped
@@ -277,6 +286,7 @@ fn poll_host(
         return Ok(HostStep::Finished(exit));
     }
     progress |= peer.poll_outbox()?;
+    progress |= peer.poll_observation()?;
     Ok(if progress {
         HostStep::Progress
     } else {

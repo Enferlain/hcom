@@ -137,6 +137,7 @@ impl<'db> Store<'db> {
         ensure_current_database(db)?;
         let incarnation = db.with_immediate_transaction(|tx| {
             tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(super::receipts::SCHEMA)?;
             tx.execute_batch(super::controller::SCHEMA)?;
             tx.execute_batch(super::directory::SCHEMA)?;
             tx.execute_batch(super::conversation::SCHEMA)?;
@@ -223,7 +224,11 @@ impl<'db> Store<'db> {
         Ok(())
     }
 
-    fn check_binding(&self, conn: &rusqlite::Connection, binding: &Binding) -> Result<()> {
+    pub(super) fn check_binding(
+        &self,
+        conn: &rusqlite::Connection,
+        binding: &Binding,
+    ) -> Result<()> {
         let key = serde_json::to_string(binding)?;
         if let Some((attached, _)) = &self.bridge {
             ensure!(*attached == key, "sandbox connection binding mismatch");

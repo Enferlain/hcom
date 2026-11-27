@@ -1156,6 +1156,138 @@ fn bridge_step(
 }
 
 #[test]
+fn accepted_guest_delivery_requires_hook_evidence_and_survives_disconnect() {
+    use super::super::peer::Peer;
+    use crate::sandbox::receipts::view;
+
+    let root = tempfile::tempdir().unwrap();
+    let host_db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    host_db
+        .conn()
+        .execute(
+            "INSERT INTO instances (name, created_at) VALUES ('owner', 1)",
+            [],
+        )
+        .unwrap();
+    let sender = crate::identity::resolve_from_name(&host_db, "owner").unwrap();
+    let owner = HostIdentity::capture(&host_db, &sender).unwrap();
+    let host_store = Store::initialize(&host_db).unwrap();
+    let team = host_store.create_team(Some(&owner)).unwrap();
+    let guest = GuestNode::new(
+        root.path(),
+        "guest.db",
+        &host_store,
+        &team.id,
+        Access::Host(&owner),
+        "worker",
+        2.0,
+    );
+    let binding = &guest.worker.binding;
+    let target = format!("@{}", binding.worker.worker);
+    assert_eq!(
+        run_cmd_send(
+            &host_db,
+            "owner",
+            &["send", "--json", &target, "--", "test receipt"]
+        ),
+        0
+    );
+    let event_id = host_db.get_last_event_id();
+    let read = || view(host_db.conn(), event_id).unwrap();
+    assert_eq!(read()["routes"][0]["transport"], "pending");
+
+    let guest_store = guest.store();
+    let mut host_inbox = HostInbox::new(&host_db, &host_store, binding);
+    let mut guest_inbox = guest.inbox();
+    let peers = |epoch| {
+        (
+            Peer::new(
+                &host_store,
+                binding,
+                epoch,
+                Receiver::Host,
+                None,
+                Default::default(),
+                host_store.snapshot_directory(binding).unwrap(),
+            )
+            .unwrap(),
+            Peer::new(
+                &guest_store,
+                binding,
+                epoch,
+                Receiver::Guest,
+                None,
+                Default::default(),
+                None,
+            )
+            .unwrap(),
+        )
+    };
+    let (mut host, mut peer) = peers(2);
+    deliver_all(&mut host, &mut peer, &mut guest_inbox);
+    deliver_all(&mut peer, &mut host, &mut host_inbox);
+    assert!(host.poll_outbox().unwrap());
+    deliver_all(&mut host, &mut peer, &mut guest_inbox);
+    deliver_all(&mut peer, &mut host, &mut host_inbox);
+    let prepared = crate::hooks::common::prepare_pending_messages(&guest.db, "guest").unwrap();
+    guest
+        .db
+        .advance_instance_cursor("guest", prepared.ack.last_event_id)
+        .unwrap();
+    guest
+        .db
+        .conn()
+        .execute(
+            "UPDATE instances SET status = 'listening' WHERE name = 'guest'",
+            [],
+        )
+        .unwrap();
+
+    assert!(host.observe_now().unwrap());
+    deliver_all(&mut host, &mut peer, &mut guest_inbox);
+    deliver_all(&mut peer, &mut host, &mut host_inbox);
+    let pending = read();
+    assert_eq!(pending["routes"][0]["transport"], "accepted");
+    assert_eq!(pending["routes"][0]["agent_delivery"], "unknown");
+    assert_eq!(pending["routes"][0]["bridge"]["connection"], "connected");
+    assert_eq!(pending["routes"][0]["bridge"]["last_activity"], "listening");
+    drop(host);
+    drop(peer);
+    assert_eq!(read()["routes"][0]["bridge"]["connection"], "disconnected");
+    assert_eq!(read()["routes"][0]["bridge"]["last_activity"], "listening");
+
+    crate::hooks::common::commit_delivery_ack(&guest.db, &prepared.ack);
+    assert_eq!(read()["routes"][0]["agent_delivery"], "unknown");
+    let (mut host, mut peer) = peers(3);
+    deliver_all(&mut host, &mut peer, &mut guest_inbox);
+    deliver_all(&mut peer, &mut host, &mut host_inbox);
+    assert!(host.observe_now().unwrap());
+    deliver_all(&mut host, &mut peer, &mut guest_inbox);
+    deliver_all(&mut peer, &mut host, &mut host_inbox);
+    let delivered = read();
+    assert_eq!(delivered["id"], pending["id"]);
+    assert_eq!(delivered["routes"][0]["transport"], "accepted");
+    assert_eq!(delivered["routes"][0]["agent_delivery"], "observed");
+    assert_eq!(delivered["routes"][0]["bridge"]["last_activity"], "active");
+    assert_eq!(delivered["routes"][0]["bridge"]["epoch"], 3);
+    host.begin_drain(true).unwrap();
+    host.complete_rotation();
+    drop(host);
+    assert_eq!(read()["routes"][0]["agent_delivery"], "observed");
+    assert_eq!(read()["routes"][0]["bridge"]["connection"], "rotating");
+    drop(peer);
+    let (mut host, mut peer) = peers(4);
+    deliver_all(&mut host, &mut peer, &mut guest_inbox);
+    deliver_all(&mut peer, &mut host, &mut host_inbox);
+    assert!(host.observe_now().unwrap());
+    deliver_all(&mut host, &mut peer, &mut guest_inbox);
+    deliver_all(&mut peer, &mut host, &mut host_inbox);
+    assert_eq!(read()["routes"][0]["bridge"]["connection"], "connected");
+    drop(host);
+    assert_eq!(read()["routes"][0]["bridge"]["connection"], "disconnected");
+}
+
+#[test]
 fn guest_broadcast_routes_to_bound_team_with_stable_ids_and_postcommit_wakes() {
     let root = tempfile::tempdir().unwrap();
     let host_db = HcomDb::open_at(&root.path().join("host.db")).unwrap();

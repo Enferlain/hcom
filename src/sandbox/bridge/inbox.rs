@@ -5,7 +5,8 @@ use serde_json::{Value, json};
 use crate::db::HcomDb;
 use crate::sandbox::directory::{host_generation, host_recipient_generation};
 use crate::sandbox::protocol::{
-    Binding, Message, MessageId, Origin, TeamPeer, validate_identifier, validate_message_text,
+    Activity, Binding, Message, MessageId, ObservationKey, Origin, TeamPeer, validate_identifier,
+    validate_message_text,
 };
 use crate::sandbox::store::{ForwardRoute, Store, UnavailableRecipient};
 use crate::shared::time::now_epoch_i64;
@@ -506,6 +507,39 @@ impl<'a> GuestInbox<'a> {
 }
 
 impl Inbound for GuestInbox<'_> {
+    fn observe(
+        &self,
+        tx: &Transaction<'_>,
+        key: Option<&ObservationKey>,
+    ) -> Result<(bool, Option<Activity>)> {
+        self.check_local_worker(tx)?;
+        let status: String = tx.query_row(
+            "SELECT status FROM instances WHERE name = ? AND created_at = ?",
+            params![self.worker.name, self.worker.created_at],
+            |row| row.get(0),
+        )?;
+        let activity = match status.as_str() {
+            "active" => Some(Activity::Active),
+            "listening" => Some(Activity::Listening),
+            "blocked" => Some(Activity::Blocked),
+            "inactive" => Some(Activity::Inactive),
+            "stopped" => Some(Activity::Stopped),
+            "launching" => Some(Activity::Launching),
+            "error" => Some(Activity::Error),
+            _ => None,
+        };
+        let delivered = match key {
+            Some(key) => crate::sandbox::receipts::observed(
+                tx,
+                key,
+                &self.worker.name,
+                self.worker.created_at,
+            )?,
+            None => false,
+        };
+        Ok((delivered, activity))
+    }
+
     fn insert(&mut self, tx: &Transaction<'_>, message: &Message) -> Result<i64> {
         self.inbox.clear();
         if message.payload.is_thread_expansion() {
@@ -643,7 +677,7 @@ impl<'a> Inbox<'a> {
         if message.payload.broadcast {
             sandbox["broadcast"] = json!(true);
         }
-        if wake_target && !self.private_guest {
+        if wake_target {
             let created_at: f64 = tx.query_row(
                 "SELECT created_at FROM instances WHERE name = ?",
                 [target],

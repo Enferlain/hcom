@@ -1495,6 +1495,7 @@ mod tests {
                 instance_name: "nova".into(),
                 created_at: None,
                 last_event_id: 7,
+                event_ids: Vec::new(),
                 status_context: "deliver:luna".into(),
                 msg_ts: String::new(),
                 mark_announced: false,

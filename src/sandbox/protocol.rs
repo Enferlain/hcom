@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_ENCODED_FRAME: u32 = 256 * 1024;
 const HEADER_LEN: u32 = 4;
 pub(super) const MAX_DIRECTORY_PEERS: usize = 256;
@@ -271,6 +271,40 @@ pub struct TeamPeer {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationKey {
+    pub id: MessageId,
+    pub digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Activity {
+    Active,
+    Listening,
+    Blocked,
+    Inactive,
+    Stopped,
+    Launching,
+    Error,
+}
+
+#[cfg(unix)]
+impl Activity {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Listening => "listening",
+            Self::Blocked => "blocked",
+            Self::Inactive => "inactive",
+            Self::Stopped => "stopped",
+            Self::Launching => "launching",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     content = "body",
@@ -278,7 +312,7 @@ pub struct TeamPeer {
     deny_unknown_fields
 )]
 pub enum FrameBody {
-    /// Version 1 peers agree on one frame limit, including the length prefix.
+    /// Peers agree on one frame limit, including the length prefix.
     Hello {
         max_frame_bytes: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,6 +328,14 @@ pub enum FrameBody {
     Rejected {
         id: MessageId,
         digest: [u8; 32],
+    },
+    Observe {
+        key: Option<ObservationKey>,
+    },
+    Observed {
+        key: Option<ObservationKey>,
+        delivered: bool,
+        activity: Option<Activity>,
     },
     Close,
 }
@@ -346,6 +388,23 @@ impl Frame {
                 message.validate()
             }
             FrameBody::Accepted { id, .. } => id.validate(),
+            FrameBody::Observe { key } | FrameBody::Observed { key, .. } => {
+                if let Some(key) = key {
+                    key.id.validate()?;
+                }
+                ensure!(
+                    key.is_some()
+                        || !matches!(
+                            self.body,
+                            FrameBody::Observed {
+                                delivered: true,
+                                ..
+                            }
+                        ),
+                    "sandbox delivery observation requires a message"
+                );
+                Ok(())
+            }
             FrameBody::Rejected { id, .. } => {
                 ensure!(
                     id.origin == self.binding.worker,
@@ -531,7 +590,8 @@ impl Connection {
             ) => {
                 anyhow::bail!("guest cannot publish a sandbox team directory");
             }
-            (Receiver::Host, FrameBody::Deliver(_)) | (Receiver::Guest, FrameBody::Send(_)) => {
+            (Receiver::Host, FrameBody::Deliver(_) | FrameBody::Observe { .. })
+            | (Receiver::Guest, FrameBody::Send(_) | FrameBody::Observed { .. }) => {
                 anyhow::bail!("sandbox frame direction mismatch");
             }
             (_, FrameBody::Hello { .. }) => self.ready = true,

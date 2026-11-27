@@ -233,6 +233,8 @@ pub struct DeliveryAck {
     /// may block. A stop + resume recreates the row and voids the ack.
     pub created_at: Option<f64>,
     pub last_event_id: i64,
+    /// Exact events emitted in this batch, for sandbox delivery evidence.
+    pub event_ids: Vec<i64>,
     pub status_context: String,
     pub msg_ts: String,
     /// Also flip `name_announced` on commit. Used for a subagent's first

@@ -346,11 +346,12 @@ pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
     // Forward-only: a delayed ack must not rewind a newer concurrent delivery.
     // Cursor and announcement move together so a partial ack can't re-announce.
     // A batch read from a row that stop + resume has since replaced is void.
-    match db.ack_hook_delivery(
+    match db.ack_hook_delivery_batch(
         &ack.instance_name,
         ack.last_event_id,
         ack.mark_announced,
         ack.created_at,
+        &ack.event_ids,
     ) {
         Ok(true) => {}
         Ok(false) => {
@@ -406,6 +407,10 @@ fn prepare_raw_messages(
         .and_then(|m| m.get("timestamp").and_then(|v| v.as_str()))
         .unwrap_or("")
         .to_string();
+    let event_ids = deliver
+        .iter()
+        .filter_map(|m| m["event_id"].as_i64())
+        .collect();
 
     Some(PreparedDelivery {
         messages: deliver,
@@ -418,6 +423,7 @@ fn prepare_raw_messages(
                 .flatten()
                 .map(|row| row.created_at),
             last_event_id: last_id,
+            event_ids,
             status_context: format!("deliver:{}", sender_display),
             msg_ts,
             mark_announced: false,
