@@ -521,28 +521,115 @@ fn conversation_field_is_canonical_omitted_and_digest_stable() {
     let _ = &binding;
 }
 
-/// A scoped payload is only valid fully addressed with host routing: the
-/// shape is rejected before digest or import otherwise.
+/// Scoped payloads take exactly one strict form: a fully addressed host
+/// grant delivery or a guest expansion request with no target and no
+/// generation, both always labeled, neither carrying a reply. Malformed
+/// mixtures are rejected at construction, before any digest or import.
 #[test]
-fn scoped_payloads_require_thread_generation_and_routing() {
+fn scoped_payloads_take_only_the_two_strict_forms() {
     let (binding, legacy) = fixture();
-    let scoped = |thread: Option<&str>, target_generation: Option<&str>, routing: Option<&str>| {
+    let scoped = |thread: Option<&str>,
+                  target: Option<&str>,
+                  target_generation: Option<&str>,
+                  routing: Option<&str>,
+                  reply: Option<MessageId>| {
         Message::new(
             legacy.id.clone(),
             MessagePayload {
                 conversation: Some("conv-1".into()),
                 thread: thread.map(str::to_owned),
+                target: target.map(str::to_owned).unwrap_or_default(),
                 target_generation: target_generation.map(str::to_owned),
                 sender_routing_generation: routing.map(str::to_owned),
+                reply_to: reply,
                 ..legacy.payload.clone()
             },
         )
     };
-    assert!(scoped(Some("work"), Some("generation-b"), Some("host-recipient")).is_ok());
-    assert!(scoped(None, Some("generation-b"), Some("host-recipient")).is_err());
-    assert!(scoped(Some("work"), None, Some("host-recipient")).is_err());
-    assert!(scoped(Some("work"), Some("generation-b"), None).is_err());
-    assert!(scoped(Some("work"), Some("generation-b"), Some("../evil")).is_err());
+    let parent = Some(legacy.id.clone());
+    // Host grant delivery: addressed target plus both generations.
+    assert!(
+        scoped(
+            Some("work"),
+            Some("worker-b"),
+            Some("generation-b"),
+            Some("host-recipient"),
+            None
+        )
+        .is_ok()
+    );
+    // Guest expansion request: no target, no generation.
+    let expansion = scoped(Some("work"), None, None, None, None).unwrap();
+    let ack = MessagePayload {
+        intent: Intent::Ack,
+        ..expansion.payload
+    };
+    assert!(Message::new(legacy.id.clone(), ack).is_err());
+
+    // Malformed mixtures and omissions.
+    assert!(
+        scoped(
+            None,
+            Some("worker-b"),
+            Some("generation-b"),
+            Some("host-recipient"),
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        scoped(
+            Some("work"),
+            None,
+            Some("generation-b"),
+            Some("host-recipient"),
+            None
+        )
+        .is_err()
+    );
+    assert!(scoped(Some("work"), None, None, Some("host-recipient"), None).is_err());
+    assert!(scoped(Some("work"), Some("worker-b"), None, None, None).is_err());
+    assert!(
+        scoped(
+            Some("work"),
+            Some("worker-b"),
+            Some("generation-b"),
+            None,
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        scoped(
+            Some("work"),
+            Some("worker-b"),
+            Some("generation-b"),
+            Some("host-recipient"),
+            parent.clone()
+        )
+        .is_err()
+    );
+    assert!(scoped(Some("work"), None, None, None, parent).is_err());
+    assert!(
+        scoped(
+            Some("work"),
+            Some("../evil"),
+            Some("generation-b"),
+            Some("host-recipient"),
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        scoped(
+            Some("../evil"),
+            Some("worker-b"),
+            Some("generation-b"),
+            Some("host-recipient"),
+            None
+        )
+        .is_err()
+    );
 
     let broadcast = MessagePayload {
         conversation: Some("conv-1".into()),
@@ -554,10 +641,11 @@ fn scoped_payloads_require_thread_generation_and_routing() {
     let _ = &binding;
 }
 
-/// Guest Send frames cannot claim a conversation id at frame validation;
-/// the same scoped message is a valid host Deliver frame.
+/// Guest Send frames carry a conversation id only as an expansion request;
+/// an addressed grant claim is a forged grant and the same scoped message is
+/// a valid host Deliver frame.
 #[test]
-fn guest_send_frames_reject_conversation_ids() {
+fn guest_send_frames_carry_only_expansion_shapes() {
     let (binding, legacy) = fixture();
     let scoped = Message::new(
         legacy.id.clone(),
@@ -586,6 +674,11 @@ fn guest_send_frames_reject_conversation_ids() {
         "unexpected rejection: {failure}"
     );
     // The same scoped message is a valid host Deliver frame for its target.
+    assert!(
+        frame(FrameBody::Deliver(scoped.clone()))
+            .validate()
+            .is_err()
+    );
     let deliver_binding = Binding {
         team: binding.team.clone(),
         sandbox: "sandbox-b".into(),
@@ -604,8 +697,8 @@ fn guest_send_frames_reject_conversation_ids() {
     .validate()
     .unwrap();
 
-    // The Send direction also rejects a conversation marker on its own,
-    // independent of the payload shape rules.
+    // The Send direction also rejects a bare conversation marker that is
+    // neither valid form, independent of the payload shape rules.
     let raw = Message {
         digest: [0; 32],
         id: legacy.id.clone(),
@@ -619,7 +712,46 @@ fn guest_send_frames_reject_conversation_ids() {
         .unwrap_err()
         .to_string();
     assert!(
-        failure.contains("guest cannot set a sandbox conversation id"),
+        failure.contains("guest thread expansion requests carry no target or generation"),
         "unexpected rejection: {failure}"
     );
+
+    // A genuine expansion request is a valid guest Send frame, and the same
+    // verbatim request is a valid host Deliver frame for a grant-holding
+    // destination whose grant check happens in its inbox.
+    let expansion = Message::new(
+        legacy.id.clone(),
+        MessagePayload {
+            conversation: Some("conv-1".into()),
+            target: String::new(),
+            target_generation: None,
+            sender_routing_generation: None,
+            broadcast: false,
+            thread: Some("work".into()),
+            reply_to: None,
+            intent: Intent::Request,
+            text: "expanding".into(),
+        },
+    )
+    .unwrap();
+    frame(FrameBody::Send(expansion.clone()))
+        .validate()
+        .unwrap();
+    let deliver_binding = Binding {
+        team: binding.team.clone(),
+        sandbox: "sandbox-b".into(),
+        worker: Origin {
+            worker: "worker-b".into(),
+            generation: "generation-b".into(),
+            incarnation: binding.worker.incarnation.clone(),
+        },
+    };
+    Frame {
+        version: VERSION,
+        epoch: 1,
+        binding: deliver_binding,
+        body: FrameBody::Deliver(expansion),
+    }
+    .validate()
+    .unwrap();
 }

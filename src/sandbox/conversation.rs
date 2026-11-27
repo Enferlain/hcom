@@ -74,7 +74,7 @@ pub(crate) fn resolve(
         return Ok(None);
     }
     let conn = db.conn();
-    if !has_conversations(conn)? {
+    if !has_table(conn, "sandbox_conversations")? {
         return Ok(None);
     }
     match participant_conversations(conn, &name, created_at, label)?.as_slice() {
@@ -330,11 +330,47 @@ fn resolve_fanout(
     Ok((conversation, hops))
 }
 
-fn has_conversations(conn: &Connection) -> Result<bool> {
+/// A guest's retained expansion grant: the authenticated conversation a
+/// directed host delivery recorded for its exact route and generation.
+pub(crate) struct GuestGrant {
+    pub(crate) conversation: String,
+    pub(crate) label: String,
+}
+
+/// Resolve a guest's unique retained grant by label for its current
+/// enrollment. Only authenticated host deliveries create evidence, the label
+/// index keeps at most one, and the generation plus binding columns make the
+/// match exact for the live enrolled worker. Nothing here reads the ordinary
+/// thread index.
+pub(crate) fn guest_grant_for_label(
+    conn: &Connection,
+    binding: &Binding,
+    label: &str,
+) -> Result<Option<GuestGrant>> {
+    if !has_table(conn, "sandbox_guest_conversations")? {
+        return Ok(None);
+    }
+    let binding_json = serde_json::to_string(binding)?;
+    Ok(conn
+        .query_row(
+            "SELECT conversation, label FROM sandbox_guest_conversations
+             WHERE label = ?1 AND generation = ?2 AND binding = ?3",
+            params![label, binding.worker.generation, binding_json],
+            |row| {
+                Ok(GuestGrant {
+                    conversation: row.get(0)?,
+                    label: row.get(1)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn has_table(conn: &Connection, name: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema
-         WHERE type = 'table' AND name = 'sandbox_conversations')",
-        [],
+         WHERE type = 'table' AND name = ?)",
+        [name],
         |row| row.get(0),
     )?)
 }

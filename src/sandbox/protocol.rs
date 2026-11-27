@@ -104,6 +104,27 @@ impl MessagePayload {
                     .is_none_or(|generation| generation == &target.generation)
         }
     }
+
+    /// A guest-authored thread expansion request: scoped to a conversation,
+    /// naming no target and no generation at all. The single predicate for
+    /// frame and inbox paths, so the shape cannot drift between them.
+    pub(super) fn is_thread_expansion(&self) -> bool {
+        self.conversation.as_ref().is_some_and(|_| {
+            self.target.is_empty()
+                && self.target_generation.is_none()
+                && self.sender_routing_generation.is_none()
+        })
+    }
+
+    /// A host-authored grant delivery: fully addressed with host routing.
+    /// Only this form can create destination evidence.
+    pub(super) fn is_conversation_delivery(&self) -> bool {
+        self.conversation.as_ref().is_some_and(|_| {
+            !self.target.is_empty()
+                && self.target_generation.is_some()
+                && self.sender_routing_generation.is_some()
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,29 +173,40 @@ impl Message {
                 self.payload.reply_to.is_none(),
                 "sandbox broadcast cannot specify a reply target"
             );
-        } else {
-            validate_identifier(&self.payload.target)?;
-            if let Some(generation) = &self.payload.target_generation {
-                validate_identifier(generation)?;
-            }
-        }
-        if let Some(conversation) = &self.payload.conversation {
+        } else if let Some(conversation) = &self.payload.conversation {
+            // A scoped payload takes exactly one of two strict forms, so a
+            // frame can never blur grant delivery and expansion dispatch:
+            // host grant delivery is fully addressed with host routing,
+            // while a guest thread expansion request names no target and no
+            // generation at all. Both always carry the thread label, and
+            // neither carries a reply: replies belong to directed messages
+            // whose parent they can name.
             validate_identifier(conversation)?;
-            // A scoped payload is a host-authored grant delivery: it must be
-            // fully addressed and carry the host routing generation before it
-            // can digest or import anywhere.
             ensure!(
                 self.payload.thread.is_some(),
                 "sandbox conversation requires a thread"
             );
             ensure!(
-                self.payload.target_generation.is_some(),
-                "sandbox conversation requires a target generation"
+                self.payload.reply_to.is_none() && self.payload.intent != Intent::Ack,
+                "sandbox conversation payloads cannot carry replies"
             );
+            let addressed = self.payload.is_conversation_delivery();
+            let expansion = self.payload.is_thread_expansion();
             ensure!(
-                self.payload.sender_routing_generation.is_some(),
-                "sandbox conversation requires a sender routing generation"
+                addressed || expansion,
+                "sandbox conversation payload mixes scoped forms"
             );
+            if let Some(generation) = &self.payload.target_generation {
+                validate_identifier(generation)?;
+            }
+            if !self.payload.target.is_empty() {
+                validate_identifier(&self.payload.target)?;
+            }
+        } else {
+            validate_identifier(&self.payload.target)?;
+            if let Some(generation) = &self.payload.target_generation {
+                validate_identifier(generation)?;
+            }
         }
         if let Some(generation) = &self.payload.sender_routing_generation {
             validate_identifier(generation)?;
@@ -275,15 +307,22 @@ impl Frame {
                     message.payload.sender_routing_generation.is_none(),
                     "guest cannot set a sandbox sender routing generation"
                 );
+                // Guests may carry a conversation id only as a thread
+                // expansion request, never as an addressed grant claim.
                 ensure!(
-                    message.payload.conversation.is_none(),
-                    "guest cannot set a sandbox conversation id"
+                    !message.payload.conversation.is_some()
+                        || message.payload.is_thread_expansion(),
+                    "guest thread expansion requests carry no target or generation"
                 );
                 message.validate()
             }
             FrameBody::Deliver(message) => {
+                // A scoped expansion request is forwarded verbatim to each
+                // grant-holding destination; its grant check happens in the
+                // destination inbox, not the frame.
                 ensure!(
-                    message.payload.addresses(&self.binding.worker),
+                    message.payload.is_thread_expansion()
+                        || message.payload.addresses(&self.binding.worker),
                     "sandbox delivery target mismatch"
                 );
                 message.validate()

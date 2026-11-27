@@ -165,21 +165,132 @@ impl<'a, 'db> HostInbox<'a, 'db> {
             );
             guest_recipients.push(destination);
         }
+        self.forward_fanout(tx, &host_recipients, &guest_recipients, message)
+    }
+
+    /// Route a verified guest thread expansion request to every current
+    /// member of its conversation: the live creating host receives the
+    /// ordinary inbox event, and each current same-team guest receives the
+    /// verbatim request over its own route. The source is excluded, replaced
+    /// generations never match their retained membership, the source binding
+    /// is already fenced by the import, and any recipient resolution or
+    /// quota failure rolls the whole import back or rejects it without a
+    /// journal row.
+    fn insert_expansion(
+        &mut self,
+        tx: &Transaction<'_>,
+        message: &Message,
+        conversation: &str,
+    ) -> Result<i64> {
+        let label = message
+            .payload
+            .thread
+            .as_deref()
+            .with_context(|| "sandbox thread expansion requires a thread")?;
+        let grant: Option<String> = tx
+            .query_row(
+                "SELECT c.team FROM sandbox_conversations c
+                 JOIN sandbox_conversation_members m ON m.conversation = c.id
+                 WHERE c.id = ?1 AND c.label = ?2 AND c.team = ?3
+                   AND m.name = ?4 AND m.generation = ?5
+                   AND m.host_created_at IS NULL",
+                params![
+                    conversation,
+                    label,
+                    self.source.team,
+                    self.source.worker.worker,
+                    self.source.worker.generation
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        ensure!(
+            grant.is_some(),
+            UnavailableRecipient("sandbox thread expansion is not granted for this source")
+        );
+
+        let peer_limit = (crate::sandbox::protocol::MAX_DIRECTORY_PEERS + 1) as i64;
+        let mut host_stmt = tx.prepare(
+            "SELECT m.name, m.host_created_at
+             FROM sandbox_conversation_members m
+             JOIN instances i ON i.name = m.name AND i.created_at = m.host_created_at
+             JOIN sandbox_team_hosts h ON h.team = ?2 AND h.name = m.name
+                  AND h.created_at = m.host_created_at
+             WHERE m.conversation = ?1 AND m.host_created_at IS NOT NULL
+               AND COALESCE(i.origin_device_id, '') = ''
+             ORDER BY m.name
+             LIMIT ?3",
+        )?;
+        let host_recipients: Vec<(String, f64)> = host_stmt
+            .query_map(params![conversation, self.source.team, peer_limit], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut guest_stmt = tx.prepare(
+            "SELECT w.binding
+             FROM sandbox_conversation_members m
+             JOIN sandbox_workers w ON w.name = m.name AND w.generation = m.generation
+             WHERE m.conversation = ?1 AND m.host_created_at IS NULL AND m.name != ?2
+               AND w.team = ?3 AND w.retired = 0
+             ORDER BY m.name
+             LIMIT ?4",
+        )?;
+        let raw_bindings: Vec<String> = guest_stmt
+            .query_map(
+                params![
+                    conversation,
+                    self.source.worker.worker,
+                    self.source.team,
+                    peer_limit
+                ],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut guest_recipients = Vec::with_capacity(raw_bindings.len());
+        for raw in raw_bindings {
+            let destination: Binding = serde_json::from_str(&raw)?;
+            ensure!(
+                destination.team == self.source.team && destination != *self.source,
+                "sandbox expansion resolved invalid peer binding"
+            );
+            guest_recipients.push(destination);
+        }
+        if host_recipients.len() + guest_recipients.len()
+            > crate::sandbox::protocol::MAX_DIRECTORY_PEERS
+        {
+            return Err(UnavailableRecipient("sandbox thread expansion exceeds peer limit").into());
+        }
+        if host_recipients.is_empty() && guest_recipients.is_empty() {
+            return Err(
+                UnavailableRecipient("sandbox thread expansion has no current recipients").into(),
+            );
+        }
+        self.forward_fanout(tx, &host_recipients, &guest_recipients, message)
+    }
+
+    fn forward_fanout(
+        &mut self,
+        tx: &Transaction<'_>,
+        host_recipients: &[(String, f64)],
+        guest_recipients: &[Binding],
+        message: &Message,
+    ) -> Result<i64> {
         let guest_names: Vec<String> = guest_recipients
             .iter()
             .map(|destination| destination.worker.worker.clone())
             .collect();
 
-        let publication = self.inbox.insert_broadcast(
+        let publication = self.inbox.insert_fanout(
             tx,
             &self.source.team,
-            &host_recipients,
-            &guest_names,
+            host_recipients,
+            guest_names,
             message,
         )?;
         let event = publication.event_id;
         let now = now_epoch_i64();
-        for destination in &guest_recipients {
+        for destination in guest_recipients {
             self.store.forward_in(
                 tx,
                 ForwardRoute {
@@ -208,10 +319,16 @@ impl Inbound for HostInbox<'_, '_> {
             source_active && message.id.origin == self.source.worker,
             "sandbox sender is not enrolled"
         );
-        ensure!(
-            message.payload.conversation.is_none(),
-            "guest cannot set a sandbox conversation id"
-        );
+        if let Some(conversation) = &message.payload.conversation {
+            // The frame gates the expansion shape and the store import gates
+            // the source binding; here the retained grant resolves the
+            // conversation-scoped fan-out.
+            ensure!(
+                message.payload.is_thread_expansion(),
+                "guest cannot claim an addressed sandbox conversation"
+            );
+            return self.insert_expansion(tx, message, conversation);
+        }
         ensure!(
             message.payload.sender_routing_generation.is_none(),
             "guest cannot set a sandbox sender routing generation"
@@ -345,6 +462,16 @@ impl<'a> GuestInbox<'a> {
         let Some(label) = &message.payload.thread else {
             anyhow::bail!("sandbox conversation evidence requires a thread");
         };
+        // A forwarded expansion request was already verified against the
+        // exact retained grant and never records anything; only
+        // authenticated addressed host deliveries mint evidence.
+        if message.payload.is_thread_expansion() {
+            return Ok(());
+        }
+        ensure!(
+            message.payload.is_conversation_delivery(),
+            "sandbox conversation evidence requires an addressed host delivery"
+        );
         let binding = serde_json::to_string(self.binding)?;
         let generation = &self.binding.worker.generation;
         let existing: Option<(String, String, String, String)> = tx
@@ -380,13 +507,47 @@ impl<'a> GuestInbox<'a> {
 impl Inbound for GuestInbox<'_> {
     fn insert(&mut self, tx: &Transaction<'_>, message: &Message) -> Result<i64> {
         self.inbox.clear();
-        ensure!(
-            message.payload.addresses(&self.binding.worker),
-            "sandbox delivery target mismatch"
-        );
+        if message.payload.is_thread_expansion() {
+            // A forwarded expansion request delivers only to a destination
+            // that already holds the exact route-bound grant for this
+            // conversation and label. Evidence itself is created exclusively
+            // by authenticated directed host deliveries, never here.
+            let conversation = message
+                .payload
+                .conversation
+                .as_deref()
+                .with_context(|| "sandbox expansion delivery requires a conversation")?;
+            let label = message
+                .payload
+                .thread
+                .as_deref()
+                .with_context(|| "sandbox expansion delivery requires a thread")?;
+            let binding = serde_json::to_string(self.binding)?;
+            let retained: Option<String> = tx
+                .query_row(
+                    "SELECT conversation FROM sandbox_guest_conversations
+                     WHERE conversation = ?1 AND label = ?2 AND generation = ?3 AND binding = ?4",
+                    params![conversation, label, self.binding.worker.generation, binding],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            ensure!(
+                retained.is_some(),
+                "sandbox expansion delivery requires a retained grant"
+            );
+        } else {
+            ensure!(
+                message.payload.addresses(&self.binding.worker),
+                "sandbox delivery target mismatch"
+            );
+        }
         ensure!(
             !(message.payload.broadcast && message.id.origin == self.binding.worker),
             "sandbox broadcast cannot target its own sender"
+        );
+        ensure!(
+            !(message.payload.is_thread_expansion() && message.id.origin == self.binding.worker),
+            "sandbox expansion cannot target its own sender"
         );
         self.check_local_worker(tx)?;
         self.retain_conversation(tx, message)?;
@@ -480,9 +641,6 @@ impl<'a> Inbox<'a> {
         if message.payload.broadcast {
             sandbox["broadcast"] = json!(true);
         }
-        if let Some(conversation) = &message.payload.conversation {
-            sandbox["conversation"] = json!(conversation);
-        }
         if wake_target && !self.private_guest {
             let created_at: f64 = tx.query_row(
                 "SELECT created_at FROM instances WHERE name = ?",
@@ -494,12 +652,12 @@ impl<'a> Inbox<'a> {
         self.insert_event(tx, team, local_targets, queued_to, sandbox, message)
     }
 
-    fn insert_broadcast(
+    fn insert_fanout(
         &mut self,
         tx: &Transaction<'_>,
         team: &str,
         host_recipients: &[(String, f64)],
-        guest_names: &[String],
+        guest_names: Vec<String>,
         message: &Message,
     ) -> Result<Publication> {
         let host_names: Vec<String> = host_recipients
@@ -509,8 +667,10 @@ impl<'a> Inbox<'a> {
         let mut sandbox = json!({
             "team": team,
             "id": message.id,
-            "broadcast": true,
         });
+        if message.payload.broadcast {
+            sandbox["broadcast"] = json!(true);
+        }
         if !host_recipients.is_empty() {
             let created_ats: serde_json::Map<String, Value> = host_recipients
                 .iter()
@@ -518,7 +678,7 @@ impl<'a> Inbox<'a> {
                 .collect();
             sandbox["recipient_created_ats"] = Value::Object(created_ats);
         }
-        self.insert_event(tx, team, host_names, guest_names.to_vec(), sandbox, message)
+        self.insert_event(tx, team, host_names, guest_names, sandbox, message)
     }
 
     fn insert_event(
@@ -543,6 +703,9 @@ impl<'a> Inbox<'a> {
         let sender = &message.id.origin.worker;
         if let Some(generation) = &payload.sender_routing_generation {
             sandbox["sender_routing_generation"] = json!(generation);
+        }
+        if let Some(conversation) = &payload.conversation {
+            sandbox["conversation"] = json!(conversation);
         }
         let mut data = json!({
             "from": sender,

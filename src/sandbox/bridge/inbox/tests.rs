@@ -2177,10 +2177,10 @@ fn guest_retains_grant_evidence_and_rejects_conflicting_ids() {
     assert_eq!(evidence_rows(), 1);
 }
 
-/// The host rejects a guest frame that claims a conversation id before any
-/// routing or import happens.
+/// The host rejects a forged scoped marker at frame validation before any
+/// grant resolution or import happens.
 #[test]
-fn host_inbox_rejects_guest_supplied_conversation_ids() {
+fn host_import_rejects_forged_scoped_markers() {
     let root = tempfile::tempdir().unwrap();
     let db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
     db.conn()
@@ -2207,8 +2207,8 @@ fn host_inbox_rejects_guest_supplied_conversation_ids() {
         .binding;
     // Message::new refuses to build a conversation-bearing payload without
     // host routing, so forge past the constructor: the import path must
-    // reject the marker at frame validation (via the size check) or at the
-    // inbox fence, whichever sees it first.
+    // reject the malformed or addressed marker at frame validation (via the
+    // size check) before the inbox grant resolution ever sees it.
     let forged = Message {
         digest: [0; 32],
         id: MessageId {
@@ -2235,8 +2235,460 @@ fn host_inbox_rejects_guest_supplied_conversation_ids() {
         .unwrap_err()
         .to_string();
     assert!(
-        failure.contains("guest cannot set a sandbox conversation id"),
+        failure.contains("guest thread expansion requests carry no target or generation"),
         "unexpected rejection: {failure}"
     );
     assert_eq!(db.get_last_event_id(), 0);
+}
+
+/// Guest thread-only dispatch resolves a retained grant, queues one immutable
+/// expansion request, and the host fans it out to the live creating host and
+/// the other current guests over preserved wire identities. Ungranted
+/// guests, foreign scopes, and stale generations are fenced; ordinary
+/// directed sends stay untouched.
+#[test]
+fn guest_thread_only_dispatch_expands_to_current_members() {
+    let root = tempfile::tempdir().unwrap();
+    let host_db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    host_db
+        .conn()
+        .execute_batch(
+            "INSERT INTO instances (name, created_at) VALUES ('host', 1), ('outsider', 2);",
+        )
+        .unwrap();
+    let host_store = Store::initialize(&host_db).unwrap();
+    let cap = |name| {
+        HostIdentity::capture(
+            &host_db,
+            &crate::identity::resolve_from_name(&host_db, name).unwrap(),
+        )
+        .unwrap()
+    };
+    let creator = cap("host");
+    let outsider = cap("outsider");
+    let team = host_store.create_team(Some(&creator)).unwrap();
+    let other_team = host_store.create_team(Some(&outsider)).unwrap();
+
+    let guest_a = GuestNode::new(
+        root.path(),
+        "ga.db",
+        &host_store,
+        &team.id,
+        Access::Host(&creator),
+        "alpha",
+        10.0,
+    );
+    let guest_b = GuestNode::new(
+        root.path(),
+        "gb.db",
+        &host_store,
+        &team.id,
+        Access::Host(&creator),
+        "bravo",
+        20.0,
+    );
+    let ungranted = GuestNode::new(
+        root.path(),
+        "gc.db",
+        &host_store,
+        &team.id,
+        Access::Host(&creator),
+        "charlie",
+        30.0,
+    );
+    let foreign = host_store
+        .reserve_worker(
+            &other_team.id,
+            Access::Host(&outsider),
+            "outside",
+            Tool::Claude,
+            Placement {
+                gateway: "gateway",
+                workspace: "default",
+                sandbox: "vm-out",
+                incarnation: &uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .unwrap()
+        .binding;
+    guest_a.refresh_directory(&host_store, 2);
+    guest_b.refresh_directory(&host_store, 2);
+    ungranted.refresh_directory(&host_store, 2);
+    let _ = &foreign;
+
+    // The creating host seeds the conversation with both guests through
+    // explicit threaded sends; the deliveries mint guest evidence.
+    let host_sender = crate::identity::resolve_from_name(&host_db, "host").unwrap();
+    let grant_envelope = crate::messages::MessageEnvelope {
+        thread: Some("work".into()),
+        ..Default::default()
+    };
+    for guest in [&guest_a, &guest_b] {
+        crate::sandbox::outgoing::queue(
+            &host_db,
+            &host_sender,
+            &guest.worker,
+            "seed",
+            &grant_envelope,
+            None,
+        )
+        .unwrap();
+        let mut inbox = HostInbox::new(&host_db, &host_store, &guest.worker.binding);
+        bridge_step(&host_store, guest, 3, &mut inbox, false, true);
+    }
+    let conversation: String = host_db
+        .conn()
+        .query_row(
+            "SELECT id FROM sandbox_conversations WHERE label = 'work'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let evidence = |db: &HcomDb| -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT count(*) FROM sandbox_guest_conversations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(evidence(&guest_a.db), 1);
+    assert_eq!(evidence(&guest_b.db), 1);
+    assert_eq!(evidence(&ungranted.db), 0);
+
+    let host_events = || -> i64 {
+        host_db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    // An ungranted team guest cannot dispatch or fall through to any
+    // ordinary membership.
+    assert_eq!(
+        run_cmd_send(
+            &ungranted.db,
+            "guest",
+            &["send", "--thread", "work", "--", "guess"]
+        ),
+        1
+    );
+    assert_eq!(
+        ungranted
+            .store()
+            .next_pending(&ungranted.worker.binding, now_epoch_i64())
+            .unwrap(),
+        None
+    );
+
+    // Guest bravo dispatches the retained thread; one immutable request is
+    // queued for the host.
+    assert_eq!(
+        run_cmd_send(
+            &guest_b.db,
+            "guest",
+            &["send", "--thread", "work", "--", "expanding"]
+        ),
+        0
+    );
+    let now = now_epoch_i64();
+    let request = guest_b
+        .store()
+        .next_pending(&guest_b.worker.binding, now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request.payload.conversation.as_deref(),
+        Some(conversation.as_str())
+    );
+    assert_eq!(request.payload.thread.as_deref(), Some("work"));
+    assert!(request.payload.target.is_empty());
+    assert_eq!(request.payload.target_generation, None);
+    assert_eq!(request.payload.sender_routing_generation, None);
+    assert!(!request.payload.broadcast);
+    let request_event_id: i64 = guest_b
+        .db
+        .conn()
+        .query_row(
+            "SELECT event_id FROM sandbox_outbox WHERE sequence = ?",
+            [request.id.sequence],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let request_journal = event(&guest_b.db, request_event_id);
+    assert_eq!(
+        request_journal["_sandbox"]["conversation"],
+        json!(conversation)
+    );
+
+    // The host import resolves the grant and fans out atomically: the live
+    // creator receives the ordinary event and alpha gets the verbatim
+    // request over its own route.
+    let before = host_events();
+    let mut bravo_host_inbox = HostInbox::new(&host_db, &host_store, &guest_b.worker.binding);
+    host_db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_thread_forward BEFORE INSERT ON sandbox_outbox
+         WHEN NEW.forwarded_sequence IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'thread forward fixture failure'); END;",
+        )
+        .unwrap();
+    let rejected = host_store.import(
+        Receiver::Host,
+        &guest_b.worker.binding,
+        &request,
+        now_epoch_i64(),
+        |tx| bravo_host_inbox.insert(tx, &request),
+    );
+    assert!(
+        rejected
+            .unwrap_err()
+            .to_string()
+            .contains("thread forward fixture failure")
+    );
+    assert_eq!(host_events(), before);
+    assert!(
+        host_store
+            .next_pending(&guest_a.worker.binding, now_epoch_i64())
+            .unwrap()
+            .is_none()
+    );
+    host_db
+        .conn()
+        .execute_batch("DROP TRIGGER reject_thread_forward")
+        .unwrap();
+    bridge_step(
+        &host_store,
+        &guest_b,
+        4,
+        &mut bravo_host_inbox,
+        false,
+        false,
+    );
+    assert_eq!(host_events(), before + 1);
+    let fanout: String = host_db
+        .conn()
+        .query_row(
+            "SELECT data FROM events ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let fanout: Value = serde_json::from_str(&fanout).unwrap();
+    assert_eq!(fanout["from"], json!(guest_b.worker.binding.worker.worker));
+    assert_eq!(fanout["delivered_to"], json!(["host"]));
+    assert_eq!(
+        fanout["queued_to"],
+        json!([guest_a.worker.binding.worker.worker])
+    );
+    assert_eq!(fanout["_sandbox"]["conversation"], json!(conversation));
+    assert_eq!(fanout["_sandbox"]["id"], json!(request.id));
+    let hops: i64 = host_db
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM sandbox_outbox WHERE accepted = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(hops, 1, "only the alpha hop is queued");
+
+    // The grant-holding destination accepts the verbatim request; the wire
+    // identity and digest survive the hop untouched, and no evidence is
+    // minted by an expansion delivery.
+    let mut host_inbox_a = HostInbox::new(&host_db, &host_store, &guest_a.worker.binding);
+    bridge_step(&host_store, &guest_a, 5, &mut host_inbox_a, false, true);
+    let alpha_event_id: i64 = guest_a
+        .db
+        .conn()
+        .query_row(
+            "SELECT event_id FROM sandbox_inbox WHERE worker = ? AND sequence = ?",
+            rusqlite::params![request.id.origin.worker, request.id.sequence],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let alpha_event = event(&guest_a.db, alpha_event_id);
+    assert_eq!(alpha_event["_sandbox"]["id"], json!(request.id));
+    assert_eq!(alpha_event["_sandbox"]["conversation"], json!(conversation));
+    assert_eq!(alpha_event["thread"], json!("work"));
+    let alpha_digest: Vec<u8> = guest_a
+        .db
+        .conn()
+        .query_row(
+            "SELECT digest FROM sandbox_inbox WHERE worker = ? AND sequence = ?",
+            rusqlite::params![request.id.origin.worker, request.id.sequence],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(alpha_digest, request.digest.to_vec());
+    assert_eq!(evidence(&guest_a.db), 1, "expansions mint no evidence");
+
+    // Guest charlie holds no grant: the same expansion delivery is refused
+    // at its inbox, and a replay on the host stays idempotent.
+    let delivered = crate::sandbox::protocol::Message {
+        digest: request.digest,
+        id: request.id.clone(),
+        payload: request.payload.clone(),
+    };
+    let charlie_store = ungranted.store();
+    let charlie_failure = charlie_store
+        .import(
+            Receiver::Guest,
+            &ungranted.worker.binding,
+            &delivered,
+            now_epoch_i64(),
+            |tx| ungranted.inbox().insert(tx, &delivered),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        charlie_failure.contains("sandbox expansion delivery requires a retained grant"),
+        "unexpected rejection: {charlie_failure}"
+    );
+    let replay = {
+        let mut inbox = HostInbox::new(&host_db, &host_store, &guest_b.worker.binding);
+        host_store
+            .import(
+                Receiver::Host,
+                &guest_b.worker.binding,
+                &request,
+                now_epoch_i64(),
+                |tx| inbox.insert(tx, &request),
+            )
+            .unwrap()
+    };
+    assert!(matches!(replay, crate::sandbox::store::Import::Replay(_)));
+    assert_eq!(host_events(), before + 1);
+
+    // Unknown or foreign scopes are rejected without a journal row, and a
+    // guest cannot claim an addressed conversation grant.
+    let forged_scope = crate::sandbox::protocol::Message::new(
+        request.id.clone(),
+        crate::sandbox::protocol::MessagePayload {
+            conversation: Some("nonexistent".into()),
+            ..request.payload.clone()
+        },
+    )
+    .unwrap();
+    let unknown = {
+        let mut inbox = HostInbox::new(&host_db, &host_store, &guest_b.worker.binding);
+        host_store
+            .write(|tx| inbox.insert(tx, &forged_scope))
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(
+        unknown.contains("sandbox thread expansion is not granted for this source"),
+        "unexpected rejection: {unknown}"
+    );
+    host_db
+        .conn()
+        .execute(
+            "INSERT INTO sandbox_conversations (id, team, label) VALUES ('foreign', ?, 'work')",
+            [&other_team.id],
+        )
+        .unwrap();
+    let foreign_scope = crate::sandbox::protocol::Message::new(
+        request.id.clone(),
+        crate::sandbox::protocol::MessagePayload {
+            conversation: Some("foreign".into()),
+            ..request.payload.clone()
+        },
+    )
+    .unwrap();
+    let foreign = {
+        let mut inbox = HostInbox::new(&host_db, &host_store, &guest_b.worker.binding);
+        host_store
+            .write(|tx| inbox.insert(tx, &foreign_scope))
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(
+        foreign.contains("sandbox thread expansion is not granted for this source"),
+        "unexpected rejection: {foreign}"
+    );
+    let addressed_claim = crate::sandbox::protocol::Message::new(
+        request.id.clone(),
+        crate::sandbox::protocol::MessagePayload {
+            conversation: Some(conversation.clone()),
+            target: guest_a.worker.binding.worker.worker.clone(),
+            target_generation: Some(guest_a.worker.binding.worker.generation.clone()),
+            sender_routing_generation: Some("host-recipient".into()),
+            ..request.payload.clone()
+        },
+    )
+    .unwrap();
+    let claimed = {
+        let mut inbox = HostInbox::new(&host_db, &host_store, &guest_b.worker.binding);
+        host_store
+            .write(|tx| inbox.insert(tx, &addressed_claim))
+            .unwrap_err()
+            .to_string()
+    };
+    assert!(
+        claimed.contains("guest cannot claim an addressed sandbox conversation"),
+        "unexpected rejection: {claimed}"
+    );
+    assert_eq!(host_events(), before + 1);
+
+    // A retired member is excluded from later expansions and its same-name
+    // replacement never inherits the membership.
+    host_store
+        .retire_worker(Access::Host(&creator), &guest_a.worker.binding)
+        .unwrap();
+    let replacement = host_store
+        .reserve_worker(
+            &team.id,
+            Access::Host(&creator),
+            "alpha",
+            Tool::Claude,
+            Placement {
+                gateway: "gateway",
+                workspace: "default",
+                sandbox: "vm-replacement",
+                incarnation: &uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        replacement.binding.worker.worker,
+        guest_a.worker.binding.worker.worker
+    );
+    assert_eq!(
+        run_cmd_send(
+            &guest_b.db,
+            "guest",
+            &["send", "--thread", "work", "--", "expanding again"]
+        ),
+        0
+    );
+    let mut bravo_host_inbox = HostInbox::new(&host_db, &host_store, &guest_b.worker.binding);
+    bridge_step(
+        &host_store,
+        &guest_b,
+        6,
+        &mut bravo_host_inbox,
+        false,
+        false,
+    );
+    let fanout: String = host_db
+        .conn()
+        .query_row(
+            "SELECT data FROM events ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let fanout: Value = serde_json::from_str(&fanout).unwrap();
+    assert_eq!(fanout["delivered_to"], json!(["host"]));
+    assert!(
+        fanout["queued_to"].is_null(),
+        "stale and replacement members are excluded: {fanout}"
+    );
 }

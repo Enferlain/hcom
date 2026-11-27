@@ -27,6 +27,12 @@ pub(crate) enum Target {
     Broadcast {
         binding: Binding,
     },
+    /// A guest thread expansion request: the retained grant names the
+    /// conversation; the host performs the fan-out.
+    Expand {
+        binding: Binding,
+        grant: super::conversation::GuestGrant,
+    },
 }
 
 impl Target {
@@ -36,7 +42,9 @@ impl Target {
 
     fn binding(&self) -> &Binding {
         match self {
-            Self::Direct { binding, .. } | Self::Broadcast { binding } => binding,
+            Self::Direct { binding, .. }
+            | Self::Broadcast { binding }
+            | Self::Expand { binding, .. } => binding,
         }
     }
 }
@@ -159,6 +167,24 @@ pub(crate) fn resolve(
             "Refusing implicit broadcast: no explicit recipient was resolved.\nTarget an agent with @name, reuse a seeded --thread, or add --broadcast."
         );
     }
+    // Thread-only dispatch resolves only a unique retained grant for the
+    // exact enrolled worker and binding; an unknown or foreign label errors
+    // here instead of falling through to any ordinary membership. Replies
+    // remain explicitly directed: they still name one target below.
+    if let Some(label) = thread
+        && targets.is_none_or(|t| t.is_empty())
+    {
+        if has_reply_to {
+            anyhow::bail!("Target one sandbox team member explicitly");
+        }
+        let grant =
+            super::conversation::guest_grant_for_label(db.conn(), &enrollment.binding, label)?
+                .with_context(|| format!("No sandbox thread grant for '{label}'"))?;
+        return Ok(Some(Target::Expand {
+            binding: enrollment.binding,
+            grant,
+        }));
+    }
     let Some([requested]) = targets else {
         anyhow::bail!("Target one sandbox team member explicitly");
     };
@@ -196,6 +222,13 @@ pub(crate) fn queue(
         ensure!(
             envelope.reply_to.is_none() && reply_event.is_none(),
             "--broadcast cannot be combined with --reply-to in a sandbox"
+        );
+    }
+    if matches!(target, Target::Expand { .. }) {
+        // Thread-only dispatch expands; it never carries a reply.
+        ensure!(
+            envelope.reply_to.is_none() && reply_event.is_none(),
+            "thread expansion requests cannot combine --reply-to"
         );
     }
 
@@ -263,6 +296,25 @@ pub(crate) fn queue(
             intent,
             text,
         },
+        Target::Expand { grant, .. } => {
+            // The strictly distinct expansion shape: scoped to the retained
+            // conversation, naming the label, addressing nobody.
+            ensure!(
+                envelope.thread.as_deref() == Some(grant.label.as_str()),
+                "sandbox thread grant does not match the requested label"
+            );
+            MessagePayload {
+                conversation: Some(grant.conversation.clone()),
+                target: String::new(),
+                target_generation: None,
+                sender_routing_generation: None,
+                broadcast: false,
+                thread: Some(grant.label.clone()),
+                reply_to: None,
+                intent,
+                text,
+            }
+        }
     };
     let now = now_epoch_i64();
     // The private guest store has no host controller to reclaim expired slots.
@@ -324,6 +376,32 @@ pub(crate) fn queue(
                         "broadcast": true,
                     },
                 }),
+                Target::Expand { grant, .. } => {
+                    // The request is immutable: the exact retained grant must
+                    // still match this route, generation, and label.
+                    let retained =
+                        super::conversation::guest_grant_for_label(tx, binding, &grant.label)?
+                            .context("sandbox thread grant is missing")?;
+                    ensure!(
+                        retained.conversation == grant.conversation,
+                        "sandbox thread grant changed during enqueue"
+                    );
+                    json!({
+                        "from": sender.name,
+                        "sender_kind": "instance",
+                        "scope": "mentions",
+                        "text": message.payload.text,
+                        "mentions": [],
+                        "delivered_to": [],
+                        "queued_to": [],
+                        "intent": intent,
+                        "_sandbox": {
+                            "team": binding.team,
+                            "id": message.id,
+                            "conversation": grant.conversation,
+                        },
+                    })
+                }
             };
             if let Some(thread) = &envelope.thread {
                 data["thread"] = json!(thread);
@@ -340,6 +418,7 @@ pub(crate) fn queue(
     let (queued_to, display_target) = match target {
         Target::Direct { peer, .. } => (vec![peer.name.clone()], peer.name.clone()),
         Target::Broadcast { .. } => (Vec::new(), "team broadcast".to_string()),
+        Target::Expand { grant, .. } => (Vec::new(), format!("thread '{}'", grant.label)),
     };
     Ok(Queued {
         event_id,
