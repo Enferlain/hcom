@@ -3,6 +3,76 @@ mod support;
 use rusqlite::{Connection, params};
 use support::Hcom;
 
+#[test]
+fn sandbox_guest_send_reports_control_escaping_to_the_caller() {
+    let h = Hcom::new();
+    let (code, help, err) = h.run(["send", "--help"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(help.contains("escaped_controls"), "{help}");
+    let guest = h.start();
+    let (code, _, err) = h.run(["sandbox", "controller", "stop"]);
+    assert_eq!(code, 0, "{err}");
+    let db = Connection::open(h.hcom_dir.join("hcom.db")).unwrap();
+    let binding = serde_json::json!({
+        "team": "team",
+        "sandbox": "vm",
+        "worker": {
+            "worker": "guest.realm",
+            "generation": "run",
+            "incarnation": db.query_row("SELECT incarnation FROM sandbox_identity", [], |row| {
+                row.get::<_, String>(0)
+            }).unwrap(),
+        }
+    });
+    let directory = serde_json::json!([{"name": "host", "alias": null, "generation": "run"}]);
+    db.execute(
+        "INSERT INTO sandbox_guest_directory
+         SELECT 1, ?1, name, created_at, ?2 FROM instances WHERE name = ?3",
+        params![binding.to_string(), directory.to_string(), guest],
+    )
+    .unwrap();
+
+    let send = |flags: &[&str], body| {
+        let mut args = vec!["send", "--name", guest.as_str()];
+        args.extend_from_slice(flags);
+        args.extend(["@host", "--", body]);
+        h.run(args)
+    };
+    let text = "status\x1b[0m\n\tready";
+    let (code, out, err) = send(&["--json"], text);
+    assert_eq!(code, 0, "{err}");
+    let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(result["escaped_controls"], true);
+    let (code, out, err) = send(&["--json"], r"status\u001b[0m");
+    assert_eq!(code, 0, "{err}");
+    let result: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(result.get("escaped_controls").is_none());
+
+    let (code, out, err) = send(&[], text);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("Queued for: host"), "{out}");
+    assert!(
+        err.contains("Escaped prohibited sandbox message controls"),
+        "{err}"
+    );
+    let (code, out, err) = send(&["--quiet"], text);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(
+        err.contains("Escaped prohibited sandbox message controls"),
+        "{err}"
+    );
+
+    let (code, out, err) = send(&["--json"], "\r\n\t ");
+    assert_eq!(code, 1, "{err}");
+    assert!(out.is_empty(), "{out}");
+    assert!(err.contains("Message required"), "{err}");
+    let queued: i64 = db
+        .query_row("SELECT count(*) FROM sandbox_outbox", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(queued, 4);
+}
+
 /// Create two isolated identities and select the receiver command-routing mode.
 fn setup(tool: &str) -> (Hcom, Connection, String, String) {
     let h = Hcom::new();

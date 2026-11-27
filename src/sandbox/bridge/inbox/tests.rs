@@ -987,7 +987,12 @@ fn ordinary_guest_send_uses_the_directory_and_replies_to_the_bound_host() {
         crate::commands::send::cmd_send(&guest_db, &args, Some(&ctx))
     };
     let reference = request_event.to_string();
+    let terminal = "received\u{1b}[31m\u{7}\u{7f}\u{9b}\r\n\tkeep \\u001b café";
+    let escaped = "received\\u001b[31m\\u0007\\u007f\\u009b\\u000d\n\tkeep \\u001b café";
     assert_eq!(send(&["send", "--json", "@missing", "--", "wrong"]), 1);
+    assert_eq!(send(&["send", "--json", "@ho$st", "--", terminal]), 1);
+    let oversized = "\u{7}".repeat(42 * 1024);
+    assert_eq!(send(&["send", "--json", "@host", "--", &oversized]), 1);
     assert_eq!(
         send(&[
             "send",
@@ -1011,7 +1016,7 @@ fn ordinary_guest_send_uses_the_directory_and_replies_to_the_bound_host() {
             &reference,
             "@host",
             "--",
-            "received"
+            terminal
         ]),
         0
     );
@@ -1019,6 +1024,11 @@ fn ordinary_guest_send_uses_the_directory_and_replies_to_the_bound_host() {
     assert_eq!(reply.id.origin, binding.worker);
     assert_eq!(reply.payload.reply_to, Some(work.id.clone()));
     assert_eq!(reply.payload.thread.as_deref(), Some("work"));
+    assert_eq!(reply.payload.text, escaped);
+    assert_eq!(
+        event(&guest_db, guest_db.get_last_event_id())["text"],
+        escaped
+    );
 
     let mut host_inbox = HostInbox::new(&host_db, &host_store, binding);
     let mut wrong = reply.payload.clone();
@@ -1042,8 +1052,20 @@ fn ordinary_guest_send_uses_the_directory_and_replies_to_the_bound_host() {
         panic!("expected host inbox reply");
     };
     let data = event(&host_db, reply_event);
+    assert_eq!(data["text"], escaped);
     assert_eq!(data["delivered_to"], json!(["host"]));
     assert_eq!(data["reply_to_local"], request.event_id);
+    assert!(matches!(
+        apply(
+            &host_store,
+            Receiver::Host,
+            binding,
+            &reply,
+            &mut host_inbox
+        ),
+        Imported::Replay
+    ));
+    assert_eq!(host_db.get_last_event_id(), reply_event);
     assert!(
         host_store
             .next_pending(&collision.binding, now)
@@ -1561,7 +1583,7 @@ fn guest_broadcast_routes_to_bound_team_with_stable_ids_and_postcommit_wakes() {
     let guest_b_wake = wake_listener(&guest_b.db, "guest", "pty");
     let guest_c_wake = wake_listener(&guest_c.db, "guest", "pty");
 
-    // Enqueue broadcast 1 via guest_send API (verifying Queued feedback & CRLF->LF), then broadcast 2
+    // Enqueue broadcast 1 via guest_send API and verify escaping feedback, then broadcast 2
     // and direct message 3 via ordinary `hcom send` CLI.
     let ga_id = crate::identity::resolve_from_name(&guest_a.db, "guest").unwrap();
     let target =
@@ -1581,12 +1603,16 @@ fn guest_broadcast_routes_to_bound_team_with_stable_ids_and_postcommit_wakes() {
     )
     .unwrap();
     assert!(queued.broadcast && queued.queued_to.is_empty());
+    assert!(queued.escaped_controls);
     assert_eq!(queued.display_target, "team broadcast");
     assert_eq!(queued.forwarding, "pending");
     let journal = event(&guest_a.db, queued.event_id);
     assert_eq!(journal["queued_to"], json!([]));
     assert_eq!(journal["_sandbox"]["broadcast"], json!(true));
-    assert_eq!(journal["text"], json!("team update\nline2\t@outsider_host"));
+    assert_eq!(
+        journal["text"],
+        json!("team update\\u000d\nline2\t@outsider_host")
+    );
     assert_eq!(
         run_cmd_send(
             &guest_a.db,
@@ -1693,7 +1719,7 @@ fn guest_broadcast_routes_to_bound_team_with_stable_ids_and_postcommit_wakes() {
     assert_eq!(
         gb_msgs,
         [
-            "team update\nline2\t@outsider_host",
+            "team update\\u000d\nline2\t@outsider_host",
             "second broadcast",
             "direct followup"
         ]
@@ -2032,11 +2058,6 @@ fn guest_broadcast_rejects_mixed_scopes_forgery_and_handles_oversized_team() {
             "spoof",
         ],
         vec!["send", "--json", "-b", "--broadcast", "--", "spoof"],
-        vec!["send", "--json", "--broadcast", "--", "bad\u{1b}[31mtext"],
-        vec!["send", "--json", "--broadcast", "--", "bad\u{0007}bell"],
-        vec!["send", "--json", "--broadcast", "--", "bad\rreturn"],
-        vec!["send", "--json", "--broadcast", "--", "bad\u{007f}del"],
-        vec!["send", "--json", "--broadcast", "--", "bad\u{0085}c1"],
     ] {
         assert_eq!(
             run_cmd_send(&guest.db, "guest", &bad),

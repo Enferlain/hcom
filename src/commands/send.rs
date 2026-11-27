@@ -33,6 +33,10 @@ Inline bundle (attach structured context):
     --extends <id>                 Parent bundle (optional)
   See 'hcom bundle --help' for bundle details
 
+OpenShell guest sends preserve newlines and tabs. Other control characters
+are escaped as visible \\uXXXX text. JSON output adds escaped_controls when
+this happens. Text mode reports it on stderr, including with --quiet.
+
 Examples:
     hcom send @luna -- Hello there!
     hcom send @luna @nova --intent request -- Can you help?
@@ -1126,9 +1130,19 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     };
 
-    if let Err(err) = validate_message(&message) {
-        eprintln!("Error: {err}");
-        return 1;
+    let invalid_message = validate_message(&message).err();
+    if let Some(err) = &invalid_message {
+        match crate::sandbox::guest_send::can_escape_controls(db, &message) {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("Error: {err}");
+                return 1;
+            }
+            Err(error) => {
+                eprintln!("Error: Failed to read sandbox enrollment: {error:#}");
+                return 1;
+            }
+        }
     }
 
     // ── Resolve sender identity ──
@@ -1188,6 +1202,17 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             return 1;
         }
     };
+
+    // The guest enrollment may have changed since early content validation.
+    if let Some(err) = invalid_message
+        && !matches!(
+            preview_delivery.sandbox_target,
+            Some(SandboxTarget::Guest(_))
+        )
+    {
+        eprintln!("Error: {err}");
+        return 1;
+    }
 
     // Self-delivery is always filtered out, so an all-self target list would
     // otherwise "succeed" with no recipients.
@@ -1420,6 +1445,9 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         });
         if let Some(queued) = &queued {
             out["queued_to"] = serde_json::json!(queued.queued_to);
+            if queued.escaped_controls {
+                out["escaped_controls"] = serde_json::json!(true);
+            }
             if queued.broadcast {
                 out["scope"] = serde_json::json!("broadcast");
             }
@@ -1433,6 +1461,13 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             crate::relay::worker::try_spawn_worker();
         }
         return 0;
+    }
+
+    if queued
+        .as_ref()
+        .is_some_and(|queued| queued.escaped_controls)
+    {
+        eprintln!("Escaped prohibited sandbox message controls as \\uXXXX.");
     }
 
     if args.quiet {

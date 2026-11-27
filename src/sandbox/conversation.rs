@@ -257,6 +257,7 @@ pub(crate) fn queue(
         display_target: format!("thread '{label}'"),
         queued_to: guest_targets.into_inner(),
         broadcast: false,
+        escaped_controls: false,
         forwarding,
         forwarding_reason,
     })

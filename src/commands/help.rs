@@ -380,7 +380,15 @@ const SEND_HELP: &[HelpEntry] = &[
     ("", ""),
     ("Output:", ""),
     ("  --json", "JSON receipt; leaves mail unread"),
-    ("  --quiet", "No output; leaves mail unread"),
+    ("  --quiet", "Suppress normal output and leave mail unread"),
+    (
+        "",
+        "OpenShell guest sends preserve newlines and tabs and escape other controls as visible \\uXXXX text.",
+    ),
+    (
+        "",
+        "JSON adds escaped_controls when the body changes. Text mode reports it on stderr, including with --quiet.",
+    ),
     ("", ""),
     ("Inline bundle (attach structured context):", ""),
     ("  --title <text>", "Create and attach bundle inline"),

@@ -18,6 +18,7 @@ pub(crate) struct Queued {
     pub queued_to: Vec<String>,
     pub display_target: String,
     pub broadcast: bool,
+    pub escaped_controls: bool,
     pub forwarding: &'static str,
     pub forwarding_reason: Option<String>,
 }
@@ -206,6 +207,7 @@ pub(crate) fn queue(
         queued_to: vec![target.to_owned()],
         display_target: target.to_owned(),
         broadcast: false,
+        escaped_controls: false,
         forwarding,
         forwarding_reason,
     })

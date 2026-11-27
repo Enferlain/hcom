@@ -48,13 +48,14 @@ pub(super) fn validate_identifier(value: &str) -> Result<()> {
 #[error("{0}")]
 pub(super) struct InvalidMessageText(String);
 
+pub(super) fn is_prohibited_message_control(c: char) -> bool {
+    c.is_control() && c != '\n' && c != '\t'
+}
+
 /// Validate the text independently of the wire identity and payload digest.
 /// An authenticated send can receive a terminal rejection for invalid text.
 pub(super) fn validate_message_text(text: &str) -> std::result::Result<(), InvalidMessageText> {
-    if text
-        .chars()
-        .any(|c| c.is_control() && c != '\n' && c != '\t')
-    {
+    if text.chars().any(is_prohibited_message_control) {
         return Err(InvalidMessageText(
             "sandbox message contains prohibited control characters".into(),
         ));

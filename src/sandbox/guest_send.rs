@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
@@ -7,8 +9,11 @@ use crate::messages::MessageEnvelope;
 use crate::shared::time::now_epoch_i64;
 use crate::shared::{SenderIdentity, SenderKind};
 
-use super::outgoing::{Queued, wire_intent, wire_text};
-use super::protocol::{Binding, Intent, MessageId, MessagePayload, Receiver, TeamPeer};
+use super::outgoing::{Queued, wire_intent};
+use super::protocol::{
+    Binding, Intent, MessageId, MessagePayload, Receiver, TeamPeer, is_prohibited_message_control,
+    validate_message_text,
+};
 use super::store::Store;
 
 struct Enrollment {
@@ -195,6 +200,36 @@ pub(crate) fn resolve(
     }))
 }
 
+/// Called only if normal CLI content validation failed. The queue still checks
+/// sender enrollment and validates the escaped body before accepting it.
+pub(crate) fn can_escape_controls(db: &HcomDb, text: &str) -> Result<bool> {
+    // Preserve the raw body's required-text check. The escaped body and the
+    // complete encoded frame have their own size checks before commit.
+    Ok(!text.trim().is_empty()
+        && text.len() <= crate::shared::MAX_MESSAGE_SIZE
+        && text.chars().any(is_prohibited_message_control)
+        && Enrollment::read(db.conn())?.is_some())
+}
+
+fn escape_controls(text: &str) -> (String, bool) {
+    let Some((first, _)) = text
+        .char_indices()
+        .find(|&(_, c)| is_prohibited_message_control(c))
+    else {
+        return (text.to_owned(), false);
+    };
+    let mut escaped = String::with_capacity(text.len());
+    escaped.push_str(&text[..first]);
+    for c in text[first..].chars() {
+        if is_prohibited_message_control(c) {
+            write!(escaped, "\\u{:04x}", u32::from(c)).expect("write to String");
+        } else {
+            escaped.push(c);
+        }
+    }
+    (escaped, true)
+}
+
 pub(crate) fn queue(
     db: &HcomDb,
     sender: &SenderIdentity,
@@ -203,7 +238,9 @@ pub(crate) fn queue(
     envelope: &MessageEnvelope,
     reply_event: Option<i64>,
 ) -> Result<Queued> {
-    let text = wire_text(text)?;
+    ensure!(!text.trim().is_empty(), "Message required");
+    let (text, escaped_controls) = escape_controls(text);
+    validate_message_text(&text)?;
     let intent = wire_intent(envelope);
     ensure!(
         envelope.bundle_id.is_none(),
@@ -425,6 +462,7 @@ pub(crate) fn queue(
         queued_to,
         display_target,
         broadcast: target.is_broadcast(),
+        escaped_controls,
         forwarding: "pending",
         forwarding_reason: None,
     })
