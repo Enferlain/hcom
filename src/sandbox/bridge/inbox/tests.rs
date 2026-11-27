@@ -510,20 +510,32 @@ fn a_lost_rejection_receipt_replays_and_releases_the_next_guest_message() {
     use super::super::peer::Peer;
     use crate::sandbox::store::Delivery;
 
-    fn exchange(from: &mut Peer<'_, '_>, to: &mut Peer<'_, '_>, inbox: &mut impl Inbound) {
+    fn transfer(
+        from: &mut Peer<'_, '_>,
+        to: &mut Peer<'_, '_>,
+        inbox: &mut impl Inbound,
+    ) -> Result<()> {
         let mut bytes = Vec::new();
-        while from.write_step(&mut bytes).unwrap() {}
+        while from.write_step(&mut bytes)? {}
         let mut input = bytes.as_slice();
         while !input.is_empty() {
-            to.read_step(&mut input, inbox).unwrap();
+            to.read_step(&mut input, inbox)?;
         }
+        Ok(())
+    }
+    fn exchange(from: &mut Peer<'_, '_>, to: &mut Peer<'_, '_>, inbox: &mut impl Inbound) {
+        transfer(from, to, inbox).unwrap();
     }
 
     let root = tempfile::tempdir().unwrap();
     let guest_db = HcomDb::open_at(&root.path().join("guest.db")).unwrap();
     let host_db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
     let guest_store = Store::initialize(&guest_db).unwrap();
-    let host_store = Store::initialize(&host_db).unwrap();
+    let mut limits = crate::sandbox::admission::Limits::default();
+    // One rejected head and eight additional denials fill this window.
+    limits.pace.messages = 9;
+    limits.pace_seconds = 3600;
+    let host_store = Store::with_limits(&host_db, limits).unwrap();
     host_db
         .conn()
         .execute(
@@ -682,6 +694,49 @@ fn a_lost_rejection_receipt_replays_and_releases_the_next_guest_message() {
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+    let accounting = || {
+        host_db
+            .conn()
+            .query_row(
+                "SELECT (SELECT count(*) FROM sandbox_rejected_head), messages, bytes
+                 FROM sandbox_pacing",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let before = accounting();
+    assert_eq!((before.0, before.1), (1, limits.pace.messages));
+    assert!(guest.poll_outbox().unwrap());
+    let failure = transfer(&mut guest, &mut host, &mut host_inbox).unwrap_err();
+    assert_eq!(failure.to_string(), "sandbox guest pacing quota exhausted");
+    assert!(failure.is::<crate::sandbox::admission::QuotaExceeded>());
+    assert_eq!(accounting(), before);
+    assert!(!host.receipt_pending());
+    assert_eq!(host_db.get_last_event_id(), 0);
+    assert_eq!(
+        guest_store.delivery(&valid.id, now).unwrap(),
+        Some(Delivery::Pending)
+    );
+    drop((host, guest));
+    // Advance the stored window without sleeping. A new epoch retries the
+    // same queued ID, whose sender never received a terminal receipt.
+    host_db
+        .conn()
+        .execute(
+            "UPDATE sandbox_pacing SET started_at = ?",
+            [now - limits.pace_seconds],
+        )
+        .unwrap();
+    let (mut host, mut guest) = connect(3);
+    exchange(&mut host, &mut guest, &mut guest_inbox);
+    exchange(&mut guest, &mut host, &mut host_inbox);
     assert!(guest.poll_outbox().unwrap());
     exchange(&mut guest, &mut host, &mut host_inbox);
     exchange(&mut host, &mut guest, &mut guest_inbox);
@@ -707,6 +762,111 @@ fn a_lost_rejection_receipt_replays_and_releases_the_next_guest_message() {
         )
         .unwrap();
     assert_eq!(messages, 1);
+}
+
+#[test]
+fn delivered_guest_history_counts_against_run_team_and_host_limits() {
+    let root = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    let mut limits = crate::sandbox::admission::Limits::default();
+    limits.run.messages = 2;
+    limits.team.messages = 3;
+    limits.host.messages = 4;
+    let store = Store::with_limits(&db, limits).unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO instances (name, created_at) VALUES ('owner', 1)",
+            [],
+        )
+        .unwrap();
+    let identity = crate::identity::resolve_from_name(&db, "owner").unwrap();
+    let owner = HostIdentity::capture(&db, &identity).unwrap();
+    let first_team = store.create_team(Some(&owner)).unwrap();
+    let second_team = store.create_team(Some(&owner)).unwrap();
+    let reserve = |team: &str, alias| {
+        store
+            .reserve_worker(
+                team,
+                Access::Host(&owner),
+                alias,
+                Tool::Claude,
+                Placement {
+                    gateway: "gateway",
+                    workspace: "default",
+                    sandbox: alias,
+                    incarnation: &uuid::Uuid::new_v4().to_string(),
+                },
+            )
+            .unwrap()
+            .binding
+    };
+    let a = reserve(&first_team.id, "alpha");
+    let b = reserve(&first_team.id, "bravo");
+    let c = reserve(&second_team.id, "charlie");
+    let d = reserve(&second_team.id, "delta");
+    let generation = host_recipient_generation(db.conn(), "owner", 1.0).unwrap();
+    let now = now_epoch_i64();
+    let deliver = |binding: &Binding, sequence| {
+        let mut inbox = HostInbox::new(&db, &store, binding);
+        let input = addressed(
+            message(binding.worker.clone(), sequence, "owner"),
+            &generation,
+        );
+        let outcome = store.import(Receiver::Host, binding, &input, now, |tx| {
+            inbox.insert(tx, &input)
+        })?;
+        if let Import::Inserted(id) = outcome {
+            inbox.committed(id);
+            assert_eq!(event(&db, id)["delivered_to"], json!(["owner"]));
+        }
+        Ok::<_, anyhow::Error>(outcome)
+    };
+    for (binding, sequence, quota) in [
+        (&a, 1, None),
+        (&a, 2, None),
+        (&a, 3, Some("run")),
+        (&b, 1, None),
+        (&b, 2, Some("team")),
+        (&c, 1, None),
+        (&d, 1, Some("host")),
+    ] {
+        if let Some(quota) = quota {
+            for _ in 0..64 {
+                assert_eq!(
+                    deliver(binding, sequence).unwrap_err().to_string(),
+                    format!("sandbox {quota} quota exhausted"),
+                );
+            }
+        } else {
+            assert!(matches!(
+                deliver(binding, sequence).unwrap(),
+                Import::Inserted(_)
+            ));
+        }
+    }
+    assert!(matches!(deliver(&a, 1).unwrap(), Import::Replay(_)));
+    assert_eq!(db.get_unread_messages("owner").len(), 4);
+    for (table, expected) in [
+        ("events", 4),
+        ("sandbox_inbox", 4),
+        ("sandbox_outbox", 0),
+        ("sandbox_rejected_head", 0),
+    ] {
+        let rows: i64 = db
+            .conn()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, expected, "{table}");
+    }
+    let paced: i64 = db
+        .conn()
+        .query_row("SELECT sum(messages) FROM sandbox_pacing", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(paced, 4);
 }
 
 #[test]

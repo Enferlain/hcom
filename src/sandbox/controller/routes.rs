@@ -9,6 +9,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::db::HcomDb;
+use crate::sandbox::admission::QuotaExceeded;
 use crate::sandbox::bridge::{self, ExecTarget, HostInbox, Session};
 use crate::sandbox::directory::{Worker, current_worker};
 use crate::sandbox::openshell::{Adapter, Profile, Qualification};
@@ -133,6 +134,7 @@ struct Active<'store, 'db> {
     binding: Binding,
     session: Session<'store, 'db>,
     stopping: Option<Instant>,
+    ready_since: Option<Instant>,
 }
 
 struct Retry {
@@ -214,14 +216,27 @@ impl<'store, 'db> Routes<'store, 'db> {
                 &mut HostInbox::new(db, store, &active.binding),
             ) {
                 Ok(None) => {
-                    if active.session.ready() && active.stopping.is_none() {
-                        self.retry.remove(generation);
+                    if self.retry.contains_key(generation)
+                        && active.session.ready()
+                        && active.stopping.is_none()
+                    {
+                        let now = Instant::now();
+                        let ready_since = active.ready_since.get_or_insert(now);
+                        // A guest can handshake and immediately retry the same
+                        // inadmissible head on every connection.
+                        if now.duration_since(*ready_since) >= MAX_RETRY {
+                            self.retry.remove(generation);
+                        }
                     }
                     true
                 }
                 Ok(Some(_)) => false,
                 Err(error) => {
-                    self.adapters.remove(generation);
+                    // A local admission limit does not invalidate the runtime
+                    // fingerprint. The next probe still verifies placement.
+                    if !error.is::<QuotaExceeded>() {
+                        self.adapters.remove(generation);
+                    }
                     if active.stopping.is_none() {
                         failed(&mut self.retry, generation, error);
                     }
@@ -268,6 +283,7 @@ impl<'store, 'db> Routes<'store, 'db> {
                             binding: worker.binding,
                             session,
                             stopping: None,
+                            ready_since: None,
                         })
                     },
                 );

@@ -2064,6 +2064,49 @@ mod tests {
             "hello",
         ]);
         assert_eq!(cmd_send(&db, &bundle, Some(&ctx("luna"))), 1);
+        // JSON escaping puts the frame over 256 KiB even though the raw
+        // message is comfortably below both the local and wire limits.
+        let oversized = "\\".repeat(140 * 1024);
+        let too_large = parse(&[
+            "send",
+            "--json",
+            "--thread",
+            "oversized",
+            &target,
+            "--",
+            &oversized,
+        ]);
+        let worker = crate::sandbox::directory::current_worker(db.conn(), &binding.worker.worker)
+            .unwrap()
+            .unwrap();
+        let error = crate::sandbox::outgoing::queue(
+            &db,
+            &identity,
+            &worker,
+            &oversized,
+            &MessageEnvelope {
+                thread: Some("oversized".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "sandbox frame exceeds size limit");
+        assert_eq!(cmd_send(&db, &too_large, Some(&ctx("luna"))), 1);
+        for table in [
+            "sandbox_outbox",
+            "sandbox_conversations",
+            "sandbox_conversation_members",
+            "sandbox_usage",
+        ] {
+            let rows: i64 = db
+                .conn()
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
         assert_eq!(db.get_last_event_id(), 0);
         assert_eq!(
             observer.accept().unwrap_err().kind(),

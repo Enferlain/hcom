@@ -3,6 +3,12 @@ use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::protocol::Binding;
 
+#[derive(Debug, thiserror::Error)]
+#[error("sandbox {scope} quota exhausted")]
+pub(super) struct QuotaExceeded {
+    scope: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
     pub messages: i64,
@@ -14,10 +20,10 @@ impl Budget {
         Self { messages, bytes }
     }
 
-    fn charge(self, used: Self, bytes: i64, scope: &str) -> Result<Self> {
+    fn charge(self, used: Self, bytes: i64, scope: &'static str) -> Result<Self> {
         ensure!(
             used.messages < self.messages && bytes <= self.bytes.saturating_sub(used.bytes),
-            "sandbox {scope} quota exhausted"
+            QuotaExceeded { scope }
         );
         Ok(Self::new(used.messages + 1, used.bytes + bytes))
     }
