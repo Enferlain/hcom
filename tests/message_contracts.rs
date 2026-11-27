@@ -105,6 +105,23 @@ fn broadcast_flag_allows_delivery_to_all() {
 }
 
 #[test]
+fn local_send_keeps_its_existing_text_rules() {
+    let (h, db, sender, receiver) = setup();
+    let text = "first\n\tsecond\rthird\u{007f}fourth";
+    let target = format!("@{receiver}");
+    let (code, stdout, stderr) = h.run(["send", "--name", &sender, &target, "--", text]);
+    assert_eq!(code, 0, "stdout: {stdout}, stderr: {stderr}");
+    let stored: String = db
+        .query_row(
+            "SELECT json_extract(data, '$.text') FROM events WHERE type = 'message' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, text);
+}
+
+#[test]
 fn implicit_broadcast_refused_without_flag() {
     let (h, _db, sender, _receiver) = setup();
 

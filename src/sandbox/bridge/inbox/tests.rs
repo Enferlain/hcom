@@ -531,8 +531,6 @@ fn a_lost_rejection_receipt_replays_and_releases_the_next_guest_message() {
             [],
         )
         .unwrap();
-    let host = crate::identity::resolve_from_name(&host_db, "host").unwrap();
-    let host = HostIdentity::capture(&host_db, &host).unwrap();
     let owner = crate::identity::resolve_from_name(&host_db, "owner").unwrap();
     let owner = HostIdentity::capture(&host_db, &owner).unwrap();
     let team = host_store.create_team(Some(&owner)).unwrap();
@@ -552,9 +550,10 @@ fn a_lost_rejection_receipt_replays_and_releases_the_next_guest_message() {
         .unwrap();
     let binding = &worker.binding;
     let now = now_epoch_i64();
-    let queue = |target: &str, created_at| {
-        let generation = host_recipient_generation(host_db.conn(), target, created_at).unwrap();
-        let payload = addressed(message(binding.worker.clone(), 1, target), &generation).payload;
+    let queue = |target: &str, generation: &str, text: &str| {
+        let mut payload = addressed(message(binding.worker.clone(), 1, target), generation).payload;
+        // Use the queue directly to exercise the host boundary independently of guest CLI checks.
+        payload.text = text.into();
         guest_store
             .enqueue(
                 Receiver::Host,
@@ -566,7 +565,8 @@ fn a_lost_rejection_receipt_replays_and_releases_the_next_guest_message() {
             )
             .unwrap()
     };
-    let expired = queue("owner", 2.0);
+    let owner_generation = host_recipient_generation(host_db.conn(), "owner", 2.0).unwrap();
+    let expired = queue("owner", &owner_generation, "expired");
     guest_db
         .conn()
         .execute(
@@ -574,8 +574,30 @@ fn a_lost_rejection_receipt_replays_and_releases_the_next_guest_message() {
             params![now - 1, expired.id.sequence],
         )
         .unwrap();
-    let rejected = queue("host", 1.0);
-    let valid = queue("owner", 2.0);
+    let rejected = queue("owner", &owner_generation, "blocked\u{1b}text");
+    let outsider_generation = host_recipient_generation(host_db.conn(), "host", 1.0).unwrap();
+    let mut denied = vec![
+        queue("host", &outsider_generation, "outside the team"),
+        queue("mention", "unassigned", "reserved target"),
+        queue(crate::shared::SENDER, "unassigned", "system target"),
+    ];
+    denied.extend(
+        [
+            "bel\u{0007}seq",
+            "cr\rseq",
+            "del\u{007f}seq",
+            "c1\u{009b}seq",
+            " \n\t ",
+        ]
+        .map(|text| queue("owner", &owner_generation, text)),
+    );
+    let literal = "printf '\\n'\n\tselect 1";
+    let valid = queue("owner", &owner_generation, literal);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    host_db
+        .upsert_notify_endpoint("owner", "pty", listener.local_addr().unwrap().port())
+        .unwrap();
     let mut host_inbox = HostInbox::new(&host_db, &host_store, binding);
     let mut guest_inbox = super::super::stage_guest_message;
     let connect = |epoch| {
@@ -630,9 +652,6 @@ fn a_lost_rejection_receipt_replays_and_releases_the_next_guest_message() {
             .reject(binding, &rejected.id, &[0; 32], now)
             .is_err()
     );
-    host_store
-        .enroll_host(&team.id, Access::Host(&owner), &host)
-        .unwrap();
     let (mut host, mut guest) = connect(2);
     exchange(&mut host, &mut guest, &mut guest_inbox);
     exchange(&mut guest, &mut host, &mut host_inbox);
@@ -648,6 +667,21 @@ fn a_lost_rejection_receipt_replays_and_releases_the_next_guest_message() {
             .acknowledge(binding, &rejected.id, &rejected.digest, now)
             .is_err()
     );
+    for denied in denied {
+        assert!(guest.poll_outbox().unwrap());
+        exchange(&mut guest, &mut host, &mut host_inbox);
+        exchange(&mut host, &mut guest, &mut guest_inbox);
+        assert_eq!(
+            guest_store.delivery(&denied.id, now).unwrap(),
+            Some(Delivery::Rejected)
+        );
+    }
+    assert_eq!(host_db.get_last_event_id(), 0);
+    assert!(host_db.get_thread_members("thread").is_empty());
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
     assert!(guest.poll_outbox().unwrap());
     exchange(&mut guest, &mut host, &mut host_inbox);
     exchange(&mut host, &mut guest, &mut guest_inbox);
@@ -655,10 +689,15 @@ fn a_lost_rejection_receipt_replays_and_releases_the_next_guest_message() {
         guest_store.delivery(&valid.id, now).unwrap(),
         Some(Delivery::Accepted)
     );
-    assert_eq!(
-        event(&host_db, host_db.get_last_event_id())["delivered_to"],
-        json!(["owner"])
-    );
+    let delivered = event(&host_db, host_db.get_last_event_id());
+    assert_eq!(delivered["delivered_to"], json!(["owner"]));
+    assert_eq!(delivered["from"], json!(binding.worker.worker));
+    assert_eq!(delivered["sender_kind"], "instance");
+    assert_eq!(delivered["text"], literal);
+    listener
+        .accept()
+        .expect("the valid message wakes the owner");
+    assert!(host_db.get_unread_messages("host").is_empty());
     let messages: i64 = host_db
         .conn()
         .query_row(
@@ -1748,7 +1787,7 @@ fn guest_broadcast_rejects_mixed_scopes_forgery_and_handles_oversized_team() {
             .is_none()
     );
 
-    // HostInbox & GuestInbox forgery, control-char, and retired-sender rejection.
+    // HostInbox & GuestInbox forgery and retired-sender rejection.
     let mut host_inbox = HostInbox::new(&host_db, &host_store, &guest.worker.binding);
     let host_before = host_db.get_last_event_id();
     let mut forged_gen = broadcast_msg(guest.worker.binding.worker.clone(), 1, "gen");
@@ -1757,11 +1796,6 @@ fn guest_broadcast_rejects_mixed_scopes_forgery_and_handles_oversized_team() {
     for bad_msg in [
         broadcast_msg(sibling.worker.binding.worker.clone(), 1, "forged origin"),
         forged_gen,
-        broadcast_msg(guest.worker.binding.worker.clone(), 2, "esc\u{1b}seq"),
-        broadcast_msg(guest.worker.binding.worker.clone(), 2, "bel\u{0007}seq"),
-        broadcast_msg(guest.worker.binding.worker.clone(), 2, "cr\rseq"),
-        broadcast_msg(guest.worker.binding.worker.clone(), 2, "del\u{007f}seq"),
-        broadcast_msg(guest.worker.binding.worker.clone(), 2, "c1\u{009b}seq"),
     ] {
         assert!(
             host_store

@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use crate::db::HcomDb;
 use crate::sandbox::directory::{host_generation, host_recipient_generation};
 use crate::sandbox::protocol::{
-    Binding, Message, MessageId, Origin, TeamPeer, validate_identifier,
+    Binding, Message, MessageId, Origin, TeamPeer, validate_identifier, validate_message_text,
 };
 use crate::sandbox::store::{ForwardRoute, Store, UnavailableRecipient};
 use crate::shared::time::now_epoch_i64;
@@ -319,6 +319,7 @@ impl Inbound for HostInbox<'_, '_> {
             source_active && message.id.origin == self.source.worker,
             "sandbox sender is not enrolled"
         );
+        validate_message_text(&message.payload.text)?;
         if let Some(conversation) = &message.payload.conversation {
             // The frame gates the expansion shape and the store import gates
             // the source binding; here the retained grant resolves the
@@ -550,6 +551,7 @@ impl Inbound for GuestInbox<'_> {
             "sandbox expansion cannot target its own sender"
         );
         self.check_local_worker(tx)?;
+        validate_message_text(&message.payload.text)?;
         self.retain_conversation(tx, message)?;
         let publication =
             self.inbox
@@ -692,14 +694,6 @@ impl<'a> Inbox<'a> {
     ) -> Result<Publication> {
         self.pending = None;
         let payload = &message.payload;
-        crate::messages::validate_message(&payload.text).map_err(anyhow::Error::msg)?;
-        ensure!(
-            !payload
-                .text
-                .chars()
-                .any(|c| c.is_control() && c != '\n' && c != '\t'),
-            "sandbox message contains prohibited control characters"
-        );
         let sender = &message.id.origin.worker;
         if let Some(generation) = &payload.sender_routing_generation {
             sandbox["sender_routing_generation"] = json!(generation);

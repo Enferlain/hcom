@@ -338,6 +338,58 @@ fn invalid_frames_cannot_begin_or_change_a_binding() {
 }
 
 #[test]
+fn guest_wire_schema_has_no_control_events_or_host_metadata() {
+    use serde_json::{Value, json};
+
+    let (binding, message) = fixture();
+    let frame = Frame {
+        version: VERSION,
+        epoch: 1,
+        binding: binding.clone(),
+        body: FrameBody::Send(message),
+    };
+    let hello = Frame {
+        body: hello_body(),
+        ..frame.clone()
+    };
+    let check_rejected = |data: Value, diagnostic: &str| {
+        let data = serde_json::to_vec(&data).unwrap();
+        let mut bytes = (data.len() as u32).to_be_bytes().to_vec();
+        bytes.extend(data);
+        let mut host = Connection::new(binding.clone(), 1, Receiver::Host).unwrap();
+        host.receive(&mut raw_frame(&hello).as_slice(), 1).unwrap();
+        let error = host.receive(&mut bytes.as_slice(), 1).unwrap_err();
+        assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+    };
+    for kind in [
+        "launch",
+        "kill",
+        "configure",
+        "terminal",
+        "sql",
+        "read",
+        "events",
+        "system",
+    ] {
+        let mut data = serde_json::to_value(&frame).unwrap();
+        data["body"] = json!({"kind": kind, "body": {}});
+        check_rejected(data, "unknown variant");
+    }
+    for (field, value) in [
+        ("pid", json!(1)),
+        ("transcript_path", json!("/fixture/transcript")),
+        ("notify_endpoint", json!("fixture")),
+        ("_relay", json!(true)),
+        ("_sandbox", json!({"team": "other"})),
+        ("sender_kind", json!("system")),
+    ] {
+        let mut data = serde_json::to_value(&frame).unwrap();
+        data["body"]["body"]["payload"][field] = value;
+        check_rejected(data, "unknown field");
+    }
+}
+
+#[test]
 fn interrupted_header_can_be_retried() {
     let (binding, _) = fixture();
     let frame = Frame {

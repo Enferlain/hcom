@@ -44,6 +44,24 @@ pub(super) fn validate_identifier(value: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct InvalidMessageText(String);
+
+/// Validate the text independently of the wire identity and payload digest.
+/// An authenticated send can receive a terminal rejection for invalid text.
+pub(super) fn validate_message_text(text: &str) -> std::result::Result<(), InvalidMessageText> {
+    if text
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        return Err(InvalidMessageText(
+            "sandbox message contains prohibited control characters".into(),
+        ));
+    }
+    crate::messages::validate_message(text).map_err(InvalidMessageText)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageId {
@@ -272,7 +290,7 @@ pub enum FrameBody {
         id: MessageId,
         digest: [u8; 32],
     },
-    /// The host could not route this guest message to its requested recipient.
+    /// The host permanently declined this guest message.
     Rejected {
         id: MessageId,
         digest: [u8; 32],

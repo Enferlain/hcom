@@ -6,7 +6,8 @@ use crate::db::HcomDb;
 
 use super::admission::Limits;
 use super::protocol::{
-    Binding, Message, MessageId, MessagePayload, Origin, Receiver, validate_message_size,
+    Binding, InvalidMessageText, Message, MessageId, MessagePayload, Origin, Receiver,
+    validate_message_size,
 };
 
 const SCHEMA: &str = "
@@ -737,7 +738,10 @@ impl<'db> Store<'db> {
                         tx.execute_batch("RELEASE sandbox_inbound_event")?;
                         event_id
                     }
-                    Err(error) if error.is::<UnavailableRecipient>() => {
+                    Err(error)
+                        if error.is::<UnavailableRecipient>()
+                            || error.is::<InvalidMessageText>() =>
+                    {
                         tx.execute_batch(
                             "ROLLBACK TO sandbox_inbound_event; RELEASE sandbox_inbound_event",
                         )?;

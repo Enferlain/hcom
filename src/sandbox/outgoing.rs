@@ -9,7 +9,7 @@ use crate::shared::time::now_epoch_i64;
 
 use super::controller::{Forwarding, forwarding_after_commit};
 use super::directory::{HostIdentity, Worker, check_sender, host_recipient_generation};
-use super::protocol::{Intent, MessageId, MessagePayload};
+use super::protocol::{Intent, MessageId, MessagePayload, validate_message_text};
 use super::store::{BatchHop, Store};
 
 #[derive(Debug)]
@@ -24,13 +24,7 @@ pub(crate) struct Queued {
 
 pub(super) fn wire_text(text: &str) -> Result<String> {
     let text = text.replace("\r\n", "\n");
-    crate::messages::validate_message(&text).map_err(anyhow::Error::msg)?;
-    ensure!(
-        !text
-            .chars()
-            .any(|c| c.is_control() && c != '\n' && c != '\t'),
-        "sandbox message contains prohibited control characters"
-    );
+    validate_message_text(&text)?;
     Ok(text)
 }
 
