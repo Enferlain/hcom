@@ -137,6 +137,8 @@ pub(crate) fn queue(
                 None
             };
             let payload = MessagePayload {
+                assigned_result: false,
+                result: None,
                 target: target.into(),
                 target_generation: Some(binding.worker.generation.clone()),
                 sender_routing_generation: Some(host_recipient_generation(
@@ -181,6 +183,9 @@ pub(crate) fn queue(
             });
             if let Some(conversation) = &message.payload.conversation {
                 data["_sandbox"]["conversation"] = json!(conversation);
+            }
+            if message.payload.assigned_result {
+                data["_sandbox"]["assigned_result"] = json!(true);
             }
             if let Some(thread) = &envelope.thread {
                 data["thread"] = json!(thread);

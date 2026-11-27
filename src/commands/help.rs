@@ -363,6 +363,10 @@ const SEND_HELP: &[HelpEntry] = &[
     ("", "  request: expect a response"),
     ("", "  inform: FYI, no response needed"),
     ("", "  ack: replying to a request (requires --reply-to)"),
+    (
+        "  --result <outcome>",
+        "OpenShell final report with --reply-to and a request thread. Use completed, failed, or cancelled.",
+    ),
     ("  --reply-to <id>", "Link to event ID (42 or 42:BOXE)"),
     (
         "  --thread <name>",

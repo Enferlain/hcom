@@ -198,6 +198,8 @@ pub(crate) fn queue(
                     guest_targets.borrow_mut().push(target.clone());
                     BatchHop {
                         payload: MessagePayload {
+                            assigned_result: false,
+                            result: None,
                             target,
                             target_generation: Some(route.worker.generation.clone()),
                             sender_routing_generation: Some(sender_generation.clone()),
@@ -222,7 +224,7 @@ pub(crate) fn queue(
             let message = messages
                 .first()
                 .context("sandbox thread fan-out is empty")?;
-            let data = json!({
+            let mut data = json!({
                 "from": host.name(),
                 "sender_kind": "instance",
                 "scope": "mentions",
@@ -238,6 +240,9 @@ pub(crate) fn queue(
                 },
                 "thread": label,
             });
+            if message.payload.assigned_result {
+                data["_sandbox"]["assigned_result"] = json!(true);
+            }
             event_id = db.insert_event_row("message", host.name(), &data, None)?;
             Ok(event_id)
         },

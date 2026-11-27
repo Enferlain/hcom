@@ -53,6 +53,8 @@ fn send(
                 incarnation: store.incarnation().into(),
             },
             MessagePayload {
+                assigned_result: false,
+                result: None,
                 target: route.worker.worker.clone(),
                 target_generation: None,
                 sender_routing_generation: None,

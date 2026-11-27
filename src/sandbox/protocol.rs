@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const MAX_ENCODED_FRAME: u32 = 256 * 1024;
+pub(super) const MAX_FINAL_FRAME: usize = 64 * 1024;
 const HEADER_LEN: u32 = 4;
 pub(super) const MAX_DIRECTORY_PEERS: usize = 256;
 
@@ -86,6 +87,24 @@ pub enum Intent {
     Ack,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl Outcome {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessagePayload {
@@ -109,9 +128,24 @@ pub struct MessagePayload {
     pub reply_to: Option<MessageId>,
     pub intent: Intent,
     pub text: String,
+    /// The host prepaid a result slot when it queued this assignment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub assigned_result: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Outcome>,
 }
 
 impl MessagePayload {
+    pub(super) fn can_assign_result(&self) -> bool {
+        self.intent == Intent::Request
+            && self.thread.is_some()
+            && self.sender_routing_generation.is_some()
+            && self.target_generation.is_some()
+            && self.result.is_none()
+            && !self.broadcast
+            && !self.target.is_empty()
+    }
+
     pub(super) fn addresses(&self, target: &Origin) -> bool {
         if self.broadcast {
             self.target.is_empty() && self.target_generation.is_none()
@@ -168,6 +202,24 @@ impl Message {
 
     pub(super) fn validate(&self) -> Result<()> {
         self.id.validate()?;
+        if self.payload.assigned_result {
+            ensure!(
+                self.payload.can_assign_result(),
+                "sandbox result assignment must be a directed, threaded host request"
+            );
+        }
+        if self.payload.result.is_some() {
+            ensure!(
+                self.payload.intent == Intent::Inform
+                    && self.payload.reply_to.is_some()
+                    && self.payload.thread.is_some()
+                    && self.payload.target_generation.is_some()
+                    && !self.payload.broadcast
+                    && self.payload.conversation.is_none()
+                    && self.payload.sender_routing_generation.is_none(),
+                "sandbox final report requires an inform with a directed request reply and thread"
+            );
+        }
         if let Some(reply) = &self.payload.reply_to {
             reply.validate()?;
         }
@@ -351,6 +403,18 @@ pub struct Frame {
 }
 
 impl Frame {
+    fn check_final_size(&self, body_bytes: usize) -> Result<()> {
+        if let FrameBody::Send(message) | FrameBody::Deliver(message) = &self.body
+            && message.payload.result.is_some()
+        {
+            ensure!(
+                body_bytes + HEADER_LEN as usize <= MAX_FINAL_FRAME,
+                "sandbox final report exceeds size limit"
+            );
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             self.version == VERSION,
@@ -455,6 +519,7 @@ fn encode(frame: &Frame) -> Result<Vec<u8>> {
         bytes.len() <= (MAX_ENCODED_FRAME - HEADER_LEN) as usize,
         "sandbox frame exceeds size limit"
     );
+    frame.check_final_size(bytes.len())?;
     Ok(bytes)
 }
 
@@ -477,6 +542,7 @@ pub(super) fn frame_length(header: [u8; HEADER_LEN as usize]) -> Result<usize> {
 
 pub(super) fn decode_frame(bytes: &[u8]) -> Result<Frame> {
     let frame: Frame = serde_json::from_slice(bytes)?;
+    frame.check_final_size(bytes.len())?;
     frame.validate()?;
     Ok(frame)
 }

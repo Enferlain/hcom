@@ -72,7 +72,8 @@ impl Limits {
 
     pub(super) fn pending(self, tx: &Transaction<'_>, wire_bytes: i64) -> Result<()> {
         let used = tx.query_row(
-            "SELECT count(*), COALESCE(sum(wire_bytes), 0) FROM sandbox_outbox WHERE accepted = 0",
+            "SELECT count(*), COALESCE(sum(wire_bytes), 0) FROM sandbox_outbox
+             WHERE accepted = 0 AND final_report = 0",
             [],
             |row| Ok(Budget::new(row.get(0)?, row.get(1)?)),
         )?;
@@ -88,20 +89,20 @@ impl Limits {
         event_id: i64,
         paced_at: Option<i64>,
     ) -> Result<()> {
-        // Account for the actual hcom event as well as the wire message and a
-        // fixed per-record allowance for the indexes and ledger metadata.
-        let event_bytes: i64 = tx.query_row(
-            "SELECT length(CAST(timestamp AS BLOB)) + length(CAST(type AS BLOB)) +
-                    length(CAST(instance AS BLOB)) + length(CAST(data AS BLOB))
-             FROM events WHERE id = ?",
-            [event_id],
-            |row| row.get(0),
-        )?;
-        let bytes = wire_bytes.saturating_add(event_bytes).saturating_add(256);
-        let run_key = serde_json::to_string(&(&binding.sandbox, &binding.worker.generation))?;
+        let bytes = record_bytes(tx, wire_bytes, event_id)?;
         if let Some(now) = paced_at {
-            self.record_pacing(tx, &run_key, wire_bytes, now)?;
+            self.pace_guest(tx, binding, wire_bytes, now)?;
         }
+        self.charge_history(tx, binding, bytes)
+    }
+
+    pub(super) fn charge_history(
+        self,
+        tx: &Transaction<'_>,
+        binding: &Binding,
+        bytes: i64,
+    ) -> Result<()> {
+        let run_key = serde_json::to_string(&(&binding.sandbox, &binding.worker.generation))?;
         for (scope, key, limit) in [
             ("run", run_key.as_str(), self.run),
             ("team", binding.team.as_str(), self.team),
@@ -167,4 +168,16 @@ impl Limits {
         let run_key = serde_json::to_string(&(&binding.sandbox, &binding.worker.generation))?;
         self.record_pacing(tx, &run_key, wire_bytes, now)
     }
+}
+
+pub(super) fn record_bytes(tx: &Transaction<'_>, wire_bytes: i64, event_id: i64) -> Result<i64> {
+    // Account for the event as well as amortized indexes and ledger metadata.
+    let event_bytes: i64 = tx.query_row(
+        "SELECT length(CAST(timestamp AS BLOB)) + length(CAST(type AS BLOB)) +
+                length(CAST(instance AS BLOB)) + length(CAST(data AS BLOB))
+         FROM events WHERE id = ?",
+        [event_id],
+        |row| row.get(0),
+    )?;
+    Ok(wire_bytes.saturating_add(event_bytes).saturating_add(256))
 }

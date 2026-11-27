@@ -974,6 +974,8 @@ mod tests {
                 sequence: 1,
             },
             super::super::protocol::MessagePayload {
+                assigned_result: false,
+                result: None,
                 target: "host".into(),
                 target_generation: None,
                 sender_routing_generation: None,

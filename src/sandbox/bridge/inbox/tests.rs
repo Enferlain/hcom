@@ -11,6 +11,8 @@ fn message(origin: Origin, sequence: i64, target: &str) -> Message {
     Message::new(
         MessageId { origin, sequence },
         MessagePayload {
+            assigned_result: false,
+            result: None,
             conversation: None,
             target: target.into(),
             target_generation: None,
@@ -1158,6 +1160,8 @@ fn broadcast_msg(origin: Origin, sequence: i64, text: &str) -> Message {
     Message::new(
         MessageId { origin, sequence },
         MessagePayload {
+            assigned_result: false,
+            result: None,
             conversation: None,
             target: String::new(),
             target_generation: None,
@@ -1334,6 +1338,346 @@ fn bridge_step(
             }
             deliver_all(&mut host_peer, &mut guest_peer, &mut guest_inbox);
         }
+    }
+}
+
+#[test]
+fn assigned_final_reports_overtake_progress_and_spend_only_their_reservations() {
+    use crate::sandbox::admission::Limits;
+    use crate::sandbox::protocol::Outcome;
+    use crate::sandbox::store::Delivery;
+
+    let root = tempfile::tempdir().unwrap();
+    let host_db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    host_db
+        .conn()
+        .execute(
+            "INSERT INTO instances (name, created_at) VALUES ('owner', 1)",
+            [],
+        )
+        .unwrap();
+    let sender = crate::identity::resolve_from_name(&host_db, "owner").unwrap();
+    let owner = HostIdentity::capture(&host_db, &sender).unwrap();
+    let host = Store::initialize(&host_db).unwrap();
+    let team = host.create_team(Some(&owner)).unwrap();
+    let guest = GuestNode::new(
+        root.path(),
+        "guest.db",
+        &host,
+        &team.id,
+        Access::Host(&owner),
+        "worker",
+        2.0,
+    );
+    let binding = &guest.worker.binding;
+    let guest_store = guest.store();
+    let run_key = serde_json::to_string(&(&binding.sandbox, &binding.worker.generation)).unwrap();
+    let target = format!("@{}", binding.worker.worker);
+    let assign = |text| {
+        run_cmd_send(
+            &host_db,
+            "owner",
+            &[
+                "send", "--json", "--intent", "request", "--thread", "work", &target, "--", text,
+            ],
+        )
+    };
+    let defaults = Limits::default();
+    host_db
+        .conn()
+        .execute(
+            "INSERT INTO sandbox_usage VALUES ('run', ?, ?, 0)",
+            params![run_key, defaults.run.messages - 1],
+        )
+        .unwrap();
+    assert_eq!(assign("without report room"), 1);
+    assert_eq!(host_db.get_last_event_id(), 0);
+    assert!(
+        host.next_pending(binding, now_epoch_i64())
+            .unwrap()
+            .is_none()
+    );
+    host_db
+        .conn()
+        .execute("DELETE FROM sandbox_usage", [])
+        .unwrap();
+
+    // A retained request from a previous build carries sender routing
+    // metadata but no host-authored assignment marker or reservation.
+    let mut legacy = addressed(
+        message(owner.origin(host.incarnation()), 1, &binding.worker.worker),
+        &binding.worker.generation,
+    )
+    .payload;
+    legacy.sender_routing_generation =
+        Some(host_recipient_generation(host_db.conn(), "owner", 1.0).unwrap());
+    let legacy = host
+        .enqueue(
+            Receiver::Guest,
+            binding,
+            owner.origin(host.incarnation()),
+            legacy,
+            now_epoch_i64(),
+            super::super::stage_guest_message,
+        )
+        .unwrap();
+    assert!(!legacy.payload.assigned_result);
+
+    for text in ["one", "two", "three"] {
+        assert_eq!(assign(text), 0);
+    }
+    bridge_step(
+        &host,
+        &guest,
+        2,
+        &mut HostInbox::new(&host_db, &host, binding),
+        false,
+        true,
+    );
+    let references: Vec<String> = guest.db.conn().prepare(
+        "SELECT CAST(request_event AS TEXT) FROM sandbox_result_requests ORDER BY request_event"
+    ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(references.len(), 3);
+    let send = |flags: &[&str], text| {
+        let mut args = vec!["send", "--json", "@owner"];
+        args.extend_from_slice(flags);
+        args.extend(["--", text]);
+        run_cmd_send(&guest.db, "guest", &args)
+    };
+    let first = references[0].as_str();
+    assert_eq!(
+        send(
+            &["--result", "completed", "--reply-to", "1"],
+            "legacy request"
+        ),
+        1
+    );
+    assert_eq!(send(&["--result", "completed"], "no request"), 1);
+    assert_eq!(
+        send(
+            &[
+                "--result",
+                "completed",
+                "--intent",
+                "ack",
+                "--reply-to",
+                first
+            ],
+            "wrong intent"
+        ),
+        1
+    );
+    assert_eq!(
+        send(
+            &[
+                "--result",
+                "completed",
+                "--thread",
+                "wrong",
+                "--reply-to",
+                first
+            ],
+            "wrong thread"
+        ),
+        1
+    );
+    assert_eq!(send(&["--reply-to", first], "progress"), 0);
+    bridge_step(
+        &host,
+        &guest,
+        3,
+        &mut HostInbox::new(&host_db, &host, binding),
+        false,
+        false,
+    );
+    let completed = || {
+        host_db
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sandbox_result_requests WHERE final_event IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(completed(), 0);
+    assert_eq!(send(&[], "blocked ordinary head"), 0);
+    let now = now_epoch_i64();
+    let ordinary = guest_store.next_pending(binding, now).unwrap().unwrap();
+
+    assert_eq!(
+        send(
+            &["--result", "failed", "--reply-to", first],
+            "rejected draft"
+        ),
+        0
+    );
+    let rejected = guest_store.next_pending(binding, now).unwrap().unwrap();
+    guest_store
+        .reject(binding, &rejected.id, &rejected.digest, now)
+        .unwrap();
+    let guest_usage = || {
+        guest
+            .db
+            .conn()
+            .query_row(
+                "SELECT messages FROM sandbox_usage WHERE scope = 'run'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    let before_correction = guest_usage();
+    let set_guest_usage = |count| {
+        guest
+            .db
+            .conn()
+            .execute(
+                "UPDATE sandbox_usage SET messages = ? WHERE scope = 'run'",
+                [count],
+            )
+            .unwrap()
+    };
+    set_guest_usage(defaults.run.messages);
+    assert_eq!(
+        send(
+            &["--result", "completed", "--reply-to", first],
+            "cannot archive draft"
+        ),
+        1
+    );
+    assert_eq!(guest_usage(), defaults.run.messages);
+    set_guest_usage(before_correction);
+    assert_eq!(
+        send(
+            &["--result", "completed", "--reply-to", first],
+            "corrected final"
+        ),
+        0
+    );
+    assert_eq!(guest_usage(), before_correction + 1);
+    assert_eq!(
+        guest_store.delivery(&rejected.id, now).unwrap(),
+        Some(Delivery::Rejected)
+    );
+
+    let saturate = |db: &HcomDb| {
+        db.conn()
+            .execute(
+                "UPDATE sandbox_usage SET messages = ? WHERE scope = 'run'",
+                [defaults.run.messages],
+            )
+            .unwrap();
+    };
+    saturate(&host_db);
+    saturate(&guest.db);
+    let mut tight = defaults;
+    tight.pace.messages = 1;
+    tight.pace_seconds = 3600;
+    let host = Store::with_limits(&host_db, tight).unwrap();
+    let mut host_inbox = HostInbox::new(&host_db, &host, binding);
+    assert_eq!(send(&[], "ordinary quota still full"), 1);
+    assert!(
+        host.import(Receiver::Host, binding, &ordinary, now, |tx| host_inbox
+            .insert(tx, &ordinary))
+            .is_err()
+    );
+    let oversized = "x".repeat(64 * 1024);
+    assert_eq!(
+        send(&["--result", "completed", "--reply-to", first], &oversized),
+        1
+    );
+    for (reference, outcome) in references.iter().skip(1).zip(["failed", "cancelled"]) {
+        assert_eq!(
+            send(
+                &["--result", outcome, "--reply-to", reference],
+                "final summary"
+            ),
+            0
+        );
+    }
+    assert_eq!(
+        send(
+            &["--result", "failed", "--reply-to", first],
+            "conflicting report"
+        ),
+        1
+    );
+    let first_final = guest_store.next_pending(binding, now).unwrap().unwrap();
+    assert!(first_final.id.sequence > ordinary.id.sequence);
+    assert_eq!(first_final.payload.result, Some(Outcome::Completed));
+    bridge_step(&host, &guest, 4, &mut host_inbox, true, false);
+    assert_eq!(completed(), 1);
+    assert_eq!(
+        guest_store.delivery(&first_final.id, now).unwrap(),
+        Some(Delivery::Pending)
+    );
+    assert_eq!(
+        guest_store
+            .delivery(&first_final.id, now + defaults.queue_ttl_seconds + 1)
+            .unwrap(),
+        Some(Delivery::Pending)
+    );
+    assert_eq!(
+        guest_store.delivery(&ordinary.id, now).unwrap(),
+        Some(Delivery::Pending)
+    );
+    let mut conflict = first_final.payload.clone();
+    conflict.result = Some(Outcome::Cancelled);
+    let conflict = Message::new(
+        MessageId {
+            origin: binding.worker.clone(),
+            sequence: 100,
+        },
+        conflict,
+    )
+    .unwrap();
+    // Conflicting finals receive a rejection even with no pacing credit.
+    assert_eq!(
+        host.import(Receiver::Host, binding, &conflict, now, |_| panic!(
+            "conflict reached the host inbox"
+        ))
+        .unwrap(),
+        Import::Rejected,
+    );
+
+    guest
+        .db
+        .conn()
+        .execute(
+            "UPDATE sandbox_outbox SET expires_at = ? WHERE sequence = ?",
+            params![now - 1, ordinary.id.sequence],
+        )
+        .unwrap();
+    bridge_step(&host, &guest, 5, &mut host_inbox, false, false);
+    assert_eq!(completed(), 3);
+    assert_eq!(
+        guest_store.delivery(&first_final.id, now).unwrap(),
+        Some(Delivery::Accepted)
+    );
+    let finalized: Vec<String> = host_db
+        .conn()
+        .prepare(
+            "SELECT json_extract(e.data, '$._sandbox.result')
+         FROM sandbox_result_requests r JOIN events e ON e.id = r.final_event
+         ORDER BY r.request_event",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(finalized, ["completed", "failed", "cancelled"]);
+    for db in [&host_db, &guest.db] {
+        let charged: i64 = db
+            .conn()
+            .query_row(
+                "SELECT messages FROM sandbox_usage WHERE scope = 'run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(charged, defaults.run.messages);
     }
 }
 
@@ -1599,6 +1943,7 @@ fn guest_broadcast_routes_to_bound_team_with_stable_ids_and_postcommit_wakes() {
             intent: Some(crate::messages::MessageIntent::Request),
             ..Default::default()
         },
+        None,
         None,
     )
     .unwrap();
@@ -2414,6 +2759,8 @@ fn guest_retains_grant_evidence_and_rejects_conflicting_ids() {
                 sequence,
             },
             MessagePayload {
+                assigned_result: false,
+                result: None,
                 target: binding.worker.worker.clone(),
                 target_generation: Some(binding.worker.generation.clone()),
                 sender_routing_generation: Some("host-recipient".into()),
@@ -2433,6 +2780,8 @@ fn guest_retains_grant_evidence_and_rejects_conflicting_ids() {
             sequence: 4,
         },
         MessagePayload {
+            assigned_result: false,
+            result: None,
             target: binding.worker.worker.clone(),
             target_generation: Some(binding.worker.generation.clone()),
             sender_routing_generation: Some("host-recipient".into()),
@@ -2564,6 +2913,8 @@ fn host_import_rejects_forged_scoped_markers() {
             sequence: 1,
         },
         payload: MessagePayload {
+            assigned_result: false,
+            result: None,
             target: "host".into(),
             target_generation: Some(host_recipient_generation(db.conn(), "host", 1.0).unwrap()),
             sender_routing_generation: None,

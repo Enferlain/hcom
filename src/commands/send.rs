@@ -7,7 +7,7 @@ use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
 use crate::identity;
 use crate::messages::{
-    InstanceInfo, MessageEnvelope, MessageScope, compute_scope, resolve_targets,
+    InstanceInfo, MessageEnvelope, MessageIntent, MessageScope, compute_scope, resolve_targets,
     sender_instance_key, should_deliver_message, validate_intent, validate_message,
 };
 use crate::shared::{
@@ -89,6 +89,10 @@ pub struct SendArgs {
     /// Message intent (request|inform|ack)
     #[arg(long)]
     pub intent: Option<String>,
+
+    /// Submit a final report for an assigned OpenShell request
+    #[arg(long, value_enum)]
+    pub result: Option<crate::sandbox::protocol::Outcome>,
 
     /// Reply to event ID (42 or 42:BOXE)
     #[arg(long)]
@@ -1030,6 +1034,19 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     }
 
     // ── Inline bundle ──
+    if args.result.is_some() {
+        if envelope
+            .intent
+            .is_some_and(|intent| intent != MessageIntent::Inform)
+            || envelope.reply_to.is_none()
+            || envelope.thread.is_none()
+        {
+            eprintln!("Error: --result requires an inform with --reply-to and a request thread");
+            return 1;
+        }
+        envelope.intent = Some(MessageIntent::Inform);
+    }
+
     let bundle_data = match args.build_bundle_data() {
         Ok(b) => b,
         Err(e) => {
@@ -1202,6 +1219,16 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             return 1;
         }
     };
+
+    if args.result.is_some()
+        && !matches!(
+            preview_delivery.sandbox_target,
+            Some(SandboxTarget::Guest(_))
+        )
+    {
+        eprintln!("Error: --result requires an assigned OpenShell guest request");
+        return 1;
+    }
 
     // The guest enrollment may have changed since early content validation.
     if let Some(err) = invalid_message
@@ -1395,6 +1422,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
                 &message,
                 &envelope,
                 reply_event,
+                args.result,
             ),
             SandboxTarget::Thread(resolved) => crate::sandbox::conversation::queue(
                 db,
@@ -2217,6 +2245,8 @@ mod tests {
                     sequence: 1,
                 },
                 MessagePayload {
+                    assigned_result: false,
+                    result: None,
                     conversation: None,
                     target: "luna".into(),
                     target_generation: Some(
@@ -2445,7 +2475,9 @@ mod tests {
 
         // The participant's thread-only send reaches current guests in one
         // atomic batch with the shared stable wire identity.
-        let fanout = parse(&["send", "--json", "--thread", "work", "--", "fanout"]);
+        let fanout = parse(&[
+            "send", "--json", "--thread", "work", "--intent", "request", "--", "fanout",
+        ]);
         assert_eq!(cmd_send(&db, &fanout, Some(&ctx("luna"))), 0);
         wait_wake(
             &observer,
@@ -2469,6 +2501,8 @@ mod tests {
             "the queued hop replays the event's stable wire identity"
         );
         assert_eq!(message.payload.thread.as_deref(), Some("work"));
+        assert!(message.payload.assigned_result);
+        assert_eq!(data["_sandbox"]["assigned_result"], true);
         assert_eq!(
             message.payload.target_generation.as_deref(),
             Some(binding.worker.generation.as_str())

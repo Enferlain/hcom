@@ -4,11 +4,12 @@ use uuid::Uuid;
 
 use crate::db::HcomDb;
 
-use super::admission::Limits;
+use super::admission::{Limits, QuotaExceeded};
 use super::protocol::{
     Binding, InvalidMessageText, Message, MessageId, MessagePayload, Origin, Receiver,
     validate_message_size,
 };
+use super::results::{self, InvalidFinal};
 
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS sandbox_identity (
@@ -141,6 +142,7 @@ impl<'db> Store<'db> {
             tx.execute_batch(super::controller::SCHEMA)?;
             tx.execute_batch(super::directory::SCHEMA)?;
             tx.execute_batch(super::conversation::SCHEMA)?;
+            tx.execute_batch(results::SCHEMA)?;
             ensure_forwarding_schema(tx)?;
             tx.execute(
                 "INSERT OR IGNORE INTO sandbox_identity VALUES (1, ?, 0)",
@@ -261,14 +263,27 @@ impl<'db> Store<'db> {
             let sequence = self.allocate_queue_sequence(tx)?;
             let message = Message::new(MessageId { origin, sequence }, payload)?;
             let wire_bytes = validate_message_size(receiver, route, &message)?;
-            self.limits.pending(tx, wire_bytes)?;
+            let final_report = message.payload.result.is_some();
+            if final_report {
+                ensure!(
+                    matches!(receiver, Receiver::Host),
+                    "sandbox final report must go to the host"
+                );
+                results::prepare_submission(tx, self.limits, route, &message)?;
+            } else {
+                self.limits.pending(tx, wire_bytes)?;
+            }
             let event_id = insert_event(tx, &message)?;
-            self.limits.record(tx, route, wire_bytes, event_id, None)?;
+            if final_report {
+                results::settle(tx, route, &message, event_id, wire_bytes)?;
+            } else {
+                self.limits.record(tx, route, wire_bytes, event_id, None)?;
+            }
             tx.execute(
                 "INSERT INTO sandbox_outbox
                     (sequence, origin_worker, origin_generation, route, digest,
-                     message, event_id, wire_bytes, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     message, event_id, wire_bytes, expires_at, final_report)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     sequence,
                     message.id.origin.worker,
@@ -278,7 +293,12 @@ impl<'db> Store<'db> {
                     serde_json::to_string(&message)?,
                     event_id,
                     wire_bytes,
-                    now.saturating_add(self.limits.queue_ttl_seconds),
+                    if final_report {
+                        i64::MAX
+                    } else {
+                        now.saturating_add(self.limits.queue_ttl_seconds)
+                    },
+                    final_report,
                 ],
             )?;
             Ok(message)
@@ -334,12 +354,14 @@ impl<'db> Store<'db> {
             let mut sized = Vec::with_capacity(hops.len());
             for hop in &hops {
                 self.check_binding(tx, &hop.route)?;
+                let mut payload = hop.payload.clone();
+                payload.assigned_result = payload.can_assign_result();
                 let message = Message::new(
                     MessageId {
                         origin: origin.clone(),
                         sequence: wire_sequence,
                     },
-                    hop.payload.clone(),
+                    payload,
                 )?;
                 let wire_bytes = validate_message_size(Receiver::Guest, &hop.route, &message)?;
                 sized.push((message, wire_bytes));
@@ -353,6 +375,7 @@ impl<'db> Store<'db> {
                 self.limits.pending(tx, *wire_bytes)?;
                 self.limits
                     .record(tx, &hop.route, *wire_bytes, event_id, None)?;
+                results::reserve(tx, self.limits, &hop.route, message, event_id)?;
                 let (sequence, forwarded_sequence, forwarded_incarnation) = if index == 0 {
                     (wire_sequence, None, None)
                 } else {
@@ -458,7 +481,8 @@ impl<'db> Store<'db> {
                 "SELECT message, digest, COALESCE(forwarded_sequence, sequence),
                         origin_worker, origin_generation, COALESCE(forwarded_incarnation, ?)
                    FROM sandbox_outbox
-                  WHERE route = ? AND accepted = 0 AND expires_at > ? ORDER BY sequence LIMIT 1",
+                  WHERE route = ? AND accepted = 0 AND expires_at > ?
+                  ORDER BY final_report DESC, sequence LIMIT 1",
                 params![self.incarnation, serde_json::to_string(route)?, now],
                 |row| {
                     Ok((
@@ -718,55 +742,84 @@ impl<'db> Store<'db> {
                 );
                 return Ok(Import::Replay(event_id));
             }
+            let final_report = message.payload.result.is_some();
             let event_id = if matches!(receiver, Receiver::Host) {
                 let route = serde_json::to_string(binding)?;
-                let last: Option<(i64, Vec<u8>)> = tx
-                    .query_row(
-                        "SELECT sequence, digest FROM sandbox_rejected_head WHERE route = ?",
-                        [&route],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?;
-                if let Some((sequence, digest)) = last
-                    && id.sequence <= sequence
-                {
-                    ensure!(
-                        id.sequence == sequence && digest == message.digest,
-                        "stale or conflicting sandbox rejection replay"
-                    );
-                    return Ok(Import::Rejected);
+                if !final_report {
+                    let last: Option<(i64, Vec<u8>)> = tx
+                        .query_row(
+                            "SELECT sequence, digest FROM sandbox_rejected_head WHERE route = ?",
+                            [&route],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    if let Some((sequence, digest)) = last
+                        && id.sequence <= sequence
+                    {
+                        ensure!(
+                            id.sequence == sequence && digest == message.digest,
+                            "stale or conflicting sandbox rejection replay"
+                        );
+                        return Ok(Import::Rejected);
+                    }
                 }
 
                 tx.execute_batch("SAVEPOINT sandbox_inbound_event")?;
-                match insert_event(tx) {
+                let insert = || -> Result<i64> {
+                    if final_report {
+                        results::check(tx, binding, message)?;
+                    }
+                    let event_id = insert_event(tx)?;
+                    if final_report {
+                        results::settle(tx, binding, message, event_id, wire_bytes)?;
+                    }
+                    Ok(event_id)
+                };
+                match insert() {
                     Ok(event_id) => {
                         tx.execute_batch("RELEASE sandbox_inbound_event")?;
                         event_id
                     }
                     Err(error)
                         if error.is::<UnavailableRecipient>()
-                            || error.is::<InvalidMessageText>() =>
+                            || error.is::<InvalidMessageText>()
+                            || error.is::<InvalidFinal>() =>
                     {
                         tx.execute_batch(
                             "ROLLBACK TO sandbox_inbound_event; RELEASE sandbox_inbound_event",
                         )?;
-                        self.limits.pace_guest(tx, binding, wire_bytes, now)?;
-                        tx.execute(
-                            "INSERT INTO sandbox_rejected_head VALUES (?, ?, ?)
-                             ON CONFLICT(route) DO UPDATE
-                             SET sequence = excluded.sequence, digest = excluded.digest",
-                            params![route, id.sequence, message.digest.as_slice()],
-                        )?;
+                        // A final rejection carries only a receipt. Return it
+                        // even at the pacing limit so it cannot block the queue.
+                        match self.limits.pace_guest(tx, binding, wire_bytes, now) {
+                            Err(error) if final_report && error.is::<QuotaExceeded>() => {}
+                            outcome => outcome?,
+                        }
+                        // Final reports can overtake ordinary sends. Keep
+                        // their rejection out of the ordinary sequence fence.
+                        if !final_report {
+                            tx.execute(
+                                "INSERT INTO sandbox_rejected_head VALUES (?, ?, ?)
+                                 ON CONFLICT(route) DO UPDATE
+                                 SET sequence = excluded.sequence, digest = excluded.digest",
+                                params![route, id.sequence, message.digest.as_slice()],
+                            )?;
+                        }
                         return Ok(Import::Rejected);
                     }
                     Err(error) => return Err(error),
                 }
             } else {
+                ensure!(!final_report, "sandbox final report must go to the host");
                 insert_event(tx)?
             };
-            let paced_at = matches!(receiver, Receiver::Host).then_some(now);
-            self.limits
-                .record(tx, binding, wire_bytes, event_id, paced_at)?;
+            if !final_report {
+                let paced_at = matches!(receiver, Receiver::Host).then_some(now);
+                self.limits
+                    .record(tx, binding, wire_bytes, event_id, paced_at)?;
+                if matches!(receiver, Receiver::Guest) {
+                    results::reserve(tx, self.limits, binding, message, event_id)?;
+                }
+            }
             tx.execute(
                 "INSERT INTO sandbox_inbox VALUES (?, ?, ?, ?, ?, ?)",
                 params![
@@ -815,6 +868,10 @@ fn ensure_forwarding_schema(tx: &Transaction<'_>) -> Result<()> {
             "rejected",
             "ALTER TABLE sandbox_outbox ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0 CHECK (rejected IN (0, 1))",
         ),
+        (
+            "final_report",
+            "ALTER TABLE sandbox_outbox ADD COLUMN final_report INTEGER NOT NULL DEFAULT 0 CHECK (final_report IN (0, 1))",
+        ),
     ] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sandbox_outbox') WHERE name = ?)",
@@ -828,7 +885,9 @@ fn ensure_forwarding_schema(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS sandbox_outbox_forwarded
            ON sandbox_outbox(route, origin_worker, origin_generation, forwarded_incarnation, forwarded_sequence)
-           WHERE forwarded_sequence IS NOT NULL;",
+         WHERE forwarded_sequence IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS sandbox_outbox_pending_final
+         ON sandbox_outbox(route, final_report DESC, sequence) WHERE accepted = 0;",
     )?;
     Ok(())
 }

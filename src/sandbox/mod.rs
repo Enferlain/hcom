@@ -11,4 +11,5 @@ pub mod openshell;
 pub(crate) mod outgoing;
 pub mod protocol;
 pub(crate) mod receipts;
+mod results;
 pub mod store;

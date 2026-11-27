@@ -64,7 +64,11 @@ A successful queue-acceptance response SHALL mean the message is durably recorde
 
 ### Requirement: Replay does not create duplicate inbox messages
 
-The bridge SHALL retry unacknowledged traffic and deduplicate by stable origin identity, database incarnation, and message sequence. Acceptance state and inbox insertion MUST commit atomically. Ordering MUST be preserved within each sender stream; cross-sender ordering and exactly-once execution of agent actions are not guaranteed.
+The bridge SHALL retry unacknowledged traffic and deduplicate by stable origin identity, database incarnation, and message sequence. Acceptance state and inbox insertion MUST commit atomically. The bridge MUST preserve order within each sender's ordinary messages and within each sender's final reports. Cross-sender ordering and exactly-once execution of agent actions are not guaranteed.
+
+#### Scenario: Ordinary traffic exhausts admission before a final report
+- **WHEN** earlier ordinary messages cannot advance through the bridge
+- **THEN** a final report may pass them and use the reservation for its request without changing the relative order of ordinary messages
 
 #### Scenario: Acknowledgment is lost
 - **WHEN** a receiver commits a message but its acceptance acknowledgment is lost

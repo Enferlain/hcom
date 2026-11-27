@@ -11,8 +11,8 @@ use crate::shared::{SenderIdentity, SenderKind};
 
 use super::outgoing::{Queued, wire_intent};
 use super::protocol::{
-    Binding, Intent, MessageId, MessagePayload, Receiver, TeamPeer, is_prohibited_message_control,
-    validate_message_text,
+    Binding, Intent, MessageId, MessagePayload, Outcome, Receiver, TeamPeer,
+    is_prohibited_message_control, validate_message_text,
 };
 use super::store::Store;
 
@@ -237,11 +237,16 @@ pub(crate) fn queue(
     text: &str,
     envelope: &MessageEnvelope,
     reply_event: Option<i64>,
+    result: Option<Outcome>,
 ) -> Result<Queued> {
     ensure!(!text.trim().is_empty(), "Message required");
     let (text, escaped_controls) = escape_controls(text);
     validate_message_text(&text)?;
     let intent = wire_intent(envelope);
+    ensure!(
+        result.is_none() || matches!(target, Target::Direct { .. }),
+        "sandbox final reports require a directed request reply"
+    );
     ensure!(
         envelope.bundle_id.is_none(),
         "sandbox sends do not support bundles"
@@ -305,6 +310,10 @@ pub(crate) fn queue(
         };
         ensure!(valid_parent, "sandbox reply is not in this conversation");
         ensure!(
+            result.is_none() || data["intent"].as_str() == Some("request"),
+            "sandbox final report must reply to a request"
+        );
+        ensure!(
             intent != Intent::Ack || !matches!(data["intent"].as_str(), Some("ack" | "inform")),
             "sandbox acknowledgment cannot reply to an acknowledgment or inform"
         );
@@ -312,6 +321,8 @@ pub(crate) fn queue(
     };
     let payload = match target {
         Target::Direct { peer, .. } => MessagePayload {
+            assigned_result: false,
+            result,
             conversation: None,
             target: peer.name.clone(),
             target_generation: Some(peer.generation.clone()),
@@ -323,6 +334,8 @@ pub(crate) fn queue(
             text,
         },
         Target::Broadcast { .. } => MessagePayload {
+            assigned_result: false,
+            result: None,
             conversation: None,
             target: String::new(),
             target_generation: None,
@@ -341,6 +354,8 @@ pub(crate) fn queue(
                 "sandbox thread grant does not match the requested label"
             );
             MessagePayload {
+                assigned_result: false,
+                result: None,
                 conversation: Some(grant.conversation.clone()),
                 target: String::new(),
                 target_generation: None,
@@ -446,6 +461,9 @@ pub(crate) fn queue(
             if let Some(reply) = reply_event {
                 data["reply_to"] = json!(reply.to_string());
                 data["reply_to_local"] = json!(reply);
+            }
+            if let Some(outcome) = message.payload.result {
+                data["_sandbox"]["result"] = json!(outcome);
             }
             event_id = db.insert_event_row("message", &sender.name, &data, None)?;
             Ok(event_id)

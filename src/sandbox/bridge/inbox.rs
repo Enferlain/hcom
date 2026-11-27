@@ -735,6 +735,12 @@ impl<'a> Inbox<'a> {
         if let Some(conversation) = &payload.conversation {
             sandbox["conversation"] = json!(conversation);
         }
+        if let Some(outcome) = payload.result {
+            sandbox["result"] = json!(outcome);
+        }
+        if payload.assigned_result {
+            sandbox["assigned_result"] = json!(true);
+        }
         let mut data = json!({
             "from": sender,
             "sender_kind": "instance",

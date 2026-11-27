@@ -19,6 +19,8 @@ fn fixture() -> (Binding, Message) {
             sequence: 1,
         },
         MessagePayload {
+            assigned_result: false,
+            result: None,
             conversation: None,
             target: "worker-b".into(),
             target_generation: None,
@@ -44,6 +46,35 @@ fn raw_frame(frame: &Frame) -> Vec<u8> {
     let mut bytes = (data.len() as u32).to_be_bytes().to_vec();
     bytes.extend(data);
     bytes
+}
+
+#[test]
+fn final_report_limit_counts_the_received_wire_bytes() {
+    let (binding, original) = fixture();
+    let mut payload = original.payload;
+    payload.target_generation = Some("requester-generation".into());
+    payload.reply_to = Some(MessageId {
+        origin: Origin {
+            worker: "host".into(),
+            ..original.id.origin.clone()
+        },
+        sequence: 2,
+    });
+    payload.result = Some(Outcome::Completed);
+    let frame = Frame {
+        version: VERSION,
+        epoch: 1,
+        binding,
+        body: FrameBody::Send(Message::new(original.id, payload).unwrap()),
+    };
+    let mut body = encode(&frame).unwrap();
+    body.resize(MAX_FINAL_FRAME - HEADER_LEN as usize, b' ');
+    assert_eq!(decode_frame(&body).unwrap(), frame);
+    body.push(b' ');
+    assert_eq!(
+        decode_frame(&body).unwrap_err().to_string(),
+        "sandbox final report exceeds size limit"
+    );
 }
 
 #[test]
@@ -444,6 +475,8 @@ fn broadcast_messages_reject_targets_threads_replies_and_preserve_legacy_digests
     let broadcast = Message::new(
         legacy.id.clone(),
         MessagePayload {
+            assigned_result: false,
+            result: None,
             conversation: None,
             target: String::new(),
             target_generation: None,
@@ -774,6 +807,8 @@ fn guest_send_frames_carry_only_expansion_shapes() {
     let expansion = Message::new(
         legacy.id.clone(),
         MessagePayload {
+            assigned_result: false,
+            result: None,
             conversation: Some("conv-1".into()),
             target: String::new(),
             target_generation: None,
