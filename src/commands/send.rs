@@ -2129,6 +2129,7 @@ mod tests {
                     sequence: 1,
                 },
                 MessagePayload {
+                    conversation: None,
                     target: "luna".into(),
                     target_generation: Some(
                         crate::sandbox::directory::host_recipient_generation(

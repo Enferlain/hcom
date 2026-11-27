@@ -1,6 +1,6 @@
 use super::*;
 use crate::sandbox::controller::RunState;
-use crate::sandbox::protocol::Intent;
+use crate::sandbox::protocol::{Binding, Intent, Message, MessagePayload, Origin, Receiver};
 
 #[cfg(unix)]
 struct DisableOnDrop<'a, 'db>(&'a Store<'db>);
@@ -38,36 +38,44 @@ fn fixture_owner(epoch: i64) -> Process {
     }
 }
 
-fn send(store: &Store<'_>, route: &Binding, spawn: impl Fn(&Path) -> Result<Child>) -> QueuedSend {
-    enqueue_host_with(
-        store,
-        route,
-        Origin {
-            worker: "host".into(),
-            generation: "host-generation".into(),
-            incarnation: store.incarnation().into(),
-        },
-        MessagePayload {
-            target: route.worker.worker.clone(),
-            target_generation: None,
-            sender_routing_generation: None,
-            broadcast: false,
-            thread: None,
-            reply_to: None,
-            intent: Intent::Request,
-            text: "fixture".into(),
-        },
-        |tx, _| {
-            tx.execute(
-                "INSERT INTO events (timestamp, type, instance, data)
-                        VALUES ('fixture', 'sandbox-fixture', 'host', '{}')",
-                [],
-            )?;
-            Ok(tx.last_insert_rowid())
-        },
-        spawn,
-    )
-    .unwrap()
+fn send(
+    store: &Store<'_>,
+    route: &Binding,
+    spawn: impl Fn(&Path) -> Result<Child>,
+) -> (Message, Forwarding) {
+    let message = store
+        .enqueue(
+            Receiver::Guest,
+            route,
+            Origin {
+                worker: "host".into(),
+                generation: "host-generation".into(),
+                incarnation: store.incarnation().into(),
+            },
+            MessagePayload {
+                target: route.worker.worker.clone(),
+                target_generation: None,
+                sender_routing_generation: None,
+                broadcast: false,
+                thread: None,
+                reply_to: None,
+                conversation: None,
+                intent: Intent::Request,
+                text: "fixture".into(),
+            },
+            now_epoch_i64(),
+            |tx, _| {
+                tx.execute(
+                    "INSERT INTO events (timestamp, type, instance, data)
+                            VALUES ('fixture', 'sandbox-fixture', 'host', '{}')",
+                    [],
+                )?;
+                Ok(tx.last_insert_rowid())
+            },
+        )
+        .unwrap();
+    let forwarding = forwarding_with(store, spawn);
+    (message, forwarding)
 }
 
 #[test]
@@ -79,22 +87,22 @@ fn failed_or_disabled_start_preserves_queued_message() {
     let first = send(&store, &route, |_| {
         panic!("disabled controller must not spawn")
     });
-    assert!(matches!(first.forwarding, Forwarding::Disabled));
+    assert!(matches!(first.1, Forwarding::Disabled));
     store.set_enabled(true).unwrap();
     let second = send(&store, &route, |_| {
-        let delivery = store.delivery(&first.message.id, now_epoch_i64())?;
+        let delivery = store.delivery(&first.0.id, now_epoch_i64())?;
         assert_eq!(delivery, Some(crate::sandbox::store::Delivery::Pending));
         assert_eq!(
             store.next_pending(&route, now_epoch_i64())?,
-            Some(first.message.clone())
+            Some(first.0.clone())
         );
         bail!("fixture spawn error")
     });
     assert!(
-        matches!(second.forwarding, Forwarding::Deferred(error) if error.contains("fixture spawn error"))
+        matches!(second.1, Forwarding::Deferred(error) if error.contains("fixture spawn error"))
     );
     assert_eq!(
-        store.delivery(&second.message.id, now_epoch_i64()).unwrap(),
+        store.delivery(&second.0.id, now_epoch_i64()).unwrap(),
         Some(crate::sandbox::store::Delivery::Pending)
     );
 }
@@ -135,7 +143,7 @@ fn send_after_crash_lazily_starts_successor_and_replays_pending() {
     let route = route();
     let first = send(&store, &route, |_| panic!("must adopt running controller"));
     assert!(
-        matches!(first.forwarding, Forwarding::ControllerReady(ref process) if process.epoch == owner.epoch)
+        matches!(first.1, Forwarding::ControllerReady(ref process) if process.epoch == owner.epoch)
     );
     assert!(process::has_identity(owner.pid, &owner.process_start));
     assert!(process::kill(owner.pid));
@@ -149,11 +157,11 @@ fn send_after_crash_lazily_starts_successor_and_replays_pending() {
     }
     let second = send(&store, &route, spawn_fixture);
     assert!(
-        matches!(second.forwarding, Forwarding::ControllerReady(ref process) if process.epoch > owner.epoch)
+        matches!(second.1, Forwarding::ControllerReady(ref process) if process.epoch > owner.epoch)
     );
     assert_eq!(
         store.next_pending(&route, now_epoch_i64()).unwrap(),
-        Some(first.message)
+        Some(first.0)
     );
     disable(&store).unwrap();
     assert!(status(store.path()).unwrap().owner.is_none());
@@ -205,13 +213,13 @@ fn idle_retirement_distinguishes_retained_runs_and_pending_work() {
         Tick::Idle
     );
     let queued = send(&store, &route(), |_| panic!("test owner should be adopted"));
-    assert!(matches!(queued.forwarding, Forwarding::ControllerReady(_)));
+    assert!(matches!(queued.1, Forwarding::ControllerReady(_)));
     let now = now_epoch_i64();
     assert_eq!(tick(now), Tick::Work);
     store.set_run_work("run", RunState::Stopped, false).unwrap();
     assert_eq!(tick(now + 3601), Tick::Exit);
     assert!(matches!(
-        store.delivery(&queued.message.id, now + 3601).unwrap(),
+        store.delivery(&queued.0.id, now + 3601).unwrap(),
         Some(crate::sandbox::store::Delivery::AwaitingExpiry)
     ));
     assert!(status(store.path()).unwrap().enabled);

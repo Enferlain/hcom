@@ -967,6 +967,7 @@ mod tests {
                 broadcast: false,
                 thread: None,
                 reply_to: None,
+                conversation: None,
                 intent: super::super::protocol::Intent::Inform,
                 text: "stale".into(),
             },

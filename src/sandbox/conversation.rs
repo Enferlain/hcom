@@ -35,6 +35,14 @@ pub(super) const SCHEMA: &str = "
         host_created_at REAL,
         PRIMARY KEY (conversation, name)
     ) STRICT;
+    CREATE TABLE IF NOT EXISTS sandbox_guest_conversations (
+        conversation TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        generation TEXT NOT NULL,
+        binding TEXT NOT NULL
+    ) STRICT;
+    CREATE UNIQUE INDEX IF NOT EXISTS sandbox_guest_conversations_label
+        ON sandbox_guest_conversations(label);
 ";
 
 /// A sandbox conversation resolved for a host sender. The label scope is
@@ -88,7 +96,9 @@ pub(crate) fn resolve(
 }
 
 /// Seed (or expand) the team conversation for an explicit authorized
-/// host-to-guest send carrying a thread, inside the send transaction.
+/// host-to-guest send carrying a thread, inside the send transaction. The
+/// caller gates replies out: inheriting a parent label through --reply-to
+/// never creates or expands a grant.
 ///
 /// A creating sender becomes a participant together with that guest; a
 /// current participant may add same-team guests. A sender without the
@@ -169,7 +179,6 @@ pub(crate) fn queue(
     let store = Store::initialize(db)?;
     let origin = host.origin(store.incarnation());
     let intent = wire_intent(envelope);
-    let sender_generation = host_recipient_generation(db.conn(), host.name(), host.created_at())?;
 
     let guest_targets = RefCell::new(Vec::new());
     let mut event_id = 0;
@@ -181,6 +190,7 @@ pub(crate) fn queue(
             // label scope, and every participant's current generation.
             check_sender(tx, team, &host)?;
             let (conversation, hops) = resolve_fanout(tx, team, label, &host)?;
+            let sender_generation = host_recipient_generation(tx, host.name(), host.created_at())?;
             let hops: Vec<BatchHop> = hops
                 .into_iter()
                 .map(|route| {
@@ -194,6 +204,10 @@ pub(crate) fn queue(
                             broadcast: false,
                             thread: Some(label.to_owned()),
                             reply_to: None,
+                            // The grant is resolved in this transaction, so
+                            // every hop digests with its opaque conversation
+                            // id attached.
+                            conversation: Some(conversation.clone()),
                             intent,
                             text: text.clone(),
                         },

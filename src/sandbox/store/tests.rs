@@ -6,6 +6,7 @@ const NOW: i64 = 1_000;
 
 fn payload(text: &str) -> MessagePayload {
     MessagePayload {
+        conversation: None,
         target: "worker-b".into(),
         target_generation: None,
         sender_routing_generation: None,
@@ -794,6 +795,7 @@ fn hop(binding: &Binding, target: &str, text: &str) -> BatchHop {
     BatchHop {
         route: binding.clone(),
         payload: MessagePayload {
+            conversation: None,
             target: target.into(),
             target_generation: Some(binding.worker.generation.clone()),
             sender_routing_generation: None,

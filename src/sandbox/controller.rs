@@ -13,8 +13,7 @@ mod state;
 
 pub(crate) use lifecycle::USAGE;
 pub use lifecycle::{
-    Forwarding, QueuedSend, enqueue_host, ensure_after_launch, forwarding_after_commit,
-    run_command, run_worker,
+    Forwarding, ensure_after_launch, forwarding_after_commit, run_command, run_worker,
 };
 #[cfg(unix)]
 pub use routes::BridgePlan;

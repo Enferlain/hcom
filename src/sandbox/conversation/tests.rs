@@ -219,6 +219,10 @@ fn thread_sends_seed_expand_and_fan_out_to_current_participants() {
             "every destination sees the same stable message id"
         );
         assert_eq!(message.payload.thread.as_deref(), Some("work"));
+        assert_eq!(
+            message.payload.conversation.as_deref(),
+            Some(conversation.as_str())
+        );
         assert!(message.payload.sender_routing_generation.is_some());
         assert!(
             message
@@ -706,4 +710,164 @@ fn replaced_host_generation_loses_the_grant() {
         None,
     );
     assert!(failed.is_err());
+}
+
+/// A directed reply inherits its parent's display label but never creates or
+/// expands a grant: guest-authored unscoped labels stay ungranted and
+/// replying to a guest keeps that guest outside the conversation.
+#[test]
+fn replies_inherit_labels_but_grant_nothing() {
+    let fixture = Fixture::new();
+    let luna = fixture.host("luna", 1.0);
+    let sender = fixture.sender("luna");
+    let store = fixture.store();
+    let team = store.create_team(Some(&luna)).unwrap();
+    let alpha = fixture.reserve(&team.id, &luna, "alpha", "vm-1");
+    let beta = fixture.reserve(&team.id, &luna, "beta", "vm-2");
+
+    // A guest-authored unscoped directed message carrying a display label:
+    // routed to luna, no grant anywhere.
+    let guest_event = fixture
+        .db
+        .insert_event_row(
+            "message",
+            &beta.binding.worker.worker,
+            &json!({
+                "from": beta.binding.worker.worker,
+                "sender_kind": "instance",
+                "scope": "mentions",
+                "text": "unscoped question",
+                "mentions": ["luna"],
+                "delivered_to": ["luna"],
+                "thread": "sneaky",
+                "intent": "request",
+                "_sandbox": {
+                    "team": team.id,
+                    "id": {
+                        "origin": {
+                            "worker": beta.binding.worker.worker,
+                            "generation": beta.binding.worker.generation,
+                            "incarnation": beta.binding.worker.incarnation,
+                        },
+                        "sequence": 1,
+                    },
+                    "recipient_created_at": 1.0,
+                },
+            }),
+            None,
+        )
+        .unwrap();
+
+    // The reply inherits "sneaky" exactly as the CLI would from --reply-to,
+    // yet grants nothing: no conversation, no membership, no scoped payload.
+    let reply_envelope = MessageEnvelope {
+        thread: Some("sneaky".into()),
+        reply_to: Some(guest_event.to_string()),
+        ..Default::default()
+    };
+    let reply = crate::sandbox::outgoing::queue(
+        &fixture.db,
+        &sender,
+        &beta,
+        "answer",
+        &reply_envelope,
+        Some(guest_event),
+    )
+    .unwrap();
+    assert!(resolve(&fixture.db, &sender, "sneaky").unwrap().is_none());
+    let data: String = fixture
+        .db
+        .conn()
+        .query_row(
+            "SELECT data FROM events WHERE id = ?",
+            [reply.event_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert!(data["_sandbox"].get("conversation").is_none());
+    assert_eq!(data["thread"], json!("sneaky"));
+    let hop = store
+        .next_pending(&beta.binding, crate::shared::time::now_epoch_i64())
+        .unwrap()
+        .unwrap();
+    assert_eq!(hop.payload.conversation, None);
+    assert_eq!(hop.payload.thread.as_deref(), Some("sneaky"));
+
+    // The same reply against an existing conversation does not expand it:
+    // beta stays outside luna's "work" conversation with alpha. The reply
+    // parent here is beta's own "work"-labeled unscoped traffic.
+    crate::sandbox::outgoing::queue(
+        &fixture.db,
+        &sender,
+        &alpha,
+        "seed",
+        &envelope(Some("work")),
+        None,
+    )
+    .unwrap();
+    let members = conversation_members(&fixture.db);
+    assert_eq!(members.len(), 2);
+    let work_guest_event = fixture
+        .db
+        .insert_event_row(
+            "message",
+            &beta.binding.worker.worker,
+            &json!({
+                "from": beta.binding.worker.worker,
+                "sender_kind": "instance",
+                "scope": "mentions",
+                "text": "unscoped work reply",
+                "mentions": ["luna"],
+                "delivered_to": ["luna"],
+                "thread": "work",
+                "intent": "inform",
+                "_sandbox": {
+                    "team": team.id,
+                    "id": {
+                        "origin": {
+                            "worker": beta.binding.worker.worker,
+                            "generation": beta.binding.worker.generation,
+                            "incarnation": beta.binding.worker.incarnation,
+                        },
+                        "sequence": 2,
+                    },
+                    "recipient_created_at": 1.0,
+                },
+            }),
+            None,
+        )
+        .unwrap();
+    let work_envelope = MessageEnvelope {
+        thread: Some("work".into()),
+        reply_to: Some(work_guest_event.to_string()),
+        ..Default::default()
+    };
+    crate::sandbox::outgoing::queue(
+        &fixture.db,
+        &sender,
+        &beta,
+        "answer",
+        &work_envelope,
+        Some(work_guest_event),
+    )
+    .unwrap();
+    let members = conversation_members(&fixture.db);
+    assert_eq!(members.len(), 2);
+    let invited = beta.binding.worker.worker.clone();
+    assert!(members.iter().all(|(name, _, _)| *name != invited));
+
+    // An explicit (non-reply) targeted send still expands with the same
+    // guest, so the gate affects only replies.
+    crate::sandbox::outgoing::queue(
+        &fixture.db,
+        &sender,
+        &beta,
+        "invite",
+        &envelope(Some("work")),
+        None,
+    )
+    .unwrap();
+    let members = conversation_members(&fixture.db);
+    assert_eq!(members.len(), 3);
 }

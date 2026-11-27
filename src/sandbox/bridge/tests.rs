@@ -125,6 +125,7 @@ impl Fixture {
 
 fn payload(target: &str, text: String) -> MessagePayload {
     MessagePayload {
+        conversation: None,
         target: target.into(),
         target_generation: None,
         text,

@@ -78,6 +78,11 @@ pub struct MessagePayload {
     /// for reply correlation. Guest senders use their bound origin generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_routing_generation: Option<String>,
+    /// Opaque host-issued conversation id for granted scoped threads. Only
+    /// the host sets it, inside the grant transaction, before digesting; the
+    /// canonical form omits it otherwise so retained digests stay stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
     /// Broadcast frames require matching builds. Directed payload digests remain stable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub broadcast: bool,
@@ -136,6 +141,10 @@ impl Message {
                 "sandbox broadcast cannot specify a target generation"
             );
             ensure!(
+                self.payload.conversation.is_none(),
+                "sandbox broadcast cannot specify a conversation"
+            );
+            ensure!(
                 self.payload.thread.is_none(),
                 "sandbox broadcast cannot specify a thread"
             );
@@ -148,6 +157,24 @@ impl Message {
             if let Some(generation) = &self.payload.target_generation {
                 validate_identifier(generation)?;
             }
+        }
+        if let Some(conversation) = &self.payload.conversation {
+            validate_identifier(conversation)?;
+            // A scoped payload is a host-authored grant delivery: it must be
+            // fully addressed and carry the host routing generation before it
+            // can digest or import anywhere.
+            ensure!(
+                self.payload.thread.is_some(),
+                "sandbox conversation requires a thread"
+            );
+            ensure!(
+                self.payload.target_generation.is_some(),
+                "sandbox conversation requires a target generation"
+            );
+            ensure!(
+                self.payload.sender_routing_generation.is_some(),
+                "sandbox conversation requires a sender routing generation"
+            );
         }
         if let Some(generation) = &self.payload.sender_routing_generation {
             validate_identifier(generation)?;
@@ -247,6 +274,10 @@ impl Frame {
                 ensure!(
                     message.payload.sender_routing_generation.is_none(),
                     "guest cannot set a sandbox sender routing generation"
+                );
+                ensure!(
+                    message.payload.conversation.is_none(),
+                    "guest cannot set a sandbox conversation id"
                 );
                 message.validate()
             }

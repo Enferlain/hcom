@@ -19,6 +19,7 @@ fn fixture() -> (Binding, Message) {
             sequence: 1,
         },
         MessagePayload {
+            conversation: None,
             target: "worker-b".into(),
             target_generation: None,
             sender_routing_generation: None,
@@ -391,6 +392,7 @@ fn broadcast_messages_reject_targets_threads_replies_and_preserve_legacy_digests
     let broadcast = Message::new(
         legacy.id.clone(),
         MessagePayload {
+            conversation: None,
             target: String::new(),
             target_generation: None,
             sender_routing_generation: None,
@@ -461,18 +463,22 @@ fn broadcast_messages_reject_targets_threads_replies_and_preserve_legacy_digests
 
     let invalid_cases = [
         MessagePayload {
+            conversation: None,
             target: "worker-b".into(),
             ..broadcast.payload.clone()
         },
         MessagePayload {
+            conversation: None,
             target_generation: Some("generation-b".into()),
             ..broadcast.payload.clone()
         },
         MessagePayload {
+            conversation: None,
             thread: Some("work".into()),
             ..broadcast.payload.clone()
         },
         MessagePayload {
+            conversation: None,
             reply_to: Some(legacy.id.clone()),
             ..broadcast.payload.clone()
         },
@@ -484,4 +490,136 @@ fn broadcast_messages_reject_targets_threads_replies_and_preserve_legacy_digests
     forged_sender_gen.sender_routing_generation = Some("fake".into());
     let forged_sender_gen = Message::new(legacy.id, forged_sender_gen).unwrap();
     assert!(validate_message_size(Receiver::Host, &binding, &forged_sender_gen).is_err());
+}
+
+/// The conversation field is canonical-omitted: ungranted payloads digest
+/// exactly like retained legacy messages, granted payloads digest with the
+/// opaque id, and legacy payloads still parse.
+#[test]
+fn conversation_field_is_canonical_omitted_and_digest_stable() {
+    let (binding, legacy) = fixture();
+    let ungranted = serde_json::to_vec(&legacy.payload).unwrap();
+    assert!(!String::from_utf8_lossy(&ungranted).contains("conversation"));
+
+    let granted_payload = MessagePayload {
+        conversation: Some("conv-1".into()),
+        target_generation: Some("generation-b".into()),
+        sender_routing_generation: Some("host-recipient".into()),
+        ..legacy.payload.clone()
+    };
+    let granted = Message::new(legacy.id.clone(), granted_payload).unwrap();
+    let granted_json = serde_json::to_vec(&granted.payload).unwrap();
+    assert!(String::from_utf8_lossy(&granted_json).contains(r#""conversation":"conv-1""#));
+    assert_ne!(granted.digest, legacy.digest);
+
+    let parsed: MessagePayload = serde_json::from_str(
+        r#"{"target":"worker-b","thread":"work","reply_to":null,"intent":"inform","text":"test"}"#,
+    )
+    .unwrap();
+    assert_eq!(parsed, legacy.payload);
+    assert_eq!(parsed.conversation, None);
+    let _ = &binding;
+}
+
+/// A scoped payload is only valid fully addressed with host routing: the
+/// shape is rejected before digest or import otherwise.
+#[test]
+fn scoped_payloads_require_thread_generation_and_routing() {
+    let (binding, legacy) = fixture();
+    let scoped = |thread: Option<&str>, target_generation: Option<&str>, routing: Option<&str>| {
+        Message::new(
+            legacy.id.clone(),
+            MessagePayload {
+                conversation: Some("conv-1".into()),
+                thread: thread.map(str::to_owned),
+                target_generation: target_generation.map(str::to_owned),
+                sender_routing_generation: routing.map(str::to_owned),
+                ..legacy.payload.clone()
+            },
+        )
+    };
+    assert!(scoped(Some("work"), Some("generation-b"), Some("host-recipient")).is_ok());
+    assert!(scoped(None, Some("generation-b"), Some("host-recipient")).is_err());
+    assert!(scoped(Some("work"), None, Some("host-recipient")).is_err());
+    assert!(scoped(Some("work"), Some("generation-b"), None).is_err());
+    assert!(scoped(Some("work"), Some("generation-b"), Some("../evil")).is_err());
+
+    let broadcast = MessagePayload {
+        conversation: Some("conv-1".into()),
+        broadcast: true,
+        target: String::new(),
+        ..legacy.payload.clone()
+    };
+    assert!(Message::new(legacy.id.clone(), broadcast).is_err());
+    let _ = &binding;
+}
+
+/// Guest Send frames cannot claim a conversation id at frame validation;
+/// the same scoped message is a valid host Deliver frame.
+#[test]
+fn guest_send_frames_reject_conversation_ids() {
+    let (binding, legacy) = fixture();
+    let scoped = Message::new(
+        legacy.id.clone(),
+        MessagePayload {
+            conversation: Some("conv-1".into()),
+            target_generation: Some("generation-b".into()),
+            sender_routing_generation: Some("host-recipient".into()),
+            ..legacy.payload.clone()
+        },
+    )
+    .unwrap();
+    let frame = |body| Frame {
+        version: VERSION,
+        epoch: 1,
+        binding: binding.clone(),
+        body,
+    };
+    // A fully scoped message is rejected on the guest Send direction by the
+    // routing-generation rule before routing ever sees it.
+    let failure = frame(FrameBody::Send(scoped.clone()))
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        failure.contains("guest cannot set a sandbox sender routing generation"),
+        "unexpected rejection: {failure}"
+    );
+    // The same scoped message is a valid host Deliver frame for its target.
+    let deliver_binding = Binding {
+        team: binding.team.clone(),
+        sandbox: "sandbox-b".into(),
+        worker: Origin {
+            worker: "worker-b".into(),
+            generation: "generation-b".into(),
+            incarnation: binding.worker.incarnation.clone(),
+        },
+    };
+    Frame {
+        version: VERSION,
+        epoch: 1,
+        binding: deliver_binding,
+        body: FrameBody::Deliver(scoped),
+    }
+    .validate()
+    .unwrap();
+
+    // The Send direction also rejects a conversation marker on its own,
+    // independent of the payload shape rules.
+    let raw = Message {
+        digest: [0; 32],
+        id: legacy.id.clone(),
+        payload: MessagePayload {
+            conversation: Some("conv-1".into()),
+            ..legacy.payload.clone()
+        },
+    };
+    let failure = frame(FrameBody::Send(raw))
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        failure.contains("guest cannot set a sandbox conversation id"),
+        "unexpected rejection: {failure}"
+    );
 }

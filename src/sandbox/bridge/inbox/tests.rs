@@ -11,6 +11,7 @@ fn message(origin: Origin, sequence: i64, target: &str) -> Message {
     Message::new(
         MessageId { origin, sequence },
         MessagePayload {
+            conversation: None,
             target: target.into(),
             target_generation: None,
             sender_routing_generation: None,
@@ -936,6 +937,7 @@ fn broadcast_msg(origin: Origin, sequence: i64, text: &str) -> Message {
     Message::new(
         MessageId { origin, sequence },
         MessagePayload {
+            conversation: None,
             target: String::new(),
             target_generation: None,
             sender_routing_generation: None,
@@ -2025,4 +2027,216 @@ fn guest_broadcast_rolls_back_events_all_queues_and_wakes_on_failure() {
     assert_eq!(normal.next_pending(&sibling_c, now).unwrap(), Some(msg));
     host_wake.accept().expect("host wakes after commit");
     observer_wake.accept().expect("observer wakes after commit");
+}
+
+/// Granted host deliveries retain verifiable membership evidence bound to the
+/// route and worker generation; conflicting grants fail closed and ungranted
+/// traffic retains nothing.
+#[test]
+fn guest_retains_grant_evidence_and_rejects_conflicting_ids() {
+    let root = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&root.path().join("guest.db")).unwrap();
+    db.conn()
+        .execute_batch("INSERT INTO instances (name, created_at) VALUES ('guest', 1);")
+        .unwrap();
+    let store = Store::initialize(&db).unwrap();
+    let binding = Binding {
+        team: "team".into(),
+        sandbox: "sandbox".into(),
+        worker: Origin {
+            worker: "guest.realm".into(),
+            generation: "one".into(),
+            incarnation: store.incarnation().into(),
+        },
+    };
+    let sender = Origin {
+        worker: "host".into(),
+        generation: "host-generation".into(),
+        incarnation: uuid::Uuid::new_v4().to_string(),
+    };
+    let local = LocalWorker {
+        name: "guest".into(),
+        created_at: 1.0,
+    };
+    let mut inbox = GuestInbox::new(&db, &binding, &local).unwrap();
+    let scoped = |sequence: i64, conversation: &str| {
+        Message::new(
+            MessageId {
+                origin: sender.clone(),
+                sequence,
+            },
+            MessagePayload {
+                target: binding.worker.worker.clone(),
+                target_generation: Some(binding.worker.generation.clone()),
+                sender_routing_generation: Some("host-recipient".into()),
+                broadcast: false,
+                thread: Some("work".into()),
+                reply_to: None,
+                conversation: Some(conversation.into()),
+                intent: Intent::Inform,
+                text: "scoped".into(),
+            },
+        )
+        .unwrap()
+    };
+    let ungranted = Message::new(
+        MessageId {
+            origin: sender.clone(),
+            sequence: 4,
+        },
+        MessagePayload {
+            target: binding.worker.worker.clone(),
+            target_generation: Some(binding.worker.generation.clone()),
+            sender_routing_generation: Some("host-recipient".into()),
+            broadcast: false,
+            thread: Some("work".into()),
+            reply_to: None,
+            conversation: None,
+            intent: Intent::Inform,
+            text: "plain".into(),
+        },
+    )
+    .unwrap();
+    let evidence_rows = || -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT count(*) FROM sandbox_guest_conversations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    // A granted delivery retains exact evidence and stamps the local event.
+    let Imported::New(granted_event) = apply(
+        &store,
+        Receiver::Guest,
+        &binding,
+        &scoped(1, "conv-1"),
+        &mut inbox,
+    ) else {
+        panic!("expected granted import")
+    };
+    assert_eq!(
+        event(&db, granted_event)["_sandbox"]["conversation"],
+        json!("conv-1")
+    );
+    let (label, generation, retained): (String, String, String) = db
+        .conn()
+        .query_row(
+            "SELECT label, generation, binding FROM sandbox_guest_conversations
+             WHERE conversation = 'conv-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(label, "work");
+    assert_eq!(generation, "one");
+    assert_eq!(retained, serde_json::to_string(&binding).unwrap());
+
+    // A later message repeating the same grant keeps one evidence row.
+    apply(
+        &store,
+        Receiver::Guest,
+        &binding,
+        &scoped(2, "conv-1"),
+        &mut inbox,
+    );
+    assert_eq!(evidence_rows(), 1);
+
+    // A different conversation id for the same label conflicts: the import
+    // fails and leaves no event or evidence behind.
+    let conflict = store.import(
+        Receiver::Guest,
+        &binding,
+        &scoped(3, "conv-2"),
+        now_epoch_i64(),
+        |tx| inbox.insert(tx, &scoped(3, "conv-2")),
+    );
+    assert!(
+        conflict
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with its retained grant")
+    );
+    assert_eq!(evidence_rows(), 1);
+
+    // Ungranted directed traffic retains nothing.
+    apply(&store, Receiver::Guest, &binding, &ungranted, &mut inbox);
+    assert_eq!(evidence_rows(), 1);
+
+    // A replay reuses the committed event without touching evidence.
+    let replay = apply(
+        &store,
+        Receiver::Guest,
+        &binding,
+        &scoped(1, "conv-1"),
+        &mut inbox,
+    );
+    assert!(matches!(replay, Imported::Replay));
+    assert_eq!(evidence_rows(), 1);
+}
+
+/// The host rejects a guest frame that claims a conversation id before any
+/// routing or import happens.
+#[test]
+fn host_inbox_rejects_guest_supplied_conversation_ids() {
+    let root = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    db.conn()
+        .execute_batch("INSERT INTO instances (name, created_at) VALUES ('host', 1);")
+        .unwrap();
+    let identity = crate::identity::resolve_from_name(&db, "host").unwrap();
+    let member = HostIdentity::capture(&db, &identity).unwrap();
+    let store = Store::initialize(&db).unwrap();
+    let team = store.create_team(Some(&member)).unwrap();
+    let source = store
+        .reserve_worker(
+            &team.id,
+            Access::Host(&member),
+            "source",
+            Tool::Claude,
+            Placement {
+                gateway: "gateway",
+                workspace: "default",
+                sandbox: "source",
+                incarnation: &uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .unwrap()
+        .binding;
+    // Message::new refuses to build a conversation-bearing payload without
+    // host routing, so forge past the constructor: the import path must
+    // reject the marker at frame validation (via the size check) or at the
+    // inbox fence, whichever sees it first.
+    let forged = Message {
+        digest: [0; 32],
+        id: MessageId {
+            origin: source.worker.clone(),
+            sequence: 1,
+        },
+        payload: MessagePayload {
+            target: "host".into(),
+            target_generation: Some(host_recipient_generation(db.conn(), "host", 1.0).unwrap()),
+            sender_routing_generation: None,
+            broadcast: false,
+            thread: Some("work".into()),
+            reply_to: None,
+            conversation: Some("conv-1".into()),
+            intent: Intent::Inform,
+            text: "forged scope".into(),
+        },
+    };
+    let mut inbox = HostInbox::new(&db, &store, &source);
+    let failure = store
+        .import(Receiver::Host, &source, &forged, now_epoch_i64(), |tx| {
+            inbox.insert(tx, &forged)
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        failure.contains("guest cannot set a sandbox conversation id"),
+        "unexpected rejection: {failure}"
+    );
+    assert_eq!(db.get_last_event_id(), 0);
 }

@@ -242,6 +242,7 @@ pub(crate) fn queue(
     };
     let payload = match target {
         Target::Direct { peer, .. } => MessagePayload {
+            conversation: None,
             target: peer.name.clone(),
             target_generation: Some(peer.generation.clone()),
             sender_routing_generation: None,
@@ -252,6 +253,7 @@ pub(crate) fn queue(
             text,
         },
         Target::Broadcast { .. } => MessagePayload {
+            conversation: None,
             target: String::new(),
             target_generation: None,
             sender_routing_generation: None,

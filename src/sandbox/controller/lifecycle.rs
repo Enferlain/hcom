@@ -4,7 +4,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::Transaction;
 
 use crate::db::HcomDb;
 use crate::shared::time::{monotonic_seconds, now_epoch_i64};
@@ -12,7 +11,6 @@ use crate::sys::{fs, process};
 
 use super::state::{Tick, read_status};
 use super::{ControllerStatus, Owner, Process, Store, lock_file, owner_released, status};
-use crate::sandbox::protocol::{Binding, Message, MessagePayload, Origin, Receiver};
 
 const WAIT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(50);
@@ -27,25 +25,6 @@ pub enum Forwarding {
     Deferred(String),
 }
 
-#[derive(Debug)]
-pub struct QueuedSend {
-    pub message: Message,
-    pub forwarding: Forwarding,
-}
-
-/// The sandbox send adapter calls this after authorization. Report an
-/// unavailable controller separately from enqueue failure, since the outbox
-/// and local event have already committed.
-pub fn enqueue_host(
-    store: &Store<'_>,
-    route: &Binding,
-    origin: Origin,
-    payload: MessagePayload,
-    insert_event: impl FnOnce(&Transaction<'_>, &Message) -> Result<i64>,
-) -> Result<QueuedSend> {
-    enqueue_host_with(store, route, origin, payload, insert_event, spawn_worker)
-}
-
 /// Resolve forwarding after the host outbox transaction commits.
 pub fn forwarding_after_commit(store: &Store<'_>) -> Forwarding {
     forwarding_with(store, spawn_worker)
@@ -57,28 +36,6 @@ fn forwarding_with(store: &Store<'_>, spawn: impl Fn(&Path) -> Result<Child>) ->
         Ok(None) => Forwarding::Disabled,
         Err(error) => Forwarding::Deferred(format!("{error:#}")),
     }
-}
-
-fn enqueue_host_with(
-    store: &Store<'_>,
-    route: &Binding,
-    origin: Origin,
-    payload: MessagePayload,
-    insert_event: impl FnOnce(&Transaction<'_>, &Message) -> Result<i64>,
-    spawn: impl Fn(&Path) -> Result<Child>,
-) -> Result<QueuedSend> {
-    let message = store.enqueue(
-        Receiver::Guest,
-        route,
-        origin,
-        payload,
-        now_epoch_i64(),
-        insert_event,
-    )?;
-    Ok(QueuedSend {
-        message,
-        forwarding: forwarding_with(store, spawn),
-    })
 }
 
 /// The sandbox launch adapter calls this before publishing a success handle.

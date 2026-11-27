@@ -5,11 +5,12 @@ use serde_json::json;
 use crate::db::HcomDb;
 use crate::messages::{MessageEnvelope, MessageIntent};
 use crate::shared::SenderIdentity;
+use crate::shared::time::now_epoch_i64;
 
-use super::controller::{Forwarding, enqueue_host};
+use super::controller::{Forwarding, forwarding_after_commit};
 use super::directory::{HostIdentity, Worker, check_sender, host_recipient_generation};
 use super::protocol::{Intent, MessageId, MessagePayload};
-use super::store::Store;
+use super::store::{BatchHop, Store};
 
 #[derive(Debug)]
 pub(crate) struct Queued {
@@ -116,69 +117,92 @@ pub(crate) fn queue(
         Ok(Some(serde_json::from_str(&id)?))
     };
 
-    let payload = MessagePayload {
-        target: target.into(),
-        target_generation: Some(binding.worker.generation.clone()),
-        sender_routing_generation: Some(host_recipient_generation(
-            db.conn(),
-            &sender.name,
-            host.created_at(),
-        )?),
-        broadcast: false,
-        thread: envelope.thread.clone(),
-        reply_to: resolve_reply()?,
-        intent,
-        text,
-    };
-
     let mut event_id = 0;
-    let queued = enqueue_host(&store, binding, origin.clone(), payload, |tx, message| {
-        // The store transaction fences the destination. Recheck sender membership
-        // and reply correlation on that connection before publishing the event.
-        check_sender(tx, &binding.team, &host)?;
-        // An explicit thread seeds (or expands) the team conversation in this
-        // same transaction. A sender without the participant grant proceeds
-        // without joining, so inherited-thread replies keep working and a
-        // guessed label cannot adopt membership.
-        let conversation = match envelope.thread.as_deref() {
-            Some(label) => {
-                super::conversation::seed_directed(tx, &binding.team, label, &host, worker)?
+    let _message = store.enqueue_host_batch(
+        now_epoch_i64(),
+        |tx, _sequence| {
+            // The store transaction fences the destination and decides the
+            // grant before the payload digest: an explicit thread seeds (or
+            // expands) the team conversation here, and only a granted send
+            // carries its opaque conversation id. A sender without the
+            // participant grant proceeds without joining, so inherited-thread
+            // replies keep working and a guessed label cannot adopt
+            // membership. Replies never seed or expand at all: inheriting a
+            // parent's display label must not mint a grant, and a reply to a
+            // guest keeps that guest outside every conversation.
+            check_sender(tx, &binding.team, &host)?;
+            let conversation = if reply_event.is_none() {
+                match envelope.thread.as_deref() {
+                    Some(label) => {
+                        super::conversation::seed_directed(tx, &binding.team, label, &host, worker)?
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let payload = MessagePayload {
+                target: target.into(),
+                target_generation: Some(binding.worker.generation.clone()),
+                sender_routing_generation: Some(host_recipient_generation(
+                    tx,
+                    &sender.name,
+                    host.created_at(),
+                )?),
+                broadcast: false,
+                thread: envelope.thread.clone(),
+                reply_to: resolve_reply()?,
+                intent,
+                text: text.clone(),
+                conversation,
+            };
+            Ok((
+                (),
+                origin.clone(),
+                vec![BatchHop {
+                    route: binding.clone(),
+                    payload,
+                }],
+            ))
+        },
+        |_tx, (), messages| {
+            let message = messages
+                .first()
+                .context("sandbox send produced no payload")?;
+            ensure!(
+                resolve_reply()? == message.payload.reply_to,
+                "sandbox reply changed during enqueue"
+            );
+            let mut data = json!({
+                "from": sender.name,
+                "sender_kind": "instance",
+                "scope": "mentions",
+                "text": message.payload.text,
+                "mentions": [],
+                "delivered_to": [],
+                "queued_to": [target],
+                "intent": intent,
+                "_sandbox": {"team": binding.team, "id": message.id},
+            });
+            if let Some(conversation) = &message.payload.conversation {
+                data["_sandbox"]["conversation"] = json!(conversation);
             }
-            None => None,
-        };
-        ensure!(
-            resolve_reply()? == message.payload.reply_to,
-            "sandbox reply changed during enqueue"
-        );
-        let mut data = json!({
-            "from": sender.name,
-            "sender_kind": "instance",
-            "scope": "mentions",
-            "text": message.payload.text,
-            "mentions": [],
-            "delivered_to": [],
-            "queued_to": [target],
-            "intent": intent,
-            "_sandbox": {"team": binding.team, "id": message.id},
-        });
-        if let Some(conversation) = conversation {
-            data["_sandbox"]["conversation"] = json!(conversation);
-        }
-        if let Some(thread) = &envelope.thread {
-            data["thread"] = json!(thread);
-        }
-        if let Some(reply) = reply_event {
-            data["reply_to"] = json!(reply.to_string());
-            data["reply_to_local"] = json!(reply);
-        }
-        event_id = db.insert_event_row("message", &sender.name, &data, None)?;
-        Ok(event_id)
-    })?;
+            if let Some(thread) = &envelope.thread {
+                data["thread"] = json!(thread);
+            }
+            if let Some(reply) = reply_event {
+                data["reply_to"] = json!(reply.to_string());
+                data["reply_to_local"] = json!(reply);
+            }
+            event_id = db.insert_event_row("message", &sender.name, &data, None)?;
+            Ok(event_id)
+        },
+    )?;
 
     // Wake readers of this committed journal entry without creating local
     // recipient subscriptions or request watches.
     crate::notify::wake_observers(db);
-    let (forwarding, forwarding_reason) = match queued.forwarding {
+    let (forwarding, forwarding_reason) = match forwarding_after_commit(&store) {
         Forwarding::ControllerReady(_) => ("pending", None),
         Forwarding::Disabled => ("disabled", None),
         Forwarding::Deferred(reason) => ("deferred", Some(reason)),

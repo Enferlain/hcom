@@ -277,6 +277,7 @@ impl Fixture {
 
 fn payload(target: &str, character: char) -> MessagePayload {
     MessagePayload {
+        conversation: None,
         target: target.into(),
         target_generation: None,
         sender_routing_generation: None,

@@ -209,6 +209,10 @@ impl Inbound for HostInbox<'_, '_> {
             "sandbox sender is not enrolled"
         );
         ensure!(
+            message.payload.conversation.is_none(),
+            "guest cannot set a sandbox conversation id"
+        );
+        ensure!(
             message.payload.sender_routing_generation.is_none(),
             "guest cannot set a sandbox sender routing generation"
         );
@@ -323,6 +327,54 @@ impl<'a> GuestInbox<'a> {
         ensure!(local, "sandbox guest inbox worker is missing");
         Ok(())
     }
+
+    /// Retain verifiable conversation membership evidence in the import
+    /// transaction. Only a host-authenticated directed message carries the
+    /// opaque id; the record binds it to this route and the enrolled worker
+    /// generation, and one label keeps one conversation so a later guest
+    /// resolver can look it up uniquely. A repeated grant must match the
+    /// retained evidence exactly; evidence never authorizes a send by itself.
+    fn retain_conversation(&self, tx: &Transaction<'_>, message: &Message) -> Result<()> {
+        let Some(conversation) = &message.payload.conversation else {
+            return Ok(());
+        };
+        ensure!(
+            !message.payload.broadcast,
+            "sandbox conversation evidence cannot arrive on a broadcast"
+        );
+        let Some(label) = &message.payload.thread else {
+            anyhow::bail!("sandbox conversation evidence requires a thread");
+        };
+        let binding = serde_json::to_string(self.binding)?;
+        let generation = &self.binding.worker.generation;
+        let existing: Option<(String, String, String, String)> = tx
+            .query_row(
+                "SELECT conversation, label, generation, binding FROM sandbox_guest_conversations
+                 WHERE conversation = ? OR label = ?",
+                params![conversation, label],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        match existing {
+            None => {
+                tx.execute(
+                    "INSERT INTO sandbox_guest_conversations
+                     (conversation, label, generation, binding) VALUES (?, ?, ?, ?)",
+                    params![conversation, label, generation, binding],
+                )?;
+            }
+            Some((retained_id, retained_label, retained_generation, retained_binding)) => {
+                ensure!(
+                    retained_id == *conversation
+                        && retained_label == *label
+                        && retained_generation == *generation
+                        && retained_binding == binding,
+                    "sandbox conversation evidence conflicts with its retained grant"
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Inbound for GuestInbox<'_> {
@@ -337,6 +389,7 @@ impl Inbound for GuestInbox<'_> {
             "sandbox broadcast cannot target its own sender"
         );
         self.check_local_worker(tx)?;
+        self.retain_conversation(tx, message)?;
         let publication =
             self.inbox
                 .insert_single(tx, &self.binding.team, &self.worker.name, true, message)?;
@@ -426,6 +479,9 @@ impl<'a> Inbox<'a> {
         let mut sandbox = json!({"team": team, "id": message.id});
         if message.payload.broadcast {
             sandbox["broadcast"] = json!(true);
+        }
+        if let Some(conversation) = &message.payload.conversation {
+            sandbox["conversation"] = json!(conversation);
         }
         if wake_target && !self.private_guest {
             let created_at: f64 = tx.query_row(
