@@ -2043,6 +2043,15 @@ mod tests {
         assert_eq!(cmd_send(&db, &args, Some(&ctx("nova"))), 1);
         let mixed = parse(&["send", "--json", &target, "@nova", "--", "hello"]);
         assert_eq!(cmd_send(&db, &mixed, Some(&ctx("luna"))), 1);
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, origin_device_id)
+                 VALUES ('nova:RELY', 3, 'relay-peer')",
+                [],
+            )
+            .unwrap();
+        let mixed_relay = parse(&["send", "--json", &target, "@nova:RELY", "--", "mixed"]);
+        assert_eq!(cmd_send(&db, &mixed_relay, Some(&ctx("luna"))), 1);
         let bundle = parse(&[
             "send",
             "--json",
@@ -2087,6 +2096,7 @@ mod tests {
         assert_eq!(data["_sandbox"]["id"], serde_json::json!(message.id));
         assert!(
             crate::relay::push::build_push_payload(&db, "device")
+                .unwrap()
                 .1
                 .is_empty()
         );
@@ -2389,6 +2399,7 @@ mod tests {
         assert!(db.get_thread_members("work").is_empty());
         assert!(
             crate::relay::push::build_push_payload(&db, "device")
+                .unwrap()
                 .1
                 .is_empty()
         );

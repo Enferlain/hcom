@@ -350,7 +350,9 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
         Err(_) => json!({}),
     };
 
-    // Get reset timestamp (local only — exclude imported events)
+    // Get reset timestamp (local only — exclude imported events and any
+    // sandbox-scoped reset; the watermark is trusted-relay state, so a
+    // sandbox-scoped reset must never move it for relay peers).
     let reset_ts = db
         .conn()
         .query_row(
@@ -358,6 +360,7 @@ pub fn build_state(db: &HcomDb, device_uuid: &str) -> Value {
              WHERE type = 'life' AND instance = '_device'
              AND json_extract(data, '$.action') = 'reset'
              AND json_extract(data, '$._relay') IS NULL
+             AND json_type(data, '$._sandbox') IS NULL
              ORDER BY id DESC LIMIT 1",
             [],
             |row| row.get::<_, Option<String>>(0),
@@ -434,9 +437,89 @@ fn log_preview_level(max_chars: usize) {
     }
 }
 
-/// Build push payload: state + events, returning (state, events, max_event_id, has_more).
+/// Scope push and RPC queries the same way, including retained RPC answers
+/// that may wrap events selected before the sandbox filter existed.
+pub(crate) fn sandbox_event_exclusion(source: &str, has_bindings: bool) -> String {
+    let (event_binding, wrapped_binding) = if has_bindings {
+        (
+            format!(
+                "AND NOT EXISTS (SELECT 1 FROM sandbox_workers w WHERE w.name = {source}.instance)"
+            ),
+            "OR (field.key = 'instance' AND EXISTS (
+                SELECT 1 FROM sandbox_workers w WHERE w.name = field.value
+            ))",
+        )
+    } else {
+        (String::new(), "")
+    };
+    format!(
+        "AND json_type({source}.data, '$._sandbox') IS NULL
+         {event_binding}
+         AND ({source}.type != 'rpc_result' OR NOT EXISTS (
+             SELECT 1 FROM json_tree({source}.data, '$.result') field
+             WHERE field.key = '_sandbox' {wrapped_binding}
+         ))"
+    )
+}
+
+/// Run a scoped export query. Whether the optional `sandbox_workers`
+/// table exists and which rows the query sees are decided inside one
+/// deferred read snapshot: a binding enrolled concurrently cannot have
+/// its events exported by a snapshot that would have excluded them. A
+/// database without the table has no bindings, and a binding row must
+/// exist before any of its worker's events, so a snapshot that predates
+/// the schema never re-opens an export window. Any error — including a
+/// broken schema — is returned: callers fail closed (export nothing)
+/// rather than fall back to an unfiltered query.
+pub(crate) fn scoped_event_query<T>(
+    db: &HcomDb,
+    build_sql: impl Fn(bool) -> String,
+    params: impl rusqlite::Params + Copy,
+    map_row: &mut impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> Result<Vec<T>, String> {
+    let mut run = |conn: &rusqlite::Connection| -> Result<Vec<T>, String> {
+        let has_sandbox_table: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                  WHERE type = 'table' AND name = 'sandbox_workers')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(&build_sql(has_sandbox_table))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params, &mut *map_row)
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    };
+    if db.conn().is_autocommit() {
+        // A deferred transaction gives the existence check and the select
+        // one read snapshot; it is read-only, so nothing is committed.
+        let snapshot = db
+            .conn()
+            .unchecked_transaction()
+            .map_err(|e| e.to_string())?;
+        let rows = run(&snapshot);
+        let _ = snapshot.rollback();
+        rows
+    } else {
+        // Already inside an ambient transaction: it is the snapshot.
+        run(db.conn())
+    }
+}
+
+/// Build push payload: state + events, returning (state, events, max_id, has_more).
 /// Fetches 101 rows, sends first 100 — has_more=true if 101st exists.
-pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>, i64, bool) {
+pub fn build_push_payload(
+    db: &HcomDb,
+    device_uuid: &str,
+) -> Result<(Value, Vec<Value>, i64, bool), String> {
     let state = build_state(db, device_uuid);
 
     let last_push_id: i64 = safe_kv_get(db, "relay_last_push_id")
@@ -445,32 +528,31 @@ pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>,
 
     let tail_start_id = last_push_id.saturating_sub(RETAINED_EVENT_TAIL);
 
-    let rows: Vec<(i64, String, String, String, String)> = db
-        .conn()
-        .prepare(
-            "SELECT id, timestamp, type, instance, data FROM events
-             WHERE id > ? AND instance NOT LIKE '%:%'
-             AND instance != '_device'
-             AND json_extract(data, '$._relay') IS NULL
-             AND json_extract(data, '$._sandbox') IS NULL
-             ORDER BY id LIMIT 101",
-        )
-        .ok()
-        .map(|mut stmt| {
-            stmt.query_map(rusqlite::params![tail_start_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
-        })
-        .unwrap_or_default();
+    let rows = scoped_event_query(
+        db,
+        |exclude_sandbox| {
+            format!(
+                "SELECT id, timestamp, type, instance, data FROM events
+                 WHERE id > {tail_start_id} AND instance NOT LIKE '%:%'
+                 AND instance != '_device'
+                 AND json_extract(data, '$._relay') IS NULL
+                 {}
+                 ORDER BY id LIMIT 101",
+                sandbox_event_exclusion("events", exclude_sandbox)
+            )
+        },
+        [],
+        &mut |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        },
+    )
+    .map_err(|error| format!("event export withheld: {error}"))?;
 
     let has_more = rows.len() > 100;
     let send_rows = &rows[..rows.len().min(100)];
@@ -492,7 +574,7 @@ pub fn build_push_payload(db: &HcomDb, device_uuid: &str) -> (Value, Vec<Value>,
         }
     }
 
-    (state, events, max_id, has_more)
+    Ok((state, events, max_id, has_more))
 }
 
 /// Events past the cursor (the retained tail is at or below it).
@@ -531,7 +613,7 @@ pub fn push(
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
     let (state, mut events, _unbounded_max_id, source_has_more) =
-        build_push_payload(db, device_uuid);
+        build_push_payload(db, device_uuid)?;
     let source_new_events = new_event_count(&events, last_push_id);
 
     let topic = state_topic(relay_id, device_uuid);
@@ -634,12 +716,21 @@ mod tests {
                 &json!({"text": "sandbox message", "_sandbox": {"team": "team"}}),
             )
             .unwrap();
+        db.log_event(
+            "rpc_result",
+            "_rpc",
+            &json!({"result": {"events": [
+                {"id": sandbox_id, "data": {"_sandbox": {"team": "team"}}}
+            ]}}),
+        )
+        .unwrap();
         safe_kv_set(&db, "relay_last_push_id", Some(&recent_id.to_string()));
 
-        let (_state, events, max_id, has_more) = build_push_payload(&db, "device-a");
+        let (_state, events, max_id, has_more) = build_push_payload(&db, "device-a").unwrap();
 
         assert!(!has_more);
         assert_eq!(max_id, recent_id);
+        assert_eq!(events.len(), 2);
         assert!(
             !events
                 .iter()
@@ -657,6 +748,175 @@ mod tests {
                 .iter()
                 .any(|event| event["id"].as_i64() == Some(recent_id))
         );
+    }
+
+    /// Create the optional sandbox schema and one binding with its foreign
+    /// projection, mirroring what sandbox enrollment writes.
+    fn seed_sandbox_binding(db: &HcomDb, generation: &str, name: &str) {
+        crate::sandbox::store::Store::initialize(db).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sandbox_teams (id, realm, owner_name, owner_created_at, controller_token)
+                 VALUES ('team-1', 'realm1', NULL, NULL, 'tok')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sandbox_workers (generation, team, alias, name, binding, gateway, workspace, retired)
+                 VALUES (?, 'team-1', 'helper', ?, ?, 'gw', '/ws', 0)",
+                rusqlite::params![generation, name, format!("binding-{generation}")],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, tool, created_at, status, status_context, background)
+                 VALUES (?, ?, 'claude', 1, 'inactive', 'sandbox', 1)",
+                rusqlite::params![name, format!("openshell:{generation}")],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn sandbox_worker_status_and_projections_stay_out_of_the_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        seed_sandbox_binding(&db, "gen-1", "helper.realm1");
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_time, created_at)
+                 VALUES ('luna', 'sess-1', 'claude', 'active', 1, 0)",
+                [],
+            )
+            .unwrap();
+
+        // A live worker's status events are written unmarked: the export
+        // must classify them by binding, not by marker.
+        let worker_status_id = db
+            .log_event("status", "helper.realm1", &json!({"status": "idle"}))
+            .unwrap();
+        // A host-origin message addressed into the sandbox team carries the
+        // marker and must stay private the same way.
+        let host_sandbox_id = db
+            .log_event(
+                "message",
+                "host",
+                &json!({"text": "to the team", "_sandbox": {"team": "team-1", "id": 1}}),
+            )
+            .unwrap();
+        let ordinary_id = db
+            .log_event("message", "luna", &json!({"text": "ordinary"}))
+            .unwrap();
+
+        let (_state, events, _max_id, _has_more) = build_push_payload(&db, "device-a").unwrap();
+        let ids: Vec<i64> = events
+            .iter()
+            .filter_map(|event| event["id"].as_i64())
+            .collect();
+        assert_eq!(ids, vec![ordinary_id], "only the ordinary event exports");
+
+        let state = build_state(&db, "device-a");
+        let instances = state["instances"].as_object().unwrap();
+        assert!(instances.contains_key("luna"));
+        assert!(
+            !instances.contains_key("helper.realm1"),
+            "the sandbox projection is not a local relay peer"
+        );
+        assert_ne!(worker_status_id, ordinary_id);
+        assert_ne!(host_sandbox_id, ordinary_id);
+    }
+
+    #[test]
+    fn sandbox_events_do_not_consume_the_push_limit_or_invent_more_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        seed_sandbox_binding(&db, "gen-1", "helper.realm1");
+        for _ in 0..120 {
+            db.log_event("status", "helper.realm1", &json!({"status": "idle"}))
+                .unwrap();
+        }
+        let ordinary_id = db
+            .log_event("message", "luna", &json!({"text": "ordinary"}))
+            .unwrap();
+
+        let (_state, events, max_id, has_more) = build_push_payload(&db, "device-a").unwrap();
+        assert_eq!(events.len(), 1, "excluded rows do not consume the limit");
+        assert_eq!(events[0]["id"].as_i64(), Some(ordinary_id));
+        assert!(!has_more, "excluded rows never claim there is more");
+        assert_eq!(max_id, ordinary_id);
+
+        // An all-sandbox tail leaves the cursor alone (bounded rescan
+        // window): the retained tail may repeat rows at or below the
+        // cursor, but no NEW event and no phantom work is reported.
+        let cursor_id = db
+            .log_event("message", "luna", &json!({"text": "cursor"}))
+            .unwrap();
+        safe_kv_set(&db, "relay_last_push_id", Some(&cursor_id.to_string()));
+        db.log_event("status", "helper.realm1", &json!({"status": "idle"}))
+            .unwrap();
+        let (_state, events, max_id, has_more) = build_push_payload(&db, "device-a").unwrap();
+        assert!(events.iter().all(|e| e["id"].as_i64() <= Some(cursor_id)));
+        assert!(!has_more);
+        assert_eq!(max_id, cursor_id);
+    }
+
+    #[test]
+    fn a_sandbox_scoped_reset_does_not_move_the_relay_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.log_event("life", "_device", &json!({"action": "reset"}))
+            .unwrap();
+        let reset_ts = build_state(&db, "device-a")["reset_ts"].as_f64().unwrap();
+        assert!(reset_ts > 0.0);
+
+        // A later sandbox-scoped reset must not move the trusted watermark.
+        db.log_event(
+            "life",
+            "_device",
+            &json!({"action": "reset", "_sandbox": {"team": "team-1"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            build_state(&db, "device-a")["reset_ts"].as_f64(),
+            Some(reset_ts)
+        );
+    }
+
+    #[test]
+    fn a_database_without_the_sandbox_schema_exports_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        let id = db
+            .log_event("message", "luna", &json!({"text": "ordinary"}))
+            .unwrap();
+        let (_state, events, max_id, _has_more) = build_push_payload(&db, "device-a").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["id"].as_i64(), Some(id));
+        assert_eq!(max_id, id);
+    }
+
+    #[test]
+    fn a_broken_sandbox_schema_fails_closed_instead_of_leaking() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        crate::sandbox::store::Store::initialize(&db).unwrap();
+        let ordinary_id = db
+            .log_event("message", "luna", &json!({"text": "ordinary"}))
+            .unwrap();
+        // The exclusion cannot be proven against this schema: the export
+        // must be withheld, never run unfiltered, and the cursor must not
+        // skip the withheld rows.
+        db.conn().execute("DROP TABLE sandbox_workers", []).unwrap();
+        db.conn()
+            .execute(
+                "CREATE TABLE sandbox_workers (generation TEXT PRIMARY KEY)",
+                [],
+            )
+            .unwrap();
+        let error = build_push_payload(&db, "device-a").unwrap_err();
+        assert!(error.contains("event export withheld"), "{error}");
+        assert!(safe_kv_get(&db, "relay_last_push_id").is_none());
+        assert_eq!(ordinary_id, 1);
     }
 
     #[test]
@@ -974,7 +1234,7 @@ mod tests {
         assert!(row_detail.len() < 1000);
 
         // Relayed status events keep the whole text for subscriptions and filters.
-        let (_, events, _, _) = build_push_payload(&db, "device-test");
+        let (_, events, _, _) = build_push_payload(&db, "device-test").unwrap();
         let event = events.iter().find(|e| e["id"] == event_id).unwrap();
         assert_eq!(event["data"]["detail"].as_str().unwrap().len(), 5000);
 

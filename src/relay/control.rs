@@ -891,6 +891,11 @@ fn handle_remote_config_get(
     _config: &HcomConfig,
 ) -> Result<Value, String> {
     if let Some(instance) = optional_param(params, "instance") {
+        if target_is_sandbox_bound(db, instance) {
+            return Err(format!(
+                "'{instance}' is an OpenShell sandbox worker — remote relay control cannot operate on it; use host sandbox management"
+            ));
+        }
         let key = optional_param(params, "field");
         if let Some(field) = key {
             reject_remote_secret_field(field)?;
@@ -1058,9 +1063,79 @@ const REMOTE_EVENTS_HARD_CAP: usize = 2000;
 const RPC_RESULT_OVERHEAD_BYTES: usize = 2 * 1024;
 const REMOTE_EVENTS_MIN_BYTES: usize = 1024;
 
-/// Largest events answer this device can publish right now. The answer rides
-/// in this device's next push next to its state snapshot, so it gets the push
-/// budget (sized for every live receiver) minus that snapshot and the wrapper.
+/// Keep filesystem and extension operations outside remote row predicates.
+const REMOTE_SQL_DENIED_FUNCTIONS: &[&str] = &["load_extension", "readfile", "writefile"];
+
+/// Validate caller SQL against the columns of one synthetic row. The alias
+/// exposes column names but creates no relation a subquery can scan. SQLite's
+/// authorizer denies reads of real tables and virtual tables, including
+/// `main.events_v`. Counting SELECT callbacks would miss scalar subqueries.
+fn validate_remote_row_predicate(db: &HcomDb, predicate: &str) -> Result<(), String> {
+    let allowed_columns: Vec<String> = {
+        let Ok(stmt) = db.conn().prepare("SELECT * FROM events_v LIMIT 0") else {
+            return Err("events schema unavailable".to_string());
+        };
+        stmt.column_names().into_iter().map(String::from).collect()
+    };
+    let conn = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
+    let columns = allowed_columns
+        .iter()
+        .map(|column| format!("NULL AS \"{}\"", column.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.authorizer(Some(
+        |ctx: rusqlite::hooks::AuthContext<'_>| -> rusqlite::hooks::Authorization {
+            use rusqlite::hooks::{AuthAction, Authorization};
+            match ctx.action {
+                AuthAction::Select => Authorization::Allow,
+                AuthAction::Function { function_name } => {
+                    if REMOTE_SQL_DENIED_FUNCTIONS
+                        .iter()
+                        .any(|denied| denied.eq_ignore_ascii_case(function_name))
+                    {
+                        Authorization::Deny
+                    } else {
+                        Authorization::Allow
+                    }
+                }
+                _ => Authorization::Deny,
+            }
+        },
+    ))
+    .map_err(|e| e.to_string())?;
+
+    // The fresh parameter proves SQLite compiled the end of our statement.
+    // Without it an unterminated block comment could swallow the row limit.
+    let boundary = format!(":hcom_limit_{}", uuid::Uuid::new_v4().simple());
+    let probe = format!(
+        "SELECT * FROM (SELECT {columns}) AS events_v WHERE (\n{predicate}\n) LIMIT {boundary}"
+    );
+    let stmt = conn
+        .prepare(&probe)
+        .map_err(|err| format!("remote predicate rejected: {err}"))?;
+    if stmt.parameter_count() != 1 || stmt.parameter_index(&boundary).ok().flatten() != Some(1) {
+        return Err("remote predicate rejected: invalid predicate boundary".into());
+    }
+    Ok(())
+}
+
+/// Whether `name` resolves to a sandbox binding on this host. OpenShell
+/// workers are routed by the sandbox controller, never the trusted
+/// relay; a relay peer attaching to one is a mixed-scope operation and
+/// is refused. Unowned `openshell:` projections fail closed the same way.
+fn target_is_sandbox_bound(db: &HcomDb, name: &str) -> bool {
+    let row = match db.get_instance_full(name) {
+        Ok(Some(row)) => row,
+        Ok(None) => return false,
+        Err(_) => return true,
+    };
+    !matches!(
+        crate::sandbox::directory::location(db, &row),
+        Ok(crate::sandbox::directory::Location::Local
+            | crate::sandbox::directory::Location::TrustedRelay(_))
+    )
+}
+
 fn remote_events_byte_cap(db: &HcomDb) -> usize {
     let state_bytes = super::existing_device_uuid()
         .map(|uuid| super::push::build_state(db, &uuid))
@@ -1101,53 +1176,66 @@ fn handle_remote_events(
     crate::core::filters::validate_type_constraints(&filters)
         .map_err(|e| format!("filter error: {e}"))?;
 
+    // Generated filters can query the scoped relation in their subqueries.
+    let filter_sql = crate::core::filters::build_sql_from_flags(&filters)
+        .map_err(|e| format!("filter error: {e}"))?;
     let mut where_clause = String::new();
-    match crate::core::filters::build_sql_from_flags(&filters) {
-        Ok(s) if !s.is_empty() => where_clause.push_str(&format!(" AND ({s})")),
-        Ok(_) => {}
-        Err(e) => return Err(format!("filter error: {e}")),
+    if !filter_sql.is_empty() {
+        where_clause.push_str(&format!(" AND ({filter_sql})"));
     }
-    if let Some(ref s) = sql {
+    if let Some(s) = &sql {
         let trimmed = s.trim();
         if !trimmed.is_empty() {
-            where_clause.push_str(&format!(" AND ({trimmed})"));
+            // The custom predicate can use current-row columns only.
+            validate_remote_row_predicate(db, trimmed)?;
+            where_clause.push_str(&format!(" AND (\n{trimmed}\n)"));
         }
     }
 
-    let query = format!(
-        "SELECT id, timestamp, type, instance, data FROM events_v WHERE 1=1{where_clause} ORDER BY id DESC LIMIT {last_n}"
+    // The scope is decided inside the same read snapshot that answers
+    // the query; a scope the schema cannot support fails closed. The CTE
+    // shadows the `events_v` name, so generated stock filters' nested
+    // reads (e.g. collision) also see only scoped events, and a caller
+    // predicate that escaped its parentheses would still only reach
+    // scoped rows.
+    let query_result = super::push::scoped_event_query(
+        db,
+        |sandbox_schema_present| {
+            let exclusion = super::push::sandbox_event_exclusion("source", sandbox_schema_present);
+            format!(
+                "WITH events_v AS (
+                     SELECT * FROM main.events_v source WHERE 1=1 {exclusion}
+                 )
+                 SELECT id, timestamp, type, instance, data
+                 FROM events_v WHERE 1=1{where_clause}
+                 ORDER BY id DESC LIMIT {last_n}"
+            )
+        },
+        [],
+        &mut |row| {
+            Ok(json!({
+                "id": row.get::<_, i64>(0)?,
+                "ts": row.get::<_, String>(1)?,
+                "type": row.get::<_, String>(2)?,
+                "instance": row.get::<_, String>(3)?,
+                "data": serde_json::from_str::<Value>(&row.get::<_, String>(4)?)
+                    .unwrap_or(json!({})),
+            }))
+        },
     );
-    let mut stmt = db
-        .conn()
-        .prepare(&query)
-        .map_err(|e| format!("sql error: {e}"))?;
-    let rows = stmt
-        .query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let ts: String = row.get(1)?;
-            let etype: String = row.get(2)?;
-            let instance: String = row.get(3)?;
-            let data_str: String = row.get(4)?;
-            Ok((id, ts, etype, instance, data_str))
-        })
-        .map_err(|e| format!("sql error: {e}"))?;
-
-    let mut events: Vec<Value> = Vec::new();
-    for row in rows {
-        match row {
-            Ok((id, ts, etype, instance, data_str)) => {
-                let data: Value = serde_json::from_str(&data_str).unwrap_or(json!({}));
-                events.push(json!({
-                    "id": id,
-                    "ts": ts,
-                    "type": etype,
-                    "instance": instance,
-                    "data": data,
-                }));
-            }
-            Err(_) => continue,
+    let mut events = match query_result {
+        Ok(events) => events,
+        Err(err) => {
+            // Fail closed: an answer that cannot prove every row is
+            // non-sandbox-scoped is withheld rather than sent unfiltered.
+            log::log_warn(
+                "relay",
+                "relay.remote_events_query_failed",
+                &format!("remote events answer withheld: {err}"),
+            );
+            return Err(format!("remote events answer withheld: {err}"));
         }
-    }
+    };
 
     let mut truncated = false;
     let mut omitted = 0usize;
@@ -1229,6 +1317,14 @@ fn handle_remote_sub_create(
             })
             .ok_or_else(|| format!("caller '{caller_input}' not found on this device"))?
     };
+    // Mixed-scope rejection: a relay peer must not attach subscriptions to
+    // OpenShell workers. Sandbox delivery is owned by the host sandbox
+    // controller, and a binding's existence is not relay-exportable state.
+    if target_is_sandbox_bound(db, &caller) {
+        return Err(format!(
+            "caller '{caller}' is an OpenShell sandbox worker — subscriptions must attach to ordinary or relay instances"
+        ));
+    }
 
     let mut filters: crate::core::filters::FilterMap = match params.get("filters") {
         Some(v) if !v.is_null() => {
@@ -1251,6 +1347,13 @@ fn handle_remote_sub_create(
 
     if filters.is_empty() && sql_parts.is_empty() {
         return Err("provide at least one filter or SQL WHERE clause".to_string());
+    }
+
+    // Validate access to current-row columns before persisting caller SQL.
+    // The join mirrors what the subscription builder stores.
+    let manual_sql = sql_parts.join(" ").replace("\\!", "!");
+    if !manual_sql.is_empty() {
+        validate_remote_row_predicate(db, &manual_sql)?;
     }
 
     let on_hit = params.get("on_hit").and_then(|v| v.as_str());
@@ -1293,9 +1396,17 @@ fn handle_remote_sub_list(
         .filter_map(|r| r.ok())
         .collect();
 
+    // Sandbox-bound callers are host-private state: their subscriptions
+    // never appear in a remote answer.
     let subs: Vec<Value> = rows
         .iter()
         .filter_map(|v| serde_json::from_str::<Value>(v).ok())
+        .filter(|sub| {
+            sub["caller"]
+                .as_str()
+                .map(|caller| !target_is_sandbox_bound(db, caller))
+                .unwrap_or(true)
+        })
         .collect();
 
     Ok(json!({ "subs": subs }))
@@ -1315,9 +1426,18 @@ fn handle_remote_sub_unsub(
     };
     let key = format!("events_sub:{sub_id}");
 
-    let exists = db.kv_get(&key).ok().flatten().is_some();
-    if !exists {
+    let stored = db.kv_get(&key).ok().flatten();
+    let Some(value) = stored else {
         return Ok(json!({ "id": sub_id, "removed": false }));
+    };
+    let sub: Value =
+        serde_json::from_str(&value).map_err(|_| "stored subscription is invalid".to_string())?;
+    if let Some(caller) = sub["caller"].as_str()
+        && target_is_sandbox_bound(db, caller)
+    {
+        return Err(format!(
+            "subscription {sub_id} belongs to an OpenShell sandbox worker — remote relay control cannot remove it"
+        ));
     }
     let _ = db.kv_set(&key, None);
     Ok(json!({ "id": sub_id, "removed": true }))
@@ -2241,6 +2361,397 @@ mod tests {
             &HcomConfig::default(),
         )
         .unwrap_err();
-        assert!(err.contains("sql error"), "unexpected err: {err}");
+        assert!(
+            err.contains("remote predicate rejected"),
+            "unexpected err: {err}"
+        );
+    }
+
+    /// Create the optional sandbox schema plus one binding and its foreign
+    /// projection, mirroring what sandbox enrollment writes.
+    fn seed_sandbox_binding(db: &HcomDb, generation: &str, name: &str) {
+        crate::sandbox::store::Store::initialize(db).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sandbox_teams (id, realm, owner_name, owner_created_at, controller_token)
+                 VALUES ('team-1', 'realm1', NULL, NULL, 'tok')",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO sandbox_workers (generation, team, alias, name, binding, gateway, workspace, retired)
+                 VALUES (?, 'team-1', 'helper', ?, ?, 'gw', '/ws', 0)",
+                rusqlite::params![generation, name, format!("binding-{generation}")],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, tool, created_at, status, status_context, background)
+                 VALUES (?, ?, 'claude', 1, 'inactive', 'sandbox', 1)",
+                rusqlite::params![name, format!("openshell:{generation}")],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn remote_events_exclude_sandbox_scope_including_unmarked_worker_status() {
+        let db = test_db();
+        seed_sandbox_binding(&db, "gen-1", "helper.realm1");
+        // A live worker's status events are written unmarked; the marker
+        // alone would leak them.
+        db.log_event("status", "helper.realm1", &json!({"status": "idle"}))
+            .unwrap();
+        db.log_event(
+            "rpc_result",
+            "_rpc",
+            &json!({"result": {"events": [
+                {"type": "status", "instance": "helper.realm1", "data": {"status": "idle"}}
+            ]}}),
+        )
+        .unwrap();
+        db.log_event(
+            "message",
+            "host",
+            &json!({"text": "to the team", "_sandbox": {"team": "team-1", "id": 1}}),
+        )
+        .unwrap();
+        let ordinary = db
+            .log_event("message", "luna", &json!({"text": "ordinary"}))
+            .unwrap();
+
+        let out =
+            handle_remote_events(&db, &json!({}), "initiator", &HcomConfig::default()).unwrap();
+        let events = out["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["id"].as_i64(), Some(ordinary));
+    }
+
+    #[test]
+    fn remote_events_answer_the_backfill_predicate_with_scoped_rows() {
+        // The exact caller SQL the backfill client sends (a range over the
+        // peer's own-origin events). Rows the predicate does not know
+        // about — the marked host message and the unmarked worker status —
+        // must be withheld by the server scope inside the range.
+        let db = test_db();
+        seed_sandbox_binding(&db, "gen-1", "helper.realm1");
+        let first = db
+            .log_event("message", "luna", &json!({"text": "in range"}))
+            .unwrap();
+        let middle = db
+            .log_event("message", "luna", &json!({"text": "also in range"}))
+            .unwrap();
+        db.log_event(
+            "message",
+            "host",
+            &json!({"text": "private", "_sandbox": {"team": "team-1", "id": 2}}),
+        )
+        .unwrap();
+        db.log_event("status", "helper.realm1", &json!({"status": "idle"}))
+            .unwrap();
+        let last = db
+            .log_event("message", "luna", &json!({"text": "bounds"}))
+            .unwrap();
+
+        let sql = format!(
+            "id > {} AND id < {} AND instance NOT LIKE '%:%' AND instance != '_device' \
+             AND type NOT IN ('control', 'rpc_result') AND json_extract(data, '$._relay') IS NULL \
+             AND json_type(data, '$._sandbox') IS NULL",
+            first, last
+        );
+        let out = handle_remote_events(
+            &db,
+            &json!({"sql": sql, "last": 100}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        let ids: Vec<i64> = out["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![middle],
+            "sandbox rows inside the gap stay private"
+        );
+
+        // A range holding only scoped rows answers empty and truncated
+        // nowhere: the gap closes with nothing to import.
+        let sql = format!("id > {} AND id < {}", middle, middle + 2);
+        let out = handle_remote_events(
+            &db,
+            &json!({"sql": sql, "last": 100}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out["count"].as_u64(), Some(0));
+        assert_eq!(out["truncated"], json!(null));
+    }
+
+    #[test]
+    fn remote_events_reject_caller_sql_reaching_unscoped_state() {
+        let db = test_db();
+        seed_events(&db, 5);
+        for sql in [
+            "1=1) /*",
+            // The synthetic row alias never permits an event-table scan.
+            "EXISTS (SELECT 1 FROM events_v WHERE type = 'message')",
+            "EXISTS (SELECT 1 FROM main.events_v)",
+            // Read of another table through a nested SELECT.
+            "EXISTS (SELECT 1 FROM kv)",
+            // CTE masquerading as the trusted view name.
+            "EXISTS (WITH events_v AS (SELECT 1 FROM kv) SELECT 1 FROM events_v)",
+            // Compound arm escaping the parenthesization.
+            "1=1) UNION SELECT json_extract(data, '$.text') FROM events --",
+        ] {
+            let err = handle_remote_events(
+                &db,
+                &json!({"sql": sql, "last": 10}),
+                "initiator",
+                &HcomConfig::default(),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("remote predicate rejected"),
+                "sql {sql:?}: {err}"
+            );
+        }
+        // Ordinary row predicates keep working.
+        let out = handle_remote_events(
+            &db,
+            &json!({"sql": "json_extract(data, '$.i') = 3", "last": 10}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out["count"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn remote_events_keep_the_stock_subquery_filters() {
+        let db = test_db();
+        // A mention filter compiles an EXISTS over json_each; a collision
+        // filter compiles a nested SELECT against events_v. Both must keep
+        // working through the scoped view.
+        let id = db
+            .log_event(
+                "message",
+                "luna",
+                &json!({"text": "ping @luna", "mentions": ["luna"]}),
+            )
+            .unwrap();
+        let out = handle_remote_events(
+            &db,
+            &json!({"filters": {"mentions": ["luna"]}, "last": 10}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        let events = out["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["id"].as_i64(), Some(id));
+
+        seed_sandbox_binding(&db, "gen-1", "helper.realm1");
+        let edit = |name| {
+            db.log_status_event(
+                name,
+                "active",
+                "tool:Edit",
+                Some("/fixture/shared.rs"),
+                Some("2026-11-27T00:00:00Z"),
+            )
+            .unwrap()
+        };
+        edit("luna");
+        edit("helper.realm1");
+        let collision_params = json!({"filters": {"collision": ["true"]}, "last": 10});
+        let out = handle_remote_events(&db, &collision_params, "initiator", &HcomConfig::default())
+            .unwrap();
+        assert_eq!(
+            out["events"],
+            json!([]),
+            "private status cannot cause a collision"
+        );
+        edit("nova");
+        let out = handle_remote_events(&db, &collision_params, "initiator", &HcomConfig::default())
+            .unwrap();
+        assert_eq!(out["count"], 2);
+    }
+
+    #[test]
+    fn remote_events_answer_is_withheld_when_scope_is_unprovable() {
+        let db = test_db();
+        crate::sandbox::store::Store::initialize(&db).unwrap();
+        seed_events(&db, 2);
+        db.conn().execute("DROP TABLE sandbox_workers", []).unwrap();
+        db.conn()
+            .execute(
+                "CREATE TABLE sandbox_workers (generation TEXT PRIMARY KEY)",
+                [],
+            )
+            .unwrap();
+        let err =
+            handle_remote_events(&db, &json!({}), "initiator", &HcomConfig::default()).unwrap_err();
+        assert!(err.contains("withheld"), "{err}");
+    }
+
+    #[test]
+    fn remote_sub_create_rejects_unscoped_predicates_before_persisting() {
+        let db = test_db();
+        let err = handle_remote_sub_create(
+            &db,
+            &json!({"caller": "bigboss", "caller_is_external": true, "sql_parts": [
+                "EXISTS (SELECT 1 FROM kv)"
+            ]}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("remote predicate rejected"), "{err}");
+        let stored: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0, "nothing was persisted");
+    }
+
+    #[test]
+    fn remote_sub_create_accepts_row_predicates() {
+        let db = test_db();
+        let out = handle_remote_sub_create(
+            &db,
+            &json!({"caller": "bigboss", "caller_is_external": true, "sql_parts": [
+                "json_extract(data, '$.team') = 'x'"
+            ]}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out["already_existed"], false);
+        let stored: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv WHERE key LIKE 'events_sub:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1);
+    }
+
+    #[test]
+    fn remote_sub_create_refuses_sandbox_bound_callers() {
+        let db = test_db();
+        seed_sandbox_binding(&db, "gen-1", "helper.realm1");
+        // External callers are verbatim; an exact binding name is refused.
+        let err = handle_remote_sub_create(
+            &db,
+            &json!({"caller": "helper.realm1", "caller_is_external": true, "sql_parts": ["1=1"]}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("sandbox worker"), "{err}");
+        // An instance caller must not reach the binding through the
+        // prefix fallback either.
+        let err = handle_remote_sub_create(
+            &db,
+            &json!({"caller": "helper", "sql_parts": ["1=1"]}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("sandbox worker"), "{err}");
+    }
+
+    #[test]
+    fn remote_sub_listing_and_unsub_never_touch_sandbox_bound_subs() {
+        let db = test_db();
+        seed_sandbox_binding(&db, "gen-1", "helper.realm1");
+        let sandbox_sub = json!({"id": "sub-sb1", "caller": "helper.realm1", "sql": "1=1"});
+        let ordinary_sub = json!({"id": "sub-ok1", "caller": "bigboss", "sql": "1=1"});
+        db.kv_set("events_sub:sub-sb1", Some(&sandbox_sub.to_string()))
+            .unwrap();
+        db.kv_set("events_sub:sub-ok1", Some(&ordinary_sub.to_string()))
+            .unwrap();
+
+        let out =
+            handle_remote_sub_list(&db, &json!({}), "initiator", &HcomConfig::default()).unwrap();
+        let ids: Vec<String> = out["subs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|sub| sub["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["sub-ok1"]);
+
+        let err = handle_remote_sub_unsub(
+            &db,
+            &json!({"id": "sub-sb1"}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("sandbox worker"), "{err}");
+        assert!(db.kv_get("events_sub:sub-sb1").unwrap().is_some());
+
+        let out = handle_remote_sub_unsub(
+            &db,
+            &json!({"id": "sub-ok1"}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(out["removed"], true);
+    }
+
+    #[test]
+    fn remote_config_get_refuses_sandbox_bound_instances() {
+        // Verified export path: config_instance_get renders the projection
+        // row's instance config JSON to the requesting peer. Mutating
+        // lifecycle handlers route through OpenSpec 6.1, not here.
+        let db = test_db();
+        seed_sandbox_binding(&db, "gen-1", "helper.realm1");
+        let err = handle_remote_config_get(
+            &db,
+            &json!({"instance": "helper.realm1"}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("OpenShell sandbox worker"), "{err}");
+    }
+
+    #[test]
+    fn remote_control_read_errors_stay_explicit_for_sandbox_targets() {
+        // Screen and transcript reads are not export paths for sandbox
+        // bindings: the projection owns no terminal port and no host
+        // transcript path, so the ordinary handlers fail explicitly.
+        let db = test_db();
+        seed_sandbox_binding(&db, "gen-1", "helper.realm1");
+        let err = handle_remote_term_screen(
+            &db,
+            &json!({"target": "helper.realm1"}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap_err();
+        assert!(!err.contains("OpenShell sandbox worker"), "{err}");
+        let err = handle_remote_transcript(
+            &db,
+            &json!({"target": "helper.realm1"}),
+            "initiator",
+            &HcomConfig::default(),
+        )
+        .unwrap_err();
+        assert!(!err.contains("OpenShell sandbox worker"), "{err}");
     }
 }

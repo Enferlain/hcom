@@ -163,7 +163,8 @@ pub(crate) fn request_params(gap: &Gap) -> Value {
     json!({
         "sql": format!(
             "id > {} AND id < {} AND instance NOT LIKE '%:%' AND instance != '_device' \
-             AND type NOT IN ('control', 'rpc_result') AND json_extract(data, '$._relay') IS NULL",
+             AND type NOT IN ('control', 'rpc_result') AND json_extract(data, '$._relay') IS NULL \
+             AND json_type(data, '$._sandbox') IS NULL",
             gap.after, gap.before
         ),
         "last": last,
@@ -265,6 +266,7 @@ pub(crate) fn apply_answer(
             oldest = oldest.min(remote_id);
             if event.get("type").and_then(|v| v.as_str()) == Some("control")
                 || event.get("instance").and_then(|v| v.as_str()) == Some("_device")
+                || super::pull::is_sandbox_event(event)
             {
                 continue;
             }
@@ -539,6 +541,10 @@ mod tests {
             sql.contains("json_extract(data, '$._relay') IS NULL"),
             "{sql}"
         );
+        assert!(
+            sql.contains("json_type(data, '$._sandbox') IS NULL"),
+            "{sql}"
+        );
 
         // No answer yet and not timed out: nothing is re-sent.
         let summary = tick(&db, "MINE", 1005.0, &mut |_, _, _| {
@@ -547,12 +553,14 @@ mod tests {
         assert_eq!(summary, TickSummary::default());
 
         // The answer arrives inside the peer's snapshot as an imported rpc_result.
+        let mut scoped = message(14, "private");
+        scoped["data"]["_sandbox"] = json!({"team": "team"});
         db.log_event(
             "rpc_result",
             "_rpc",
             &answer(
                 &request_id,
-                vec![message(15, "second"), message(12, "first")],
+                vec![message(15, "second"), scoped, message(12, "first")],
                 false,
             ),
         )

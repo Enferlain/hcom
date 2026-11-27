@@ -1355,6 +1355,7 @@ fn guest_broadcast_routes_to_bound_team_with_stable_ids_and_postcommit_wakes() {
     }
     assert!(
         crate::relay::push::build_push_payload(&host_db, "device")
+            .unwrap()
             .1
             .is_empty()
     );

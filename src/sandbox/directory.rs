@@ -608,6 +608,19 @@ pub(crate) fn active_worker_names(db: &HcomDb) -> Result<std::collections::HashS
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// Recognize retained worker names even after retirement, for history and
+/// derived-event filtering.
+pub(crate) fn known_worker_name(conn: &Connection, name: &str) -> Result<bool> {
+    if !has_directory(conn)? {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sandbox_workers WHERE name = ?)",
+        [name],
+        |row| row.get(0),
+    )?)
+}
+
 fn decode_worker(row: &rusqlite::Row<'_>) -> Result<Worker> {
     let key: String = row.get(1)?;
     let binding: Binding = serde_json::from_str(&key)?;

@@ -63,7 +63,7 @@ pub struct EventsArgs {
     /// Start after this event id (with --follow or --wait)
     #[arg(long = "after-id", requires = "cursor_mode")]
     pub after_id: Option<i64>,
-    /// Raw SQL WHERE clause
+    /// SQL WHERE clause. Remote fetch predicates can read only the current event.
     #[arg(long)]
     pub sql: Option<String>,
     /// Composable event filters
@@ -114,7 +114,7 @@ pub struct EventsSubArgs {
     /// Composable event filters
     #[command(flatten)]
     pub filters: EventFilterArgs,
-    /// SQL parts or "list" keyword
+    /// SQL parts or "list". Remote predicates can read only the current event.
     pub rest: Vec<String>,
 }
 

@@ -699,7 +699,10 @@ fn relay_new(db: &HcomDb, argv: &[String]) -> i32 {
 
     // Clear the previous group's device state only once the new group is
     // certain to replace it: a failed probe above leaves the old config live.
-    relay::clear_relay_device_state(db);
+    if let Err(error) = relay::clear_relay_device_state(db) {
+        eprintln!("Error: could not clear the previous relay group's state: {error}");
+        return 1;
+    }
 
     // Save config
     if let Err(e) = persist_relay_config(&relay_id, &pinned_broker, auth_token.as_deref(), &psk) {
@@ -807,7 +810,10 @@ fn relay_connect(db: &HcomDb, argv: &[String]) -> i32 {
                 .unwrap_or_default();
             println!("Leaving group {old_key}. To rejoin: hcom relay connect {old_token}\n");
         }
-        relay::clear_relay_device_state(db);
+        if let Err(error) = relay::clear_relay_device_state(db) {
+            eprintln!("Error: could not clear the previous relay group's state: {error}");
+            return 1;
+        }
     }
 
     // Save config

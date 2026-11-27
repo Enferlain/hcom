@@ -316,7 +316,7 @@ fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or(key.as_str());
-        let notification = format_sub_notification(
+        if let Some(notification) = format_sub_notification(
             db,
             sub_id,
             candidate_event_id,
@@ -324,8 +324,9 @@ fn sweep_expired_reqwatch_graces(db: &HcomDb, now: f64) {
             target,
             &serde_json::json!({"status": "listening"}),
             Some(&filters),
-        );
-        let _ = send_sub_notification(db, caller, &notification);
+        ) {
+            let _ = send_sub_notification(db, caller, &notification, None);
+        }
     }
 }
 
@@ -739,15 +740,56 @@ struct OnHitReaction {
     caller_kind: String,
     text: String,
     chain: Vec<String>,
+    sandbox: Option<SandboxSubscriptionScope>,
 }
 
 impl OnHitReaction {
     fn send(&self, db: &HcomDb) {
-        if let Err(e) =
-            send_reaction_message(db, &self.caller, &self.caller_kind, &self.text, &self.chain)
-        {
+        if let Err(e) = send_reaction_message(
+            db,
+            &self.caller,
+            &self.caller_kind,
+            &self.text,
+            &self.chain,
+            self.sandbox.as_ref(),
+        ) {
             crate::log::log_error("db", "check_event_subscriptions.on_hit", &format!("{e}"));
         }
+    }
+}
+
+#[derive(Clone)]
+struct SandboxSubscriptionScope {
+    team: String,
+    recipients: Vec<String>,
+}
+
+impl SandboxSubscriptionScope {
+    fn from_event(data: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            team: data.get("_sandbox")?.get("team")?.as_str()?.to_owned(),
+            recipients: data
+                .get("delivered_to")?
+                .as_array()?
+                .iter()
+                .filter_map(|recipient| recipient.as_str().map(str::to_owned))
+                .collect(),
+        })
+    }
+
+    fn allows(&self, db: &HcomDb, caller: &str) -> bool {
+        // Notifications and reactions can only reach the source event's local
+        // recipients. Relay projections never receive them.
+        self.recipients.iter().any(|recipient| recipient == caller)
+            && db
+                .conn()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM instances
+                     WHERE name = ? AND COALESCE(origin_device_id, '') = '')",
+                    [caller],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(false)
     }
 }
 
@@ -763,6 +805,22 @@ fn fire_matching_subscriptions(
     only: Option<&HashSet<String>>,
     mut defer_reactions: Option<&mut Vec<OnHitReaction>>,
 ) {
+    let sandbox = SandboxSubscriptionScope::from_event(data);
+    if sandbox.is_none() {
+        // Unmarked worker status can be withheld by the relay using its
+        // instance binding. Skip its automations too: there is no event
+        // scope with which to authorize a notification or reaction.
+        let could_be_projection = instance.contains('.') && !instance.contains(':');
+        if data.get("_sandbox").is_some()
+            || (could_be_projection
+                && !matches!(
+                    crate::sandbox::directory::known_worker_name(db.conn(), instance),
+                    Ok(false)
+                ))
+        {
+            return;
+        }
+    }
     let rows: Vec<(String, String)> = match db.conn.prepare_cached(
         "SELECT key, value FROM kv
          WHERE key LIKE 'events_sub:%'
@@ -792,6 +850,12 @@ fn fire_matching_subscriptions(
             Err(_) => continue,
         };
         if subscription_is_delivery_only(&sub) {
+            continue;
+        }
+        if sandbox.as_ref().is_some_and(|scope| {
+            let caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
+            !scope.allows(db, caller)
+        }) {
             continue;
         }
         if let Some(sql) = sub
@@ -976,7 +1040,7 @@ fn fire_matching_subscriptions(
         }
 
         let filters_opt = sub.get("filters");
-        let notification = format_sub_notification(
+        let Some(notification) = format_sub_notification(
             db,
             sub_id,
             event_id,
@@ -984,8 +1048,10 @@ fn fire_matching_subscriptions(
             instance,
             data,
             filters_opt,
-        );
-        let _ = send_sub_notification(db, caller, &notification);
+        ) else {
+            continue;
+        };
+        let _ = send_sub_notification(db, caller, &notification, sandbox.as_ref());
 
         if let Some(on_hit_text) = sub.get("on_hit_text").and_then(|v| v.as_str()) {
             let caller_kind = sub
@@ -999,6 +1065,7 @@ fn fire_matching_subscriptions(
                 caller_kind: caller_kind.to_string(),
                 text: on_hit_text.to_string(),
                 chain,
+                sandbox: sandbox.clone(),
             };
             match defer_reactions.as_deref_mut() {
                 Some(queue) => queue.push(reaction),
@@ -1144,7 +1211,7 @@ pub(crate) fn send_message_as(
     sender_kind: &str,
     message: &str,
 ) -> Result<Vec<String>> {
-    send_reaction_message(db, sender_name, sender_kind, message, &[])
+    send_reaction_message(db, sender_name, sender_kind, message, &[], None)
 }
 
 fn send_reaction_message(
@@ -1153,6 +1220,7 @@ fn send_reaction_message(
     sender_kind: &str,
     message: &str,
     reaction_chain: &[String],
+    sandbox: Option<&SandboxSubscriptionScope>,
 ) -> Result<Vec<String>> {
     let mut stmt = db.conn.prepare_cached("SELECT name, tag FROM instances")?;
     let instances: Vec<InstanceInfo> = stmt
@@ -1184,22 +1252,31 @@ fn send_reaction_message(
             .any(|target| sandbox_names.contains(target)),
         "sandbox targets require a team-scoped send path"
     );
-    let (scope, mention_list, delivered_to) = if scope_result.scope == MessageScope::Broadcast {
-        let delivered: Vec<String> = instances
-            .iter()
-            .filter(|inst| inst.name != sender_name && !sandbox_names.contains(&inst.name))
-            .map(|inst| inst.name.clone())
-            .collect();
-        ("broadcast".to_string(), vec![], delivered)
-    } else {
-        let delivered: Vec<String> = scope_result
-            .mentions
-            .iter()
-            .filter(|n| n.as_str() != sender_name)
-            .cloned()
-            .collect();
-        ("mentions".to_string(), scope_result.mentions, delivered)
-    };
+    let (mut scope, mut mention_list, mut delivered_to) =
+        if scope_result.scope == MessageScope::Broadcast {
+            let delivered: Vec<String> = instances
+                .iter()
+                .filter(|inst| inst.name != sender_name && !sandbox_names.contains(&inst.name))
+                .map(|inst| inst.name.clone())
+                .collect();
+            ("broadcast".to_string(), vec![], delivered)
+        } else {
+            let delivered: Vec<String> = scope_result
+                .mentions
+                .iter()
+                .filter(|n| n.as_str() != sender_name)
+                .cloned()
+                .collect();
+            ("mentions".to_string(), scope_result.mentions, delivered)
+        };
+    if let Some(sandbox) = sandbox {
+        delivered_to.retain(|recipient| sandbox.allows(db, recipient));
+        if delivered_to.is_empty() {
+            return Ok(delivered_to);
+        }
+        scope = "mentions".to_string();
+        mention_list.clone_from(&delivered_to);
+    }
 
     let mut event_data = serde_json::json!({
         "from": sender_name,
@@ -1214,6 +1291,10 @@ fn send_reaction_message(
 
     if !reaction_chain.is_empty() {
         event_data["reaction_subscriptions"] = json!(reaction_chain);
+    }
+    if let Some(sandbox) = sandbox {
+        // Derived rows retain team provenance for both export and later reactions.
+        event_data["_sandbox"] = json!({"team": sandbox.team});
     }
 
     let routing_instance = match sender_kind {
@@ -1276,7 +1357,7 @@ fn format_sub_notification(
     instance: &str,
     data: &serde_json::Value,
     filters: Option<&serde_json::Value>,
-) -> String {
+) -> Option<String> {
     if let Some(f) = filters {
         if f.get("request_watch").is_some() {
             let request_id = f
@@ -1290,24 +1371,19 @@ fn format_sub_notification(
             } else {
                 "stopped"
             };
-            return format!(
+            return Some(format!(
                 "[sub:{}] #{} {} {} without responding to your request #{}",
                 sub_id, event_id, target, action, request_id
-            );
+            ));
         }
 
         if f.get("collision").is_some() && event_type == "status" {
             let file_path = data.get("detail").and_then(|v| v.as_str()).unwrap_or("?");
-            if let Some(partner) = find_collision_partner(db, event_id, instance, file_path) {
-                return format!(
-                    "\u{26a0}\u{fe0f} COLLISION [sub:{}] #{}: {} and {} both edited {}",
-                    sub_id, event_id, instance, partner, file_path
-                );
-            }
-            return format!(
-                "\u{26a0}\u{fe0f} COLLISION [sub:{}] #{}: {} edited {} (conflict with another agent)",
-                sub_id, event_id, instance, file_path
-            );
+            let partner = find_collision_partner(db, event_id, instance, file_path)?;
+            return Some(format!(
+                "\u{26a0}\u{fe0f} COLLISION [sub:{}] #{}: {} and {} both edited {}",
+                sub_id, event_id, instance, partner, file_path
+            ));
         }
     }
 
@@ -1387,7 +1463,7 @@ fn format_sub_notification(
         _ => {}
     }
 
-    parts.join(" | ")
+    Some(parts.join(" | "))
 }
 
 fn find_collision_partner(
@@ -1396,26 +1472,36 @@ fn find_collision_partner(
     instance: &str,
     file_path: &str,
 ) -> Option<String> {
-    db.conn
-        .query_row(
-            &format!(
+    use crate::relay::push::{sandbox_event_exclusion, scoped_event_query};
+    scoped_event_query(
+        db,
+        |has_bindings| {
+            format!(
                 "SELECT e.instance FROM events_v ev, events_v e
                  WHERE ev.id = ?
                  AND +e.type = 'status' AND e.status_context IN {}
                  AND e.status_detail = ?
                  AND e.instance != ?
-                 AND {}
+                 AND {} {}
                  ORDER BY e.id DESC LIMIT 1",
                 FILE_WRITE_CONTEXTS,
                 collision_window_sql("ev", "e"),
-            ),
-            params![event_id, file_path, instance],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
+                sandbox_event_exclusion("e", has_bindings),
+            )
+        },
+        params![event_id, file_path, instance],
+        &mut |row| row.get::<_, String>(0),
+    )
+    .ok()?
+    .pop()
 }
 
-fn send_sub_notification(db: &HcomDb, caller: &str, message: &str) -> bool {
+fn send_sub_notification(
+    db: &HcomDb,
+    caller: &str,
+    message: &str,
+    sandbox: Option<&SandboxSubscriptionScope>,
+) -> bool {
     let row: Option<(String, Option<String>)> = db
         .conn
         .query_row(
@@ -1435,11 +1521,12 @@ fn send_sub_notification(db: &HcomDb, caller: &str, message: &str) -> bool {
     };
 
     let text = format!("@{} {}", full_name, message);
-    let Ok(delivered_to) = send_system_message(db, "[hcom-events]", &text) else {
+    let Ok(delivered_to) =
+        send_reaction_message(db, "[hcom-events]", "system", &text, &[], sandbox)
+    else {
         return false;
     };
-    // send_system_message only logs the [hcom-events] row; unlike `hcom send`
-    // it does not ping notify endpoints, so the notification can sit unread
+    // Logging the [hcom-events] row does not ping notify endpoints, so it can sit unread
     // until an unrelated wake. Wake only the matching caller here: this path
     // runs inline from log_event, so avoid a broader wake_all fan-out.
     if delivered_to.iter().any(|recipient| recipient == caller) {
@@ -1938,11 +2025,34 @@ mod tests {
             .unwrap();
         assert_eq!(notices(), 0);
 
+        let private_edit = || {
+            db.log_event(
+                "status",
+                "worker.realm",
+                &json!({
+                    "status": "active", "context": "tool:Edit", "detail": "src/a.rs",
+                    "_sandbox": {"team": "team"},
+                }),
+            )
+            .unwrap();
+        };
+        private_edit();
         db.log_status_event("luna", "active", "tool:Edit", Some("src/a.rs"), None)
             .unwrap();
+        assert_eq!(notices(), 0, "a private edit cannot trigger a notice");
+        private_edit();
         db.log_status_event("nova", "active", "tool:Edit", Some("src/a.rs"), None)
             .unwrap();
         assert_eq!(notices(), 1);
+        let text: String = db.conn().query_row(
+            "SELECT msg_text FROM events_v WHERE type = 'message' AND msg_from = '[hcom-events]'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(
+            text.contains("nova and luna") && !text.contains("worker.realm"),
+            "{text}"
+        );
         cleanup_test_db(path);
     }
 
@@ -1998,6 +2108,111 @@ mod tests {
         let sub_val: serde_json::Value = serde_json::from_str(&sub_after).unwrap();
         assert_eq!(sub_val["last_id"], 0);
 
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn sandbox_subscription_outputs_stay_with_local_recipients() {
+        use crate::sandbox::directory::{Access, Placement};
+        use crate::sandbox::store::Store;
+
+        let (db, db_path) = setup_full_test_db();
+        db.conn
+            .execute_batch(
+                "INSERT INTO instances (name, created_at, origin_device_id)
+                 VALUES ('luna', 1, NULL), ('nova', 2, NULL), ('outsider', 3, NULL),
+                        ('peer:RELY', 4, 'relay-device');",
+            )
+            .unwrap();
+        for caller in ["luna", "outsider", "peer:RELY"] {
+            let sub = json!({
+                "id": caller,
+                "caller": caller,
+                "caller_kind": "instance",
+                "sql": "type = 'status' OR json_extract(data, '$.text') = 'sandbox-fixture'",
+                "last_id": 0,
+                "on_hit_text": "@nova @outsider @peer:RELY derived",
+            });
+            db.kv_set(&format!("events_sub:{caller}"), Some(&sub.to_string()))
+                .unwrap();
+        }
+        let store = Store::initialize(&db).unwrap();
+        let team = store.create_team(None).unwrap();
+        let worker = store
+            .reserve_worker(
+                &team.id,
+                Access::Controller(team.external_controller.as_ref().unwrap()),
+                "worker",
+                crate::tool::Tool::Claude,
+                Placement {
+                    gateway: "gateway",
+                    workspace: "default",
+                    sandbox: "sandbox",
+                    incarnation: store.incarnation(),
+                },
+            )
+            .unwrap();
+        let status_id = db
+            .log_event(
+                "status",
+                &worker.binding.worker.worker,
+                &json!({"status": "idle"}),
+            )
+            .unwrap();
+        assert_eq!(db.get_last_event_id(), status_id);
+        let source = db
+            .log_event(
+                "message",
+                &worker.binding.worker.worker,
+                &json!({
+                    "from": worker.binding.worker.worker,
+                    "scope": "mentions",
+                    "text": "sandbox-fixture",
+                    "_sandbox": {"team": "team"},
+                    "delivered_to": ["luna", "nova", "peer:RELY"]
+                }),
+            )
+            .unwrap();
+        let derived: Vec<serde_json::Value> = db
+            .conn
+            .prepare("SELECT data FROM events WHERE id > ? ORDER BY id")
+            .unwrap()
+            .query_map([source], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+            .collect();
+        assert_eq!(derived.len(), 2);
+        assert_eq!(derived[0]["delivered_to"], json!(["luna"]));
+        assert_eq!(derived[1]["delivered_to"], json!(["nova"]));
+        assert_eq!(derived[1]["mentions"], json!(["nova"]));
+        for event in derived {
+            assert_eq!(event["_sandbox"]["team"], "team");
+        }
+        assert!(
+            crate::relay::push::build_push_payload(&db, "device")
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        for caller in ["outsider", "peer:RELY"] {
+            let stored = db.kv_get(&format!("events_sub:{caller}")).unwrap().unwrap();
+            let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+            assert_eq!(stored["last_id"], 0);
+        }
+        store
+            .retire_worker(
+                Access::Controller(team.external_controller.as_ref().unwrap()),
+                &worker.binding,
+            )
+            .unwrap();
+        let status_id = db
+            .log_event(
+                "status",
+                &worker.binding.worker.worker,
+                &json!({"status": "idle"}),
+            )
+            .unwrap();
+        assert_eq!(db.get_last_event_id(), status_id);
         cleanup_test_db(db_path);
     }
 
@@ -2633,7 +2848,8 @@ mod tests {
         assert!(send_sub_notification(
             &db,
             "tofu",
-            "[sub:test] #42 dani status | blocked | approval"
+            "[sub:test] #42 dani status | blocked | approval",
+            None,
         ));
 
         assert!(

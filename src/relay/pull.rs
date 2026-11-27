@@ -708,6 +708,13 @@ fn import_remote_events(
             if event_id <= last_event_id {
                 continue; // Already imported
             }
+            if is_sandbox_event(event) {
+                // A snapshot from an older peer may contain messages the
+                // sender should have withheld. Advance past them without
+                // creating an inbox row or attempting the same gap again.
+                max_event_id = max_event_id.max(event_id);
+                continue;
+            }
 
             // Skip events from before our reset
             let event_ts = event_epoch(event);
@@ -756,6 +763,23 @@ fn import_remote_events(
 }
 
 /// Seconds since the epoch for a relayed event's `ts` (0.0 when absent).
+pub(super) fn is_sandbox_event(event: &Value) -> bool {
+    fn contains_scope(value: &Value) -> bool {
+        match value {
+            Value::Object(fields) => {
+                fields.contains_key("_sandbox") || fields.values().any(contains_scope)
+            }
+            Value::Array(items) => items.iter().any(contains_scope),
+            _ => false,
+        }
+    }
+
+    event.get("data").is_some_and(|data| {
+        data.get("_sandbox").is_some()
+            || (event["type"] == "rpc_result" && data.get("result").is_some_and(contains_scope))
+    })
+}
+
 pub(crate) fn event_epoch(event: &Value) -> f64 {
     parse_ts(event.get("ts"))
 }
@@ -1551,6 +1575,38 @@ mod tests {
             "instance": "luna",
             "data": {"from": "luna", "text": text, "mentions": ["nova"]},
         })
+    }
+
+    #[test]
+    #[serial]
+    fn snapshot_import_advances_past_sandbox_events_without_delivering_them() {
+        let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let mut scoped = own_event(2, "private");
+        scoped["data"]["_sandbox"] = json!({"team": "team"});
+        let wrapped = json!({
+            "id": 3, "type": "rpc_result", "instance": "_rpc",
+            "data": {"result": {"events": [scoped.clone()]}}
+        });
+        assert!(import_remote_events(
+            &db,
+            "device-1234",
+            "ABCD",
+            &[own_event(1, "ordinary"), scoped, wrapped],
+            0.0,
+            "MINE"
+        ));
+        assert_eq!(event_cursor(&db, "device-1234"), 3);
+        let only_message: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.text') FROM events WHERE type = 'message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(only_message, "ordinary");
+        assert_eq!(db.get_last_event_id(), 1);
     }
 
     #[test]

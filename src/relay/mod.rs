@@ -355,9 +355,13 @@ pub fn is_worker_heartbeat_fresh(db: &HcomDb) -> bool {
 }
 
 /// Clear all per-device relay KV entries and reset global relay counters.
-/// Called on `relay new` so stale device mappings from the previous relay group
-/// don't contaminate the new one.
-pub fn clear_relay_device_state(db: &HcomDb) {
+/// Called on `relay new` and relay group switches so stale device mappings
+/// from the previous relay group don't contaminate the new one.
+///
+/// Preserves local instances and active OpenShell sandbox worker projections
+/// identified by an authoritative `sandbox_workers` binding, while staying
+/// compatible with pre-sandbox databases that have not initialized that schema.
+pub fn clear_relay_device_state(db: &HcomDb) -> anyhow::Result<()> {
     let prefixes = [
         "relay_short_",
         "relay_uuid_short_",
@@ -369,28 +373,47 @@ pub fn clear_relay_device_state(db: &HcomDb) {
         "relay_ctrl_",
         PEER_MAX_PACKET_PREFIX,
     ];
-    for prefix in &prefixes {
-        if let Ok(entries) = db.kv_prefix(prefix) {
-            for (key, _) in entries {
-                safe_kv_set(db, &key, None);
-            }
+    db.with_write_scope(|| {
+        for prefix in &prefixes {
+            db.kv_delete_prefix(prefix)?;
         }
-    }
-    // Reset global counters
-    for key in &[
-        "relay_device_count",
-        "relay_last_push",
-        "relay_last_push_id",
-        "relay_last_sync",
-        "relay_local_reset_ts",
-    ] {
-        safe_kv_set(db, key, None);
-    }
-    // Remove remote instances from the old relay
-    let _ = db.conn().execute(
-        "DELETE FROM instances WHERE origin_device_id IS NOT NULL AND origin_device_id != ''",
-        [],
-    );
+        for key in &[
+            "relay_device_count",
+            "relay_last_push",
+            "relay_last_push_id",
+            "relay_last_sync",
+            "relay_local_reset_ts",
+        ] {
+            db.kv_set(key, None)?;
+        }
+        // The write scope keeps sandbox enrollment from racing schema detection.
+        let conn = db.conn();
+        let has_sandbox_workers: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sandbox_workers')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_sandbox_workers {
+            conn.execute(
+                "DELETE FROM instances
+                 WHERE origin_device_id IS NOT NULL
+                   AND origin_device_id != ''
+                   AND NOT EXISTS (
+                       SELECT 1 FROM sandbox_workers w
+                       WHERE w.retired = 0
+                         AND w.name = instances.name
+                         AND ('openshell:' || w.generation) = instances.origin_device_id
+                   )",
+                [],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM instances WHERE origin_device_id IS NOT NULL AND origin_device_id != ''",
+                [],
+            )?;
+        }
+        Ok(())
+    })
 }
 
 // ── Relay health: derived effective state ──────────────────────────
@@ -1339,5 +1362,215 @@ mod tests {
             Some("1700000001.0")
         );
         assert!(safe_kv_get(&db, "relay_status").is_none());
+    }
+
+    // ── Relay-peer cleanup vs authoritative sandbox projections ────
+
+    fn has_sandbox_workers_table(db: &HcomDb) -> bool {
+        db.conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sandbox_workers')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    }
+
+    fn seed_relay_kv(db: &HcomDb, device_id: &str, short_id: &str) {
+        remember_device_short_id(db, device_id, short_id);
+        safe_kv_set(db, &format!("relay_caps_{device_id}"), Some("[\"launch\"]"));
+        safe_kv_set(db, &format!("relay_events_{device_id}"), Some("12"));
+        safe_kv_set(
+            db,
+            &format!("relay_reset_{device_id}"),
+            Some("1700000000.0"),
+        );
+        safe_kv_set(
+            db,
+            &format!("relay_sync_time_{device_id}"),
+            Some("1700000001.0"),
+        );
+        safe_kv_set(
+            db,
+            &format!("relay_state_ts_{device_id}"),
+            Some("1700000002"),
+        );
+        safe_kv_set(db, &format!("relay_ctrl_{device_id}"), Some("1"));
+        safe_kv_set(
+            db,
+            &format!("{PEER_MAX_PACKET_PREFIX}{device_id}"),
+            Some("65536"),
+        );
+        safe_kv_set(db, "relay_device_count", Some("1"));
+        safe_kv_set(db, "relay_last_push", Some("1700000003.0"));
+        safe_kv_set(db, "relay_last_push_id", Some("99"));
+        safe_kv_set(db, "relay_last_sync", Some("1700000004.0"));
+        safe_kv_set(db, "relay_local_reset_ts", Some("1700000005.0"));
+    }
+
+    #[test]
+    fn clear_relay_device_state_preserves_bound_sandbox_workers_not_prefixes() {
+        use crate::sandbox::directory::{Access, HostIdentity, Location, Placement, location};
+        use crate::sandbox::store::Store;
+        use crate::tool::Tool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, status) VALUES ('host', 1.0, 'listening')",
+                [],
+            )
+            .unwrap();
+        let host_sender = crate::identity::resolve_from_name(&db, "host").unwrap();
+        let host = HostIdentity::capture(&db, &host_sender).unwrap();
+        let store = Store::initialize(&db).unwrap();
+        let team = store.create_team(Some(&host)).unwrap();
+        let access = Access::Host(&host);
+
+        let active = store
+            .reserve_worker(
+                &team.id,
+                access,
+                "worker",
+                Tool::Claude,
+                Placement {
+                    gateway: "gateway",
+                    workspace: "default",
+                    sandbox: "owned-vm",
+                    incarnation: "fedc8acb-cc62-422d-9724-54e730e64f6e",
+                },
+            )
+            .unwrap();
+
+        // A retired worker whose projection row lingered (or reappeared) has no active binding.
+        let retired = store
+            .reserve_worker(
+                &team.id,
+                access,
+                "retired",
+                Tool::Codex,
+                Placement {
+                    gateway: "gateway",
+                    workspace: "default",
+                    sandbox: "retired-vm",
+                    incarnation: "00000000-0000-4000-8000-000000000001",
+                },
+            )
+            .unwrap();
+        store.retire_worker(access, &retired.binding).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, tool, created_at, status, status_context, background)
+                 VALUES (?, ?, 'codex', 2.0, 'inactive', 'sandbox', 1)",
+                rusqlite::params![
+                    retired.binding.worker.worker,
+                    format!("openshell:{}", retired.binding.worker.generation)
+                ],
+            )
+            .unwrap();
+
+        // Ordinary relay peers (including dotted names and spoofed openshell: prefix without binding)
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, created_at) VALUES
+                 ('peer:ABCD', 'relay-device-1', 3.0),
+                 ('dotted.peer:WXYZ', 'relay-device-2', 4.0),
+                 ('spoofed.realm', 'openshell:unowned-generation', 5.0)",
+                [],
+            )
+            .unwrap();
+        seed_relay_kv(&db, "relay-device-1", "ABCD");
+        seed_relay_kv(&db, "relay-device-2", "WXYZ");
+
+        clear_relay_device_state(&db).unwrap();
+
+        // Local host and active sandbox projection survive with authoritative OpenShell classification.
+        assert!(db.get_instance_full("host").unwrap().is_some());
+        let active_row = db
+            .get_instance_full(&active.binding.worker.worker)
+            .unwrap()
+            .expect("active sandbox worker projection must be preserved");
+        assert_eq!(
+            location(&db, &active_row).unwrap(),
+            Location::OpenShell(active)
+        );
+
+        // Relay peers, retired projection, and unowned openshell:-prefixed row are cleared.
+        assert!(db.get_instance_full("peer:ABCD").unwrap().is_none());
+        assert!(db.get_instance_full("dotted.peer:WXYZ").unwrap().is_none());
+        assert!(db.get_instance_full("spoofed.realm").unwrap().is_none());
+        assert!(
+            db.get_instance_full(&retired.binding.worker.worker)
+                .unwrap()
+                .is_none()
+        );
+
+        // Per-device and global relay KV state is cleared.
+        for key in [
+            "relay_short_ABCD",
+            "relay_uuid_short_relay-device-1",
+            "relay_caps_relay-device-1",
+            "relay_events_relay-device-1",
+            "relay_reset_relay-device-1",
+            "relay_sync_time_relay-device-1",
+            "relay_state_ts_relay-device-1",
+            "relay_ctrl_relay-device-1",
+            "relay_max_packet_relay-device-1",
+            "relay_device_count",
+            "relay_last_push",
+            "relay_last_push_id",
+            "relay_last_sync",
+            "relay_local_reset_ts",
+        ] {
+            assert!(safe_kv_get(&db, key).is_none(), "{key} should be cleared");
+        }
+    }
+
+    #[test]
+    fn clear_relay_device_state_keeps_pre_sandbox_schema_compatibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        assert!(!has_sandbox_workers_table(&db));
+
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, origin_device_id, created_at) VALUES
+                 ('local_host', NULL, 1.0),
+                 ('peer:ABCD', 'relay-device-1', 2.0),
+                 ('dotted.peer:WXYZ', 'relay-device-2', 3.0)",
+                [],
+            )
+            .unwrap();
+        seed_relay_kv(&db, "relay-device-1", "ABCD");
+
+        clear_relay_device_state(&db).unwrap();
+
+        assert!(db.get_instance_full("local_host").unwrap().is_some());
+        assert!(db.get_instance_full("peer:ABCD").unwrap().is_none());
+        assert!(db.get_instance_full("dotted.peer:WXYZ").unwrap().is_none());
+        assert!(safe_kv_get(&db, "relay_short_ABCD").is_none());
+        assert!(!has_sandbox_workers_table(&db));
+    }
+
+    #[test]
+    fn clear_relay_device_state_keeps_peer_mappings_when_cleanup_cannot_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_at(&dir.path().join("hcom.db")).unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE sandbox_workers (generation TEXT PRIMARY KEY);
+             INSERT INTO instances (name, origin_device_id, created_at)
+             VALUES ('peer:ABCD', 'relay-device-1', 2.0);",
+            )
+            .unwrap();
+        remember_device_short_id(&db, "relay-device-1", "ABCD");
+
+        assert!(clear_relay_device_state(&db).is_err());
+        assert!(db.get_instance_full("peer:ABCD").unwrap().is_some());
+        assert_eq!(
+            safe_kv_get(&db, "relay_short_ABCD").as_deref(),
+            Some("relay-device-1")
+        );
     }
 }
