@@ -20,6 +20,8 @@ fn fixture() -> (Binding, Message) {
         },
         MessagePayload {
             assigned_result: false,
+            expects_result: false,
+            validation: Vec::new(),
             result: None,
             conversation: None,
             target: "worker-b".into(),
@@ -46,6 +48,33 @@ fn raw_frame(frame: &Frame) -> Vec<u8> {
     let mut bytes = (data.len() as u32).to_be_bytes().to_vec();
     bytes.extend(data);
     bytes
+}
+
+#[test]
+fn validation_claims_require_a_final_and_reject_claimed_host_provenance() {
+    let (_, message) = fixture();
+    let mut payload = message.payload;
+    let claim = serde_json::json!({
+        "commit": "c".repeat(40), "environment": "guest.test", "summary": "tests passed"
+    });
+    let mut forged = claim.clone();
+    forged["source"] = serde_json::json!("host_observed");
+    assert!(forged.to_string().parse::<ValidationClaim>().is_err());
+    let mut invalid = claim.clone();
+    invalid["environment"] = serde_json::json!("unsafe/path");
+    assert!(invalid.to_string().parse::<ValidationClaim>().is_err());
+
+    payload.validation = vec![claim.to_string().parse().unwrap()];
+    assert!(Message::new(message.id.clone(), payload.clone()).is_err());
+    payload.result = Some(Outcome::Completed);
+    payload.target_generation = Some("generation-b".into());
+    payload.reply_to = Some(MessageId {
+        sequence: 2,
+        ..message.id.clone()
+    });
+    assert!(Message::new(message.id.clone(), payload.clone()).is_ok());
+    payload.validation = vec![payload.validation[0].clone(); 9];
+    assert!(Message::new(message.id, payload).is_err());
 }
 
 #[test]
@@ -476,6 +505,8 @@ fn broadcast_messages_reject_targets_threads_replies_and_preserve_legacy_digests
         legacy.id.clone(),
         MessagePayload {
             assigned_result: false,
+            expects_result: false,
+            validation: Vec::new(),
             result: None,
             conversation: None,
             target: String::new(),
@@ -808,6 +839,8 @@ fn guest_send_frames_carry_only_expansion_shapes() {
         legacy.id.clone(),
         MessagePayload {
             assigned_result: false,
+            expects_result: false,
+            validation: Vec::new(),
             result: None,
             conversation: Some("conv-1".into()),
             target: String::new(),

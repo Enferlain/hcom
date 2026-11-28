@@ -6,9 +6,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 pub const MAX_ENCODED_FRAME: u32 = 256 * 1024;
 pub(super) const MAX_FINAL_FRAME: usize = 64 * 1024;
+#[derive(Debug, thiserror::Error)]
+#[error("sandbox final report exceeds size limit")]
+pub(super) struct FinalFrameTooLarge;
 const HEADER_LEN: u32 = 4;
 pub(super) const MAX_DIRECTORY_PEERS: usize = 256;
 
@@ -107,6 +110,44 @@ impl Outcome {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ValidationClaim {
+    pub commit: String,
+    pub environment: String,
+    pub summary: String,
+}
+
+impl ValidationClaim {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            matches!(self.commit.len(), 40 | 64)
+                && self
+                    .commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "sandbox validation claim requires a full lowercase Git object ID"
+        );
+        validate_identifier(&self.environment)?;
+        ensure!(
+            self.summary.len() <= 2048,
+            "sandbox validation summary exceeds size limit"
+        );
+        validate_message_text(&self.summary)?;
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for ValidationClaim {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let claim: Self = serde_json::from_str(value).map_err(|error| error.to_string())?;
+        claim.validate().map_err(|error| error.to_string())?;
+        Ok(claim)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessagePayload {
     pub target: String,
     // Preserve the digest of retained messages written before this field was added.
@@ -131,8 +172,13 @@ pub struct MessagePayload {
     /// The host prepaid a result slot when it queued this assignment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub assigned_result: bool,
+    /// A guest requester prepaid private inbox space for a peer's final.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expects_result: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Outcome>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation: Vec<ValidationClaim>,
 }
 
 impl MessagePayload {
@@ -202,10 +248,32 @@ impl Message {
 
     pub(super) fn validate(&self) -> Result<()> {
         self.id.validate()?;
+        if !self.payload.validation.is_empty() {
+            ensure!(
+                self.payload.result.is_some() && self.payload.validation.len() <= 8,
+                "sandbox validation claims require a final report and are limited to eight"
+            );
+            for claim in &self.payload.validation {
+                claim.validate()?;
+            }
+        }
         if self.payload.assigned_result {
             ensure!(
                 self.payload.can_assign_result(),
                 "sandbox result assignment must be a directed, threaded host request"
+            );
+        }
+        if self.payload.expects_result {
+            ensure!(
+                self.payload.intent == Intent::Request
+                    && self.payload.thread.is_some()
+                    && self.payload.target_generation.is_some()
+                    && self.payload.sender_routing_generation.is_none()
+                    && self.payload.conversation.is_none()
+                    && self.payload.result.is_none()
+                    && !self.payload.broadcast
+                    && !self.payload.assigned_result,
+                "sandbox peer assignment requires a directed guest request"
             );
         }
         if self.payload.result.is_some() {
@@ -373,12 +441,18 @@ pub enum FrameBody {
     },
     Send(Message),
     Deliver(Message),
+    DeliverAssignment(Message),
     Accepted {
         id: MessageId,
         digest: [u8; 32],
     },
     /// The host permanently declined this guest message.
     Rejected {
+        id: MessageId,
+        digest: [u8; 32],
+    },
+    /// A guest permanently declined an assignment or the reserved return of a final.
+    DeclinedDelivery {
         id: MessageId,
         digest: [u8; 32],
     },
@@ -409,7 +483,7 @@ impl Frame {
         {
             ensure!(
                 body_bytes + HEADER_LEN as usize <= MAX_FINAL_FRAME,
-                "sandbox final report exceeds size limit"
+                FinalFrameTooLarge
             );
         }
         Ok(())
@@ -442,6 +516,10 @@ impl Frame {
                 message.validate()
             }
             FrameBody::Deliver(message) => {
+                ensure!(
+                    !message.payload.expects_result,
+                    "sandbox peer assignment requires host confirmation"
+                );
                 // A scoped expansion request is forwarded verbatim to each
                 // grant-holding destination; its grant check happens in the
                 // destination inbox, not the frame.
@@ -452,7 +530,18 @@ impl Frame {
                 );
                 message.validate()
             }
-            FrameBody::Accepted { id, .. } => id.validate(),
+            FrameBody::DeliverAssignment(message) => {
+                ensure!(
+                    message.payload.expects_result
+                        && message.payload.addresses(&self.binding.worker)
+                        && message.id.origin.worker != self.binding.worker.worker,
+                    "sandbox peer assignment does not match its destination"
+                );
+                message.validate()
+            }
+            FrameBody::Accepted { id, .. } | FrameBody::DeclinedDelivery { id, .. } => {
+                id.validate()
+            }
             FrameBody::Observe { key } | FrameBody::Observed { key, .. } => {
                 if let Some(key) = key {
                     key.id.validate()?;
@@ -657,8 +746,16 @@ impl Connection {
             ) => {
                 anyhow::bail!("guest cannot publish a sandbox team directory");
             }
-            (Receiver::Host, FrameBody::Deliver(_) | FrameBody::Observe { .. })
-            | (Receiver::Guest, FrameBody::Send(_) | FrameBody::Observed { .. }) => {
+            (
+                Receiver::Host,
+                FrameBody::Deliver(_) | FrameBody::DeliverAssignment(_) | FrameBody::Observe { .. },
+            )
+            | (
+                Receiver::Guest,
+                FrameBody::Send(_)
+                | FrameBody::DeclinedDelivery { .. }
+                | FrameBody::Observed { .. },
+            ) => {
                 anyhow::bail!("sandbox frame direction mismatch");
             }
             (_, FrameBody::Hello { .. }) => self.ready = true,
@@ -682,6 +779,9 @@ pub(super) fn validate_message_size(
         binding: binding.clone(),
         body: match receiver {
             Receiver::Host => FrameBody::Send(message.clone()),
+            Receiver::Guest if message.payload.expects_result => {
+                FrameBody::DeliverAssignment(message.clone())
+            }
             Receiver::Guest => FrameBody::Deliver(message.clone()),
         },
     };

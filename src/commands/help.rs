@@ -367,6 +367,10 @@ const SEND_HELP: &[HelpEntry] = &[
         "  --result <outcome>",
         "OpenShell final report with --reply-to and a request thread. Use completed, failed, or cancelled.",
     ),
+    (
+        "  --result-validation <json>",
+        "Worker-reported validation with commit, environment, and summary. Repeat up to eight times.",
+    ),
     ("  --reply-to <id>", "Link to event ID (42 or 42:BOXE)"),
     (
         "  --thread <name>",

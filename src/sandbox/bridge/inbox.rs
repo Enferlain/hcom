@@ -8,6 +8,7 @@ use crate::sandbox::protocol::{
     Activity, Binding, Message, MessageId, ObservationKey, Origin, TeamPeer, validate_identifier,
     validate_message_text,
 };
+use crate::sandbox::results::MissingReturnReservation;
 use crate::sandbox::store::{ForwardRoute, Store, UnavailableRecipient};
 use crate::shared::time::now_epoch_i64;
 
@@ -376,6 +377,12 @@ impl Inbound for HostInbox<'_, '_> {
             self.inbox.arm(publication);
             return Ok(event);
         }
+        if message.payload.expects_result {
+            return Err(UnavailableRecipient(
+                "sandbox peer assignment requires a current guest target",
+            )
+            .into());
+        }
         let local_created_at: Option<f64> = tx
             .query_row(
                 "SELECT i.created_at FROM sandbox_team_hosts h JOIN instances i
@@ -735,10 +742,8 @@ impl<'a> Inbox<'a> {
         if let Some(conversation) = &payload.conversation {
             sandbox["conversation"] = json!(conversation);
         }
-        if let Some(outcome) = payload.result {
-            sandbox["result"] = json!(outcome);
-        }
-        if payload.assigned_result {
+        crate::sandbox::results::add_report_metadata(&mut sandbox, message);
+        if payload.assigned_result || payload.expects_result {
             sandbox["assigned_result"] = json!(true);
         }
         let mut data = json!({
@@ -758,8 +763,12 @@ impl<'a> Inbox<'a> {
             data["thread"] = json!(thread);
         }
         if let Some(reply) = &payload.reply_to {
-            let reply = reply_event(tx, team, payload.thread.as_deref(), reply)?
-                .context("sandbox reply is not in this team conversation")?;
+            let parent = reply_event(tx, team, payload.thread.as_deref(), reply)?;
+            let reply = if self.private_guest && payload.result.is_some() {
+                parent.ok_or(MissingReturnReservation)?
+            } else {
+                parent.context("sandbox reply is not in this team conversation")?
+            };
             if payload.intent == crate::sandbox::protocol::Intent::Ack {
                 let parent: Option<String> = tx.query_row(
                     "SELECT json_extract(data, '$.intent') FROM events WHERE id = ?",

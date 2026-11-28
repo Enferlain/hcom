@@ -6,8 +6,8 @@ use crate::db::HcomDb;
 
 use super::admission::{Limits, QuotaExceeded};
 use super::protocol::{
-    Binding, InvalidMessageText, Message, MessageId, MessagePayload, Origin, Receiver,
-    validate_message_size,
+    Binding, FinalFrameTooLarge, InvalidMessageText, Message, MessageId, MessagePayload, Origin,
+    Receiver, validate_message_size,
 };
 use super::results::{self, InvalidFinal};
 
@@ -278,6 +278,9 @@ impl<'db> Store<'db> {
                 results::settle(tx, route, &message, event_id, wire_bytes)?;
             } else {
                 self.limits.record(tx, route, wire_bytes, event_id, None)?;
+                if matches!(receiver, Receiver::Host) {
+                    results::expect_return(tx, self.limits, route, &message)?;
+                }
             }
             tx.execute(
                 "INSERT INTO sandbox_outbox
@@ -355,6 +358,10 @@ impl<'db> Store<'db> {
             for hop in &hops {
                 self.check_binding(tx, &hop.route)?;
                 let mut payload = hop.payload.clone();
+                ensure!(
+                    !payload.expects_result,
+                    "host batch cannot claim a peer assignment"
+                );
                 payload.assigned_result = payload.can_assign_result();
                 let message = Message::new(
                     MessageId {
@@ -445,16 +452,23 @@ impl<'db> Store<'db> {
         self.check_binding(tx, destination)?;
         // Validating the Deliver envelope also checks its target against this binding.
         let wire_bytes = validate_message_size(Receiver::Guest, destination, message)?;
-        self.limits.pending(tx, wire_bytes)?;
+        let final_report = message.payload.result.is_some();
+        if final_report {
+            results::check(tx, source, message)?;
+            results::check_size(tx, wire_bytes, event_id)?;
+        } else {
+            self.limits.pending(tx, wire_bytes)?;
+            self.limits
+                .record(tx, destination, wire_bytes, event_id, None)?;
+            results::reserve_forwarded(tx, self.limits, source, destination, message, event_id)?;
+        }
         let ordinal = self.allocate_queue_sequence(tx)?;
-        self.limits
-            .record(tx, destination, wire_bytes, event_id, None)?;
         tx.execute(
             "INSERT INTO sandbox_outbox
                 (sequence, origin_worker, origin_generation, route, digest,
                  message, event_id, wire_bytes, expires_at,
-                 forwarded_sequence, forwarded_incarnation)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     forwarded_sequence, forwarded_incarnation, final_report)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 ordinal,
                 message.id.origin.worker,
@@ -464,9 +478,14 @@ impl<'db> Store<'db> {
                 serde_json::to_string(message)?,
                 event_id,
                 wire_bytes,
-                now.saturating_add(self.limits.queue_ttl_seconds),
+                if final_report {
+                    i64::MAX
+                } else {
+                    now.saturating_add(self.limits.queue_ttl_seconds)
+                },
                 message.id.sequence,
                 message.id.origin.incarnation,
+                final_report,
             ],
         )?;
         Ok(())
@@ -569,6 +588,21 @@ impl<'db> Store<'db> {
         self.settle(route, message, digest, now, true)
     }
 
+    #[cfg(unix)]
+    pub(super) fn decline_delivery(
+        &self,
+        route: &Binding,
+        message: &MessageId,
+        digest: &[u8; 32],
+        now: i64,
+    ) -> Result<()> {
+        ensure!(
+            message.origin != route.worker,
+            "sandbox delivery cannot decline its own origin"
+        );
+        self.settle(route, message, digest, now, true)
+    }
+
     fn settle(
         &self,
         route: &Binding,
@@ -586,7 +620,9 @@ impl<'db> Store<'db> {
                    AND origin_worker = ?4 AND origin_generation = ?5
                    AND route = ?6 AND digest = ?7
                    AND ((accepted = ?9 AND rejected = ?10)
-                        OR (accepted = 0 AND expires_at > ?8))",
+                        OR (accepted = 0 AND expires_at > ?8))
+                   AND (NOT ?10 OR NOT EXISTS (SELECT 1 FROM sandbox_result_requests r
+                        WHERE r.request = ?11 AND r.route = ?6 AND r.final_event IS NOT NULL))",
                 params![
                     message.sequence,
                     self.incarnation,
@@ -598,6 +634,11 @@ impl<'db> Store<'db> {
                     now,
                     if rejected { 2 } else { 1 },
                     rejected,
+                    if rejected {
+                        Some(serde_json::to_string(message)?)
+                    } else {
+                        None
+                    },
                 ],
             )?;
             ensure!(changed == 1, "receipt does not match sandbox outbox");
@@ -772,6 +813,9 @@ impl<'db> Store<'db> {
                     let event_id = insert_event(tx)?;
                     if final_report {
                         results::settle(tx, binding, message, event_id, wire_bytes)?;
+                    } else if message.payload.expects_result {
+                        self.limits
+                            .record(tx, binding, wire_bytes, event_id, Some(now))?;
                     }
                     Ok(event_id)
                 };
@@ -783,7 +827,12 @@ impl<'db> Store<'db> {
                     Err(error)
                         if error.is::<UnavailableRecipient>()
                             || error.is::<InvalidMessageText>()
-                            || error.is::<InvalidFinal>() =>
+                            || error.is::<InvalidFinal>()
+                            || (final_report && error.is::<FinalFrameTooLarge>())
+                            || (message.payload.expects_result
+                                && error
+                                    .downcast_ref::<QuotaExceeded>()
+                                    .is_some_and(QuotaExceeded::is_history)) =>
                     {
                         tx.execute_batch(
                             "ROLLBACK TO sandbox_inbound_event; RELEASE sandbox_inbound_event",
@@ -809,13 +858,18 @@ impl<'db> Store<'db> {
                     Err(error) => return Err(error),
                 }
             } else {
-                ensure!(!final_report, "sandbox final report must go to the host");
-                insert_event(tx)?
+                let event_id = insert_event(tx)?;
+                if final_report {
+                    results::accept_return(tx, binding, message, event_id, wire_bytes)?;
+                }
+                event_id
             };
             if !final_report {
                 let paced_at = matches!(receiver, Receiver::Host).then_some(now);
-                self.limits
-                    .record(tx, binding, wire_bytes, event_id, paced_at)?;
+                if !matches!(receiver, Receiver::Host) || !message.payload.expects_result {
+                    self.limits
+                        .record(tx, binding, wire_bytes, event_id, paced_at)?;
+                }
                 if matches!(receiver, Receiver::Guest) {
                     results::reserve(tx, self.limits, binding, message, event_id)?;
                 }
@@ -887,7 +941,9 @@ fn ensure_forwarding_schema(tx: &Transaction<'_>) -> Result<()> {
            ON sandbox_outbox(route, origin_worker, origin_generation, forwarded_incarnation, forwarded_sequence)
          WHERE forwarded_sequence IS NOT NULL;
          CREATE INDEX IF NOT EXISTS sandbox_outbox_pending_final
-         ON sandbox_outbox(route, final_report DESC, sequence) WHERE accepted = 0;",
+         ON sandbox_outbox(route, final_report DESC, sequence) WHERE accepted = 0;
+         CREATE INDEX IF NOT EXISTS sandbox_outbox_rejected_events
+         ON sandbox_outbox(event_id, route) WHERE rejected = 1;",
     )?;
     Ok(())
 }

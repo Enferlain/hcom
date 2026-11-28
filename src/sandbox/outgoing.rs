@@ -138,6 +138,8 @@ pub(crate) fn queue(
             };
             let payload = MessagePayload {
                 assigned_result: false,
+                expects_result: false,
+                validation: Vec::new(),
                 result: None,
                 target: target.into(),
                 target_generation: Some(binding.worker.generation.clone()),

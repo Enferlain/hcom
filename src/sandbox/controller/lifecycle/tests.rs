@@ -54,6 +54,8 @@ fn send(
             },
             MessagePayload {
                 assigned_result: false,
+                expects_result: false,
+                validation: Vec::new(),
                 result: None,
                 target: route.worker.worker.clone(),
                 target_generation: None,

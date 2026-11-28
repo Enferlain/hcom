@@ -12,6 +12,8 @@ fn message(origin: Origin, sequence: i64, target: &str) -> Message {
         MessageId { origin, sequence },
         MessagePayload {
             assigned_result: false,
+            expects_result: false,
+            validation: Vec::new(),
             result: None,
             conversation: None,
             target: target.into(),
@@ -1161,6 +1163,8 @@ fn broadcast_msg(origin: Origin, sequence: i64, text: &str) -> Message {
         MessageId { origin, sequence },
         MessagePayload {
             assigned_result: false,
+            expects_result: false,
+            validation: Vec::new(),
             result: None,
             conversation: None,
             target: String::new(),
@@ -1339,6 +1343,308 @@ fn bridge_step(
             deliver_all(&mut host_peer, &mut guest_peer, &mut guest_inbox);
         }
     }
+}
+
+#[test]
+fn peer_request_and_final_keep_their_wire_identity_across_reserved_hops() {
+    use crate::sandbox::{
+        admission::Limits,
+        protocol::{MAX_FINAL_FRAME, Outcome, validate_message_size},
+        store::Delivery,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO instances (name, created_at) VALUES ('owner', 1)",
+            [],
+        )
+        .unwrap();
+    let owner = HostIdentity::capture(
+        &db,
+        &crate::identity::resolve_from_name(&db, "owner").unwrap(),
+    )
+    .unwrap();
+    let host = Store::initialize(&db).unwrap();
+    let team = host.create_team(Some(&owner)).unwrap();
+    let guest = |alias, file| {
+        GuestNode::new(
+            root.path(),
+            file,
+            &host,
+            &team.id,
+            Access::Host(&owner),
+            alias,
+            2.0,
+        )
+    };
+    let requester = guest("requesterlongname", "alpha.db");
+    let reporter = guest("bravo", "bravo.db");
+    let a = &requester.worker.binding;
+    let b = &reporter.worker.binding;
+    requester.refresh_directory(&host, 2);
+    let a_store = requester.store();
+    let b_store = reporter.store();
+    let now = now_epoch_i64();
+    let host_declined = |route: &Binding, message: &Message| {
+        db.conn().query_row(
+            "SELECT accepted = 2 AND rejected = 1 FROM sandbox_outbox
+             WHERE forwarded_sequence = ? AND forwarded_incarnation = ? AND route = ? AND digest = ?",
+            params![message.id.sequence, message.id.origin.incarnation,
+                serde_json::to_string(route).unwrap(), message.digest.as_slice()],
+            |row| row.get::<_, bool>(0),
+        ).unwrap()
+    };
+    let ask = || {
+        run_cmd_send(
+            &requester.db,
+            "guest",
+            &[
+                "send",
+                "--json",
+                "--intent",
+                "request",
+                "--thread",
+                "peer-work",
+                "@bravo",
+                "--",
+                "test peer result",
+            ],
+        )
+    };
+    assert_eq!(ask(), 0);
+    let refused = a_store.next_pending(a, now).unwrap().unwrap();
+    assert!(refused.payload.expects_result);
+    assert!(!refused.payload.assigned_result);
+    let mut a_inbox = HostInbox::new(&db, &host, a);
+    let mut b_inbox = HostInbox::new(&db, &host, b);
+    let requester_run = serde_json::to_string(&(&a.sandbox, &a.worker.generation)).unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO sandbox_usage VALUES ('run', ?, ?, 0)",
+            params![requester_run, Limits::default().run.messages],
+        )
+        .unwrap();
+    bridge_step(&host, &requester, 3, &mut a_inbox, false, false);
+    assert_eq!(
+        a_store.delivery(&refused.id, now).unwrap(),
+        Some(Delivery::Rejected)
+    );
+    assert_eq!(db.get_last_event_id(), 0);
+    assert!(host.next_pending(b, now).unwrap().is_none());
+    assert_eq!(
+        db.conn()
+            .query_row("SELECT count(*) FROM sandbox_result_requests", [], |row| {
+                row.get::<_, i64>(0)
+            },)
+            .unwrap(),
+        0
+    );
+    db.conn()
+        .execute(
+            "DELETE FROM sandbox_usage WHERE scope = 'run' AND scope_key = ?",
+            [requester_run],
+        )
+        .unwrap();
+    assert_eq!(ask(), 0);
+    let refused_at_guest = a_store.next_pending(a, now).unwrap().unwrap();
+    bridge_step(&host, &requester, 4, &mut a_inbox, false, false);
+    let reporter_run = serde_json::to_string(&(&b.sandbox, &b.worker.generation)).unwrap();
+    reporter
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO sandbox_usage VALUES ('run', ?, ?, 0)",
+            params![reporter_run, Limits::default().run.messages],
+        )
+        .unwrap();
+    bridge_step(&host, &reporter, 4, &mut b_inbox, false, true);
+    assert!(host_declined(b, &refused_at_guest));
+    assert_eq!(reporter.db.get_last_event_id(), 0);
+    let mut after_decline = addressed(
+        message(b.worker.clone(), 98, &a.worker.worker),
+        &a.worker.generation,
+    );
+    after_decline.payload.result = Some(Outcome::Completed);
+    after_decline.payload.intent = Intent::Inform;
+    after_decline.payload.thread = refused_at_guest.payload.thread.clone();
+    let after_decline = Message::new(
+        after_decline.id,
+        MessagePayload {
+            reply_to: Some(refused_at_guest.id),
+            ..after_decline.payload
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        host.import(Receiver::Host, b, &after_decline, now, |_| panic!(
+            "declined assignment must not publish a final"
+        ))
+        .unwrap(),
+        Import::Rejected,
+    );
+    reporter
+        .db
+        .conn()
+        .execute("DELETE FROM sandbox_usage WHERE scope='run'", [])
+        .unwrap();
+
+    assert_eq!(ask(), 0);
+    let request = a_store.next_pending(a, now).unwrap().unwrap();
+    let requester_event = requester.db.get_last_event_id();
+    bridge_step(&host, &requester, 5, &mut a_inbox, false, false);
+    assert_eq!(host.next_pending(b, now).unwrap(), Some(request.clone()));
+    bridge_step(&host, &reporter, 5, &mut b_inbox, true, true);
+    let reporter_event = reporter.db.get_last_event_id();
+    assert_eq!(
+        event(&reporter.db, reporter_event)["_sandbox"]["id"],
+        json!(request.id)
+    );
+    // Losing and replaying the assignment receipt keeps one local reservation.
+    bridge_step(&host, &reporter, 6, &mut b_inbox, false, true);
+    assert_eq!(reporter.db.get_last_event_id(), reporter_event);
+
+    assert_eq!(ask(), 0);
+    let missing_return = a_store.next_pending(a, now).unwrap().unwrap();
+    let missing_requester_event = requester.db.get_last_event_id();
+    bridge_step(&host, &requester, 6, &mut a_inbox, false, false);
+    bridge_step(&host, &reporter, 7, &mut b_inbox, false, true);
+    let missing_return_event = reporter.db.get_last_event_id().to_string();
+
+    // The exact destination envelope is larger than the sender's envelope.
+    let mut oversized = addressed(
+        message(b.worker.clone(), 99, &a.worker.worker),
+        &a.worker.generation,
+    );
+    oversized.payload.result = Some(Outcome::Completed);
+    oversized.payload.intent = Intent::Inform;
+    oversized.payload.thread = request.payload.thread.clone();
+    oversized.payload.reply_to = Some(request.id.clone());
+    let near_limit = (MAX_FINAL_FRAME - 1400..MAX_FINAL_FRAME)
+        .step_by(4)
+        .find_map(|bytes| {
+            oversized.payload.text = "x".repeat(bytes);
+            let candidate = Message::new(oversized.id.clone(), oversized.payload.clone()).unwrap();
+            (validate_message_size(Receiver::Host, b, &candidate).is_ok()
+                && validate_message_size(Receiver::Guest, a, &candidate).is_err())
+            .then_some(candidate)
+        })
+        .expect("a final that fits only the shorter binding");
+    assert_eq!(
+        host.import(Receiver::Host, b, &near_limit, now, |tx| b_inbox
+            .insert(tx, &near_limit))
+            .unwrap(),
+        Import::Rejected
+    );
+
+    for db in [&db, &requester.db, &reporter.db] {
+        db.conn()
+            .execute(
+                "UPDATE sandbox_usage SET messages = ? WHERE scope = 'run'",
+                [Limits::default().run.messages],
+            )
+            .unwrap();
+    }
+    let claim = json!({
+        "commit": "a".repeat(40),
+        "environment": "openshell.test",
+        "summary": "cargo test passed",
+    });
+    assert_eq!(
+        run_cmd_send(
+            &reporter.db,
+            "guest",
+            &[
+                "send",
+                "--json",
+                "@requesterlongname",
+                "--result",
+                "completed",
+                "--reply-to",
+                &reporter_event.to_string(),
+                "--result-validation",
+                &claim.to_string(),
+                "--",
+                "peer final at full usage",
+            ]
+        ),
+        0
+    );
+    let final_report = b_store.next_pending(b, now).unwrap().unwrap();
+    assert_eq!(final_report.payload.result, Some(Outcome::Completed));
+    bridge_step(&host, &reporter, 8, &mut b_inbox, false, false);
+    assert_eq!(
+        b_store.delivery(&final_report.id, now).unwrap(),
+        Some(Delivery::Accepted)
+    );
+    assert_eq!(
+        host.next_pending(a, now).unwrap(),
+        Some(final_report.clone())
+    );
+    bridge_step(&host, &requester, 7, &mut a_inbox, true, true);
+    let final_event = requester.db.get_last_event_id();
+    let received = event(&requester.db, final_event);
+    assert_eq!(received["_sandbox"]["id"], json!(final_report.id));
+    assert_eq!(received["_sandbox"]["result"], "completed");
+    assert_eq!(
+        received["_sandbox"]["validation"],
+        json!({"source": "worker_reported", "claims": [claim]}),
+    );
+    assert_eq!(received["reply_to_local"], requester_event);
+    bridge_step(&host, &requester, 8, &mut a_inbox, false, true);
+    assert_eq!(requester.db.get_last_event_id(), final_event);
+
+    requester
+        .db
+        .conn()
+        .execute(
+            "DELETE FROM sandbox_result_expected WHERE request = ?",
+            [serde_json::to_string(&missing_return.id).unwrap()],
+        )
+        .unwrap();
+    requester
+        .db
+        .conn()
+        .execute("DELETE FROM events WHERE id = ?", [missing_requester_event])
+        .unwrap();
+    assert_eq!(
+        run_cmd_send(
+            &reporter.db,
+            "guest",
+            &[
+                "send",
+                "--json",
+                "@requesterlongname",
+                "--result",
+                "failed",
+                "--reply-to",
+                &missing_return_event,
+                "--",
+                "accepted by host but unavailable at requester",
+            ]
+        ),
+        0
+    );
+    let declined = b_store.next_pending(b, now).unwrap().unwrap();
+    bridge_step(&host, &reporter, 9, &mut b_inbox, false, false);
+    assert_eq!(
+        b_store.delivery(&declined.id, now).unwrap(),
+        Some(Delivery::Accepted)
+    );
+    bridge_step(&host, &requester, 9, &mut a_inbox, false, true);
+    assert!(host_declined(a, &declined));
+    assert_eq!(requester.db.get_last_event_id(), final_event);
+    assert!(host.next_pending(a, now).unwrap().is_none());
+    let settled: i64 = db
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM sandbox_result_requests WHERE final_event IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(settled, 2);
 }
 
 #[test]
@@ -2760,6 +3066,8 @@ fn guest_retains_grant_evidence_and_rejects_conflicting_ids() {
             },
             MessagePayload {
                 assigned_result: false,
+                expects_result: false,
+                validation: Vec::new(),
                 result: None,
                 target: binding.worker.worker.clone(),
                 target_generation: Some(binding.worker.generation.clone()),
@@ -2781,6 +3089,8 @@ fn guest_retains_grant_evidence_and_rejects_conflicting_ids() {
         },
         MessagePayload {
             assigned_result: false,
+            expects_result: false,
+            validation: Vec::new(),
             result: None,
             target: binding.worker.worker.clone(),
             target_generation: Some(binding.worker.generation.clone()),
@@ -2914,6 +3224,8 @@ fn host_import_rejects_forged_scoped_markers() {
         },
         payload: MessagePayload {
             assigned_result: false,
+            expects_result: false,
+            validation: Vec::new(),
             result: None,
             target: "host".into(),
             target_generation: Some(host_recipient_generation(db.conn(), "host", 1.0).unwrap()),

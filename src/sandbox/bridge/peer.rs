@@ -4,11 +4,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, ensure};
 
+use crate::sandbox::admission::QuotaExceeded;
 use crate::sandbox::openshell::ROTATION_BYTES;
 use crate::sandbox::protocol::{
     Binding, Connection, Frame, FrameBody, MAX_ENCODED_FRAME, MessageId, ObservationKey, Receiver,
     TeamPeer, VERSION, write_frame,
 };
+use crate::sandbox::results::{InvalidFinal, MissingReturnReservation};
 use crate::sandbox::store::{Import, Store};
 use crate::shared::time::now_epoch_i64;
 
@@ -53,6 +55,7 @@ struct PendingWrite {
 struct Outstanding {
     id: MessageId,
     digest: [u8; 32],
+    guest_can_decline: bool,
     sent: bool,
     deadline: Instant,
 }
@@ -301,10 +304,17 @@ impl<'store, 'db> Peer<'store, 'db> {
         let outstanding = Outstanding {
             id: message.id.clone(),
             digest: message.digest,
+            guest_can_decline: matches!(self.receiver, Receiver::Host)
+                && (message.payload.expects_result
+                    || message.payload.assigned_result
+                    || message.payload.result.is_some()),
             sent: false,
             deadline: now + self.limits.progress,
         };
         let bytes = self.encode(match self.receiver {
+            Receiver::Host if message.payload.expects_result => {
+                FrameBody::DeliverAssignment(message)
+            }
             Receiver::Host => FrameBody::Deliver(message),
             Receiver::Guest => FrameBody::Send(message),
         })?;
@@ -430,7 +440,9 @@ impl<'store, 'db> Peer<'store, 'db> {
         }
         let store = self.attached.as_ref().expect("handshake attaches bridge");
         match body {
-            FrameBody::Send(message) | FrameBody::Deliver(message) => {
+            FrameBody::Send(message)
+            | FrameBody::Deliver(message)
+            | FrameBody::DeliverAssignment(message) => {
                 ensure!(
                     !self.incoming_credit_used,
                     "sandbox bridge exceeded payload credit"
@@ -442,7 +454,23 @@ impl<'store, 'db> Peer<'store, 'db> {
                     &message,
                     now_epoch_i64(),
                     |tx| import.insert(tx, &message),
-                )?;
+                );
+                let result = match result {
+                    Err(error)
+                        if matches!(self.receiver, Receiver::Guest)
+                            && ((message.payload.expects_result
+                                || message.payload.assigned_result)
+                                && error
+                                    .downcast_ref::<QuotaExceeded>()
+                                    .is_some_and(QuotaExceeded::is_history)
+                                || (message.payload.result.is_some()
+                                    && (error.is::<MissingReturnReservation>()
+                                        || error.is::<InvalidFinal>()))) =>
+                    {
+                        Import::Rejected
+                    }
+                    result => result?,
+                };
                 if let Import::Inserted(event_id) = result {
                     import.committed(event_id);
                 }
@@ -450,6 +478,12 @@ impl<'store, 'db> Peer<'store, 'db> {
                 // payload. Any undelivered receipt is recovered by replay.
                 if self.draining.is_none() {
                     let receipt = match result {
+                        Import::Rejected if matches!(self.receiver, Receiver::Guest) => {
+                            FrameBody::DeclinedDelivery {
+                                id: message.id,
+                                digest: message.digest,
+                            }
+                        }
                         Import::Rejected => FrameBody::Rejected {
                             id: message.id,
                             digest: message.digest,
@@ -467,15 +501,22 @@ impl<'store, 'db> Peer<'store, 'db> {
                 }
             }
             FrameBody::Accepted { ref id, ref digest }
-            | FrameBody::Rejected { ref id, ref digest } => {
+            | FrameBody::Rejected { ref id, ref digest }
+            | FrameBody::DeclinedDelivery { ref id, ref digest } => {
+                let declined = matches!(body, FrameBody::DeclinedDelivery { .. });
                 ensure!(
                     self.outstanding.as_ref().is_some_and(|send| {
-                        send.sent && &send.id == id && &send.digest == digest
+                        send.sent
+                            && &send.id == id
+                            && &send.digest == digest
+                            && (!declined || send.guest_can_decline)
                     }),
                     "sandbox bridge receipt does not match the sent payload"
                 );
                 let now = now_epoch_i64();
-                if matches!(body, FrameBody::Rejected { .. }) {
+                if declined {
+                    store.decline_delivery(&self.binding, id, digest, now)?;
+                } else if matches!(body, FrameBody::Rejected { .. }) {
                     store.reject(&self.binding, id, digest, now)?;
                 } else {
                     store.acknowledge(&self.binding, id, digest, now)?;

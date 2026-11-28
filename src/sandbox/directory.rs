@@ -975,6 +975,8 @@ mod tests {
             },
             super::super::protocol::MessagePayload {
                 assigned_result: false,
+                expects_result: false,
+                validation: Vec::new(),
                 result: None,
                 target: "host".into(),
                 target_generation: None,

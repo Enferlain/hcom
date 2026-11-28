@@ -9,6 +9,12 @@ pub(super) struct QuotaExceeded {
     scope: &'static str,
 }
 
+impl QuotaExceeded {
+    pub(super) fn is_history(&self) -> bool {
+        matches!(self.scope, "run" | "team" | "host")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
     pub messages: i64,

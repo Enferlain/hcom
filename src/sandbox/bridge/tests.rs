@@ -126,6 +126,8 @@ impl Fixture {
 fn payload(target: &str, text: String) -> MessagePayload {
     MessagePayload {
         assigned_result: false,
+        expects_result: false,
+        validation: Vec::new(),
         result: None,
         conversation: None,
         target: target.into(),

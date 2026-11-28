@@ -94,6 +94,10 @@ pub struct SendArgs {
     #[arg(long, value_enum)]
     pub result: Option<crate::sandbox::protocol::Outcome>,
 
+    /// Attach a JSON validation claim with commit, environment, and summary (repeatable)
+    #[arg(long, requires = "result")]
+    pub result_validation: Vec<crate::sandbox::protocol::ValidationClaim>,
+
     /// Reply to event ID (42 or 42:BOXE)
     #[arg(long)]
     pub reply_to: Option<String>,
@@ -1422,7 +1426,8 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
                 &message,
                 &envelope,
                 reply_event,
-                args.result,
+                args.result
+                    .map(|outcome| (outcome, args.result_validation.as_slice())),
             ),
             SandboxTarget::Thread(resolved) => crate::sandbox::conversation::queue(
                 db,
@@ -2246,6 +2251,8 @@ mod tests {
                 },
                 MessagePayload {
                     assigned_result: false,
+                    expects_result: false,
+                    validation: Vec::new(),
                     result: None,
                     conversation: None,
                     target: "luna".into(),

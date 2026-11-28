@@ -7,6 +7,8 @@ const NOW: i64 = 1_000;
 fn payload(text: &str) -> MessagePayload {
     MessagePayload {
         assigned_result: false,
+        expects_result: false,
+        validation: Vec::new(),
         result: None,
         conversation: None,
         target: "worker-b".into(),
@@ -115,8 +117,11 @@ fn enqueue_and_receipt_are_atomic_and_survive_reopen() {
     db.conn()
         .execute_batch(
             "DROP INDEX sandbox_outbox_forwarded;
+         DROP INDEX sandbox_outbox_rejected_events;
+         DROP INDEX sandbox_outbox_pending_final;
          ALTER TABLE sandbox_outbox DROP COLUMN forwarded_sequence;
          ALTER TABLE sandbox_outbox DROP COLUMN forwarded_incarnation;
+         ALTER TABLE sandbox_outbox DROP COLUMN final_report;
          ALTER TABLE sandbox_outbox DROP COLUMN rejected;",
         )
         .unwrap();
@@ -798,6 +803,8 @@ fn hop(binding: &Binding, target: &str, text: &str) -> BatchHop {
         route: binding.clone(),
         payload: MessagePayload {
             assigned_result: false,
+            expects_result: false,
+            validation: Vec::new(),
             result: None,
             conversation: None,
             target: target.into(),

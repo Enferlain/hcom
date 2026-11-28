@@ -199,6 +199,8 @@ pub(crate) fn queue(
                     BatchHop {
                         payload: MessagePayload {
                             assigned_result: false,
+                            expects_result: false,
+                            validation: Vec::new(),
                             result: None,
                             target,
                             target_generation: Some(route.worker.generation.clone()),

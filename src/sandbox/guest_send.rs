@@ -11,7 +11,7 @@ use crate::shared::{SenderIdentity, SenderKind};
 
 use super::outgoing::{Queued, wire_intent};
 use super::protocol::{
-    Binding, Intent, MessageId, MessagePayload, Outcome, Receiver, TeamPeer,
+    Binding, Intent, MessageId, MessagePayload, Outcome, Receiver, TeamPeer, ValidationClaim,
     is_prohibited_message_control, validate_message_text,
 };
 use super::store::Store;
@@ -237,7 +237,7 @@ pub(crate) fn queue(
     text: &str,
     envelope: &MessageEnvelope,
     reply_event: Option<i64>,
-    result: Option<Outcome>,
+    result: Option<(Outcome, &[ValidationClaim])>,
 ) -> Result<Queued> {
     ensure!(!text.trim().is_empty(), "Message required");
     let (text, escaped_controls) = escape_controls(text);
@@ -322,7 +322,11 @@ pub(crate) fn queue(
     let payload = match target {
         Target::Direct { peer, .. } => MessagePayload {
             assigned_result: false,
-            result,
+            expects_result: intent == Intent::Request
+                && envelope.thread.is_some()
+                && peer.alias.is_some(),
+            result: result.map(|(outcome, _)| outcome),
+            validation: result.map_or_else(Vec::new, |(_, claims)| claims.to_vec()),
             conversation: None,
             target: peer.name.clone(),
             target_generation: Some(peer.generation.clone()),
@@ -335,6 +339,8 @@ pub(crate) fn queue(
         },
         Target::Broadcast { .. } => MessagePayload {
             assigned_result: false,
+            expects_result: false,
+            validation: Vec::new(),
             result: None,
             conversation: None,
             target: String::new(),
@@ -355,6 +361,8 @@ pub(crate) fn queue(
             );
             MessagePayload {
                 assigned_result: false,
+                expects_result: false,
+                validation: Vec::new(),
                 result: None,
                 conversation: Some(grant.conversation.clone()),
                 target: String::new(),
@@ -462,9 +470,7 @@ pub(crate) fn queue(
                 data["reply_to"] = json!(reply.to_string());
                 data["reply_to_local"] = json!(reply);
             }
-            if let Some(outcome) = message.payload.result {
-                data["_sandbox"]["result"] = json!(outcome);
-            }
+            super::results::add_report_metadata(&mut data["_sandbox"], message);
             event_id = db.insert_event_row("message", &sender.name, &data, None)?;
             Ok(event_id)
         },
