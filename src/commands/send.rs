@@ -98,6 +98,10 @@ pub struct SendArgs {
     #[arg(long, requires = "result")]
     pub result_validation: Vec<crate::sandbox::protocol::ValidationClaim>,
 
+    /// Reserve the initial prompt for one enrolled OpenShell worker
+    #[arg(long)]
+    pub hcom_initial: bool,
+
     /// Reply to event ID (42 or 42:BOXE)
     #[arg(long)]
     pub reply_to: Option<String>,
@@ -1038,6 +1042,19 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     }
 
     // ── Inline bundle ──
+    if args.hcom_initial {
+        if envelope
+            .intent
+            .is_some_and(|intent| intent != MessageIntent::Request)
+            || envelope.reply_to.is_some()
+            || envelope.thread.is_none()
+            || args.result.is_some()
+        {
+            eprintln!("Error: --hcom-initial requires a new threaded request");
+            return 1;
+        }
+        envelope.intent = Some(MessageIntent::Request);
+    }
     if args.result.is_some() {
         if envelope
             .intent
@@ -1223,6 +1240,17 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             return 1;
         }
     };
+
+    if args.hcom_initial
+        && (effective_targets.len() != 1
+            || !matches!(
+                preview_delivery.sandbox_target,
+                Some(SandboxTarget::Host(_))
+            ))
+    {
+        eprintln!("Error: --hcom-initial requires one explicitly addressed OpenShell worker");
+        return 1;
+    }
 
     if args.result.is_some()
         && !matches!(
@@ -1411,6 +1439,15 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             .as_deref()
             .and_then(|reply| resolve_reply_to_local(db, reply));
         let result = match target {
+            SandboxTarget::Host(worker) if args.hcom_initial => {
+                crate::sandbox::outgoing::queue_initial(
+                    db,
+                    &sender_identity,
+                    worker,
+                    &message,
+                    &envelope,
+                )
+            }
             SandboxTarget::Host(worker) => crate::sandbox::outgoing::queue(
                 db,
                 &sender_identity,
@@ -1478,6 +1515,9 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         });
         if let Some(queued) = &queued {
             out["queued_to"] = serde_json::json!(queued.queued_to);
+            if let Some(initial_request) = &queued.initial_request {
+                out["initial_request"] = serde_json::json!(initial_request);
+            }
             if queued.escaped_controls {
                 out["escaped_controls"] = serde_json::json!(true);
             }
@@ -1517,6 +1557,12 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         );
         if let Some(reason) = &queued.forwarding_reason {
             feedback.push_str(&format!("\n{reason}"));
+        }
+        if let Some(request) = &queued.initial_request {
+            feedback.push_str(&format!(
+                "\nInitial request: {}",
+                serde_json::to_string(request).expect("serialize initial request ID")
+            ));
         }
         feedback
     } else {

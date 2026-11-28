@@ -1346,6 +1346,230 @@ fn bridge_step(
 }
 
 #[test]
+fn initial_prompt_needs_durable_private_reservation_before_bootstrap() {
+    use super::super::{GuestManifest, initial_prompt};
+    use crate::sandbox::{admission::Limits, store::Delivery};
+
+    let root = tempfile::tempdir().unwrap();
+    let db = HcomDb::open_at(&root.path().join("host.db")).unwrap();
+    db.conn()
+        .execute(
+            "INSERT INTO instances (name, created_at) VALUES ('owner', 1), ('provisioner', 2)",
+            [],
+        )
+        .unwrap();
+    let identity = crate::identity::resolve_from_name(&db, "owner").unwrap();
+    let owner = HostIdentity::capture(&db, &identity).unwrap();
+    let provisioner = HostIdentity::capture(
+        &db,
+        &crate::identity::resolve_from_name(&db, "provisioner").unwrap(),
+    )
+    .unwrap();
+    let host = Store::initialize(&db).unwrap();
+    let team = host.create_team(Some(&owner)).unwrap();
+    host.enroll_host(&team.id, Access::Host(&owner), &provisioner)
+        .unwrap();
+    let guest = GuestNode::new(
+        root.path(),
+        "guest.db",
+        &host,
+        &team.id,
+        Access::Host(&provisioner),
+        "worker",
+        2.0,
+    );
+    let binding = &guest.worker.binding;
+    let guest_store = guest.store();
+    let target = format!("@{}", binding.worker.worker);
+    let request = |actor: &str, prompt: &str| {
+        run_cmd_send(
+            &db,
+            actor,
+            &[
+                "send",
+                "--json",
+                "--hcom-initial",
+                "--thread",
+                "initial-work",
+                &target,
+                "--",
+                prompt,
+            ],
+        )
+    };
+    let text = "Initial prompt\nwith a second line";
+    assert_eq!(
+        request("owner", text),
+        1,
+        "an enrolled host other than the reserving actor cannot claim the slot"
+    );
+    let run_key = serde_json::to_string(&(&binding.sandbox, &binding.worker.generation)).unwrap();
+    let limit = Limits::default().run.messages;
+    db.conn()
+        .execute(
+            "INSERT INTO sandbox_usage VALUES ('run', ?, ?, 0)",
+            params![run_key, limit - 1],
+        )
+        .unwrap();
+    assert_eq!(
+        request("provisioner", text),
+        1,
+        "the host cannot reserve both the request and its final"
+    );
+    assert_eq!(db.get_last_event_id(), 0);
+    let assignments = || {
+        db.conn()
+            .query_row("SELECT count(*) FROM sandbox_initial_requests", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(assignments(), 0);
+    db.conn()
+        .execute("DELETE FROM sandbox_usage WHERE scope = 'run'", [])
+        .unwrap();
+    assert_eq!(request("provisioner", text), 0);
+    let host_event = db.get_last_event_id();
+    db.conn()
+        .execute(
+            "UPDATE sandbox_usage SET messages = ? WHERE scope = 'run'",
+            [limit],
+        )
+        .unwrap();
+    assert_eq!(
+        request("provisioner", text),
+        0,
+        "an exact retry returns the committed reservation"
+    );
+    assert_eq!(request("provisioner", "Changed initial prompt"), 1);
+    let expires_at: i64 = db
+        .conn()
+        .query_row(
+            "SELECT expires_at FROM sandbox_outbox WHERE event_id = ?",
+            [host_event],
+            |row| row.get(0),
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "UPDATE sandbox_outbox SET expires_at = 0 WHERE event_id = ?",
+            [host_event],
+        )
+        .unwrap();
+    assert_eq!(
+        request("provisioner", text),
+        1,
+        "the delivery window elapsed"
+    );
+    host.expire_pending(now_epoch_i64()).unwrap();
+    assert_eq!(request("provisioner", text), 1, "expiry was recorded");
+    db.conn()
+        .execute(
+            "UPDATE sandbox_outbox SET rejected = 1 WHERE event_id = ?",
+            [host_event],
+        )
+        .unwrap();
+    assert_eq!(
+        request("provisioner", text),
+        1,
+        "the guest declined the assignment"
+    );
+    db.conn()
+        .execute(
+            "UPDATE sandbox_outbox SET accepted = 0, rejected = 0, expires_at = ?
+             WHERE event_id = ?",
+            params![expires_at, host_event],
+        )
+        .unwrap();
+    assert_eq!(assignments(), 1);
+    assert_eq!(db.get_last_event_id(), host_event);
+
+    let now = now_epoch_i64();
+    let message = host.next_pending(binding, now).unwrap().unwrap();
+    assert_eq!(message.id.sequence, 1);
+    assert_eq!(event(&db, host_event)["_sandbox"]["initial_prompt"], true);
+    let mut manifest = GuestManifest {
+        binding: binding.clone(),
+        database: root.path().join("guest.db"),
+        local_worker: Some(LocalWorker {
+            name: guest.local.name.clone(),
+            created_at: guest.local.created_at,
+        }),
+        startup_key: Some([1; 32]),
+        initial_request: Some(message.id.clone()),
+    };
+    assert!(initial_prompt(&guest_store, &guest.db, &manifest).is_err());
+    let mut host_inbox = HostInbox::new(&db, &host, binding);
+    bridge_step(&host, &guest, 2, &mut host_inbox, true, true);
+    let bootstrap = initial_prompt(&guest_store, &guest.db, &manifest).unwrap();
+    assert_eq!(bootstrap.initial_request, message.id);
+    assert_eq!(bootstrap.requester, "provisioner");
+    assert_eq!(bootstrap.thread, "initial-work");
+    assert!(
+        bootstrap
+            .prompt
+            .starts_with("Initial prompt\nwith a second line\n\n")
+    );
+    assert!(
+        bootstrap
+            .prompt
+            .contains(&format!("--reply-to {}", bootstrap.request_event))
+    );
+    assert_eq!(bootstrap.request_event, guest.db.get_last_event_id());
+    assert_eq!(
+        host.delivery(&message.id, now).unwrap(),
+        Some(Delivery::Pending)
+    );
+    bridge_step(&host, &guest, 3, &mut host_inbox, false, true);
+    assert_eq!(
+        initial_prompt(&guest_store, &guest.db, &manifest)
+            .unwrap()
+            .request_event,
+        bootstrap.request_event
+    );
+    assert_eq!(guest.db.get_last_event_id(), bootstrap.request_event);
+
+    manifest.local_worker.as_mut().unwrap().created_at += 1.0;
+    assert!(initial_prompt(&guest_store, &guest.db, &manifest).is_err());
+    manifest.local_worker.as_mut().unwrap().created_at = guest.local.created_at;
+    manifest.initial_request.as_mut().unwrap().sequence += 1;
+    assert!(initial_prompt(&guest_store, &guest.db, &manifest).is_err());
+    manifest.initial_request = Some(message.id);
+
+    assert_eq!(
+        run_cmd_send(
+            &guest.db,
+            "guest",
+            &[
+                "send",
+                "--json",
+                "@provisioner",
+                "--result",
+                "completed",
+                "--reply-to",
+                &bootstrap.request_event.to_string(),
+                "--",
+                "Initial request completed",
+            ]
+        ),
+        0
+    );
+    assert!(
+        initial_prompt(&guest_store, &guest.db, &manifest).is_err(),
+        "a queued final means this initial assignment has already been used"
+    );
+    bridge_step(&host, &guest, 4, &mut host_inbox, false, false);
+    assert_eq!(
+        event(&db, db.get_last_event_id())["reply_to_local"],
+        host_event
+    );
+    assert_eq!(
+        event(&db, db.get_last_event_id())["_sandbox"]["result"],
+        "completed"
+    );
+}
+
+#[test]
 fn peer_request_and_final_keep_their_wire_identity_across_reserved_hops() {
     use crate::sandbox::{
         admission::Limits,

@@ -19,6 +19,10 @@ pub(super) const SCHEMA: &str = "
         outcome TEXT,
         PRIMARY KEY (request, route)
     ) STRICT;
+    CREATE TABLE IF NOT EXISTS sandbox_initial_requests (
+        route TEXT PRIMARY KEY NOT NULL,
+        request TEXT NOT NULL
+    ) STRICT;
     CREATE TABLE IF NOT EXISTS sandbox_result_expected (
         request TEXT NOT NULL,
         route TEXT NOT NULL,
@@ -42,6 +46,30 @@ pub(super) struct InvalidFinal(pub &'static str);
 #[derive(Debug, thiserror::Error)]
 #[error("sandbox peer result has no matching open inbox reservation")]
 pub(super) struct MissingReturnReservation;
+
+#[derive(Debug, thiserror::Error)]
+#[error("sandbox worker already has an initial request")]
+pub(super) struct InitialRequestExists;
+
+pub(super) fn register_initial(
+    tx: &Transaction<'_>,
+    binding: &Binding,
+    message: &Message,
+) -> Result<()> {
+    ensure!(
+        message.payload.assigned_result && message.payload.reply_to.is_none(),
+        "sandbox initial prompt must be a new assigned request"
+    );
+    let inserted = tx.execute(
+        "INSERT INTO sandbox_initial_requests VALUES (?, ?) ON CONFLICT(route) DO NOTHING",
+        params![
+            serde_json::to_string(binding)?,
+            serde_json::to_string(&message.id)?
+        ],
+    )?;
+    ensure!(inserted == 1, InitialRequestExists);
+    Ok(())
+}
 
 pub(super) fn add_report_metadata(sandbox: &mut serde_json::Value, message: &Message) {
     let Some(outcome) = message.payload.result else {

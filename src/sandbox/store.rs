@@ -687,14 +687,22 @@ impl<'db> Store<'db> {
     /// Retention must preserve the fan-out rows together or persist a separate
     /// fan-out record before pruning individual routes (task 3.5).
     pub fn delivery(&self, id: &MessageId, now: i64) -> Result<Option<Delivery>> {
-        ensure_current_database(self.db)?;
+        self.delivery_on(self.connection()?, id, now)
+    }
+
+    pub(super) fn delivery_on(
+        &self,
+        conn: &rusqlite::Connection,
+        id: &MessageId,
+        now: i64,
+    ) -> Result<Option<Delivery>> {
         if id.origin.incarnation != self.incarnation {
             return Ok(None);
         }
         // A fan-out wire id maps to one row per destination. A single route's
         // receipt is not a whole-batch status, so an ambiguous identity stays
         // unknown instead of reporting the first hop's state as aggregate.
-        let fan_out: bool = self.db.conn().query_row(
+        let fan_out: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sandbox_outbox
              WHERE origin_worker = ? AND origin_generation = ?
                AND forwarded_sequence = ? AND forwarded_incarnation = ?)",
@@ -709,9 +717,7 @@ impl<'db> Store<'db> {
         if fan_out {
             return Ok(None);
         }
-        let row: Option<(i64, bool, i64)> = self
-            .db
-            .conn()
+        let row: Option<(i64, bool, i64)> = conn
             .query_row(
                 "SELECT accepted, rejected, expires_at FROM sandbox_outbox
                  WHERE sequence = ? AND forwarded_sequence IS NULL

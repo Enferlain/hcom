@@ -5,12 +5,12 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitSta
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Transaction, params};
-use serde::Deserialize;
+use rusqlite::{OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
 
 use super::controller::Owner;
 use super::openshell::Adapter;
-use super::protocol::{Activity, Binding, Message, ObservationKey, Receiver, TeamPeer};
+use super::protocol::{Activity, Binding, Message, MessageId, ObservationKey, Receiver, TeamPeer};
 use super::store::Store;
 use crate::db::HcomDb;
 use crate::shared::time::now_iso;
@@ -57,6 +57,7 @@ where
 use peer::{Limits, Peer};
 
 pub(crate) const GUEST_COMMAND: &str = "sandbox-guest-bridge";
+pub(crate) const BOOTSTRAP_COMMAND: &str = "sandbox-guest-bootstrap";
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const DIAGNOSTIC_LIMIT: usize = 64 * 1024;
 const DIAGNOSTIC_TAIL: usize = 1024;
@@ -380,6 +381,7 @@ struct GuestManifest {
     database: PathBuf,
     local_worker: Option<LocalWorker>,
     startup_key: Option<[u8; proof::BYTES]>,
+    initial_request: Option<MessageId>,
 }
 
 #[derive(Deserialize)]
@@ -389,32 +391,18 @@ struct LocalWorker {
     created_at: f64,
 }
 
-pub(crate) fn guest_main(args: &[String]) -> Result<()> {
-    use std::io::{IsTerminal, Read};
+fn read_manifest(path: &str) -> Result<GuestManifest> {
+    use std::io::Read;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let [manifest, epoch] = args else {
-        anyhow::bail!("invalid sandbox guest bridge arguments");
-    };
     ensure!(
-        absolute_guest_path(manifest),
+        absolute_guest_path(path),
         "invalid sandbox guest bridge manifest path"
     );
-    let epoch = epoch
-        .parse::<i64>()
-        .context("invalid sandbox bridge epoch")?;
-    ensure!(epoch > 0, "invalid sandbox bridge epoch");
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    ensure!(
-        !stdin.is_terminal() && !stdout.is_terminal(),
-        "sandbox guest bridge requires non-terminal stdio"
-    );
-
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(manifest)?;
+        .open(path)?;
     let metadata = file.metadata()?;
     ensure!(
         metadata.is_file(),
@@ -437,6 +425,109 @@ pub(crate) fn guest_main(args: &[String]) -> Result<()> {
         manifest.database.is_absolute() && manifest.database.is_file(),
         "sandbox guest bridge requires an existing private database"
     );
+    Ok(manifest)
+}
+
+#[derive(Debug, Serialize)]
+struct BootstrapPrompt {
+    initial_request: MessageId,
+    request_event: i64,
+    requester: String,
+    thread: String,
+    prompt: String,
+}
+
+fn initial_prompt(
+    store: &Store<'_>,
+    db: &HcomDb,
+    manifest: &GuestManifest,
+) -> Result<BootstrapPrompt> {
+    let request = manifest
+        .initial_request
+        .as_ref()
+        .context("sandbox guest manifest has no initial request")?;
+    ensure!(
+        manifest.startup_key.is_some(),
+        "sandbox bootstrap requires a managed guest manifest"
+    );
+    let worker = manifest
+        .local_worker
+        .as_ref()
+        .context("sandbox bootstrap requires a registered worker")?;
+    ensure!(
+        store.incarnation() == manifest.binding.worker.incarnation,
+        "sandbox guest database incarnation mismatch"
+    );
+    let inbox = inbox::GuestInbox::new(db, &manifest.binding, worker)?;
+    let route = serde_json::to_string(&manifest.binding)?;
+    let request_key = serde_json::to_string(request)?;
+    store.write(|tx| {
+        inbox.check_local_worker(tx)?;
+        let (request_event, requester, thread, prompt): (i64, String, String, String) = tx.query_row(
+            "SELECT r.request_event, r.requester, r.thread, json_extract(e.data, '$.text')
+             FROM sandbox_result_requests r
+             JOIN sandbox_inbox i ON i.event_id = r.request_event
+             JOIN events e ON e.id = r.request_event AND e.type = 'message'
+             JOIN sandbox_guest_directory d ON d.singleton = 1 AND d.binding = r.route
+             WHERE r.request = ?1 AND r.route = ?2 AND r.final_event IS NULL
+               AND d.local_name = ?3 AND d.local_created_at = ?4
+               AND i.worker = ?5 AND i.generation = ?6 AND i.incarnation = ?7 AND i.sequence = ?8
+               AND json_extract(e.data, '$._sandbox.assigned_result') = 1
+               AND json_extract(e.data, '$._sandbox.sender_routing_generation') = r.requester_generation
+               AND json_extract(e.data, '$.thread') = r.thread
+               AND json_extract(e.data, '$.reply_to') IS NULL",
+            params![request_key, route, worker.name, worker.created_at, request.origin.worker,
+                request.origin.generation, request.origin.incarnation, request.sequence],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?.context("sandbox initial request has not been durably assigned to this worker")?;
+        super::protocol::validate_message_text(&prompt)?;
+        let prompt = format!(
+            "{prompt}\n\n[hcom initial request #{request_event} in thread {thread}]\n\
+             When finished, send a final report to @{requester}. Use \
+             `hcom send @{requester} --result completed --reply-to {request_event} -- \"summary\"` \
+             and choose `failed` or `cancelled` when appropriate."
+        );
+        Ok(BootstrapPrompt {
+            initial_request: request.clone(),
+            request_event,
+            requester,
+            thread,
+            prompt,
+        })
+    })
+}
+
+pub(crate) fn bootstrap_main(args: &[String]) -> Result<()> {
+    let [path] = args else {
+        anyhow::bail!("usage: hcom sandbox-guest-bootstrap <manifest>");
+    };
+    let manifest = read_manifest(path)?;
+    let db = HcomDb::open_at(&manifest.database)?;
+    let store = Store::initialize(&db)?;
+    println!(
+        "{}",
+        serde_json::to_string(&initial_prompt(&store, &db, &manifest)?)?
+    );
+    Ok(())
+}
+
+pub(crate) fn guest_main(args: &[String]) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let [path, epoch] = args else {
+        anyhow::bail!("invalid sandbox guest bridge arguments");
+    };
+    let epoch = epoch
+        .parse::<i64>()
+        .context("invalid sandbox bridge epoch")?;
+    ensure!(epoch > 0, "invalid sandbox bridge epoch");
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    ensure!(
+        !stdin.is_terminal() && !stdout.is_terminal(),
+        "sandbox guest bridge requires non-terminal stdio"
+    );
+    let manifest = read_manifest(path)?;
     let db = HcomDb::open_at(&manifest.database)?;
     let store = Store::initialize(&db)?;
     ensure!(

@@ -489,5 +489,6 @@ pub(crate) fn queue(
         escaped_controls,
         forwarding: "pending",
         forwarding_reason: None,
+        initial_request: None,
     })
 }

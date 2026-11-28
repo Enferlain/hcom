@@ -8,9 +8,11 @@ use crate::shared::SenderIdentity;
 use crate::shared::time::now_epoch_i64;
 
 use super::controller::{Forwarding, forwarding_after_commit};
-use super::directory::{HostIdentity, Worker, check_sender, host_recipient_generation};
-use super::protocol::{Intent, MessageId, MessagePayload, validate_message_text};
-use super::store::{BatchHop, Store};
+use super::directory::{
+    HostIdentity, Worker, check_initial_requester, check_sender, host_recipient_generation,
+};
+use super::protocol::{Intent, Message, MessageId, MessagePayload, validate_message_text};
+use super::store::{BatchHop, Delivery, Store};
 
 #[derive(Debug)]
 pub(crate) struct Queued {
@@ -21,6 +23,7 @@ pub(crate) struct Queued {
     pub escaped_controls: bool,
     pub forwarding: &'static str,
     pub forwarding_reason: Option<String>,
+    pub initial_request: Option<MessageId>,
 }
 
 pub(super) fn wire_text(text: &str) -> Result<String> {
@@ -44,6 +47,34 @@ pub(crate) fn queue(
     text: &str,
     envelope: &MessageEnvelope,
     reply_event: Option<i64>,
+) -> Result<Queued> {
+    queue_request(db, sender, worker, text, envelope, reply_event, false)
+}
+
+pub(crate) fn queue_initial(
+    db: &HcomDb,
+    sender: &SenderIdentity,
+    worker: &Worker,
+    text: &str,
+    envelope: &MessageEnvelope,
+) -> Result<Queued> {
+    ensure!(
+        envelope.intent == Some(MessageIntent::Request)
+            && envelope.thread.is_some()
+            && envelope.reply_to.is_none(),
+        "sandbox initial prompt requires a new threaded request"
+    );
+    queue_request(db, sender, worker, text, envelope, None, true)
+}
+
+fn queue_request(
+    db: &HcomDb,
+    sender: &SenderIdentity,
+    worker: &Worker,
+    text: &str,
+    envelope: &MessageEnvelope,
+    reply_event: Option<i64>,
+    initial: bool,
 ) -> Result<Queued> {
     let text = wire_text(text)?;
     ensure!(
@@ -113,7 +144,7 @@ pub(crate) fn queue(
     };
 
     let mut event_id = 0;
-    let _message = store.enqueue_host_batch(
+    let message = store.enqueue_host_batch(
         now_epoch_i64(),
         |tx, _sequence| {
             // The store transaction fences the destination and decides the
@@ -125,7 +156,11 @@ pub(crate) fn queue(
             // membership. Replies never seed or expand at all: inheriting a
             // parent's display label must not mint a grant, and a reply to a
             // guest keeps that guest outside every conversation.
-            check_sender(tx, &binding.team, &host)?;
+            if initial {
+                check_initial_requester(tx, binding, &host)?;
+            } else {
+                check_sender(tx, &binding.team, &host)?;
+            }
             let conversation = if reply_event.is_none() {
                 match envelope.thread.as_deref() {
                     Some(label) => {
@@ -164,7 +199,7 @@ pub(crate) fn queue(
                 }],
             ))
         },
-        |_tx, (), messages| {
+        |tx, (), messages| {
             let message = messages
                 .first()
                 .context("sandbox send produced no payload")?;
@@ -189,6 +224,10 @@ pub(crate) fn queue(
             if message.payload.assigned_result {
                 data["_sandbox"]["assigned_result"] = json!(true);
             }
+            if initial {
+                super::results::register_initial(tx, binding, message)?;
+                data["_sandbox"]["initial_prompt"] = json!(true);
+            }
             if let Some(thread) = &envelope.thread {
                 data["thread"] = json!(thread);
             }
@@ -199,11 +238,62 @@ pub(crate) fn queue(
             event_id = db.insert_event_row("message", &sender.name, &data, None)?;
             Ok(event_id)
         },
-    )?;
-
-    // Wake readers of this committed journal entry without creating local
-    // recipient subscriptions or request watches.
-    crate::notify::wake_observers(db);
+    );
+    let initial_request = match message {
+        Ok(message) => {
+            // Publish only after committing the request and its reservation.
+            crate::notify::wake_observers(db);
+            initial.then_some(message.id)
+        }
+        Err(error) if initial && error.is::<super::results::InitialRequestExists>() => {
+            let (saved_event, saved_id) = store.write(|tx| {
+                store.check_binding(tx, binding)?;
+                check_initial_requester(tx, binding, &host)?;
+                let (saved_event, saved_id, encoded): (i64, String, String) = tx
+                    .query_row(
+                        "SELECT r.request_event, i.request, o.message
+                     FROM sandbox_initial_requests i
+                     JOIN sandbox_result_requests r ON r.route = i.route AND r.request = i.request
+                     JOIN sandbox_outbox o ON o.route = r.route AND o.event_id = r.request_event
+                     WHERE i.route = ?",
+                        [&route],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?
+                    .context("sandbox initial request evidence is unavailable")?;
+                let saved: Message = serde_json::from_str(&encoded)?;
+                saved.validate()?;
+                ensure!(
+                    serde_json::to_string(&saved.id)? == saved_id
+                        && saved.id.origin == origin
+                        && saved.payload.assigned_result
+                        && saved.payload.target == target
+                        && saved.payload.target_generation.as_deref()
+                            == Some(binding.worker.generation.as_str())
+                        && saved.payload.reply_to.is_none()
+                        && saved.payload.thread == envelope.thread
+                        && saved.payload.text == text,
+                    "sandbox initial request differs from the committed assignment"
+                );
+                match store.delivery_on(tx, &saved.id, now_epoch_i64())? {
+                    Some(Delivery::Pending | Delivery::Accepted) => {}
+                    Some(Delivery::AwaitingExpiry | Delivery::Expired) => {
+                        anyhow::bail!("sandbox initial request {saved_id} expired");
+                    }
+                    Some(Delivery::Rejected) => {
+                        anyhow::bail!("sandbox initial request {saved_id} was rejected");
+                    }
+                    None => {
+                        anyhow::bail!("sandbox initial request {saved_id} has no delivery state")
+                    }
+                }
+                Ok((saved_event, saved.id))
+            })?;
+            event_id = saved_event;
+            Some(saved_id)
+        }
+        Err(error) => return Err(error),
+    };
     let (forwarding, forwarding_reason) = match forwarding_after_commit(&store) {
         Forwarding::ControllerReady(_) => ("pending", None),
         Forwarding::Disabled => ("disabled", None),
@@ -217,5 +307,6 @@ pub(crate) fn queue(
         escaped_controls: false,
         forwarding,
         forwarding_reason,
+        initial_request,
     })
 }

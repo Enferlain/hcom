@@ -371,6 +371,10 @@ const SEND_HELP: &[HelpEntry] = &[
         "  --result-validation <json>",
         "Worker-reported validation with commit, environment, and summary. Repeat up to eight times.",
     ),
+    (
+        "  --hcom-initial",
+        "Reserve a worker's initial prompt with --thread and one OpenShell target. JSON includes initial_request.",
+    ),
     ("  --reply-to <id>", "Link to event ID (42 or 42:BOXE)"),
     (
         "  --thread <name>",

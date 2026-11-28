@@ -40,6 +40,11 @@ pub(super) const SCHEMA: &str = "
     ) STRICT;
     CREATE UNIQUE INDEX IF NOT EXISTS sandbox_workers_current
         ON sandbox_workers(name) WHERE retired = 0;
+    CREATE TABLE IF NOT EXISTS sandbox_worker_provisioners (
+        generation TEXT PRIMARY KEY NOT NULL REFERENCES sandbox_workers(generation),
+        name TEXT NOT NULL,
+        created_at REAL NOT NULL
+    ) STRICT;
     CREATE INDEX IF NOT EXISTS sandbox_workers_name
         ON sandbox_workers(name);
     CREATE INDEX IF NOT EXISTS sandbox_workers_team_alias
@@ -291,6 +296,12 @@ impl Store<'_> {
                     placement.workspace,
                 ],
             )?;
+            if let Access::Host(host) = access {
+                tx.execute(
+                    "INSERT INTO sandbox_worker_provisioners VALUES (?, ?, ?)",
+                    params![generation, host.name, host.created_at],
+                )?;
+            }
             tx.execute(
                 "INSERT INTO instances
                    (name, origin_device_id, tool, created_at, status, status_context, background)
@@ -493,6 +504,31 @@ pub(crate) fn current_worker(conn: &Connection, name: &str) -> Result<Option<Wor
 
 pub(super) fn check_sender(conn: &Connection, team: &str, host: &HostIdentity) -> Result<()> {
     authorize(conn, team, Access::Host(host), false).map(|_| ())
+}
+
+pub(super) fn check_initial_requester(
+    conn: &Connection,
+    binding: &Binding,
+    host: &HostIdentity,
+) -> Result<()> {
+    check_sender(conn, &binding.team, host)?;
+    let provisioner: Option<(String, f64)> = conn
+        .query_row(
+            "SELECT name, created_at FROM sandbox_worker_provisioners WHERE generation = ?",
+            [&binding.worker.generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((name, created_at)) = provisioner {
+        ensure!(
+            name == host.name && created_at == host.created_at,
+            "sandbox initial prompt requires the host that reserved the worker"
+        );
+    } else {
+        // Earlier worker rows do not identify their reserving host.
+        authorize(conn, &binding.team, Access::Host(host), true)?;
+    }
+    Ok(())
 }
 
 /// Resolve a bare alias only among the sender's current memberships.

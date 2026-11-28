@@ -267,6 +267,7 @@ pub(crate) fn queue(
         escaped_controls: false,
         forwarding,
         forwarding_reason,
+        initial_request: None,
     })
 }
 

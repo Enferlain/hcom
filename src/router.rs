@@ -202,6 +202,8 @@ pub enum Action {
     SandboxWorker,
     #[cfg(unix)]
     SandboxGuestBridge,
+    #[cfg(unix)]
+    SandboxGuestBootstrap,
 }
 
 /// Global flags extracted from argv before dispatch.
@@ -372,6 +374,10 @@ pub fn resolve_action(argv: &[String]) -> Action {
     #[cfg(unix)]
     if first == crate::sandbox::bridge::GUEST_COMMAND {
         return Action::SandboxGuestBridge;
+    }
+    #[cfg(unix)]
+    if first == crate::sandbox::bridge::BOOTSTRAP_COMMAND {
+        return Action::SandboxGuestBootstrap;
     }
 
     // PTY mode: `hcom pty <tool> [args...]`
@@ -715,6 +721,10 @@ pub fn dispatch() -> anyhow::Result<()> {
     if matches!(action, Action::SandboxGuestBridge) {
         return crate::sandbox::bridge::guest_main(&argv[1..]);
     }
+    #[cfg(unix)]
+    if matches!(action, Action::SandboxGuestBootstrap) {
+        return crate::sandbox::bridge::bootstrap_main(&argv[1..]);
+    }
 
     // Skip dev_root re-exec for `config dev_root` so a stale pointer can't
     // trap the user. Also keep `update` on the invoked (installed) binary;
@@ -764,7 +774,7 @@ pub fn dispatch() -> anyhow::Result<()> {
             }
         }
         #[cfg(unix)]
-        Action::SandboxGuestBridge => {
+        Action::SandboxGuestBridge | Action::SandboxGuestBootstrap => {
             unreachable!("guest bridge dispatched before dev-root routing")
         }
         Action::Command { ref cmd, ref args } if cmd == "sandbox" => {
